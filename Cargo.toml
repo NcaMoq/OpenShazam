@@ -6,6 +6,7 @@ members = [
     "crates/sigx-core",
     "crates/sigx-testkit",
     "crates/sigx-cli",
+    "crates/shazam-progressive",
     "crates/shazam-http-lab",
     "apps/openshazam",
 ]

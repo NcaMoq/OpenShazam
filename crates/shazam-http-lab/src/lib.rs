@@ -17,6 +17,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
+use shazam_progressive::{RecognitionTiming, RetryDirective};
 
 const SIGNATURE_DATA_URI: &str = "data:audio/vnd.shazam.sig;base64,";
 const SHAZAM_MAC_PLATFORM: &str = "MAC";
@@ -38,6 +39,17 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// Classification of one progressive recognition HTTP response. The response
+/// body is consumed immediately; callers only receive parsed track data or
+/// bounded control fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressiveHttpResponse {
+    Matched(Vec<TrackCandidate>),
+    NoMatch(Option<RetryDirective>),
+    HttpError(u16),
+    InvalidResponse,
+}
+
 /// Non-secret host profile sent to the Config endpoint. The installation ID
 /// is deliberately not part of this type; it is parsed from the HTTPS response
 /// and is never persisted by this crate.
@@ -54,9 +66,60 @@ pub struct ConfigRequestProfile {
 
 /// The two values required to construct a Mac manual-tag route. No `Debug`
 /// implementation is provided so accidental logging cannot expose INID.
+#[derive(Clone)]
 pub struct ShazamConfiguration {
     tag_url_template: String,
     installation_id: String,
+    manual_timing: ManualTaggingTiming,
+}
+
+/// Recognized numeric fields from the Shazam Config response. These remain
+/// optional: a missing or ambiguous field is not replaced with an assumed
+/// server value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManualTaggingTiming {
+    pub sample_ms: Option<u64>,
+    pub progressive_ms: Option<u64>,
+    pub minimum_sample_ms: Option<u64>,
+    pub maximum_sample_ms: Option<u64>,
+}
+
+impl ManualTaggingTiming {
+    /// Build the control-engine profile from Config values plus explicit local
+    /// safety bounds. Attempt count and request timeout are local safeguards,
+    /// not claims about the Mac app's undocumented defaults.
+    pub fn recognition_timing(
+        self,
+        sample_rate: u32,
+        minimum_sample_fallback_ms: u64,
+        default_retry_interval_ms: u64,
+        request_timeout_ms: u64,
+        maximum_retry_delay_ms: u64,
+        maximum_attempts: u8,
+    ) -> Result<RecognitionTiming, Error> {
+        let initial_sample_ms = self.progressive_ms.or(self.sample_ms).ok_or_else(|| {
+            Error::BadResponse("Config has no usable manual sample duration".into())
+        })?;
+        let timing = RecognitionTiming {
+            sample_rate,
+            minimum_signature_ms: self.minimum_sample_ms.unwrap_or(minimum_sample_fallback_ms),
+            initial_sample_ms,
+            progressive_step_ms: self.progressive_ms.unwrap_or(initial_sample_ms),
+            maximum_sample_ms: self.maximum_sample_ms.or(self.sample_ms).ok_or_else(|| {
+                Error::BadResponse("Config has no usable maximum sample duration".into())
+            })?,
+            default_retry_interval_ms,
+            request_timeout_ms,
+            maximum_retry_delay_ms,
+            maximum_attempts,
+        };
+        if timing.default_retry_interval_ms > maximum_retry_delay_ms {
+            return Err(Error::BadResponse(
+                "local default retry interval exceeds the local safety bound".into(),
+            ));
+        }
+        Ok(timing)
+    }
 }
 
 impl ShazamConfiguration {
@@ -71,6 +134,10 @@ impl ShazamConfiguration {
 
     pub fn tag_url_template(&self) -> &str {
         &self.tag_url_template
+    }
+
+    pub fn manual_timing(&self) -> ManualTaggingTiming {
+        self.manual_timing
     }
 }
 
@@ -209,7 +276,123 @@ pub fn parse_shazam_config(body: &[u8]) -> Result<ShazamConfiguration, Error> {
     Ok(ShazamConfiguration {
         tag_url_template: tag_url_template.to_owned(),
         installation_id: installation_id.to_owned(),
+        manual_timing: parse_manual_tagging_timing(&root),
     })
+}
+
+fn parse_manual_tagging_timing(root: &Value) -> ManualTaggingTiming {
+    ManualTaggingTiming {
+        sample_ms: unique_config_number(root, "sampleseconds").and_then(seconds_to_ms),
+        progressive_ms: unique_config_number(root, "progressiveseconds").and_then(seconds_to_ms),
+        minimum_sample_ms: unique_config_number(root, "minsamplems").and_then(number_to_ms),
+        maximum_sample_ms: unique_config_number(root, "maxsamplems").and_then(number_to_ms),
+    }
+}
+
+fn unique_config_number(root: &Value, key: &str) -> Option<f64> {
+    fn collect(value: &Value, key: &str, found: &mut Vec<f64>) {
+        match value {
+            Value::Object(object) => {
+                for (name, child) in object {
+                    if name.eq_ignore_ascii_case(key) {
+                        if let Some(number) = child.as_f64().filter(|number| number.is_finite()) {
+                            found.push(number);
+                        }
+                    }
+                    collect(child, key, found);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    collect(child, key, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut values = Vec::new();
+    collect(root, key, &mut values);
+    let first = *values.first()?;
+    values
+        .iter()
+        .all(|value| (*value - first).abs() <= f64::EPSILON)
+        .then_some(first)
+}
+
+fn seconds_to_ms(seconds: f64) -> Option<u64> {
+    if !(0.0..=600.0).contains(&seconds) {
+        return None;
+    }
+    let millis = seconds * 1_000.0;
+    (millis.is_finite() && millis <= u64::MAX as f64).then_some(millis.round() as u64)
+}
+
+fn number_to_ms(millis: f64) -> Option<u64> {
+    if !(0.0..=600_000.0).contains(&millis) {
+        return None;
+    }
+    (millis.is_finite() && millis <= u64::MAX as f64).then_some(millis.round() as u64)
+}
+
+/// Decode the Mac 2.11 response fields confirmed in the ARM64 request parser.
+/// `retryms` is a cumulative sample target in milliseconds; otherwise
+/// `sampleseconds` is the target and `intervalseconds` is the wait. The
+/// similarly named `retryInMilliseconds` is not present in this binary and is
+/// deliberately ignored. Unknown/invalid layouts leave retry choice to the
+/// caller's bounded local fallback.
+pub fn retry_directive_from_response(body: &[u8]) -> Result<Option<RetryDirective>, Error> {
+    let root: Value = serde_json::from_slice(body)
+        .map_err(|_| Error::BadResponse("recognition response is not valid JSON".into()))?;
+    if let Some(retry_ms) = root
+        .get("retryms")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .and_then(number_to_ms)
+    {
+        return Ok(Some(RetryDirective {
+            delay_ms: Some(0),
+            target_sample_ms: Some(retry_ms),
+        }));
+    }
+
+    let sample_ms = root
+        .get("sampleseconds")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .and_then(seconds_to_ms);
+    let interval_ms = root
+        .get("intervalseconds")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .and_then(seconds_to_ms);
+
+    Ok(
+        (sample_ms.is_some() || interval_ms.is_some()).then_some(RetryDirective {
+            delay_ms: interval_ms,
+            target_sample_ms: sample_ms,
+        }),
+    )
+}
+
+/// Convert the response status/body into the minimal state transition used by
+/// the progressive controller. Unknown retry fields do not force sampling or
+/// waiting; callers fall back to their bounded local policy.
+pub fn interpret_progressive_http_response(status: u16, body: &[u8]) -> ProgressiveHttpResponse {
+    if !(200..300).contains(&status) {
+        return ProgressiveHttpResponse::HttpError(status);
+    }
+
+    match parse_track_candidates(body) {
+        Ok(candidates) if !candidates.is_empty() => ProgressiveHttpResponse::Matched(candidates),
+        Ok(_) | Err(Error::NoMatches) => {
+            ProgressiveHttpResponse::NoMatch(retry_directive_from_response(body).ok().flatten())
+        }
+        Err(_) => match retry_directive_from_response(body).ok().flatten() {
+            Some(retry) => ProgressiveHttpResponse::NoMatch(Some(retry)),
+            None => ProgressiveHttpResponse::InvalidResponse,
+        },
+    }
 }
 
 /// Resolve a Config-provided Mac tag template while keeping the route
@@ -335,6 +518,22 @@ pub fn post_loopback_json(endpoint: &str, body: &[u8]) -> Result<HttpResponse, E
 /// not use a proxy or follow redirects, and requires a locally installed curl.
 /// Call only when you are authorized to use this first-party endpoint.
 pub fn post_shazam_json(endpoint: &str, body: &[u8]) -> Result<HttpResponse, Error> {
+    post_shazam_json_with_timeout(endpoint, body, Duration::from_secs(20))
+}
+
+/// POST the observed Mac manual-tag request with a caller-selected local
+/// timeout. The timeout controls the curl process only; server retry timing is
+/// a separate value carried by `RetryDirective`.
+pub fn post_shazam_json_with_timeout(
+    endpoint: &str,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<HttpResponse, Error> {
+    if timeout.is_zero() || timeout > Duration::from_secs(600) {
+        return Err(Error::BadResponse(
+            "HTTPS timeout must be greater than zero and at most 600 seconds".into(),
+        ));
+    }
     validate_shazam_endpoint(endpoint)?;
 
     let mut child = Command::new(system_curl_program())
@@ -345,7 +544,9 @@ pub fn post_shazam_json(endpoint: &str, body: &[u8]) -> Result<HttpResponse, Err
             "--silent",
             "--show-error",
             "--max-time",
-            "20",
+        ])
+        .arg(format!("{:.3}", timeout.as_secs_f64().max(0.001)))
+        .args([
             "--proto",
             "=https",
             "--http1.1",
@@ -1112,6 +1313,123 @@ mod tests {
     }
 
     #[test]
+    fn config_parser_extracts_only_unique_manual_timing_values() {
+        let fixture = br#"{
+            "inid":"fixture-installation-id",
+            "apis":{"tag":{"href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true"}},
+            "tagging":{"sampleseconds":12,"progressiveseconds":3,"minsamplems":3000,"maxsamplems":12000}
+        }"#;
+        let configuration = parse_shazam_config(fixture).unwrap();
+        assert_eq!(
+            configuration.manual_timing(),
+            ManualTaggingTiming {
+                sample_ms: Some(12_000),
+                progressive_ms: Some(3_000),
+                minimum_sample_ms: Some(3_000),
+                maximum_sample_ms: Some(12_000),
+            }
+        );
+        let timing = configuration
+            .manual_timing()
+            .recognition_timing(44_100, 1_000, 0, 20_000, 30_000, 4)
+            .unwrap();
+        assert_eq!(timing.initial_sample_ms, 3_000);
+        assert_eq!(timing.progressive_step_ms, 3_000);
+        assert_eq!(timing.maximum_sample_ms, 12_000);
+        assert_eq!(timing.default_retry_interval_ms, 0);
+    }
+
+    #[test]
+    fn ambiguous_or_missing_config_timing_is_not_filled_with_assumptions() {
+        let value: Value = serde_json::from_slice(
+            br#"{"tagging":{"sampleseconds":12,"progressiveseconds":3},"other":{"sampleseconds":9}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_manual_tagging_timing(&value).sample_ms, None);
+        assert_eq!(
+            parse_manual_tagging_timing(&value).progressive_ms,
+            Some(3_000)
+        );
+        assert!(parse_manual_tagging_timing(&value)
+            .recognition_timing(16_000, 1_000, 0, 20_000, 30_000, 4)
+            .is_err());
+    }
+
+    #[test]
+    fn retry_response_fields_are_parsed_without_retaining_response_values() {
+        assert_eq!(
+            retry_directive_from_response(
+                br#"{"retryms":6000,"sampleseconds":12,"intervalseconds":2}"#
+            )
+            .unwrap(),
+            Some(RetryDirective {
+                delay_ms: Some(0),
+                target_sample_ms: Some(6_000),
+            })
+        );
+        assert_eq!(
+            retry_directive_from_response(br#"{"sampleseconds":6,"intervalseconds":2}"#).unwrap(),
+            Some(RetryDirective {
+                delay_ms: Some(2_000),
+                target_sample_ms: Some(6_000),
+            })
+        );
+        assert_eq!(
+            retry_directive_from_response(br#"{"retryInMilliseconds":1250}"#).unwrap(),
+            None
+        );
+        assert_eq!(
+            retry_directive_from_response(br#"{"matches":[]}"#).unwrap(),
+            None
+        );
+        assert!(retry_directive_from_response(b"not json").is_err());
+    }
+
+    #[test]
+    fn progressive_response_classifier_covers_match_retry_http_and_invalid() {
+        assert_eq!(
+            interpret_progressive_http_response(
+                200,
+                br#"{"track":{"title":"Mock Song","subtitle":"Mock Artist"}}"#
+            ),
+            ProgressiveHttpResponse::Matched(vec![TrackCandidate {
+                track_id: None,
+                title: "Mock Song".into(),
+                artist: "Mock Artist".into(),
+            }])
+        );
+        assert_eq!(
+            interpret_progressive_http_response(200, br#"{"matches":[]}"#),
+            ProgressiveHttpResponse::NoMatch(None)
+        );
+        assert_eq!(
+            interpret_progressive_http_response(
+                200,
+                br#"{"matches":[],"sampleseconds":6,"intervalseconds":0.25}"#
+            ),
+            ProgressiveHttpResponse::NoMatch(Some(RetryDirective {
+                delay_ms: Some(250),
+                target_sample_ms: Some(6_000),
+            }))
+        );
+        assert_eq!(
+            interpret_progressive_http_response(
+                200,
+                br#"{"matches":[],"retryInMilliseconds":250}"#
+            ),
+            ProgressiveHttpResponse::NoMatch(None)
+        );
+        assert_eq!(
+            interpret_progressive_http_response(503, br#"{"matches":[]}"#),
+            ProgressiveHttpResponse::HttpError(503)
+        );
+        assert_eq!(
+            interpret_progressive_http_response(200, b"not json"),
+            ProgressiveHttpResponse::InvalidResponse
+        );
+    }
+
+    #[test]
     fn config_parser_rejects_missing_ids_and_non_allowlisted_tag_routes() {
         assert!(matches!(
             parse_shazam_config(br#"{"apis":{"tag":{"href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected=&sharehub=false&hidelb=true"}}}"#),
@@ -1227,6 +1545,12 @@ mod tests {
             post_loopback_json("https://127.0.0.1:443/match", body),
             Err(Error::InvalidEndpoint(_))
         ));
+    }
+
+    #[test]
+    fn live_request_timeout_is_bounded_before_transport_start() {
+        assert!(post_shazam_json_with_timeout("", b"{}", Duration::ZERO).is_err());
+        assert!(post_shazam_json_with_timeout("", b"{}", Duration::from_secs(601)).is_err());
     }
 
     #[cfg(windows)]
