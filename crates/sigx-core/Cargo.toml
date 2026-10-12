@@ -1,0 +1,9 @@
+[package]
+name = "sigx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+sigx-dsp = { path = "../sigx-dsp" }
+sigx-format = { path = "../sigx-format" }

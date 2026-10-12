@@ -1,0 +1,12 @@
+[package]
+name = "shazam-http-lab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64 = "0.22.1"
+serde_json = "1.0.149"
+sigx-core = { path = "../sigx-core" }
+sigx-format = { path = "../sigx-format" }

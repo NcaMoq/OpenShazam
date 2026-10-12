@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sigx-format",
+    "crates/sigx-dsp",
+    "crates/sigx-core",
+    "crates/sigx-testkit",
+    "crates/sigx-cli",
+    "crates/shazam-http-lab",
+    "apps/openshazam",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+rust-version = "1.85"
