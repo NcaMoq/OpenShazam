@@ -4,13 +4,14 @@ use std::{
     net::TcpListener,
     process::{Command, ExitCode},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(any(test, not(windows)))]
 use std::path::Path;
 
 use serde_json::{json, Value};
+use shazam_progressive::{ProgressiveSession, RecognitionOutcome, SessionStatus};
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -26,6 +27,9 @@ fn main() -> ExitCode {
     }
     if command == "audio-live" {
         return run_audio(args.collect(), true);
+    }
+    if command == "audio-progressive-live" {
+        return run_audio_progressive(args.collect());
     }
     if command == "signature-live" {
         return run_signature_live(args.collect());
@@ -119,6 +123,20 @@ fn run_audio(args: Vec<String>, live: bool) -> ExitCode {
         }
     };
     let input_path = &args[0];
+    let (samples, sample_rate) = match decode_audio_file(input_path, duration_seconds) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            eprintln!("could not decode audio input: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    eprintln!(
+        "Decoded {duration_seconds}s to mono Int16 at the source rate ({sample_rate} Hz); DSP remains Pure Rust."
+    );
+    run_samples(samples, sample_rate, live)
+}
+
+fn decode_audio_file(input_path: &str, duration_seconds: u32) -> Result<(Vec<i16>, u32), String> {
     let probe = match Command::new("ffprobe")
         .args([
             "-v",
@@ -134,22 +152,15 @@ fn run_audio(args: Vec<String>, live: bool) -> ExitCode {
         .output()
     {
         Ok(output) if output.status.success() => output,
-        Ok(_) => {
-            eprintln!("ffprobe could not read an audio stream from the input");
-            return ExitCode::from(1);
-        }
+        Ok(_) => return Err("ffprobe could not read an audio stream".into()),
         Err(error) => {
-            eprintln!("could not start ffprobe: {error}");
-            return ExitCode::from(1);
+            return Err(format!("could not start ffprobe: {error}"));
         }
     };
     let rate_text = String::from_utf8_lossy(&probe.stdout);
     let sample_rate = match rate_text.trim().parse::<u32>() {
         Ok(rate) => rate,
-        Err(_) => {
-            eprintln!("ffprobe returned an unsupported sample-rate value");
-            return ExitCode::from(1);
-        }
+        Err(_) => return Err("ffprobe returned an unsupported sample-rate value".into()),
     };
     let decoded = match Command::new("ffmpeg")
         .args(["-nostdin", "-v", "error", "-i"])
@@ -168,31 +179,569 @@ fn run_audio(args: Vec<String>, live: bool) -> ExitCode {
         .output()
     {
         Ok(output) if output.status.success() => output.stdout,
-        Ok(_) => {
-            eprintln!("ffmpeg failed to decode the requested audio segment");
-            return ExitCode::from(1);
-        }
+        Ok(_) => return Err("ffmpeg failed to decode the requested audio segment".into()),
         Err(error) => {
-            eprintln!("could not start ffmpeg: {error}");
-            return ExitCode::from(1);
+            return Err(format!("could not start ffmpeg: {error}"));
         }
     };
     if decoded.len() % 2 != 0 {
-        eprintln!("ffmpeg returned a partial Int16 sample");
-        return ExitCode::from(1);
+        return Err("ffmpeg returned a partial Int16 sample".into());
     }
     let samples: Vec<i16> = decoded
         .chunks_exact(2)
         .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
         .collect();
     if samples.is_empty() {
-        eprintln!("decoded audio segment contains no samples");
+        return Err("decoded audio segment contains no samples".into());
+    }
+    Ok((samples, sample_rate))
+}
+
+fn run_audio_progressive(args: Vec<String>) -> ExitCode {
+    if !(1..=2).contains(&args.len()) {
+        eprintln!("usage: shazam-http-lab audio-progressive-live <audio-file> [seconds]");
+        return ExitCode::from(2);
+    }
+    let duration_seconds = match args
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("12")
+        .parse::<u32>()
+    {
+        Ok(seconds @ 1..=30) => seconds,
+        _ => {
+            eprintln!("duration must be an integer from 1 to 30 seconds");
+            return ExitCode::from(2);
+        }
+    };
+    let (samples, sample_rate) = match decode_audio_file(&args[0], duration_seconds) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            eprintln!("could not decode audio input: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    run_progressive_samples(samples, sample_rate)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProgressiveLocalPolicy {
+    minimum_sample_fallback_ms: u64,
+    default_retry_delay_ms: u64,
+    maximum_retry_delay_ms: u64,
+    request_timeout_ms: u64,
+    maximum_attempts: u8,
+}
+
+fn progressive_local_policy(
+    timing: shazam_http_lab::ManualTaggingTiming,
+) -> Result<ProgressiveLocalPolicy, String> {
+    let initial_sample_ms = timing
+        .progressive_ms
+        .or(timing.sample_ms)
+        .ok_or_else(|| "Config has no initial sample target".to_owned())?;
+    let maximum_retry_delay_ms = env_u64_setting(
+        "OPENSHZAM_PROGRESSIVE_RETRY_DELAY_CAP_MS",
+        30_000,
+        0,
+        600_000,
+    )?;
+    let default_retry_delay_ms = env_u64_setting(
+        "OPENSHZAM_PROGRESSIVE_DEFAULT_RETRY_DELAY_MS",
+        0,
+        0,
+        maximum_retry_delay_ms,
+    )?;
+    let request_timeout_ms = env_u64_setting(
+        "OPENSHZAM_PROGRESSIVE_REQUEST_TIMEOUT_MS",
+        20_000,
+        1,
+        600_000,
+    )?;
+    let minimum_sample_fallback_ms = env_u64_setting(
+        "OPENSHZAM_PROGRESSIVE_MINIMUM_SAMPLE_FALLBACK_MS",
+        initial_sample_ms,
+        1,
+        600_000,
+    )?;
+    let maximum_attempts = env_u64_setting("OPENSHZAM_PROGRESSIVE_MAX_ATTEMPTS", 4, 1, 32)?
+        .try_into()
+        .map_err(|_| "maximum attempts does not fit in u8".to_owned())?;
+
+    Ok(ProgressiveLocalPolicy {
+        minimum_sample_fallback_ms,
+        default_retry_delay_ms,
+        maximum_retry_delay_ms,
+        request_timeout_ms,
+        maximum_attempts,
+    })
+}
+
+fn env_u64_setting(name: &str, default: u64, minimum: u64, maximum: u64) -> Result<u64, String> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| format!("{name} must be an unsigned integer"))?;
+            if !(minimum..=maximum).contains(&parsed) {
+                return Err(format!("{name} must be between {minimum} and {maximum}"));
+            }
+            Ok(parsed)
+        }
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid Unicode")),
+    }
+}
+
+fn run_progressive_samples(samples: Vec<i16>, sample_rate: u32) -> ExitCode {
+    let profile = match config_request_profile_from_host() {
+        Ok(profile) => profile,
+        Err(error) => {
+            eprintln!("cannot identify this host for Config: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let configuration = match shazam_http_lab::fetch_shazam_config(&profile) {
+        Ok(configuration) => configuration,
+        Err(error) => {
+            eprintln!("could not fetch Shazam Config: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let local_policy = match progressive_local_policy(configuration.manual_timing()) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("invalid local progressive settings: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut timing = match configuration.manual_timing().recognition_timing(
+        sample_rate,
+        local_policy.minimum_sample_fallback_ms,
+        local_policy.default_retry_delay_ms,
+        local_policy.request_timeout_ms,
+        local_policy.maximum_retry_delay_ms,
+        local_policy.maximum_attempts,
+    ) {
+        Ok(timing) => timing,
+        Err(error) => {
+            eprintln!("Config has no usable progressive timing values: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let available_ms = (samples.len() as u128 * 1_000 / u128::from(sample_rate)) as u64;
+    timing.maximum_sample_ms = timing.maximum_sample_ms.min(available_ms);
+    if timing.maximum_sample_ms < timing.initial_sample_ms {
+        eprintln!("audio prefix is shorter than Config's initial sample target");
         return ExitCode::from(1);
     }
-    eprintln!(
-        "Decoded {duration_seconds}s to mono Int16 at the source rate ({sample_rate} Hz); DSP remains Pure Rust."
+    let mut session = match ProgressiveSession::new(timing) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("could not initialize progressive recognition: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "progressive session: sample_rate_hz={sample_rate} first_signature_threshold_ms={} maximum_sample_ms={} maximum_attempts={} elapsed_origin=after_config_and_decode",
+        timing.initial_sample_ms.max(timing.minimum_signature_ms),
+        timing.maximum_sample_ms,
+        timing.maximum_attempts
     );
-    run_samples(samples, sample_rate, live)
+    let started = Instant::now();
+    let chunk_frames = (sample_rate as usize / 10).max(1);
+    let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
+    let mut offset = 0;
+    let mut attempts = 0u8;
+    let mut matched = false;
+    let mut worker_active = false;
+
+    while offset < samples.len() {
+        if session_is_terminal(session.status()) {
+            break;
+        }
+        let end = (offset + chunk_frames).min(samples.len());
+        let report = match session.push_i16(&samples[offset..end]) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("progressive PCM input failed: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        offset += report.accepted_frames;
+        // Replay file PCM at its sample cadence. The recognition worker runs
+        // concurrently, so request latency does not stop PCM delivery. Poll
+        // only after this chunk's represented audio time has elapsed; otherwise
+        // the final chunk would be recognized up to one chunk (100 ms) early.
+        let target_elapsed_ms =
+            (offset as u128 * 1_000 / u128::from(sample_rate)).min(u128::from(u64::MAX)) as u64;
+        while elapsed_ms(started) < target_elapsed_ms && !session_is_terminal(session.status()) {
+            let remaining = target_elapsed_ms.saturating_sub(elapsed_ms(started));
+            let wait = Duration::from_millis(remaining.min(25));
+            if worker_active {
+                match completion_receiver.recv_timeout(wait) {
+                    Ok(completion) => {
+                        worker_active = false;
+                        if let Err(error) = apply_progressive_completion(
+                            &mut session,
+                            completion,
+                            started,
+                            &mut attempts,
+                            &mut matched,
+                        ) {
+                            eprintln!("progressive response could not be applied: {error}");
+                            return ExitCode::from(1);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        eprintln!("recognition worker stopped without a result");
+                        worker_active = false;
+                        fail_disconnected_worker(&mut session, elapsed_ms(started), &mut attempts);
+                    }
+                }
+                if worker_active {
+                    if let Err(error) = session.poll(elapsed_ms(started)) {
+                        eprintln!("progressive timeout check failed: {error}");
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                thread::sleep(wait);
+            }
+        }
+        if matched || session_is_terminal(session.status()) {
+            break;
+        }
+        let job = match session.poll(elapsed_ms(started)) {
+            Ok(job) => job,
+            Err(error) => {
+                eprintln!("progressive session failed: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        if let Some(job) = job {
+            if worker_active {
+                eprintln!("progressive engine produced overlapping HTTP work");
+                return ExitCode::from(1);
+            }
+            if let Err(error) = dispatch_progressive_job(
+                &configuration,
+                job,
+                started,
+                timing.request_timeout_ms,
+                completion_sender.clone(),
+            ) {
+                eprintln!("could not start recognition worker: {error}");
+                return ExitCode::from(1);
+            }
+            worker_active = true;
+        }
+        if report.accepted_frames == 0 {
+            break;
+        }
+    }
+
+    session.finish_input();
+    loop {
+        if worker_active {
+            match completion_receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(completion) => {
+                    worker_active = false;
+                    if let Err(error) = apply_progressive_completion(
+                        &mut session,
+                        completion,
+                        started,
+                        &mut attempts,
+                        &mut matched,
+                    ) {
+                        eprintln!("progressive response could not be applied: {error}");
+                        return ExitCode::from(1);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(error) = session.poll(elapsed_ms(started)) {
+                        eprintln!("progressive timeout check failed: {error}");
+                        return ExitCode::from(1);
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    eprintln!("recognition worker stopped without a result");
+                    fail_disconnected_worker(&mut session, elapsed_ms(started), &mut attempts);
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if session_is_terminal(session.status()) {
+            break;
+        }
+        let now_ms = elapsed_ms(started);
+        match session.poll(now_ms) {
+            Ok(Some(job)) => {
+                if let Err(error) = dispatch_progressive_job(
+                    &configuration,
+                    job,
+                    started,
+                    timing.request_timeout_ms,
+                    completion_sender.clone(),
+                ) {
+                    eprintln!("could not start recognition worker: {error}");
+                    return ExitCode::from(1);
+                }
+                worker_active = true;
+            }
+            Ok(None) => match session.status() {
+                SessionStatus::WaitingForRetry { not_before_ms, .. } if now_ms < not_before_ms => {
+                    thread::sleep(Duration::from_millis((not_before_ms - now_ms).min(25)));
+                }
+                SessionStatus::InFlight { .. } => {
+                    eprintln!("in-flight request has no recognition worker");
+                    break;
+                }
+                _ => break,
+            },
+            Err(error) => {
+                eprintln!("progressive session failed: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    if matched {
+        ExitCode::SUCCESS
+    } else {
+        println!(
+            "no match after {attempts} attempt(s); accepted sample_ms={}",
+            session.sample_ms()
+        );
+        ExitCode::from(1)
+    }
+}
+
+#[derive(Debug)]
+struct ProgressiveAttemptResult {
+    status: Option<u16>,
+    outcome: RecognitionOutcome,
+    candidates: Vec<shazam_http_lab::TrackCandidate>,
+    error: Option<&'static str>,
+    post_started_ms: Option<u64>,
+    response_received_ms: Option<u64>,
+}
+
+struct ProgressiveCompletion {
+    attempt: u8,
+    sample_ms: u64,
+    signature_ready_ms: u64,
+    result: ProgressiveAttemptResult,
+}
+
+fn dispatch_progressive_job(
+    configuration: &shazam_http_lab::ShazamConfiguration,
+    job: shazam_progressive::RecognitionJob,
+    session_started: Instant,
+    request_timeout_ms: u64,
+    sender: std::sync::mpsc::Sender<ProgressiveCompletion>,
+) -> Result<(), String> {
+    let attempt = job.attempt;
+    let sample_ms = job.sample_ms;
+    let signature_ready_ms = job.generated_at_ms;
+    let configuration = (*configuration).clone();
+    thread::Builder::new()
+        .name(format!("openshazam-recognition-{attempt}"))
+        .spawn(move || {
+            let result =
+                submit_progressive_job(&configuration, &job, session_started, request_timeout_ms);
+            let _ = sender.send(ProgressiveCompletion {
+                attempt,
+                sample_ms,
+                signature_ready_ms,
+                result,
+            });
+        })
+        .map(|_| ())
+        .map_err(|_| "could not start the bounded recognition worker".to_owned())
+}
+
+fn submit_progressive_job(
+    configuration: &shazam_http_lab::ShazamConfiguration,
+    job: &shazam_progressive::RecognitionJob,
+    session_started: Instant,
+    request_timeout_ms: u64,
+) -> ProgressiveAttemptResult {
+    let failed = |error| ProgressiveAttemptResult {
+        status: None,
+        outcome: RecognitionOutcome::TransportFailure,
+        candidates: Vec::new(),
+        error: Some(error),
+        post_started_ms: None,
+        response_received_ms: None,
+    };
+    let tag_id = match random_uuid_v4() {
+        Ok(tag_id) => tag_id,
+        Err(_) => return failed("could not create a request identifier"),
+    };
+    let streaming_provider = env::var("SHAZAM_STREAMING_PROVIDER").unwrap_or_default();
+    let endpoint = match (env::var("SHAZAM_TAG_URL_TEMPLATE"), env::var("SHAZAM_INID")) {
+        (Ok(template), Ok(installation_id)) => shazam_http_lab::resolve_shazam_tag_url(
+            &template,
+            &installation_id,
+            &tag_id,
+            &streaming_provider,
+        ),
+        (Err(_), Err(_)) => configuration.resolve_tag_url(&tag_id, &streaming_provider),
+        _ => return failed("manual recognition route overrides must be paired"),
+    };
+    let endpoint = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(_) => return failed("could not resolve an authorized recognition route"),
+    };
+    let timestamp_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(timestamp) => timestamp.as_millis().min(u128::from(u64::MAX)) as u64,
+        Err(_) => return failed("system clock is before the Unix epoch"),
+    };
+    let timezone = local_timezone_name();
+    let body = match shazam_http_lab::build_request_body(
+        &job.signature,
+        job.sample_ms,
+        timestamp_ms,
+        &timezone,
+        json!({}),
+        json!({}),
+        None,
+    ) {
+        Ok(body) => body,
+        Err(_) => return failed("could not build the recognition request"),
+    };
+    let post_started_ms = elapsed_ms(session_started);
+    let response = shazam_http_lab::post_shazam_json_with_timeout(
+        &endpoint,
+        &body,
+        Duration::from_millis(request_timeout_ms),
+    );
+    let response_received_ms = elapsed_ms(session_started);
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            return ProgressiveAttemptResult {
+                status: None,
+                outcome: RecognitionOutcome::TransportFailure,
+                candidates: Vec::new(),
+                error: Some("HTTPS recognition request failed"),
+                post_started_ms: Some(post_started_ms),
+                response_received_ms: Some(response_received_ms),
+            };
+        }
+    };
+    let (outcome, candidates, error) =
+        match shazam_http_lab::interpret_progressive_http_response(response.status, &response.body)
+        {
+            shazam_http_lab::ProgressiveHttpResponse::Matched(candidates) => {
+                (RecognitionOutcome::Match, candidates, None)
+            }
+            shazam_http_lab::ProgressiveHttpResponse::NoMatch(retry) => {
+                (RecognitionOutcome::NoMatch { retry }, Vec::new(), None)
+            }
+            shazam_http_lab::ProgressiveHttpResponse::HttpError(_) => (
+                RecognitionOutcome::TransportFailure,
+                Vec::new(),
+                Some("recognition HTTP response was unsuccessful; body withheld"),
+            ),
+            shazam_http_lab::ProgressiveHttpResponse::InvalidResponse => (
+                RecognitionOutcome::InvalidResponse,
+                Vec::new(),
+                Some("HTTP response did not contain a recognized track or retry"),
+            ),
+        };
+    ProgressiveAttemptResult {
+        status: Some(response.status),
+        outcome,
+        candidates,
+        error,
+        post_started_ms: Some(post_started_ms),
+        response_received_ms: Some(response_received_ms),
+    }
+}
+
+fn apply_progressive_completion(
+    session: &mut ProgressiveSession,
+    completion: ProgressiveCompletion,
+    session_started: Instant,
+    attempts: &mut u8,
+    matched: &mut bool,
+) -> Result<(), String> {
+    *attempts = completion.attempt;
+    let post_rtt_ms = completion
+        .result
+        .post_started_ms
+        .zip(completion.result.response_received_ms)
+        .map(|(started, received)| received.saturating_sub(started));
+    println!(
+        "attempt={} cumulative_sample_ms={} signature_ready_elapsed_ms={} post_started_elapsed_ms={:?} response_received_elapsed_ms={:?} post_rtt_ms={:?} HTTP status={:?}",
+        completion.attempt,
+        completion.sample_ms,
+        completion.signature_ready_ms,
+        completion.result.post_started_ms,
+        completion.result.response_received_ms,
+        post_rtt_ms,
+        completion.result.status
+    );
+
+    let in_flight_attempt = match session.status() {
+        SessionStatus::InFlight { attempt } => attempt,
+        _ => return Ok(()),
+    };
+    if in_flight_attempt != completion.attempt {
+        return Err("received a response for a non-current attempt".into());
+    }
+    session
+        .complete(
+            completion.attempt,
+            completion.result.outcome,
+            elapsed_ms(session_started),
+        )
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = completion.result.error {
+        eprintln!("progressive request state: {error}");
+    }
+    if !completion.result.candidates.is_empty() {
+        for (index, candidate) in completion.result.candidates.iter().enumerate() {
+            println!(
+                "match[{}] title={:?} artist={:?}",
+                index + 1,
+                candidate.title,
+                candidate.artist
+            );
+        }
+        *matched = true;
+    }
+    Ok(())
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn fail_disconnected_worker(session: &mut ProgressiveSession, now_ms: u64, attempts: &mut u8) {
+    if let SessionStatus::InFlight { attempt } = session.status() {
+        *attempts = attempt;
+        if let Err(error) = session.complete(attempt, RecognitionOutcome::TransportFailure, now_ms)
+        {
+            eprintln!("could not close disconnected recognition attempt: {error}");
+        }
+    }
+}
+
+fn session_is_terminal(status: SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Succeeded
+            | SessionStatus::Exhausted
+            | SessionStatus::Failed(_)
+            | SessionStatus::Cancelled
+    )
 }
 
 fn run_samples(samples: Vec<i16>, sample_rate: u32, live: bool) -> ExitCode {
@@ -373,8 +922,16 @@ fn run_config_check() -> ExitCode {
                 eprintln!("Config was fetched but its tag route could not be resolved: {error}");
                 return ExitCode::from(1);
             }
+            let timing = configuration.manual_timing();
             println!(
-                "Config loaded over verified HTTPS; route resolved in memory, INID present (redacted); no Shazam app cache was read or written."
+                "Config loaded over verified HTTPS; route resolved in memory, INID redacted; no Shazam app cache was read or written."
+            );
+            println!(
+                "manual timing fields (ms): sample={:?} progressive={:?} minimum={:?} maximum={:?}",
+                timing.sample_ms,
+                timing.progressive_ms,
+                timing.minimum_sample_ms,
+                timing.maximum_sample_ms
             );
             ExitCode::SUCCESS
         }
@@ -575,8 +1132,46 @@ fn timezone_from_zoneinfo_path(path: &Path) -> Option<String> {
 fn run_mock_roundtrip(
     body: &[u8],
 ) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    run_mock_roundtrip_with_response(
+        body,
+        br#"{"matches":[{"trackid":"mock-track-001","title":"Mock Result Only","artist":"Local Test Fixture"}]}"#,
+    )
+}
+
+fn run_mock_roundtrip_with_response(
+    body: &[u8],
+    response: &[u8],
+) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    run_mock_roundtrip_with_status_and_gate(200, body, response, None)
+}
+
+#[cfg(test)]
+fn run_mock_roundtrip_with_status(
+    status: u16,
+    body: &[u8],
+    response: &[u8],
+) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    run_mock_roundtrip_with_status_and_gate(status, body, response, None)
+}
+
+#[cfg(test)]
+fn run_mock_roundtrip_with_gate(
+    body: &[u8],
+    response: &[u8],
+    gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    run_mock_roundtrip_with_status_and_gate(200, body, response, gate)
+}
+
+fn run_mock_roundtrip_with_status_and_gate(
+    status: u16,
+    body: &[u8],
+    response: &[u8],
+    gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
+    let response = response.to_vec();
     let server = thread::spawn(
         move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let (stream, _) = listener.accept()?;
@@ -619,14 +1214,27 @@ fn run_mock_roundtrip(
                 return Err("mock request did not contain a signature".into());
             }
 
-            let response = br#"{"matches":[{"trackid":"mock-track-001","title":"Mock Result Only","artist":"Local Test Fixture"}]}"#;
+            if let Some((accepted, release)) = gate {
+                accepted
+                    .send(())
+                    .map_err(|_| io::Error::other("mock request observer disconnected"))?;
+                release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| io::Error::other("mock response release timed out"))?;
+            }
+
             let mut stream = reader.into_inner();
+            let reason = match status {
+                200 => "OK",
+                503 => "Service Unavailable",
+                _ => "Mock Response",
+            };
             write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            response.len()
-        )?;
-            stream.write_all(response)?;
+                stream,
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )?;
+            stream.write_all(&response)?;
             Ok(())
         },
     );
@@ -645,6 +1253,7 @@ fn usage() {
     eprintln!("   or: shazam-http-lab audio-mock <audio-file> [seconds]");
     eprintln!("   or: shazam-http-lab signature-live <signature.bin> <sample-duration-ms>");
     eprintln!("   or: shazam-http-lab audio-live <audio-file> [seconds]");
+    eprintln!("   or: shazam-http-lab audio-progressive-live <audio-file> [seconds]");
     eprintln!("   or: shazam-http-lab config-check");
     eprintln!(
         "Live commands fetch Config automatically unless both manual route overrides are set."
@@ -655,8 +1264,20 @@ fn usage() {
 
 #[cfg(test)]
 mod tests {
-    use super::timezone_from_zoneinfo_path;
-    use std::path::Path;
+    use super::{
+        apply_progressive_completion, run_mock_roundtrip_with_gate,
+        run_mock_roundtrip_with_response, run_mock_roundtrip_with_status,
+        timezone_from_zoneinfo_path, ProgressiveAttemptResult, ProgressiveCompletion,
+    };
+    use serde_json::json;
+    use shazam_progressive::{
+        ProgressiveSession, RecognitionOutcome, RecognitionTiming, SessionStatus, StopReason,
+    };
+    use std::{
+        path::Path,
+        thread,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn creates_uuid_v4_from_the_platform_random_source() {
@@ -672,6 +1293,305 @@ mod tests {
             timezone_from_zoneinfo_path(Path::new("/var/db/timezone/zoneinfo/Asia/Tokyo")),
             Some("Asia/Tokyo".into())
         );
+    }
+
+    #[test]
+    fn progressive_signature_mock_http_retry_and_match_end_to_end() {
+        let mut session = ProgressiveSession::new(RecognitionTiming {
+            sample_rate: 16_000,
+            minimum_signature_ms: 1_000,
+            initial_sample_ms: 1_000,
+            progressive_step_ms: 1_000,
+            maximum_sample_ms: 3_000,
+            default_retry_interval_ms: 0,
+            request_timeout_ms: 5_000,
+            maximum_retry_delay_ms: 1_000,
+            maximum_attempts: 3,
+        })
+        .unwrap();
+        let samples: Vec<i16> = (0..48_000)
+            .map(|index| ((index * 73 % 30_001) - 15_000) as i16)
+            .collect();
+
+        session.push_i16(&samples[..16_000]).unwrap();
+        let first = session.poll(0).unwrap().unwrap();
+        assert_eq!(first.sample_ms, 1_000);
+
+        let retry_body = shazam_http_lab::build_request_body(
+            &first.signature,
+            first.sample_ms,
+            1_800_000_000_000,
+            "Asia/Tokyo",
+            json!({}),
+            json!({}),
+            None,
+        )
+        .unwrap();
+        let (accepted_sender, accepted_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let request = thread::spawn(move || {
+            run_mock_roundtrip_with_gate(
+                &retry_body,
+                br#"{"sampleseconds":2,"intervalseconds":0.05}"#,
+                Some((accepted_sender, release_receiver)),
+            )
+        });
+        accepted_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock server accepted the in-flight request");
+        // The HTTP request is held open after its body is received. The PCM
+        // engine must still accept samples without changing the active attempt.
+        session.push_i16(&samples[16_000..32_000]).unwrap();
+        assert_eq!(session.status(), SessionStatus::InFlight { attempt: 1 });
+        release_sender.send(()).unwrap();
+        let (status, response) = request
+            .join()
+            .expect("mock HTTP task did not panic")
+            .unwrap();
+        assert_eq!(status, 200);
+        let retry = match shazam_http_lab::interpret_progressive_http_response(status, &response) {
+            shazam_http_lab::ProgressiveHttpResponse::NoMatch(Some(retry)) => retry,
+            other => panic!("expected retry response, got {other:?}"),
+        };
+        session
+            .complete(
+                first.attempt,
+                RecognitionOutcome::NoMatch { retry: Some(retry) },
+                1,
+            )
+            .unwrap();
+        assert!(session.poll(50).unwrap().is_none());
+        let second = session.poll(51).unwrap().unwrap();
+        assert_eq!(second.sample_ms, 2_000);
+        assert_eq!(second.attempt, 2);
+
+        let match_body = shazam_http_lab::build_request_body(
+            &second.signature,
+            second.sample_ms,
+            1_800_000_000_001,
+            "Asia/Tokyo",
+            json!({}),
+            json!({}),
+            None,
+        )
+        .unwrap();
+        let (status, response) = run_mock_roundtrip_with_response(
+            &match_body,
+            br#"{"track":{"title":"Mock Progressive Song","subtitle":"Mock Artist"}}"#,
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        let candidates =
+            match shazam_http_lab::interpret_progressive_http_response(status, &response) {
+                shazam_http_lab::ProgressiveHttpResponse::Matched(candidates) => candidates,
+                other => panic!("expected mock track response, got {other:?}"),
+            };
+        assert_eq!(candidates[0].title, "Mock Progressive Song");
+        assert_eq!(candidates[0].artist, "Mock Artist");
+        assert_eq!(
+            session
+                .complete(second.attempt, RecognitionOutcome::Match, 52)
+                .unwrap(),
+            SessionStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn progressive_http_mock_initial_match_finishes_first_attempt() {
+        let mut session = ProgressiveSession::new(RecognitionTiming {
+            sample_rate: 16_000,
+            minimum_signature_ms: 1_000,
+            initial_sample_ms: 1_000,
+            progressive_step_ms: 1_000,
+            maximum_sample_ms: 3_000,
+            default_retry_interval_ms: 0,
+            request_timeout_ms: 5_000,
+            maximum_retry_delay_ms: 1_000,
+            maximum_attempts: 3,
+        })
+        .unwrap();
+        let samples: Vec<i16> = (0..16_000)
+            .map(|index| ((index * 73 % 30_001) - 15_000) as i16)
+            .collect();
+        session.push_i16(&samples).unwrap();
+        let job = session.poll(0).unwrap().unwrap();
+        let request_body = shazam_http_lab::build_request_body(
+            &job.signature,
+            job.sample_ms,
+            1_800_000_000_000,
+            "Asia/Tokyo",
+            json!({}),
+            json!({}),
+            None,
+        )
+        .unwrap();
+        let (status, response) = run_mock_roundtrip_with_response(
+            &request_body,
+            br#"{"track":{"title":"Initial Mock Song","subtitle":"Initial Mock Artist"}}"#,
+        )
+        .unwrap();
+        let candidates =
+            match shazam_http_lab::interpret_progressive_http_response(status, &response) {
+                shazam_http_lab::ProgressiveHttpResponse::Matched(candidates) => candidates,
+                other => panic!("expected initial match, got {other:?}"),
+            };
+        assert_eq!(candidates[0].title, "Initial Mock Song");
+        assert_eq!(candidates[0].artist, "Initial Mock Artist");
+        assert_eq!(
+            session
+                .complete(job.attempt, RecognitionOutcome::Match, 1)
+                .unwrap(),
+            SessionStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn progressive_http_mock_error_and_invalid_json_are_terminal() {
+        for (status_code, response_body, expected, reason) in [
+            (
+                503,
+                &br#"{"track":{"title":"ignored","subtitle":"ignored"}}"#[..],
+                shazam_http_lab::ProgressiveHttpResponse::HttpError(503),
+                StopReason::TransportFailure,
+            ),
+            (
+                200,
+                &b"not json"[..],
+                shazam_http_lab::ProgressiveHttpResponse::InvalidResponse,
+                StopReason::InvalidResponse,
+            ),
+        ] {
+            let mut session = ProgressiveSession::new(RecognitionTiming {
+                sample_rate: 16_000,
+                minimum_signature_ms: 1_000,
+                initial_sample_ms: 1_000,
+                progressive_step_ms: 1_000,
+                maximum_sample_ms: 3_000,
+                default_retry_interval_ms: 0,
+                request_timeout_ms: 5_000,
+                maximum_retry_delay_ms: 1_000,
+                maximum_attempts: 3,
+            })
+            .unwrap();
+            let samples: Vec<i16> = (0..16_000)
+                .map(|index| ((index * 73 % 30_001) - 15_000) as i16)
+                .collect();
+            session.push_i16(&samples).unwrap();
+            let job = session.poll(0).unwrap().unwrap();
+            let request_body = shazam_http_lab::build_request_body(
+                &job.signature,
+                job.sample_ms,
+                1_800_000_000_000,
+                "Asia/Tokyo",
+                json!({}),
+                json!({}),
+                None,
+            )
+            .unwrap();
+            let (status, response) =
+                run_mock_roundtrip_with_status(status_code, &request_body, response_body).unwrap();
+            let classification =
+                shazam_http_lab::interpret_progressive_http_response(status, &response);
+            assert_eq!(classification, expected);
+            let outcome = match classification {
+                shazam_http_lab::ProgressiveHttpResponse::HttpError(_) => {
+                    RecognitionOutcome::TransportFailure
+                }
+                shazam_http_lab::ProgressiveHttpResponse::InvalidResponse => {
+                    RecognitionOutcome::InvalidResponse
+                }
+                other => panic!("unexpected mock failure classification: {other:?}"),
+            };
+            assert_eq!(
+                session.complete(job.attempt, outcome, 1).unwrap(),
+                SessionStatus::Failed(reason)
+            );
+        }
+    }
+
+    #[test]
+    fn progressive_http_mock_response_after_cancellation_is_ignored() {
+        let mut session = ProgressiveSession::new(RecognitionTiming {
+            sample_rate: 16_000,
+            minimum_signature_ms: 1_000,
+            initial_sample_ms: 1_000,
+            progressive_step_ms: 1_000,
+            maximum_sample_ms: 3_000,
+            default_retry_interval_ms: 0,
+            request_timeout_ms: 5_000,
+            maximum_retry_delay_ms: 1_000,
+            maximum_attempts: 3,
+        })
+        .unwrap();
+        let samples: Vec<i16> = (0..16_000)
+            .map(|index| ((index * 73 % 30_001) - 15_000) as i16)
+            .collect();
+        session.push_i16(&samples).unwrap();
+        let job = session.poll(0).unwrap().unwrap();
+        let request_body = shazam_http_lab::build_request_body(
+            &job.signature,
+            job.sample_ms,
+            1_800_000_000_000,
+            "Asia/Tokyo",
+            json!({}),
+            json!({}),
+            None,
+        )
+        .unwrap();
+
+        let (accepted_sender, accepted_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let request = thread::spawn(move || {
+            run_mock_roundtrip_with_gate(
+                &request_body,
+                br#"{"track":{"title":"Late Mock Song","subtitle":"Late Mock Artist"}}"#,
+                Some((accepted_sender, release_receiver)),
+            )
+        });
+        accepted_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock server accepted the in-flight request");
+        assert_eq!(session.cancel(), Some(job.attempt));
+        assert_eq!(session.status(), SessionStatus::Cancelled);
+
+        release_sender.send(()).unwrap();
+        let (status, response) = request
+            .join()
+            .expect("mock HTTP task did not panic")
+            .unwrap();
+        let (outcome, candidates, error) =
+            match shazam_http_lab::interpret_progressive_http_response(status, &response) {
+                shazam_http_lab::ProgressiveHttpResponse::Matched(candidates) => {
+                    (RecognitionOutcome::Match, candidates, None)
+                }
+                other => panic!("expected late mock match, got {other:?}"),
+            };
+        assert_eq!(candidates[0].title, "Late Mock Song");
+        let mut attempts = 0;
+        let mut matched = false;
+        apply_progressive_completion(
+            &mut session,
+            ProgressiveCompletion {
+                attempt: job.attempt,
+                sample_ms: job.sample_ms,
+                signature_ready_ms: 1,
+                result: ProgressiveAttemptResult {
+                    status: Some(status),
+                    outcome,
+                    candidates,
+                    error,
+                    post_started_ms: Some(1),
+                    response_received_ms: Some(2),
+                },
+            },
+            Instant::now(),
+            &mut attempts,
+            &mut matched,
+        )
+        .unwrap();
+        assert_eq!(attempts, job.attempt);
+        assert!(!matched);
+        assert_eq!(session.status(), SessionStatus::Cancelled);
     }
 
     #[test]

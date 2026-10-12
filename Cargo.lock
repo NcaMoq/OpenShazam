@@ -656,6 +656,15 @@ dependencies = [
  "getrandom",
  "iana-time-zone",
  "serde_json",
+ "shazam-progressive",
+ "sigx-core",
+ "sigx-format",
+]
+
+[[package]]
+name = "shazam-progressive"
+version = "0.1.0"
+dependencies = [
  "sigx-core",
  "sigx-format",
 ]

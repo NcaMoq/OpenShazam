@@ -38,20 +38,32 @@ Create a local mock recognition request from an audio file (no service request):
 cargo run --locked -p shazam-http-lab -- audio-mock <audio-file> [seconds]
 ```
 
-The live command fetches Config over verified HTTPS on each run and resolves
-the recognition route and installation identifier in memory. It does not read
-or write Shazam app preferences and does not send an AMP token. An authorized
-macOS end-to-end test passed with all manual overrides unset: the CLI generated
-a Pure Rust Signature and received HTTP 200 with a track result matching the
-audio metadata. This is an unofficial, non-public recognition route; use it
-only when you are authorized, and expect the service to change.
-
 `SHAZAM_TAG_URL_TEMPLATE` and `SHAZAM_INID` remain paired manual overrides.
 Optional `SHAZAM_CONFIG_*` variables override the detected locale, model, OS
 version/build, or country (`-` is used when storefront country is unknown).
 
 ```sh
 cargo run --locked -p shazam-http-lab -- audio-live <audio-file> [seconds]
+```
+
+The progressive file command feeds the Pure Rust SigX engine in PCM chunks,
+submits a Signature at Config's cumulative sample threshold, and continues with
+larger prefixes when recognition requests a retry. Sample duration is audio
+time. File chunks are paced at roughly 100 ms; the HTTPS request runs separately
+so PCM feeding continues during the response wait. Logs distinguish cumulative
+sample duration, Signature-ready time, POST start, response receipt, and request
+latency. Their elapsed-time origin is after Config retrieval and source decode;
+the command is not a microphone adapter.
+
+The local safety controls are `OPENSHZAM_PROGRESSIVE_MINIMUM_SAMPLE_FALLBACK_MS`,
+`OPENSHZAM_PROGRESSIVE_DEFAULT_RETRY_DELAY_MS`,
+`OPENSHZAM_PROGRESSIVE_RETRY_DELAY_CAP_MS`,
+`OPENSHZAM_PROGRESSIVE_REQUEST_TIMEOUT_MS`, and
+`OPENSHZAM_PROGRESSIVE_MAX_ATTEMPTS`. Defaults are local safeguards, not claims
+about undocumented Shazam app defaults.
+
+```sh
+cargo run --locked -p shazam-http-lab -- audio-progressive-live <audio-file> [seconds]
 ```
 
 Check Config retrieval without sending an audio signature:
@@ -75,6 +87,12 @@ cargo run --locked -p openshazam -- list-devices
 cargo run --locked -p openshazam -- recognize-loopback [device-id]
 cargo run --locked -p openshazam -- capture-signature-loopback <new-output.sig> [device-id]
 ```
+
+The existing Windows command remains fixed at 12 seconds. The progressive
+adapter point is the downmixed PCM packet from `capture_loopback_frames`:
+forward it to `ProgressiveSession::push_f32`, then dispatch each returned
+`RecognitionJob` on a worker. This connection is not wired or Windows-runtime
+tested yet.
 
 Private Native fixtures are not included. The ordinary workspace tests do not
 require them. To run the optional private-vector regression, set
