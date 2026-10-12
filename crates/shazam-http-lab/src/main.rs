@@ -2,11 +2,13 @@ use std::{
     env, fs,
     io::{self, BufRead, BufReader, Read, Write},
     net::TcpListener,
-    path::Path,
     process::{Command, ExitCode},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(any(test, not(windows)))]
+use std::path::Path;
 
 use serde_json::{json, Value};
 
@@ -361,7 +363,7 @@ fn run_config_check() -> ExitCode {
     let profile = match config_request_profile_from_host() {
         Ok(profile) => profile,
         Err(error) => {
-            eprintln!("cannot identify this Mac for Config: {error}");
+            eprintln!("cannot identify this host for Config: {error}");
             return ExitCode::from(1);
         }
     };
@@ -383,6 +385,7 @@ fn run_config_check() -> ExitCode {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn config_request_profile_from_host() -> Result<shazam_http_lab::ConfigRequestProfile, String> {
     let language = env::var("SHAZAM_CONFIG_LANGUAGE")
         .ok()
@@ -431,6 +434,17 @@ fn config_request_profile_from_host() -> Result<shazam_http_lab::ConfigRequestPr
     })
 }
 
+#[cfg(windows)]
+fn config_request_profile_from_host() -> Result<shazam_http_lab::ConfigRequestProfile, String> {
+    shazam_http_lab::windows_config_request_profile().map_err(|error| error.to_string())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn config_request_profile_from_host() -> Result<shazam_http_lab::ConfigRequestProfile, String> {
+    Err("automatic Config profile detection is available only on Windows and macOS".into())
+}
+
+#[cfg(target_os = "macos")]
 fn command_value(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program).args(args).output().ok()?;
     if !output.status.success() {
@@ -440,6 +454,7 @@ fn command_value(program: &str, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+#[cfg(target_os = "macos")]
 fn mac_preferred_language() -> Option<String> {
     let raw = command_value("defaults", &["read", "-g", "AppleLanguages"])?;
     let first = first_quoted_value(&raw)?;
@@ -447,12 +462,14 @@ fn mac_preferred_language() -> Option<String> {
     (!language.is_empty()).then(|| language.to_owned())
 }
 
+#[cfg(target_os = "macos")]
 fn mac_locale_identifier() -> Option<String> {
     let raw = command_value("defaults", &["read", "-g", "AppleLocale"])?;
     let locale = raw.trim().split('.').next()?.replace('-', "_");
     (!locale.is_empty()).then_some(locale)
 }
 
+#[cfg(target_os = "macos")]
 fn first_quoted_value(value: &str) -> Option<String> {
     let start = value.find('"')? + 1;
     let end = start + value[start..].find('"')?;
@@ -461,7 +478,7 @@ fn first_quoted_value(value: &str) -> Option<String> {
 
 fn random_uuid_v4() -> io::Result<String> {
     let mut bytes = [0u8; 16];
-    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::getrandom(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(format!(
@@ -526,7 +543,17 @@ fn mock_signature(signature: &[u8], sample_ms: u64) -> ExitCode {
     }
 }
 
-/// Match Foundation's local IANA timezone name from macOS's zoneinfo symlink.
+/// Use the host's local IANA timezone for the diagnostic recognition request.
+#[cfg(windows)]
+fn local_timezone_name() -> String {
+    env::var("TZ")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| iana_time_zone::get_timezone().ok())
+        .unwrap_or_else(|| "UTC".into())
+}
+
+#[cfg(not(windows))]
 fn local_timezone_name() -> String {
     fs::read_link("/etc/localtime")
         .ok()
@@ -535,6 +562,7 @@ fn local_timezone_name() -> String {
         .unwrap_or_else(|| "UTC".into())
 }
 
+#[cfg(any(test, not(windows)))]
 fn timezone_from_zoneinfo_path(path: &Path) -> Option<String> {
     let path = path.to_str()?;
     ["/zoneinfo/", "/zoneinfo.default/"]
@@ -629,6 +657,14 @@ fn usage() {
 mod tests {
     use super::timezone_from_zoneinfo_path;
     use std::path::Path;
+
+    #[test]
+    fn creates_uuid_v4_from_the_platform_random_source() {
+        let id = super::random_uuid_v4().unwrap();
+        assert_eq!(id.len(), 36);
+        assert_eq!(&id[14..15], "4");
+        assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"));
+    }
 
     #[test]
     fn extracts_iana_timezone_from_macos_zoneinfo_symlink() {

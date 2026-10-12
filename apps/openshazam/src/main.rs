@@ -8,53 +8,113 @@ use sigx_core::{Config, SigX};
 #[cfg(windows)]
 use std::{fs::OpenOptions, io::Write};
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 const CAPTURE_RATE: u32 = 16_000;
 #[cfg(windows)]
 const CAPTURE_SECONDS: usize = 12;
-#[cfg(windows)]
-const CAPTURE_FRAMES: usize = CAPTURE_RATE as usize * CAPTURE_SECONDS;
 #[cfg(target_os = "macos")]
 mod macos_capture;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() != 2 || args[0] != "capture-signature" {
-        eprintln!("usage: openshazam capture-signature <new-output.sig>");
-        return ExitCode::from(2);
-    }
-
-    let output = Path::new(&args[1]);
-    if output.exists() {
-        eprintln!(
-            "refusing to overwrite existing output: {}",
-            output.display()
-        );
-        return ExitCode::from(2);
-    }
-
     #[cfg(windows)]
-    let result = capture_signature(output);
+    let result = run_windows_command(&args);
 
     #[cfg(target_os = "macos")]
-    let result = macos_capture::capture_signature(output);
+    let result = run_macos_command(&args);
 
     #[cfg(not(any(windows, target_os = "macos")))]
     let result: Result<(), Box<dyn std::error::Error>> = Err(Box::new(io::Error::new(
         io::ErrorKind::Unsupported,
-        "microphone capture is available only on Windows and macOS",
+        "audio capture is available only on Windows and macOS",
     )));
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("capture failed: {error}");
+            eprintln!("OpenShazam failed: {error}");
             ExitCode::from(1)
         }
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
+fn run_windows_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    match args.first().map(String::as_str) {
+        Some("list-devices") if args.len() == 1 => list_render_devices(),
+        Some("capture-signature-loopback") if (2..=3).contains(&args.len()) => {
+            let output = Path::new(&args[1]);
+            refuse_overwrite(output)?;
+            let signature = capture_loopback_signature(args.get(2).map(String::as_str))?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output)?;
+            file.write_all(&signature)?;
+            println!(
+                "Wrote {} bytes to {} (local only; no network request was made)",
+                signature.len(),
+                output.display()
+            );
+            Ok(())
+        }
+        Some("recognize-loopback") if args.len() <= 2 => {
+            let signature = capture_loopback_signature(args.get(1).map(String::as_str))?;
+            let (status, candidates) = shazam_http_lab::recognize_signature_for_windows(
+                &signature,
+                (CAPTURE_SECONDS * 1_000) as u64,
+            )?;
+            println!("Shazam HTTP status={status}");
+            for (index, candidate) in candidates.iter().enumerate() {
+                println!(
+                    "match[{}] title={:?} artist={:?}",
+                    index + 1,
+                    candidate.title,
+                    candidate.artist
+                );
+            }
+            Ok(())
+        }
+        _ => {
+            print_windows_usage();
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid command or arguments").into())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn refuse_overwrite(output: &Path) -> io::Result<()> {
+    if output.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to overwrite existing output: {}",
+                output.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn print_windows_usage() {
+    eprintln!("usage: openshazam list-devices");
+    eprintln!("   or: openshazam recognize-loopback [device-id]");
+    eprintln!("   or: openshazam capture-signature-loopback <new-output.sig> [device-id]");
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.len() != 2 || args[0] != "capture-signature" {
+        eprintln!("usage: openshazam capture-signature <new-output.sig>");
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid command or arguments").into(),
+        );
+    }
+    macos_capture::capture_signature(Path::new(&args[1]))
+}
+
+#[cfg(test)]
 fn decode_mono_f32le(bytes: &[u8]) -> io::Result<Vec<f32>> {
     if bytes.len() % 4 != 0 {
         return Err(io::Error::new(
@@ -94,7 +154,7 @@ struct CaptureAccumulator {
 
 #[cfg(any(windows, test, target_os = "macos"))]
 impl CaptureAccumulator {
-    #[cfg(any(windows, test))]
+    #[cfg(test)]
     fn new(target_frames: usize) -> io::Result<Self> {
         Self::new_for_rate(CAPTURE_RATE, target_frames)
     }
@@ -130,7 +190,7 @@ impl CaptureAccumulator {
         self.frames_seen
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(test)]
     fn push_packet(
         &mut self,
         bytes: &[u8],
@@ -167,7 +227,7 @@ impl CaptureAccumulator {
         self.push_samples(&samples)
     }
 
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(any(windows, test, target_os = "macos"))]
     fn push_interleaved_f32(&mut self, samples: &[f32], channels: usize) -> io::Result<()> {
         if channels == 0 || samples.len() % channels != 0 {
             return Err(io::Error::new(
@@ -219,61 +279,253 @@ impl CaptureAccumulator {
 }
 
 #[cfg(windows)]
-fn capture_signature(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    use wasapi::{
-        initialize_mta, AudioCaptureClient, DeviceEnumerator, Direction, SampleType, StreamMode,
-        WaveFormat,
-    };
+fn list_render_devices() -> Result<(), Box<dyn std::error::Error>> {
+    use wasapi::{initialize_mta, DeviceEnumerator, Direction};
 
     initialize_mta().ok()?;
     let enumerator = DeviceEnumerator::new()?;
-    let device = enumerator.get_default_device(&Direction::Capture)?;
-    let mut audio_client = device.get_iaudioclient()?;
+    let default_id = enumerator
+        .get_default_device(&Direction::Render)
+        .and_then(|device| device.get_id())
+        .ok();
+    let devices = enumerator.get_device_collection(&Direction::Render)?;
+    if devices.get_nbr_devices()? == 0 {
+        println!("No active Windows playback devices were found.");
+        return Ok(());
+    }
+    for index in 0..devices.get_nbr_devices()? {
+        let device = devices.get_device_at_index(index)?;
+        let id = device.get_id()?;
+        let default_marker = if default_id.as_deref() == Some(id.as_str()) {
+            " (default)"
+        } else {
+            ""
+        };
+        println!("{}{}\n  {id}", device.get_friendlyname()?, default_marker);
+    }
+    Ok(())
+}
 
-    // Request the canonical input shape; shared-mode WASAPI may convert the
-    // endpoint mix format to this stream format.
-    let format = WaveFormat::new(32, 32, &SampleType::Float, CAPTURE_RATE as usize, 1, None);
-    let (_, minimum_period_hns) = audio_client.get_device_period()?;
-    audio_client.initialize_client(
-        &format,
-        &Direction::Capture,
-        &StreamMode::EventsShared {
-            autoconvert: true,
+#[cfg(windows)]
+fn capture_loopback_signature(
+    selected_device_id: Option<&str>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use wasapi::{initialize_mta, AudioCaptureClient, DeviceEnumerator, Direction, StreamMode};
+
+    initialize_mta().ok()?;
+    let enumerator = DeviceEnumerator::new()?;
+    let device = match selected_device_id {
+        Some(device_id) => enumerator.get_device(device_id)?,
+        None => enumerator
+            .get_default_device(&Direction::Render)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no default Windows playback device is available: {error:?}"),
+                )
+            })?,
+    };
+    if device.get_direction() != Direction::Render {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the selected endpoint is not a playback device; use `list-devices` to choose an output",
+        )
+        .into());
+    }
+    let device_name = device.get_friendlyname()?;
+    let mut audio_client = device.get_iaudioclient()?;
+    let native_format = audio_client.get_mixformat()?;
+    let (format, auto_convert) = if format_usable_by_sigx(&native_format) {
+        let (_, minimum_period_hns) = audio_client.get_device_period()?;
+        let mode = StreamMode::EventsShared {
+            autoconvert: false,
             buffer_duration_hns: minimum_period_hns.max(200_000),
-        },
-    )?;
+        };
+        if audio_client
+            .initialize_client(&native_format, &Direction::Capture, &mode)
+            .is_ok()
+        {
+            (native_format, false)
+        } else {
+            audio_client = device.get_iaudioclient()?;
+            (canonical_loopback_format(), true)
+        }
+    } else {
+        (canonical_loopback_format(), true)
+    };
+    if auto_convert {
+        println!(
+            "Using Windows shared-mode conversion because the endpoint mix format is not directly supported by SigX."
+        );
+    }
+    if auto_convert {
+        let (_, minimum_period_hns) = audio_client.get_device_period()?;
+        audio_client.initialize_client(
+            &format,
+            &Direction::Capture,
+            &StreamMode::EventsShared {
+                autoconvert: true,
+                buffer_duration_hns: minimum_period_hns.max(200_000),
+            },
+        )?;
+    }
+    let sample_rate = format.get_samplespersec();
+    let channels = usize::from(format.get_nchannels());
+    let frames = (sample_rate as usize)
+        .checked_mul(CAPTURE_SECONDS)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "capture length overflow"))?;
+    let mut accumulator = CaptureAccumulator::new_for_rate(sample_rate, frames)?;
     let event = audio_client.set_get_eventhandle()?;
     let capture: AudioCaptureClient = audio_client.get_audiocaptureclient()?;
-    let mut accumulator = CaptureAccumulator::new(CAPTURE_FRAMES)?;
 
-    println!("Capturing {CAPTURE_SECONDS}s from the default microphone as 16-kHz mono Float32...");
+    println!(
+        "Capturing {CAPTURE_SECONDS}s of system playback from {device_name:?} at {sample_rate} Hz, {channels} channel(s)..."
+    );
     audio_client.start_stream()?;
-    let capture_result = capture_frames(&capture, &event, &mut accumulator);
+    let capture_result =
+        capture_loopback_frames(&capture, &event, &format, channels, &mut accumulator);
     let stop_result = audio_client.stop_stream();
     capture_result?;
     stop_result?;
 
     let signature = accumulator.finish()?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)?;
-    file.write_all(&signature)?;
     println!(
-        "Wrote {} bytes to {} (local only; no network request was made)",
-        signature.len(),
-        output.display()
+        "WASAPI loopback capture complete: 12s PCM -> Pure Rust SigX ({} bytes).",
+        signature.len()
     );
-    Ok(())
+    Ok(signature)
 }
 
 #[cfg(windows)]
-fn capture_frames(
+fn canonical_loopback_format() -> wasapi::WaveFormat {
+    wasapi::WaveFormat::new(32, 32, &wasapi::SampleType::Float, 48_000, 1, None)
+}
+
+#[cfg(windows)]
+fn format_usable_by_sigx(format: &wasapi::WaveFormat) -> bool {
+    let sample_rate = format.get_samplespersec();
+    let channels = usize::from(format.get_nchannels());
+    let bits = format.get_bitspersample();
+    let valid_bits = format.get_validbitspersample();
+    let block_align = format.get_blockalign() as usize;
+    let Some(sample_bytes) = usize::from(bits).checked_add(7).map(|bits| bits / 8) else {
+        return false;
+    };
+    let sample_type = match format.get_subformat() {
+        Ok(sample_type) => sample_type,
+        Err(_) => return false,
+    };
+    let valid_bits_supported = valid_bits == bits || (bits == 32 && valid_bits == 24);
+    sample_rate_supported(sample_rate)
+        && (1..=32).contains(&channels)
+        && sample_bytes > 0
+        && block_align == sample_bytes.saturating_mul(channels)
+        && valid_bits_supported
+        && match sample_type {
+            wasapi::SampleType::Float => matches!(bits, 32 | 64) && valid_bits == bits,
+            wasapi::SampleType::Int => matches!(bits, 8 | 16 | 24 | 32),
+        }
+}
+
+#[cfg(windows)]
+fn sample_rate_supported(sample_rate: u32) -> bool {
+    matches!(
+        sample_rate,
+        8_000 | 16_000 | 22_050 | 32_000 | 44_100 | 48_000 | 96_000
+    )
+}
+
+#[cfg(windows)]
+fn decode_wasapi_interleaved(
+    bytes: &[u8],
+    frames: usize,
+    format: &wasapi::WaveFormat,
+) -> io::Result<Vec<f32>> {
+    use wasapi::SampleType;
+
+    if !format_usable_by_sigx(format) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "WASAPI returned an unsupported PCM format or SigX sample rate",
+        ));
+    }
+    let channels = usize::from(format.get_nchannels());
+    let bits = format.get_bitspersample();
+    let sample_bytes = (usize::from(bits) + 7) / 8;
+    let sample_count = frames
+        .checked_mul(channels)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "capture packet too large"))?;
+    let byte_count = sample_count
+        .checked_mul(sample_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "capture packet too large"))?;
+    let data = bytes.get(..byte_count).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WASAPI packet is shorter than the reported frame count",
+        )
+    })?;
+    let sample_type = format.get_subformat().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("unsupported WASAPI sample type: {error:?}"),
+        )
+    })?;
+    data.chunks_exact(sample_bytes)
+        .map(|chunk| {
+            let sample = match (sample_type, bits) {
+                (SampleType::Float, 32) => {
+                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                }
+                (SampleType::Float, 64) => {
+                    f64::from_le_bytes(chunk.try_into().expect("validated 64-bit float sample"))
+                        as f32
+                }
+                (SampleType::Int, 8) => (i16::from(chunk[0]) - 128) as f32 / 128.0,
+                (SampleType::Int, 16) => i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32_768.0,
+                (SampleType::Int, 24) => {
+                    let packed = i32::from(chunk[0])
+                        | (i32::from(chunk[1]) << 8)
+                        | (i32::from(chunk[2]) << 16);
+                    let signed = if packed & 0x80_0000 != 0 {
+                        packed | !0xFF_FFFF
+                    } else {
+                        packed
+                    };
+                    signed as f32 / 8_388_608.0
+                }
+                (SampleType::Int, 32) => {
+                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32
+                        / 2_147_483_648.0
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "unsupported WASAPI PCM container width",
+                    ));
+                }
+            };
+            if sample.is_finite() {
+                Ok(sample.clamp(-1.0, 1.0))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WASAPI packet contains a non-finite sample",
+                ))
+            }
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn capture_loopback_frames(
     capture: &wasapi::AudioCaptureClient,
     event: &wasapi::Handle,
+    format: &wasapi::WaveFormat,
+    channels: usize,
     accumulator: &mut CaptureAccumulator,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut empty_wakeups = 0usize;
+    let mut received_audio_packet = false;
 
     while accumulator.remaining_frames() > 0 {
         event.wait_for_event(2_000)?;
@@ -299,23 +551,29 @@ fn capture_frames(
             empty_wakeups = 0;
 
             let byte_count = (packet_frames as usize)
-                .checked_mul(4)
+                .checked_mul(format.get_blockalign() as usize)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "packet too large"))?;
             let mut bytes = vec![0u8; byte_count];
             let (read_frames, info) = capture.read_from_device(&mut bytes)?;
+            if info.flags.data_discontinuity && received_audio_packet {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WASAPI reported a playback-capture discontinuity; retry after playback is stable",
+                )
+                .into());
+            }
             if read_frames == 0 {
-                accumulator.push_packet(
-                    &[],
-                    0,
-                    info.flags.silent,
-                    info.flags.data_discontinuity,
-                )?;
                 break;
             }
+            received_audio_packet = true;
 
-            let sample_count = read_frames as usize;
-            let byte_count = sample_count
-                .checked_mul(4)
+            let frame_count = (read_frames as usize).min(accumulator.remaining_frames());
+            if info.flags.silent {
+                accumulator.push_interleaved_f32(&vec![0.0; frame_count * channels], channels)?;
+                continue;
+            }
+            let byte_count = frame_count
+                .checked_mul(format.get_blockalign() as usize)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "packet too large"))?;
             let packet_bytes = bytes.get(..byte_count).ok_or_else(|| {
                 io::Error::new(
@@ -323,12 +581,8 @@ fn capture_frames(
                     "WASAPI returned fewer bytes than reported frames",
                 )
             })?;
-            accumulator.push_packet(
-                packet_bytes,
-                sample_count,
-                info.flags.silent,
-                info.flags.data_discontinuity,
-            )?;
+            let samples = decode_wasapi_interleaved(packet_bytes, frame_count, format)?;
+            accumulator.push_interleaved_f32(&samples, channels)?;
         }
     }
 
@@ -349,6 +603,29 @@ mod tests {
             .flat_map(|sample| sample.to_le_bytes())
             .collect();
         assert_eq!(decode_mono_f32le(&bytes).unwrap(), samples);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn decodes_stereo_int16_wasapi_mix_format() {
+        let format = wasapi::WaveFormat::new(16, 16, &wasapi::SampleType::Int, 48_000, 2, None);
+        let bytes = [0x00, 0x00, 0x00, 0x80, 0xff, 0x7f, 0x00, 0x00];
+        let samples = super::decode_wasapi_interleaved(&bytes, 2, &format).unwrap();
+        assert_eq!(samples, [0.0, -1.0, 32_767.0 / 32_768.0, 0.0]);
+
+        let mut accumulator = CaptureAccumulator::new_for_rate(48_000, 2).unwrap();
+        accumulator.push_interleaved_f32(&samples, 2).unwrap();
+        assert_eq!(accumulator.frames_seen(), 2);
+        Signature::parse(&accumulator.finish().unwrap()).expect("mixed down audio creates SigX");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn decodes_packed_24_bit_pcm_without_losing_sign() {
+        let format = wasapi::WaveFormat::new(24, 24, &wasapi::SampleType::Int, 44_100, 1, None);
+        let bytes = [0x00, 0x00, 0x80, 0xff, 0xff, 0x7f];
+        let samples = super::decode_wasapi_interleaved(&bytes, 2, &format).unwrap();
+        assert_eq!(samples, [-1.0, 8_388_607.0 / 8_388_608.0]);
     }
 
     #[test]

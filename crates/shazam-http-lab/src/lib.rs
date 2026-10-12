@@ -337,7 +337,7 @@ pub fn post_loopback_json(endpoint: &str, body: &[u8]) -> Result<HttpResponse, E
 pub fn post_shazam_json(endpoint: &str, body: &[u8]) -> Result<HttpResponse, Error> {
     validate_shazam_endpoint(endpoint)?;
 
-    let mut child = Command::new("/usr/bin/curl")
+    let mut child = Command::new(system_curl_program())
         .args([
             "--disable",
             "--noproxy",
@@ -434,6 +434,16 @@ pub fn post_shazam_json(endpoint: &str, body: &[u8]) -> Result<HttpResponse, Err
     })
 }
 
+#[cfg(windows)]
+fn system_curl_program() -> &'static str {
+    "curl.exe"
+}
+
+#[cfg(not(windows))]
+fn system_curl_program() -> &'static str {
+    "/usr/bin/curl"
+}
+
 /// Fetch the current Shazam Config using an ordinary verified HTTPS GET.
 /// Redirects, cookies, proxies, AMP credentials, and Shazam app storage are
 /// not used. The response is parsed in memory and only `inid` plus
@@ -441,7 +451,7 @@ pub fn post_shazam_json(endpoint: &str, body: &[u8]) -> Result<HttpResponse, Err
 pub fn fetch_shazam_config(profile: &ConfigRequestProfile) -> Result<ShazamConfiguration, Error> {
     let url = build_config_url(profile)?;
     let app_version_header = format!("X-Shazam-AppVersion: {}", profile.app_version);
-    let mut child = Command::new("/usr/bin/curl")
+    let mut child = Command::new(system_curl_program())
         .args([
             "--disable",
             "--noproxy",
@@ -517,6 +527,140 @@ pub fn fetch_shazam_config(profile: &ConfigRequestProfile) -> Result<ShazamConfi
         )));
     }
     parse_shazam_config(&combined[..marker_index])
+}
+
+/// Resolve the host's Shazam Config route and submit an in-memory Pure Rust
+/// Signature using the Windows host profile and Windows HTTPS transport.
+/// The request tag and signature are never written to disk by this helper.
+#[cfg(windows)]
+pub fn recognize_signature_for_windows(
+    signature: &[u8],
+    sample_ms: u64,
+) -> Result<(u16, Vec<TrackCandidate>), Error> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let profile = windows_config_request_profile()?;
+    let config = fetch_shazam_config(&profile)?;
+    let tag_id = random_uuid_v4()?;
+    let streaming_provider = std::env::var("SHAZAM_STREAMING_PROVIDER").unwrap_or_default();
+    let endpoint = config.resolve_tag_url(&tag_id, &streaming_provider)?;
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Error::Transport(format!("system clock is before Unix epoch: {error}")))?
+        .as_millis() as u64;
+    let timezone = std::env::var("TZ")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| iana_time_zone::get_timezone().ok())
+        .unwrap_or_else(|| "UTC".into());
+    let body = build_request_body(
+        signature,
+        sample_ms,
+        timestamp_ms,
+        &timezone,
+        json!({}),
+        json!({}),
+        None,
+    )?;
+    let response = post_shazam_json(&endpoint, &body)?;
+    if !(200..300).contains(&response.status) {
+        return Err(Error::BadResponse(format!(
+            "Shazam recognition returned HTTP {}; response body withheld",
+            response.status
+        )));
+    }
+    let candidates = parse_track_candidates(&response.body)?;
+    Ok((response.status, candidates))
+}
+
+/// Read locale, OS, and device fields used by the existing Windows Config
+/// route. The API currently returns the supported MAC/MACOS route, so these
+/// fields describe the host while the established route identifier is kept.
+#[cfg(windows)]
+pub fn windows_config_request_profile() -> Result<ConfigRequestProfile, Error> {
+    const SCRIPT: &str = r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $culture=Get-Culture; $os=Get-CimInstance Win32_OperatingSystem; $computer=Get-CimInstance Win32_ComputerSystem; [ordered]@{language=$culture.TwoLetterISOLanguageName; locale=$culture.Name; model=$computer.Model; os_version=$os.Version; os_build=$os.BuildNumber} | ConvertTo-Json -Compress"#;
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            SCRIPT,
+        ])
+        .output()
+        .map_err(|error| {
+            Error::Transport(format!(
+                "could not start PowerShell for Windows Config profile: {error}"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(Error::Transport(
+            "PowerShell could not read the Windows locale, OS, or device model".into(),
+        ));
+    }
+    let host = parse_windows_host_profile(&output.stdout)?;
+    let profile_value = |name: &str, detected: String| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(detected)
+    };
+    Ok(ConfigRequestProfile {
+        country: profile_value("SHAZAM_CONFIG_COUNTRY", "-".into()),
+        language: profile_value("SHAZAM_CONFIG_LANGUAGE", host.language),
+        locale: profile_value("SHAZAM_CONFIG_LOCALE", host.locale),
+        model: profile_value("SHAZAM_CONFIG_MODEL", host.model),
+        os_version: profile_value("SHAZAM_CONFIG_OS_VERSION", host.os_version),
+        os_build: profile_value("SHAZAM_CONFIG_OS_BUILD", host.os_build),
+        app_version: "2.11.0".into(),
+    })
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsHostProfile {
+    language: String,
+    locale: String,
+    model: String,
+    os_version: String,
+    os_build: String,
+}
+
+#[cfg(windows)]
+fn parse_windows_host_profile(bytes: &[u8]) -> Result<WindowsHostProfile, Error> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| {
+        Error::BadResponse("PowerShell returned invalid Windows profile JSON".into())
+    })?;
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| Error::BadResponse(format!("Windows profile is missing {name}")))
+    };
+    Ok(WindowsHostProfile {
+        language: field("language")?,
+        locale: field("locale")?.replace('-', "_"),
+        model: field("model")?,
+        os_version: field("os_version")?,
+        os_build: field("os_build")?,
+    })
+}
+
+#[cfg(windows)]
+fn random_uuid_v4() -> Result<String, Error> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| Error::Transport(format!("could not generate request tag ID: {error}")))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    ))
 }
 
 fn validate_shazam_endpoint(endpoint: &str) -> Result<(), Error> {
@@ -1083,5 +1227,28 @@ mod tests {
             post_loopback_json("https://127.0.0.1:443/match", body),
             Err(Error::InvalidEndpoint(_))
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_host_profile_keeps_supported_mac_config_route_and_windows_fields() {
+        let host = parse_windows_host_profile(
+            br#"{"language":"ja","locale":"ja-JP","model":"Windows Test Device","os_version":"10.0.26200","os_build":"26200"}"#,
+        )
+        .unwrap();
+        assert_eq!(host.locale, "ja_JP");
+        let url = build_config_url(&ConfigRequestProfile {
+            country: "-".into(),
+            language: host.language,
+            locale: host.locale,
+            model: host.model,
+            os_version: host.os_version,
+            os_build: host.os_build,
+            app_version: "2.11.0".into(),
+        })
+        .unwrap();
+        assert!(url.contains("platform=MAC&os=MACOS"));
+        assert!(url.contains("model=Windows%20Test%20Device"));
+        assert!(url.contains("osVersion=10.0.26200"));
     }
 }

@@ -7,6 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.22.1"
+getrandom = "0.2.17"
 serde_json = "1.0.149"
 sigx-core = { path = "../sigx-core" }
 sigx-format = { path = "../sigx-format" }
+
+[target.'cfg(windows)'.dependencies]
+iana-time-zone = "0.1.65"

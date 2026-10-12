@@ -2,16 +2,15 @@
 
 OpenShazam is an unofficial Rust music-fingerprinting and recognition
 prototype. It includes a Pure Rust SigX pipeline, a command-line HTTP
-recognition experiment, and an early microphone-to-Signature prototype.
+recognition experiment, and Windows WASAPI loopback recognition.
 
 ## Requirements
 
 - Rust 1.85 or newer
 - `ffmpeg` and `ffprobe` for audio-file input
-- `/usr/bin/curl` for the experimental live HTTP command
-- macOS system tools (`defaults`, `sysctl`, `sw_vers`) for automatic Config profile detection
-- A Windows x64 Rust toolchain for native Windows execution; that runtime path
-  has not yet been validated
+- `curl` on macOS or `curl.exe` on Windows for the experimental live HTTP command
+- macOS system tools (`defaults`, `sysctl`, `sw_vers`) or Windows PowerShell/CIM
+  for automatic Config profile detection
 
 ## Build and test
 
@@ -61,11 +60,20 @@ Check Config retrieval without sending an audio signature:
 cargo run --locked -p shazam-http-lab -- config-check
 ```
 
-The microphone prototype writes a Signature locally and does not perform
-recognition:
+On Windows, Config reads the host locale, model, OS version/build, and IANA
+timezone. The service currently rejects `platform=WIN` with HTTP 400 and returns
+the existing Mac tag route for `MAC/MACOS`; the live command uses that route
+with the Windows host profile. Windows HTTPS uses `curl.exe` with Schannel
+certificate validation.
+
+On Windows, `openshazam` can list playback endpoints, recognize 12 seconds of
+system playback from the default output, or write that loopback Signature
+locally. Pass a listed device ID to target a non-default output:
 
 ```sh
-cargo run --locked -p openshazam -- capture-signature <new-output.sig>
+cargo run --locked -p openshazam -- list-devices
+cargo run --locked -p openshazam -- recognize-loopback [device-id]
+cargo run --locked -p openshazam -- capture-signature-loopback <new-output.sig> [device-id]
 ```
 
 Private Native fixtures are not included. The ordinary workspace tests do not
