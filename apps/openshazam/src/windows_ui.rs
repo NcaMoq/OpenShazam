@@ -1527,9 +1527,9 @@ struct CompositionScene {
     compositor: Compositor,
     _target: DesktopWindowTarget,
     root: ContainerVisual,
+    button_ripple_root: ContainerVisual,
     inner_audio_root: ContainerVisual,
     inner_wave_root: ContainerVisual,
-    inner_inverse_clip: CompositionGeometricClip,
     outer_audio_root: ContainerVisual,
     rings: [CompositionRing; 6],
     button: ContainerVisual,
@@ -1567,16 +1567,14 @@ struct AnimationSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompositionRootLayer {
     OuterRipples,
-    InnerRipples,
-    Button,
+    CenteredButtonAndRipples,
 }
 
-fn composition_root_layer_order() -> [CompositionRootLayer; 3] {
-    // Sequential InsertAtTop calls reproduce the native insertion sequence:
-    // inner circles below the button, outer circles added last at the front.
+fn composition_root_layer_order() -> [CompositionRootLayer; 2] {
+    // Keep the button and inner mask under one shared transform. Outer circles
+    // are still inserted last at the front, matching native layer insertion.
     [
-        CompositionRootLayer::InnerRipples,
-        CompositionRootLayer::Button,
+        CompositionRootLayer::CenteredButtonAndRipples,
         CompositionRootLayer::OuterRipples,
     ]
 }
@@ -1636,33 +1634,43 @@ impl CompositionScene {
         // Native uses a 3.5×96pt inverse mask (336pt) around the button.
         // The largest visible inner fill remains 288pt inside that mask.
         let inner_bounds = INNER_MASK_BOUNDS;
+        // The listening button and its inverse ripple-mask hole share this
+        // transform. Separate Composition transforms could expose a one-frame
+        // edge mismatch while the audio scale changes.
+        let button_ripple_root = compositor.CreateContainerVisual()?;
+        button_ripple_root.SetSize(Vector2 {
+            X: inner_bounds,
+            Y: inner_bounds,
+        })?;
+        button_ripple_root.SetCenterPoint(Vector3 {
+            X: inner_bounds * 0.5,
+            Y: inner_bounds * 0.5,
+            Z: 0.0,
+        })?;
+        button_ripple_root.SetOffset(Vector3 {
+            X: center_x - inner_bounds * 0.5,
+            Y: center_y - inner_bounds * 0.5,
+            Z: 0.0,
+        })?;
         let inner_audio_root = compositor.CreateContainerVisual()?;
         inner_audio_root.SetSize(Vector2 {
             X: inner_bounds,
             Y: inner_bounds,
         })?;
-        inner_audio_root.SetCenterPoint(Vector3 {
-            X: inner_bounds * 0.5,
-            Y: inner_bounds * 0.5,
-            Z: 0.0,
-        })?;
-        inner_audio_root.SetOffset(Vector3 {
-            X: center_x - inner_bounds * 0.5,
-            Y: center_y - inner_bounds * 0.5,
-            Z: 0.0,
-        })?;
         inner_audio_root.SetOpacity(0.0)?;
         let inner_inverse_clip = unsafe {
             make_inverse_circle_clip(compositor, d2d_factory, inner_bounds, BUTTON_CLEAR_DIAMETER)?
         };
-        // The fill waves follow the audio-driven inner scale, while the clear
-        // hole follows the button scale. Keep the mask in the unscaled parent
-        // coordinate space and transform the clip independently.
+        // The clear hole inherits the shared button transform. The fill waves
+        // are compensated below so their audio-driven scale stays separate.
         inner_inverse_clip.SetCenterPoint(Vector2 {
             X: inner_bounds * 0.5,
             Y: inner_bounds * 0.5,
         })?;
         inner_audio_root.SetClip(&inner_inverse_clip)?;
+        button_ripple_root
+            .Children()?
+            .InsertAtTop(&inner_audio_root)?;
         let inner_wave_root = compositor.CreateContainerVisual()?;
         inner_wave_root.SetSize(Vector2 {
             X: inner_bounds,
@@ -1964,8 +1972,8 @@ impl CompositionScene {
             Z: 0.0,
         })?;
         button.SetOffset(Vector3 {
-            X: BUTTON_X as f32,
-            Y: body_top + BUTTON_TOP as f32,
+            X: (BUTTON_X + BUTTON_SIZE * 0.5) as f32 - inner_bounds * 0.5,
+            Y: (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32 - inner_bounds * 0.5,
             Z: 0.0,
         })?;
         let button_shape_visual = compositor.CreateShapeVisual()?;
@@ -2063,12 +2071,14 @@ impl CompositionScene {
             .InsertAtTop(&no_match_icon_transform)?;
         button.Children()?.InsertAtTop(&button_content)?;
 
+        button_ripple_root.Children()?.InsertAtTop(&button)?;
         let children = root.Children()?;
         for layer in composition_root_layer_order() {
             match layer {
                 CompositionRootLayer::OuterRipples => children.InsertAtTop(&outer_audio_root)?,
-                CompositionRootLayer::InnerRipples => children.InsertAtTop(&inner_audio_root)?,
-                CompositionRootLayer::Button => children.InsertAtTop(&button)?,
+                CompositionRootLayer::CenteredButtonAndRipples => {
+                    children.InsertAtTop(&button_ripple_root)?
+                }
             }
         }
 
@@ -2140,9 +2150,9 @@ impl CompositionScene {
             compositor: compositor.clone(),
             _target: target,
             root,
+            button_ripple_root,
             inner_audio_root,
             inner_wave_root,
-            inner_inverse_clip,
             outer_audio_root,
             rings,
             button,
@@ -2207,7 +2217,7 @@ impl CompositionScene {
             let outer_bounds = ui_model::OUTER_DIAMETERS[0] as f32;
             let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
             let center_y = snapshot.body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32;
-            self.inner_audio_root.SetOffset(Vector3 {
+            self.button_ripple_root.SetOffset(Vector3 {
                 X: center_x - inner_bounds * 0.5,
                 Y: center_y - inner_bounds * 0.5,
                 Z: 0.0,
@@ -2243,7 +2253,7 @@ impl CompositionScene {
             .is_some_and(|elapsed| elapsed >= 0.18)
             && !self.no_match_active
         {
-            self.start_no_match_motion(snapshot.body_top)?;
+            self.start_no_match_motion()?;
             self.no_match_active = true;
         } else if snapshot.no_match_elapsed.is_none()
             && (self.no_match_active || self.no_match_restore_active)
@@ -2271,8 +2281,8 @@ impl CompositionScene {
         }
         if !self.no_match_active {
             self.button.SetOffset(Vector3 {
-                X: BUTTON_X as f32,
-                Y: snapshot.body_top + BUTTON_TOP as f32,
+                X: (BUTTON_X + BUTTON_SIZE * 0.5) as f32 - INNER_MASK_BOUNDS * 0.5,
+                Y: (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32 - INNER_MASK_BOUNDS * 0.5,
                 Z: 0.0,
             })?;
         }
@@ -2365,14 +2375,17 @@ impl CompositionScene {
         }
 
         if !snapshot.show_ripples {
+            self.button_ripple_root.SetScale(Vector3 {
+                X: 1.0,
+                Y: 1.0,
+                Z: 1.0,
+            })?;
             self.inner_audio_root.SetOpacity(0.0)?;
             self.inner_wave_root.SetScale(Vector3 {
                 X: 1.0,
                 Y: 1.0,
                 Z: 1.0,
             })?;
-            self.inner_inverse_clip
-                .SetScale(Vector2 { X: 1.0, Y: 1.0 })?;
             self.outer_audio_root.SetOpacity(0.0)?;
             self.outer_audio_root.SetScale(Vector3 {
                 X: 1.0,
@@ -2422,14 +2435,23 @@ impl CompositionScene {
                 snapshot.levels,
                 snapshot.auto_spring,
             );
-            self.inner_wave_root.SetScale(Vector3 {
-                X: (frame.inner_container_factor / 3.0 * frame.inner_audio_scale) as f32,
-                Y: (frame.inner_container_factor / 3.0 * frame.inner_audio_scale) as f32,
+            let shared_scale = frame.button_child_scale as f32;
+            self.button_ripple_root.SetScale(Vector3 {
+                X: shared_scale,
+                Y: shared_scale,
                 Z: 1.0,
             })?;
-            self.inner_inverse_clip.SetScale(Vector2 {
-                X: frame.button_child_scale as f32,
-                Y: frame.button_child_scale as f32,
+            self.button.SetScale(Vector3 {
+                X: 1.0,
+                Y: 1.0,
+                Z: 1.0,
+            })?;
+            self.inner_wave_root.SetScale(Vector3 {
+                X: (frame.inner_container_factor / 3.0 * frame.inner_audio_scale) as f32
+                    / shared_scale,
+                Y: (frame.inner_container_factor / 3.0 * frame.inner_audio_scale) as f32
+                    / shared_scale,
+                Z: 1.0,
             })?;
             self.inner_audio_root
                 .SetOpacity(frame.inner_audio_opacity as f32)?;
@@ -2471,11 +2493,6 @@ impl CompositionScene {
                 snapshot.levels,
                 snapshot.auto_spring,
             );
-            self.button.SetScale(Vector3 {
-                X: frame.button_child_scale as f32,
-                Y: frame.button_child_scale as f32,
-                Z: 1.0,
-            })?;
             self.last_button_scale = frame.button_child_scale as f32;
         }
         Ok(())
@@ -2505,9 +2522,9 @@ impl CompositionScene {
             .StartAnimation(&HSTRING::from("Scale"), &restore)
     }
 
-    fn start_no_match_motion(&mut self, body_top: f32) -> windows::core::Result<()> {
-        let button_left = BUTTON_X as f32;
-        let button_top = body_top + BUTTON_TOP as f32;
+    fn start_no_match_motion(&mut self) -> windows::core::Result<()> {
+        let button_left = (BUTTON_X + BUTTON_SIZE * 0.5) as f32 - INNER_MASK_BOUNDS * 0.5;
+        let button_top = (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32 - INNER_MASK_BOUNDS * 0.5;
         let tagging_profile = ui_model::no_match_position_profile(
             BUTTON_SIZE,
             -0.150_000_005_960_464_48,
@@ -2530,7 +2547,7 @@ impl CompositionScene {
             create_no_match_position_animation(&self.compositor, 0.0, 0.0, icon_profile)?;
         self.button.SetOffset(Vector3 {
             X: button_left + tagging_profile.from as f32,
-            Y: body_top + BUTTON_TOP as f32,
+            Y: button_top,
             Z: 0.0,
         })?;
         self.no_match_icon_transform.SetOffset(Vector3 {
@@ -6646,12 +6663,11 @@ mod tests {
     }
 
     #[test]
-    fn native_root_insertion_keeps_inner_behind_button_and_outer_in_front() {
+    fn listening_button_and_inner_mask_share_a_group_below_outer_ripples() {
         assert_eq!(
             composition_root_layer_order(),
             [
-                CompositionRootLayer::InnerRipples,
-                CompositionRootLayer::Button,
+                CompositionRootLayer::CenteredButtonAndRipples,
                 CompositionRootLayer::OuterRipples,
             ]
         );
@@ -6681,11 +6697,13 @@ mod tests {
             );
             let hole_diameter = BUTTON_CLEAR_DIAMETER as f64 * frame.button_child_scale;
             let fill_scale = frame.inner_container_factor / 3.0 * frame.inner_audio_scale;
+            let compensated_fill_scale = fill_scale / frame.button_child_scale;
             let expected_button_scale = 0.75 + 0.35 * bass;
             let expected_fill_scale = 0.7 + 0.6 * bass;
             assert!((frame.button_child_scale - expected_button_scale).abs() < 1e-9);
             assert!((fill_scale - expected_fill_scale).abs() < 1e-9);
             assert!((hole_diameter - 96.0 * expected_button_scale).abs() < 1e-9);
+            assert!((frame.button_child_scale * compensated_fill_scale - fill_scale).abs() < 1e-9);
             assert!(
                 (48.0 * (expected_fill_scale - expected_button_scale) - (-2.4 + 12.0 * bass)).abs()
                     < 1e-9
