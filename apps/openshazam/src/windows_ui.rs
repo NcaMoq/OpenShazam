@@ -2399,6 +2399,11 @@ fn result_artwork_frame(panel_top: f32) -> D2D_RECT_F {
     rect(10.0, panel_top + 20.0, 160.0, panel_top + 170.0)
 }
 
+// [R] DetailsColumn 204pt wide with 20pt insets yields a 164pt text column
+// when preserving its derived x=172 leading edge (UI-3.2).
+const RESULT_DETAILS_LEFT: f32 = 172.0;
+const RESULT_DETAILS_RIGHT: f32 = 336.0;
+
 fn history_artwork_frame(row_top: f32) -> D2D_RECT_F {
     rect(20.0, row_top + 12.0, 85.0, row_top + 77.0)
 }
@@ -3166,13 +3171,23 @@ impl Renderer {
         );
         self.text(
             &track.title,
-            rect(172.0, top + 20.0, 355.0, top + 88.0),
+            rect(
+                RESULT_DETAILS_LEFT,
+                top + 20.0,
+                RESULT_DETAILS_RIGHT,
+                top + 88.0,
+            ),
             &self.text.result_title,
             &self.palette.title,
         );
         self.text(
             &track.artist,
-            rect(172.0, top + 91.0, 355.0, top + 137.0),
+            rect(
+                RESULT_DETAILS_LEFT,
+                top + 91.0,
+                RESULT_DETAILS_RIGHT,
+                top + 137.0,
+            ),
             &self.text.result_artist,
             &self.palette.subtitle,
         );
@@ -5421,6 +5436,7 @@ mod tests {
         should_start_startup_logo, ui_model, CaptureMode, CompositionRootLayer,
         HistoryMutationEvent, HistoryMutationTransition, MainPhase, ResultCardAdvance,
         ResultCardStage, WindowKind, INNER_RIPPLE_DIAMETER, OUTER_BASE_OPACITY,
+        RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT,
     };
 
     #[test]
@@ -5847,6 +5863,12 @@ mod tests {
         );
         assert_eq!(history.right - history.left, 65.0);
         assert_eq!(history.bottom - history.top, 65.0);
+    }
+
+    #[test]
+    fn result_details_keep_the_derived_164_point_text_column() {
+        assert_eq!(RESULT_DETAILS_LEFT, 172.0);
+        assert_eq!(RESULT_DETAILS_RIGHT - RESULT_DETAILS_LEFT, 164.0);
     }
 
     #[test]
