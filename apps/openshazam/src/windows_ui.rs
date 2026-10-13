@@ -858,10 +858,20 @@ impl CompositionLogo {
                 ui_model::StartupLogoStage::TransparentStroke => {}
                 ui_model::StartupLogoStage::SolidLongStroke => {}
                 ui_model::StartupLogoStage::Complete => {
+                    for geometry in &self._transparent_geometries {
+                        geometry.StopAnimation(&HSTRING::from("TrimStart"))?;
+                    }
                     for geometry in &self._long_geometries {
                         geometry.StopAnimation(&HSTRING::from("TrimStart"))?;
                         geometry.StopAnimation(&HSTRING::from("TrimEnd"))?;
                     }
+                    // The native implementation removes its temporary
+                    // translucent strokes and their outline shadow when the
+                    // solid logo takes over. Leaving either visual visible
+                    // underneath the final paths adds a ghost edge/pattern
+                    // that becomes especially noticeable while listening.
+                    self._transparent_visual.SetOpacity(0.0)?;
+                    self._transparent_shadow_visual.SetOpacity(0.0)?;
                     self.long_visual.SetOpacity(0.0)?;
                     self.final_visual.SetOpacity(1.0)?;
                 }
