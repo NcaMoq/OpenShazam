@@ -5857,12 +5857,11 @@ mod tests {
     fn native_header_icons_embed_the_high_resolution_catalog_renditions() {
         assert_eq!(SETTINGS_ICON_PIXELS.len(), 32 * 32 * 4);
         assert_eq!(WHITE_CLOSE_ICON_PIXELS.len(), 24 * 24 * 4);
-        assert!(SETTINGS_ICON_PIXELS
-            .chunks_exact(4)
-            .any(|pixel| pixel[3] > 0));
-        assert!(WHITE_CLOSE_ICON_PIXELS
-            .chunks_exact(4)
-            .any(|pixel| pixel[3] > 0));
+        // The catalog packs these images in a bottom-origin atlas. Preserve
+        // their recognizable silhouettes so another valid but wrong crop
+        // (for example a social icon) cannot pass as the settings/close art.
+        assert_eq!(SETTINGS_ICON_PIXELS[(16 * 32 + 16) * 4 + 3], 0);
+        assert!(WHITE_CLOSE_ICON_PIXELS[(12 * 24 + 12) * 4 + 3] > 0);
     }
 
     #[test]
