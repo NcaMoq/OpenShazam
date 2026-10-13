@@ -341,6 +341,7 @@ struct Palette {
     skeleton: ID2D1SolidColorBrush,
     result_start: ID2D1LinearGradientBrush,
     listening: ID2D1LinearGradientBrush,
+    listening_bottom: ID2D1LinearGradientBrush,
     empty_overlay: ID2D1LinearGradientBrush,
 }
 
@@ -2470,6 +2471,19 @@ fn result_details_rects(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeaderFillScope {
+    HeaderAndArrow,
+    HeaderRectangle,
+}
+
+fn header_fill_scope(edge: ArrowEdge) -> HeaderFillScope {
+    match edge {
+        ArrowEdge::Top => HeaderFillScope::HeaderAndArrow,
+        ArrowEdge::Bottom => HeaderFillScope::HeaderRectangle,
+    }
+}
+
 fn history_artwork_frame(row_top: f32) -> D2D_RECT_F {
     rect(20.0, row_top + 12.0, 85.0, row_top + 77.0)
 }
@@ -2836,30 +2850,64 @@ impl Renderer {
             // Ready state onward. Listening and Auto use the same colors;
             // result and NoMatch panels are separate overlays below.
             MainPhase::Ready | MainPhase::Error { .. } | MainPhase::Timeout { .. } => {
-                self.fill_gradient_rect(
-                    &rect(
-                        0.0,
+                if header_fill_scope(app.arrow_edge) == HeaderFillScope::HeaderAndArrow {
+                    self.fill_gradient_geometry(
+                        &self.popup_header(app)?,
+                        &self.palette.listening,
                         body_top,
-                        CONTENT_WIDTH as f32,
-                        body_top + TOP_HEIGHT as f32,
-                    ),
-                    &self.palette.listening,
-                    body_top,
-                )?;
+                    )?;
+                } else {
+                    self.fill_gradient_rect(
+                        &rect(
+                            0.0,
+                            body_top,
+                            CONTENT_WIDTH as f32,
+                            body_top + TOP_HEIGHT as f32,
+                        ),
+                        &self.palette.listening_bottom,
+                        body_top,
+                    )?;
+                }
             }
             MainPhase::Listening { .. } => {
-                self.fill_gradient_geometry(
-                    &self.popup_header(app)?,
-                    &self.palette.listening,
-                    body_top,
-                )?;
+                if header_fill_scope(app.arrow_edge) == HeaderFillScope::HeaderAndArrow {
+                    self.fill_gradient_geometry(
+                        &self.popup_header(app)?,
+                        &self.palette.listening,
+                        body_top,
+                    )?;
+                } else {
+                    self.fill_gradient_rect(
+                        &rect(
+                            0.0,
+                            body_top,
+                            CONTENT_WIDTH as f32,
+                            body_top + TOP_HEIGHT as f32,
+                        ),
+                        &self.palette.listening_bottom,
+                        body_top,
+                    )?;
+                }
             }
             MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. } => {
-                self.fill_gradient_geometry(
-                    &self.popup_header(app)?,
-                    &self.palette.result_start,
-                    body_top,
-                )?;
+                if header_fill_scope(app.arrow_edge) == HeaderFillScope::HeaderAndArrow {
+                    self.fill_gradient_geometry(
+                        &self.popup_header(app)?,
+                        &self.palette.result_start,
+                        body_top,
+                    )?;
+                } else {
+                    self.fill_gradient_rect(
+                        &rect(
+                            0.0,
+                            body_top,
+                            CONTENT_WIDTH as f32,
+                            body_top + TOP_HEIGHT as f32,
+                        ),
+                        &self.palette.result_start,
+                        body_top,
+                    )?;
+                }
             }
         }
 
@@ -3738,6 +3786,28 @@ unsafe fn create_palette(
             },
         )?,
     };
+    // The taskbar-facing lower arrow has the native popup orientation reversed:
+    // the cyan stop begins at the top of the header and blue ends at the history edge.
+    let listening_bottom = match theme {
+        Theme::Light => gradient(
+            target,
+            [d2d_color(3, 187, 255, 1.0), d2d_color(0, 103, 255, 1.0)],
+            Vector2 { X: 190.0, Y: 0.0 },
+            Vector2 {
+                X: 190.0,
+                Y: TOP_HEIGHT as f32,
+            },
+        )?,
+        Theme::Dark => gradient(
+            target,
+            [d2d_color(55, 66, 73, 1.0), d2d_color(0, 0, 0, 1.0)],
+            Vector2 { X: 190.0, Y: 0.0 },
+            Vector2 {
+                X: 190.0,
+                Y: TOP_HEIGHT as f32,
+            },
+        )?,
+    };
     let overlay_colors = match theme {
         Theme::Light => [
             d2d_color(255, 255, 255, 0.90),
@@ -3769,6 +3839,7 @@ unsafe fn create_palette(
         skeleton,
         result_start,
         listening,
+        listening_bottom,
         empty_overlay,
     })
 }
@@ -5544,13 +5615,13 @@ mod tests {
     use super::{
         advance_result_card_stage, animation_needs_frame, button_border_arc_points,
         composition_root_layer_order, copy_notification_text, gradient_origin_transform,
-        history_artwork_frame, history_row_top, inverse_circle_clip_radii, is_offline_failure,
-        is_timeout_failure, native_icon_layout, parse_debug_string, parse_match,
-        phase_needs_timeout, point_in_rect, result_artwork_frame, result_details_rects,
-        result_panel_top_at, should_start_startup_logo, ui_model, CaptureMode,
-        CompositionRootLayer, HistoryMutationEvent, HistoryMutationTransition, MainPhase,
-        ResultCardAdvance, ResultCardStage, WindowKind, INNER_RIPPLE_DIAMETER, OUTER_BASE_OPACITY,
-        RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT,
+        header_fill_scope, history_artwork_frame, history_row_top, inverse_circle_clip_radii,
+        is_offline_failure, is_timeout_failure, native_icon_layout, parse_debug_string,
+        parse_match, phase_needs_timeout, point_in_rect, result_artwork_frame,
+        result_details_rects, result_panel_top_at, should_start_startup_logo, ui_model, ArrowEdge,
+        CaptureMode, CompositionRootLayer, HeaderFillScope, HistoryMutationEvent,
+        HistoryMutationTransition, MainPhase, ResultCardAdvance, ResultCardStage, WindowKind,
+        INNER_RIPPLE_DIAMETER, OUTER_BASE_OPACITY, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT,
     };
 
     #[test]
@@ -5977,6 +6048,18 @@ mod tests {
         );
         assert_eq!(history.right - history.left, 65.0);
         assert_eq!(history.bottom - history.top, 65.0);
+    }
+
+    #[test]
+    fn bottom_arrow_is_excluded_from_the_header_gradient_union() {
+        assert_eq!(
+            header_fill_scope(ArrowEdge::Top),
+            HeaderFillScope::HeaderAndArrow
+        );
+        assert_eq!(
+            header_fill_scope(ArrowEdge::Bottom),
+            HeaderFillScope::HeaderRectangle
+        );
     }
 
     #[test]
