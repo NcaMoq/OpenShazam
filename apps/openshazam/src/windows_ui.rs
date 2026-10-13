@@ -628,6 +628,19 @@ fn composition_scale_for_dpi(dpi: u32) -> f32 {
     dpi.max(96) as f32 / 96.0
 }
 
+fn composition_pixel_phase(dip: f32, scale: f32) -> f32 {
+    ((dip * scale).round() - dip * scale) / scale
+}
+
+fn composition_button_pixel_snap_offset(dpi: u32, body_top: f32) -> Vector3 {
+    let scale = composition_scale_for_dpi(dpi);
+    Vector3 {
+        X: composition_pixel_phase((BUTTON_X + BUTTON_SIZE * 0.5) as f32, scale),
+        Y: composition_pixel_phase(body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32, scale),
+        Z: 0.0,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ShzLogoLayout {
     center_x: f32,
@@ -1605,6 +1618,7 @@ impl CompositionScene {
         } else {
             0.0
         };
+        root.SetOffset(composition_button_pixel_snap_offset(dpi, body_top))?;
         let clip_bottom = MAIN_WINDOW_HEIGHT as f32 - (body_top + TOP_HEIGHT as f32);
         let clip = compositor.CreateInsetClipWithInsets(0.0, 0.0, 0.0, clip_bottom.max(0.0))?;
         root.SetClip(&clip)?;
@@ -2162,7 +2176,9 @@ impl CompositionScene {
             X: scale,
             Y: scale,
             Z: 1.0,
-        })
+        })?;
+        self.root
+            .SetOffset(composition_button_pixel_snap_offset(dpi, self.body_top))
     }
 
     fn update(&mut self, snapshot: AnimationSnapshot) -> windows::core::Result<()> {
@@ -2178,6 +2194,10 @@ impl CompositionScene {
 
         if self.body_top != snapshot.body_top {
             self.body_top = snapshot.body_top;
+            self.root.SetOffset(composition_button_pixel_snap_offset(
+                self.dpi,
+                self.body_top,
+            ))?;
             let bottom_inset = MAIN_WINDOW_HEIGHT as f32 - (snapshot.body_top + TOP_HEIGHT as f32);
             let clip =
                 self.compositor
@@ -6056,7 +6076,8 @@ fn _assert_only_ui_dependencies_are_used(_: &Path) {}
 mod tests {
     use super::{
         advance_result_card_stage, animation_needs_frame, button_border_arc_points,
-        composition_root_layer_order, copy_notification_text, gradient_origin_transform,
+        composition_button_pixel_snap_offset, composition_root_layer_order,
+        composition_scale_for_dpi, copy_notification_text, gradient_origin_transform,
         header_fill_scope, history_artwork_frame, history_row_top, inverse_circle_clip_radii,
         is_offline_failure, is_timeout_failure, localized_ui_text, native_icon_layout,
         no_match_copy, no_match_icon_rect, parse_debug_string, parse_match, phase_needs_timeout,
@@ -6065,9 +6086,9 @@ mod tests {
         timeout_copy, ui_model, ArrowEdge, CaptureMode, CompositionRootLayer, HeaderFillScope,
         HistoryMutationEvent, HistoryMutationTransition, MainPhase, NoMatchIconCommand,
         ResultCardAdvance, ResultCardStage, Theme, UiLanguage, UiTextKey, WindowKind,
-        BUTTON_CLEAR_DIAMETER, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY,
-        POPUP_ARROW_HEIGHT, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS,
-        WHITE_CLOSE_ICON_PIXELS,
+        BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, INNER_MASK_BOUNDS,
+        NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, POPUP_ARROW_HEIGHT, RESULT_DETAILS_LEFT,
+        RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, WHITE_CLOSE_ICON_PIXELS,
     };
 
     #[test]
@@ -6317,6 +6338,30 @@ mod tests {
             assert_eq!(composition_center_x, d2d_center_x, "{dpi} DPI x");
             assert_eq!(composition_center_y, d2d_center_y, "{dpi} DPI y");
             assert!((scale - ui_model::dpi_scale(dpi) as f32).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn composition_pixel_phase_aligns_button_and_ripples_at_fractional_dpi() {
+        for dpi in [96, 120, 144, 168, 192, 240, 288] {
+            let scale = composition_scale_for_dpi(dpi);
+            for body_top in [0.0, POPUP_ARROW_HEIGHT as f32] {
+                let offset = composition_button_pixel_snap_offset(dpi, body_top);
+                let logical_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
+                let logical_y = body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32;
+                let physical_x = (logical_x + offset.X) * scale;
+                let physical_y = (logical_y + offset.Y) * scale;
+                assert!(
+                    (physical_x - physical_x.round()).abs() < 1e-5,
+                    "{dpi} DPI x"
+                );
+                assert!(
+                    (physical_y - physical_y.round()).abs() < 1e-5,
+                    "{dpi} DPI y"
+                );
+                assert!(offset.X.abs() * scale <= 0.5 + 1e-5, "{dpi} DPI x offset");
+                assert!(offset.Y.abs() * scale <= 0.5 + 1e-5, "{dpi} DPI y offset");
+            }
         }
     }
 
