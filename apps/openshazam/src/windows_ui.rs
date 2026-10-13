@@ -495,8 +495,35 @@ const SHZ_LOGO_SOURCE_SIZE: f32 = 210.0;
 const SHZ_LOGO_REFERENCE_SIZE: f32 = 367.5;
 const SHZ_LOGO_STROKE_WIDTH: f32 = 38.0;
 
-fn shz_logo_scale(button_size: f32) -> f32 {
-    button_size / SHZ_LOGO_REFERENCE_SIZE
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ShzLogoLayout {
+    center_x: f32,
+    center_y: f32,
+    offset_x: f32,
+    offset_y: f32,
+    scale_x: f32,
+    scale_y: f32,
+}
+
+fn shz_logo_layout(button_width: f32, button_height: f32) -> ShzLogoLayout {
+    let center_x = button_width * 0.5;
+    let center_y = button_height * 0.5;
+    ShzLogoLayout {
+        center_x,
+        center_y,
+        offset_x: center_x - SHZ_LOGO_SOURCE_SIZE * 0.5,
+        offset_y: center_y - SHZ_LOGO_SOURCE_SIZE * 0.5,
+        scale_x: button_width / SHZ_LOGO_REFERENCE_SIZE,
+        scale_y: button_height / SHZ_LOGO_REFERENCE_SIZE,
+    }
+}
+
+#[cfg(test)]
+fn shz_logo_point_in_button(layout: ShzLogoLayout, point: (f32, f32)) -> (f32, f32) {
+    (
+        layout.center_x + (point.0 - SHZ_LOGO_SOURCE_SIZE * 0.5) * layout.scale_x,
+        layout.center_y + (point.1 - SHZ_LOGO_SOURCE_SIZE * 0.5) * layout.scale_y,
+    )
 }
 
 impl CompositionLogo {
@@ -558,21 +585,20 @@ impl CompositionLogo {
             X: SHZ_LOGO_SOURCE_SIZE,
             Y: SHZ_LOGO_SOURCE_SIZE,
         })?;
-        let center = BUTTON_SIZE as f32 * 0.5;
-        let scale = shz_logo_scale(center * 2.0);
+        let layout = shz_logo_layout(BUTTON_SIZE as f32, BUTTON_SIZE as f32);
         visual.SetCenterPoint(Vector3 {
-            X: SHZ_LOGO_SOURCE_SIZE * 0.5,
-            Y: SHZ_LOGO_SOURCE_SIZE * 0.5,
+            X: layout.center_x - layout.offset_x,
+            Y: layout.center_y - layout.offset_y,
             Z: 0.0,
         })?;
         visual.SetOffset(Vector3 {
-            X: center - SHZ_LOGO_SOURCE_SIZE * 0.5,
-            Y: center - SHZ_LOGO_SOURCE_SIZE * 0.5,
+            X: layout.offset_x,
+            Y: layout.offset_y,
             Z: 0.0,
         })?;
         visual.SetScale(Vector3 {
-            X: scale,
-            Y: scale,
+            X: layout.scale_x,
+            Y: layout.scale_y,
             Z: 1.0,
         })?;
         visual.Children()?.InsertAtTop(&transparent_root)?;
@@ -4539,9 +4565,24 @@ mod tests {
     fn native_button_logo_uses_specified_geometry_scale_and_stroke() {
         use super::*;
 
-        let scale = shz_logo_scale(96.0);
-        assert!((scale - (96.0 / 367.5)).abs() < f32::EPSILON);
-        assert!((SHZ_LOGO_STROKE_WIDTH * scale - 9.926_531).abs() < 0.000_01);
+        let layout = shz_logo_layout(96.0, 96.0);
+        assert!((layout.scale_x - (96.0 / 367.5)).abs() < f32::EPSILON);
+        assert_eq!(layout.scale_x, layout.scale_y);
+        assert_eq!((layout.offset_x, layout.offset_y), (-57.0, -57.0));
+        assert_eq!(
+            (
+                layout.center_x - layout.offset_x,
+                layout.center_y - layout.offset_y
+            ),
+            (105.0, 105.0)
+        );
+        assert!((SHZ_LOGO_STROKE_WIDTH * layout.scale_x - 9.926_531).abs() < 0.000_01);
+        let top_start = shz_logo_point_in_button(layout, SHZ_LOGO_TOP_PATH.start);
+        assert!((top_start.0 - 40.474_12).abs() < 0.000_02);
+        assert!((top_start.1 - 23.282_94).abs() < 0.000_02);
+        let bottom_start = shz_logo_point_in_button(layout, SHZ_LOGO_BOTTOM_PATH.start);
+        assert!((bottom_start.0 - 55.528_49).abs() < 0.000_02);
+        assert!((bottom_start.1 - 73.082_78).abs() < 0.000_02);
         assert_eq!(SHZ_LOGO_SOURCE_SIZE, 210.0);
         assert_eq!(SHZ_LOGO_TOP_PATH.curves.len(), 4);
         assert_eq!(SHZ_LOGO_BOTTOM_PATH.curves.len(), 4);
