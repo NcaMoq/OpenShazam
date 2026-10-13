@@ -1310,11 +1310,12 @@ enum CompositionRootLayer {
 }
 
 fn composition_root_layer_order() -> [CompositionRootLayer; 3] {
-    // InsertAtTop is front-to-back: keep both ripple groups behind the button.
+    // Sequential InsertAtTop calls reproduce the native insertion sequence:
+    // inner circles below the button, outer circles added last at the front.
     [
-        CompositionRootLayer::OuterRipples,
         CompositionRootLayer::InnerRipples,
         CompositionRootLayer::Button,
+        CompositionRootLayer::OuterRipples,
     ]
 }
 
@@ -6124,13 +6125,13 @@ mod tests {
     }
 
     #[test]
-    fn button_is_inserted_above_both_ripple_groups() {
+    fn native_root_insertion_keeps_inner_behind_button_and_outer_in_front() {
         assert_eq!(
             composition_root_layer_order(),
             [
-                CompositionRootLayer::OuterRipples,
                 CompositionRootLayer::InnerRipples,
                 CompositionRootLayer::Button,
+                CompositionRootLayer::OuterRipples,
             ]
         );
     }
