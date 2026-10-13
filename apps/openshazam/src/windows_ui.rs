@@ -130,7 +130,7 @@ use windows::{
     UI::Composition::{CompositionDrawingSurface, CompositionMaskBrush, CompositionSurfaceBrush},
 };
 
-use windows_numerics::{Vector2, Vector3};
+use windows_numerics::{Matrix3x2, Vector2, Vector3};
 
 use crate::ui_model::{
     self, CubicBezier, TaggingMode, UiLevels, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, CONTENT_HEIGHT,
@@ -2047,6 +2047,15 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
     }
 }
 
+fn gradient_origin_transform(top: f32) -> Matrix3x2 {
+    Matrix3x2 {
+        M11: 1.0,
+        M22: 1.0,
+        M32: top,
+        ..Default::default()
+    }
+}
+
 fn create_text_format(
     factory: &IDWriteFactory,
     size: f32,
@@ -2260,6 +2269,30 @@ impl Renderer {
         self.target.FillRectangle(&area, brush);
     }
 
+    unsafe fn fill_gradient_rect(
+        &self,
+        area: &D2D_RECT_F,
+        brush: &ID2D1LinearGradientBrush,
+        top: f32,
+    ) -> windows::core::Result<()> {
+        brush.SetTransform(&gradient_origin_transform(top));
+        self.target.FillRectangle(area, brush);
+        brush.SetTransform(&gradient_origin_transform(0.0));
+        Ok(())
+    }
+
+    unsafe fn fill_gradient_geometry(
+        &self,
+        geometry: &ID2D1Geometry,
+        brush: &ID2D1LinearGradientBrush,
+        top: f32,
+    ) -> windows::core::Result<()> {
+        brush.SetTransform(&gradient_origin_transform(top));
+        self.target.FillGeometry(geometry, brush, None);
+        brush.SetTransform(&gradient_origin_transform(0.0));
+        Ok(())
+    }
+
     unsafe fn text(
         &self,
         value: &str,
@@ -2304,7 +2337,7 @@ impl Renderer {
             // Ready state onward. Listening and Auto use the same colors;
             // result and NoMatch panels are separate overlays below.
             MainPhase::Ready | MainPhase::Error { .. } => {
-                self.target.FillRectangle(
+                self.fill_gradient_rect(
                     &rect(
                         0.0,
                         body_top,
@@ -2312,18 +2345,22 @@ impl Renderer {
                         body_top + TOP_HEIGHT as f32,
                     ),
                     &self.palette.listening,
-                );
+                    body_top,
+                )?;
             }
             MainPhase::Listening { .. } => {
-                self.target
-                    .FillGeometry(&self.popup_header(app)?, &self.palette.listening, None);
+                self.fill_gradient_geometry(
+                    &self.popup_header(app)?,
+                    &self.palette.listening,
+                    body_top,
+                )?;
             }
             MainPhase::Matched { .. } | MainPhase::NoMatch { .. } => {
-                self.target.FillGeometry(
+                self.fill_gradient_geometry(
                     &self.popup_header(app)?,
                     &self.palette.result_start,
-                    None,
-                );
+                    body_top,
+                )?;
             }
         }
 
@@ -2356,7 +2393,7 @@ impl Renderer {
                 ref track,
                 entered_at,
             } => {
-                self.draw_result_panel(track, body_top, entered_at.elapsed().as_secs_f64());
+                self.draw_result_panel(track, body_top, entered_at.elapsed().as_secs_f64())?;
             }
             MainPhase::NoMatch {
                 entered_at,
@@ -2366,7 +2403,7 @@ impl Renderer {
                     body_top,
                     entered_at.elapsed().as_secs_f64(),
                     *returned_to_ready_at,
-                );
+                )?;
             }
             MainPhase::Error { ref message, .. } => {
                 self.draw_ready(app, body_top);
@@ -2655,13 +2692,17 @@ impl Renderer {
         }
     }
 
-    unsafe fn draw_result_panel(&self, track: &Track, body_top: f32, elapsed: f64) {
+    unsafe fn draw_result_panel(
+        &self,
+        track: &Track,
+        body_top: f32,
+        elapsed: f64,
+    ) -> windows::core::Result<()> {
         let entrance = ui_model::native_bezier((elapsed / 0.3).clamp(0.0, 1.0)) as f32;
         let y_offset = (1.0 - entrance) * -TOP_HEIGHT as f32;
         let top = body_top + y_offset;
         let panel = rect(0.0, top, CONTENT_WIDTH as f32, top + TOP_HEIGHT as f32);
-        self.target
-            .FillRectangle(&panel, &self.palette.result_start);
+        self.fill_gradient_rect(&panel, &self.palette.result_start, top)?;
         let art = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
             rect: rect(10.0, top + 20.0, 160.0, top + 170.0),
             radiusX: 5.0,
@@ -2705,6 +2746,7 @@ impl Renderer {
             &self.text.icon,
             &self.palette.subtitle,
         );
+        Ok(())
     }
 
     unsafe fn draw_no_match_panel(
@@ -2712,7 +2754,7 @@ impl Renderer {
         body_top: f32,
         elapsed: f64,
         returned_to_ready_at: Option<Instant>,
-    ) {
+    ) -> windows::core::Result<()> {
         let entrance = ui_model::native_bezier((elapsed / 0.3).clamp(0.0, 1.0)) as f32;
         let closing = returned_to_ready_at
             .map(|start| {
@@ -2723,8 +2765,7 @@ impl Renderer {
         let y_offset = (1.0 - entrance) * -TOP_HEIGHT as f32 + (1.0 - closing) * TOP_HEIGHT as f32;
         let top = body_top + y_offset;
         let panel = rect(0.0, top, CONTENT_WIDTH as f32, top + TOP_HEIGHT as f32);
-        self.target
-            .FillRectangle(&panel, &self.palette.result_start);
+        self.fill_gradient_rect(&panel, &self.palette.result_start, top)?;
         self.text(
             "見つかりませんでした",
             rect(15.0, top + 55.0, 365.0, top + 84.0),
@@ -2756,6 +2797,7 @@ impl Renderer {
             &self.text.icon,
             &self.palette.subtitle,
         );
+        Ok(())
     }
 
     unsafe fn draw_error_banner(&self, message: &str, body_top: f32) {
@@ -4492,7 +4534,7 @@ fn _assert_only_ui_dependencies_are_used(_: &Path) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_debug_string, parse_match};
+    use super::{gradient_origin_transform, parse_debug_string, parse_match};
 
     #[test]
     fn parses_cli_result_without_changing_recognition_protocol() {
@@ -4659,6 +4701,19 @@ mod tests {
         assert_eq!(SHZ_LOGO_BOTTOM_PATH.curves.len(), 4);
         assert_eq!(SHZ_LOGO_TOP_PATH.start, (76.19, 10.38));
         assert_eq!(SHZ_LOGO_BOTTOM_PATH.start, (133.82, 201.02));
+    }
+
+    #[test]
+    fn gradient_origin_translation_preserves_dip_scale_and_tracks_panel_top() {
+        for top in [0.0, 10.0, 27.5, 180.0] {
+            let transform = gradient_origin_transform(top);
+            assert_eq!(transform.M11, 1.0);
+            assert_eq!(transform.M12, 0.0);
+            assert_eq!(transform.M21, 0.0);
+            assert_eq!(transform.M22, 1.0);
+            assert_eq!(transform.M31, 0.0);
+            assert_eq!(transform.M32, top);
+        }
     }
 
     #[test]
