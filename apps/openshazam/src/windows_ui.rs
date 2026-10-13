@@ -34,11 +34,12 @@ use windows::{
                     D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP,
                     D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
                 },
-                D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1Geometry,
+                D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1Geometry,
                 ID2D1HwndRenderTarget, ID2D1Layer, ID2D1LinearGradientBrush, ID2D1RenderTarget,
-                ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_COMBINE_MODE_EXCLUDE,
-                D2D1_COMBINE_MODE_UNION, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
-                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
+                ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
+                D2D1_COMBINE_MODE_EXCLUDE, D2D1_COMBINE_MODE_UNION, D2D1_ELLIPSE,
+                D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
                 D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_OPTIONS_NONE,
                 D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -386,6 +387,8 @@ struct Renderer {
     factory: ID2D1Factory,
     write_factory: IDWriteFactory,
     target: ID2D1RenderTarget,
+    settings_icon: ID2D1Bitmap,
+    white_close_icon: ID2D1Bitmap,
     hwnd_target: Option<ID2D1HwndRenderTarget>,
     dc_target: Option<ID2D1DCRenderTarget>,
     layered_surface: Option<LayeredSurface>,
@@ -398,6 +401,32 @@ struct Renderer {
     popup_outline: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     popup_header: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     result_details_cache: RefCell<Option<CachedResultDetailsMetrics>>,
+}
+
+const SETTINGS_ICON_PIXELS: &[u8; 4096] = include_bytes!("../assets/settings-2x.bgra");
+const WHITE_CLOSE_ICON_PIXELS: &[u8; 2304] = include_bytes!("../assets/WhiteClose-2x.bgra");
+
+unsafe fn create_ui_icon_bitmap(
+    target: &ID2D1RenderTarget,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> windows::core::Result<ID2D1Bitmap> {
+    let properties = D2D1_BITMAP_PROPERTIES {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        // Source pixels are the 2x renditions; destination coordinates stay in DIPs.
+        dpiX: 192.0,
+        dpiY: 192.0,
+    };
+    target.CreateBitmap(
+        D2D_SIZE_U { width, height },
+        Some(pixels.as_ptr().cast()),
+        width * 4,
+        &properties,
+    )
 }
 
 /// Premultiplied BGRA backing for the popup's per-pixel alpha presentation.
@@ -2590,6 +2619,8 @@ impl Renderer {
             (render_target, Some(target), None, None)
         };
         target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        let settings_icon = create_ui_icon_bitmap(&target, SETTINGS_ICON_PIXELS, 32, 32)?;
+        let white_close_icon = create_ui_icon_bitmap(&target, WHITE_CLOSE_ICON_PIXELS, 24, 24)?;
         let palette = create_palette(&target, theme)?;
         let text = create_text_styles(&write_factory)?;
         let composition = if kind == WindowKind::Main {
@@ -2614,6 +2645,8 @@ impl Renderer {
             factory,
             write_factory,
             target,
+            settings_icon,
+            white_close_icon,
             hwnd_target,
             dc_target,
             layered_surface,
@@ -3158,81 +3191,24 @@ impl Renderer {
 
     unsafe fn draw_cancel_button(&self, body_top: f32) {
         let [left, top, right, bottom] = native_icon_layout(body_top).cancel_visual;
-        self.target.DrawLine(
-            Vector2 {
-                X: left + 1.5,
-                Y: top + 1.5,
-            },
-            Vector2 {
-                X: right - 1.5,
-                Y: bottom - 1.5,
-            },
-            &self.palette.white_ink,
-            1.4,
-            None,
-        );
-        self.target.DrawLine(
-            Vector2 {
-                X: right - 1.5,
-                Y: top + 1.5,
-            },
-            Vector2 {
-                X: left + 1.5,
-                Y: bottom - 1.5,
-            },
-            &self.palette.white_ink,
-            1.4,
+        let destination = rect(left, top, right, bottom);
+        self.target.DrawBitmap(
+            &self.white_close_icon,
+            Some(&destination),
+            1.0,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
             None,
         );
     }
 
     unsafe fn draw_settings_icon(&self, body_top: f32) {
-        let [left, top, right, _bottom] = native_icon_layout(body_top).settings_visual;
-        let center = Vector2 {
-            X: (left + right) * 0.5,
-            Y: (top + _bottom) * 0.5,
-        };
-        for spoke in 0..8 {
-            let angle = std::f32::consts::TAU * spoke as f32 / 8.0;
-            let (sin, cos) = angle.sin_cos();
-            self.target.DrawLine(
-                Vector2 {
-                    X: center.X + cos * 5.0,
-                    Y: center.Y + sin * 5.0,
-                },
-                Vector2 {
-                    X: center.X + cos * 7.0,
-                    Y: center.Y + sin * 7.0,
-                },
-                &self.palette.subtitle,
-                1.6,
-                None,
-            );
-        }
-        self.target.DrawEllipse(
-            &D2D1_ELLIPSE {
-                point: Vector2 {
-                    X: center.X,
-                    Y: center.Y,
-                },
-                radiusX: 4.8,
-                radiusY: 4.8,
-            },
-            &self.palette.subtitle,
-            1.5,
-            None,
-        );
-        self.target.DrawEllipse(
-            &D2D1_ELLIPSE {
-                point: Vector2 {
-                    X: center.X,
-                    Y: center.Y,
-                },
-                radiusX: 1.8,
-                radiusY: 1.8,
-            },
-            &self.palette.subtitle,
-            1.4,
+        let [left, top, right, bottom] = native_icon_layout(body_top).settings_visual;
+        let destination = rect(left, top, right, bottom);
+        self.target.DrawBitmap(
+            &self.settings_icon,
+            Some(&destination),
+            1.0,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
             None,
         );
     }
@@ -5638,7 +5614,7 @@ mod tests {
         CaptureMode, CompositionRootLayer, HeaderFillScope, HistoryMutationEvent,
         HistoryMutationTransition, MainPhase, ResultCardAdvance, ResultCardStage, WindowKind,
         BUTTON_CLEAR_DIAMETER, INNER_MASK_BOUNDS, OUTER_BASE_OPACITY, RESULT_DETAILS_LEFT,
-        RESULT_DETAILS_RIGHT,
+        RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, WHITE_CLOSE_ICON_PIXELS,
     };
 
     #[test]
@@ -5875,6 +5851,18 @@ mod tests {
         assert!(point_in_rect(353.0, 25.0, layout.result_close_hit));
         assert!(!point_in_rect(352.9, 25.0, layout.result_close_hit));
         assert!(!point_in_rect(349.0, 25.0, layout.result_close_hit));
+    }
+
+    #[test]
+    fn native_header_icons_embed_the_high_resolution_catalog_renditions() {
+        assert_eq!(SETTINGS_ICON_PIXELS.len(), 32 * 32 * 4);
+        assert_eq!(WHITE_CLOSE_ICON_PIXELS.len(), 24 * 24 * 4);
+        assert!(SETTINGS_ICON_PIXELS
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] > 0));
+        assert!(WHITE_CLOSE_ICON_PIXELS
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] > 0));
     }
 
     #[test]
