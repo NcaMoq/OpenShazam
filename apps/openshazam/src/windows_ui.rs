@@ -26,13 +26,13 @@ use windows::{
         Graphics::{
             Direct2D::{
                 Common::{
-                    D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
-                    D2D1_FIGURE_END_CLOSED, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT, D2D_RECT_F,
-                    D2D_SIZE_U,
+                    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F,
+                    D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D1_GRADIENT_STOP,
+                    D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
                 },
-                D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1LinearGradientBrush,
-                ID2D1SolidColorBrush, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
-                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
+                D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1HwndRenderTarget,
+                ID2D1LinearGradientBrush, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ELLIPSE,
+                D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
                 D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
                 D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
                 D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
@@ -49,9 +49,10 @@ use windows::{
             Dwm::DwmFlush,
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
-                BeginPaint, CombineRgn, CreatePolygonRgn, CreateRoundRectRgn, DeleteObject,
-                EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromRect, SetWindowRgn,
-                MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_OR, WINDING,
+                BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
+                GetMonitorInfoW, InvalidateRect, MonitorFromRect, SelectObject, AC_SRC_ALPHA,
+                AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
+                HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
             },
         },
         System::{
@@ -81,15 +82,16 @@ use windows::{
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-                GetWindowLongPtrW, KillTimer, LoadCursorW, LoadIconW, PeekMessageW, PostMessageW,
-                PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-                SetWindowPos, ShowWindow, TranslateMessage, WaitMessage, CS_DBLCLKS, CW_USEDEFAULT,
-                GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION, MSG, PM_REMOVE, SWP_NOACTIVATE,
-                SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNORMAL, WM_ACTIVATE, WM_APP,
-                WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS,
-                WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-                WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WNDPROC,
-                WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+                GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, LoadIconW, PeekMessageW,
+                PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer,
+                SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
+                WaitMessage, CS_DBLCLKS, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION,
+                MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+                SW_SHOWNORMAL, ULW_ALPHA, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY,
+                WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+                WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+                WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+                WS_POPUP, WS_VISIBLE,
             },
         },
     },
@@ -297,12 +299,119 @@ struct TextStyles {
 
 struct Renderer {
     factory: ID2D1Factory,
-    target: ID2D1HwndRenderTarget,
+    target: ID2D1RenderTarget,
+    hwnd_target: Option<ID2D1HwndRenderTarget>,
+    dc_target: Option<ID2D1DCRenderTarget>,
+    layered_surface: Option<LayeredSurface>,
     palette: Palette,
     text: TextStyles,
     dpi: u32,
     theme_generation: u64,
     composition: Option<CompositionScene>,
+}
+
+/// Premultiplied BGRA backing for the popup's per-pixel alpha presentation.
+/// The popup includes a non-rectangular tray arrow, so a GDI window region
+/// would reintroduce aliased edges even when Direct2D anti-aliases the paths.
+struct LayeredSurface {
+    dc: HDC,
+    bitmap: HBITMAP,
+    previous_bitmap: HGDIOBJ,
+    size: D2D_SIZE_U,
+    _pixels: *mut c_void,
+}
+
+impl LayeredSurface {
+    unsafe fn new(width: u32, height: u32) -> windows::core::Result<Self> {
+        let dc = CreateCompatibleDC(None);
+        if dc.0.is_null() {
+            return Err(Error::from_thread());
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width.max(1) as i32,
+                biHeight: -(height.max(1) as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut pixels = std::ptr::null_mut();
+        let bitmap = match CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut pixels, None, 0) {
+            Ok(bitmap) => bitmap,
+            Err(error) => {
+                let _ = DeleteDC(dc);
+                return Err(error);
+            }
+        };
+        let previous_bitmap = SelectObject(dc, bitmap.into());
+        if pixels.is_null() || previous_bitmap.0.is_null() || previous_bitmap.0 as isize == -1 {
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            return Err(Error::from_thread());
+        }
+        Ok(Self {
+            dc,
+            bitmap,
+            previous_bitmap,
+            size: D2D_SIZE_U {
+                width: width.max(1),
+                height: height.max(1),
+            },
+            _pixels: pixels,
+        })
+    }
+
+    unsafe fn present(&self, hwnd: HWND) -> windows::core::Result<()> {
+        let mut window = RECT::default();
+        GetWindowRect(hwnd, &mut window)?;
+        let destination = POINT {
+            x: window.left,
+            y: window.top,
+        };
+        let source = POINT::default();
+        let size = windows::Win32::Foundation::SIZE {
+            cx: window.right - window.left,
+            cy: window.bottom - window.top,
+        };
+        if size.cx.max(0) as u32 != self.size.width || size.cy.max(0) as u32 != self.size.height {
+            return Err(Error::new(
+                windows::core::HRESULT(0x80070057_u32 as i32),
+                "Layered popup surface size does not match the window client size",
+            ));
+        }
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&destination),
+            Some(&size),
+            Some(self.dc),
+            Some(&source),
+            Default::default(),
+            Some(&blend),
+            ULW_ALPHA,
+        )
+    }
+}
+
+impl Drop for LayeredSurface {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SelectObject(self.dc, self.previous_bitmap);
+            let _ = DeleteObject(self.bitmap.into());
+            let _ = DeleteDC(self.dc);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1427,26 +1536,41 @@ impl Renderer {
         let mut client = RECT::default();
         GetClientRect(hwnd, &mut client)?;
         let dpi = dpi.max(96);
+        let size = D2D_SIZE_U {
+            width: (client.right - client.left).max(1) as u32,
+            height: (client.bottom - client.top).max(1) as u32,
+        };
         let target_properties = D2D1_RENDER_TARGET_PROPERTIES {
             r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                alphaMode: if kind == WindowKind::Main {
+                    D2D1_ALPHA_MODE_PREMULTIPLIED
+                } else {
+                    D2D1_ALPHA_MODE_IGNORE
+                },
             },
             dpiX: dpi as f32,
             dpiY: dpi as f32,
             usage: D2D1_RENDER_TARGET_USAGE_NONE,
             minLevel: Default::default(),
         };
-        let hwnd_properties = D2D1_HWND_RENDER_TARGET_PROPERTIES {
-            hwnd,
-            pixelSize: D2D_SIZE_U {
-                width: (client.right - client.left).max(1) as u32,
-                height: (client.bottom - client.top).max(1) as u32,
-            },
-            presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+        let (target, hwnd_target, dc_target, layered_surface) = if kind == WindowKind::Main {
+            let surface = LayeredSurface::new(size.width, size.height)?;
+            let dc_target = factory.CreateDCRenderTarget(&target_properties)?;
+            dc_target.BindDC(surface.dc, &client)?;
+            let target: ID2D1RenderTarget = dc_target.cast()?;
+            (target, None, Some(dc_target), Some(surface))
+        } else {
+            let hwnd_properties = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+                hwnd,
+                pixelSize: size,
+                presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+            };
+            let target = factory.CreateHwndRenderTarget(&target_properties, &hwnd_properties)?;
+            let render_target: ID2D1RenderTarget = target.cast()?;
+            (render_target, Some(target), None, None)
         };
-        let target = factory.CreateHwndRenderTarget(&target_properties, &hwnd_properties)?;
         target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         let palette = create_palette(&target, theme)?;
         let text = create_text_styles(&write_factory)?;
@@ -1463,6 +1587,9 @@ impl Renderer {
         Ok(Self {
             factory,
             target,
+            hwnd_target,
+            dc_target,
+            layered_surface,
             palette,
             text,
             dpi,
@@ -1478,7 +1605,24 @@ impl Renderer {
                 width: (client.right - client.left).max(1) as u32,
                 height: (client.bottom - client.top).max(1) as u32,
             };
-            let _ = self.target.Resize(&size);
+            if let Some(target) = self.hwnd_target.as_ref() {
+                let _ = target.Resize(&size);
+            }
+            if let (Some(surface), Some(target)) =
+                (self.layered_surface.as_mut(), self.dc_target.as_ref())
+            {
+                let width = size.width.max(1);
+                let height = size.height.max(1);
+                if surface.size.width != width || surface.size.height != height {
+                    if let Ok(replacement) = LayeredSurface::new(width, height) {
+                        if target.BindDC(replacement.dc, &client).is_ok() {
+                            *surface = replacement;
+                        }
+                    }
+                } else {
+                    let _ = target.BindDC(surface.dc, &client);
+                }
+            }
         }
     }
 
@@ -1512,7 +1656,11 @@ impl Renderer {
             WindowKind::About => self.draw_about(app)?,
             WindowKind::MicrophoneInfo => self.draw_microphone_info(app)?,
         }
-        self.target.EndDraw(None, None)
+        self.target.EndDraw(None, None)?;
+        if let Some(surface) = self.layered_surface.as_ref() {
+            surface.present(app.main_hwnd)?;
+        }
+        Ok(())
     }
 
     fn update_composition(&mut self, snapshot: AnimationSnapshot) -> windows::core::Result<()> {
@@ -2164,7 +2312,7 @@ impl Renderer {
 }
 
 unsafe fn create_palette(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1RenderTarget,
     theme: Theme,
 ) -> windows::core::Result<Palette> {
     let (background, foreground, subtitle, skeleton, separator) = match theme {
@@ -2265,14 +2413,14 @@ unsafe fn create_palette(
 }
 
 unsafe fn solid(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1RenderTarget,
     color: D2D1_COLOR_F,
 ) -> windows::core::Result<ID2D1SolidColorBrush> {
     target.CreateSolidColorBrush(&color, None)
 }
 
 unsafe fn gradient(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1RenderTarget,
     colors: [D2D1_COLOR_F; 2],
     start: Vector2,
     end: Vector2,
@@ -2420,7 +2568,9 @@ unsafe fn create_window(
     }
     let extended = match kind {
         WindowKind::Main => {
-            WS_EX_TOOLWINDOW | windows::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST
+            WS_EX_TOOLWINDOW
+                | WS_EX_LAYERED
+                | windows::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST
         }
         _ => WS_EX_TOOLWINDOW,
     };
@@ -2482,70 +2632,6 @@ unsafe fn delete_tray_icon(hwnd: HWND) {
     let _ = Shell_NotifyIconW(NIM_DELETE, &data);
 }
 
-unsafe fn set_popup_region(data: &WindowData) {
-    if data.kind != WindowKind::Main {
-        return;
-    }
-    let app = &*data.app;
-    let dpi = GetDpiForWindow(data.hwnd).max(96);
-    let factor = f64::from(dpi) / 96.0;
-    let width = (MAIN_WINDOW_WIDTH * factor).round() as i32;
-    let height = (MAIN_WINDOW_HEIGHT * factor).round() as i32;
-    let arrow_height = (POPUP_ARROW_HEIGHT * factor).round() as i32;
-    let radius = (POPUP_CORNER_RADIUS * factor).round() as i32;
-    let center = (f64::from(app.arrow_center) * factor).round() as i32;
-    let body_y = if app.arrow_edge == ArrowEdge::Top {
-        arrow_height
-    } else {
-        0
-    };
-    let body = CreateRoundRectRgn(
-        0,
-        body_y,
-        width + 1,
-        height
-            - (if app.arrow_edge == ArrowEdge::Bottom {
-                arrow_height
-            } else {
-                0
-            }),
-        radius * 2,
-        radius * 2,
-    );
-    let points = if app.arrow_edge == ArrowEdge::Top {
-        [
-            POINT {
-                x: center - (10.0 * factor).round() as i32,
-                y: arrow_height,
-            },
-            POINT { x: center, y: 0 },
-            POINT {
-                x: center + (10.0 * factor).round() as i32,
-                y: arrow_height,
-            },
-        ]
-    } else {
-        [
-            POINT {
-                x: center - (10.0 * factor).round() as i32,
-                y: height - arrow_height,
-            },
-            POINT {
-                x: center,
-                y: height,
-            },
-            POINT {
-                x: center + (10.0 * factor).round() as i32,
-                y: height - arrow_height,
-            },
-        ]
-    };
-    let arrow = CreatePolygonRgn(&points, WINDING);
-    let _ = CombineRgn(Some(body), Some(body), Some(arrow), RGN_OR);
-    let _ = DeleteObject(arrow.into());
-    let _ = SetWindowRgn(data.hwnd, Some(body), true);
-}
-
 unsafe fn anchor_popup(app: &mut AppState) {
     let hwnd = app.main_hwnd;
     let identifier = NOTIFYICONIDENTIFIER {
@@ -2604,9 +2690,6 @@ unsafe fn anchor_popup(app: &mut AppState) {
             ((tray_center_x - x) as f64 / scale).clamp(14.0, CONTENT_WIDTH - 14.0) as f32;
         let flags = SWP_SHOWWINDOW;
         let _ = SetWindowPos(hwnd, None, x, y, width, height, flags);
-        if let Some(data) = window_data(hwnd) {
-            set_popup_region(data);
-        }
     } else {
         app.arrow_edge = ArrowEdge::Top;
         app.arrow_center = (CONTENT_WIDTH * 0.5) as f32;
@@ -3191,7 +3274,6 @@ unsafe extern "system" fn window_proc(
                 Ok(renderer) => data.renderer = Some(renderer),
                 Err(error) => app.message = Some(format!("Direct2D初期化失敗: {error}")),
             }
-            set_popup_region(data);
             LRESULT(0)
         }
         WM_PAINT => {
@@ -3231,7 +3313,6 @@ unsafe extern "system" fn window_proc(
             if let Some(renderer) = data.renderer.as_mut() {
                 renderer.on_dpi_changed(new_dpi, hwnd, app);
             }
-            set_popup_region(data);
             LRESULT(0)
         }
         WM_TRAYICON_MESSAGE if data.kind == WindowKind::Main => {
@@ -3748,6 +3829,81 @@ mod tests {
         let (decoded, rest) = parse_debug_string("\"Line\\n\\\"One\\\"\" artist=\"A\"").unwrap();
         assert_eq!(decoded, "Line\n\"One\"");
         assert_eq!(rest, " artist=\"A\"");
+    }
+
+    #[test]
+    fn premultiplied_d2d_round_rect_keeps_antialiased_alpha_edges() {
+        use super::*;
+
+        unsafe {
+            let surface = LayeredSurface::new(32, 32).unwrap();
+            let factory: ID2D1Factory =
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).unwrap();
+            let properties = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                minLevel: Default::default(),
+            };
+            let target = factory.CreateDCRenderTarget(&properties).unwrap();
+            let area = RECT {
+                left: 0,
+                top: 0,
+                right: 32,
+                bottom: 32,
+            };
+            target.BindDC(surface.dc, &area).unwrap();
+            target.BeginDraw();
+            target.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
+            let brush = target
+                .CreateSolidColorBrush(
+                    &D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 1.0,
+                    },
+                    None,
+                )
+                .unwrap();
+            target.FillRoundedRectangle(
+                &windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: 0.0,
+                        top: 0.0,
+                        right: 32.0,
+                        bottom: 32.0,
+                    },
+                    radiusX: 8.0,
+                    radiusY: 8.0,
+                },
+                &brush,
+            );
+            target.EndDraw(None, None).unwrap();
+
+            let pixels = surface._pixels.cast::<u8>();
+            let alpha_values = (0..32usize * 32)
+                .map(|pixel| *pixels.add(pixel * 4 + 3))
+                .collect::<Vec<_>>();
+            assert!(
+                alpha_values.contains(&0),
+                "transparent corner pixels are retained"
+            );
+            assert!(
+                alpha_values.iter().any(|alpha| (1..255).contains(alpha)),
+                "rounded contour retains fractional coverage for smooth composition"
+            );
+        }
     }
 
     #[test]
