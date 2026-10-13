@@ -50,7 +50,7 @@ use windows::{
                 DWRITE_FONT_WEIGHT_DEMI_BOLD, DWRITE_FONT_WEIGHT_HEAVY, DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
                 DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-                DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_WORD_WRAPPING_WRAP,
+                DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_WRAP,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
@@ -360,8 +360,28 @@ struct TextStyles {
     logo: IDWriteTextFormat,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ResultDetailsRects {
+    title: D2D_RECT_F,
+    artist: D2D_RECT_F,
+    action: D2D_RECT_F,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResultDetailsMetrics {
+    title_height: f32,
+    artist_height: f32,
+}
+
+struct CachedResultDetailsMetrics {
+    title: String,
+    artist: String,
+    metrics: ResultDetailsMetrics,
+}
+
 struct Renderer {
     factory: ID2D1Factory,
+    write_factory: IDWriteFactory,
     target: ID2D1RenderTarget,
     hwnd_target: Option<ID2D1HwndRenderTarget>,
     dc_target: Option<ID2D1DCRenderTarget>,
@@ -374,6 +394,7 @@ struct Renderer {
     popup_layer: Option<ID2D1Layer>,
     popup_outline: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     popup_header: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
+    result_details_cache: RefCell<Option<CachedResultDetailsMetrics>>,
 }
 
 /// Premultiplied BGRA backing for the popup's per-pixel alpha presentation.
@@ -2403,6 +2424,51 @@ fn result_artwork_frame(panel_top: f32) -> D2D_RECT_F {
 // when preserving its derived x=172 leading edge (UI-3.2).
 const RESULT_DETAILS_LEFT: f32 = 172.0;
 const RESULT_DETAILS_RIGHT: f32 = 336.0;
+const RESULT_DETAILS_CENTER_Y: f32 = 95.0;
+const RESULT_TITLE_MIN_HEIGHT: f32 = 24.0;
+const RESULT_TITLE_MAX_LINES: f32 = 3.0;
+const RESULT_ARTIST_MIN_HEIGHT: f32 = 18.0;
+const RESULT_ARTIST_MAX_LINES: f32 = 4.0;
+const RESULT_DETAILS_TITLE_ARTIST_GAP: f32 = 5.0;
+const RESULT_DETAILS_ARTIST_ACTION_GAP: f32 = 10.0;
+const RESULT_ACTION_HEIGHT: f32 = 20.0;
+
+fn result_details_rects(
+    panel_top: f32,
+    title_height: f32,
+    artist_height: f32,
+) -> ResultDetailsRects {
+    let total_height = title_height
+        + RESULT_DETAILS_TITLE_ARTIST_GAP
+        + artist_height
+        + RESULT_DETAILS_ARTIST_ACTION_GAP
+        + RESULT_ACTION_HEIGHT;
+    let title_top = panel_top + RESULT_DETAILS_CENTER_Y - total_height * 0.5;
+    let title_bottom = title_top + title_height;
+    let artist_top = title_bottom + RESULT_DETAILS_TITLE_ARTIST_GAP;
+    let artist_bottom = artist_top + artist_height;
+    let action_top = artist_bottom + RESULT_DETAILS_ARTIST_ACTION_GAP;
+    ResultDetailsRects {
+        title: rect(
+            RESULT_DETAILS_LEFT,
+            title_top,
+            RESULT_DETAILS_RIGHT,
+            title_bottom,
+        ),
+        artist: rect(
+            RESULT_DETAILS_LEFT,
+            artist_top,
+            RESULT_DETAILS_RIGHT,
+            artist_bottom,
+        ),
+        action: rect(
+            RESULT_DETAILS_LEFT,
+            action_top,
+            RESULT_DETAILS_LEFT + 70.0,
+            action_top + RESULT_ACTION_HEIGHT,
+        ),
+    }
+}
 
 fn history_artwork_frame(row_top: f32) -> D2D_RECT_F {
     rect(20.0, row_top + 12.0, 85.0, row_top + 77.0)
@@ -2516,6 +2582,7 @@ impl Renderer {
         };
         Ok(Self {
             factory,
+            write_factory,
             target,
             hwnd_target,
             dc_target,
@@ -2528,6 +2595,7 @@ impl Renderer {
             popup_layer,
             popup_outline: RefCell::new(None),
             popup_header: RefCell::new(None),
+            result_details_cache: RefCell::new(None),
         })
     }
 
@@ -2689,6 +2757,60 @@ impl Renderer {
             windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_CLIP,
             DWRITE_MEASURING_MODE_NATURAL,
         );
+    }
+
+    unsafe fn measured_text_height(
+        &self,
+        value: &str,
+        format: &IDWriteTextFormat,
+        min_height: f32,
+        max_lines: f32,
+    ) -> windows::core::Result<f32> {
+        if value.is_empty() {
+            return Ok(min_height);
+        }
+        let content: Vec<u16> = value.encode_utf16().collect();
+        let max_height = max_lines * min_height;
+        let layout = self.write_factory.CreateTextLayout(
+            &content,
+            format,
+            RESULT_DETAILS_RIGHT - RESULT_DETAILS_LEFT,
+            max_height,
+        )?;
+        let mut metrics = DWRITE_TEXT_METRICS::default();
+        layout.GetMetrics(&mut metrics)?;
+        Ok(metrics.height.clamp(min_height, max_height))
+    }
+
+    unsafe fn result_details_metrics(
+        &self,
+        track: &Track,
+    ) -> windows::core::Result<ResultDetailsMetrics> {
+        if let Some(cached) = self.result_details_cache.borrow().as_ref() {
+            if cached.title == track.title && cached.artist == track.artist {
+                return Ok(cached.metrics);
+            }
+        }
+        let metrics = ResultDetailsMetrics {
+            title_height: self.measured_text_height(
+                &track.title,
+                &self.text.result_title,
+                RESULT_TITLE_MIN_HEIGHT,
+                RESULT_TITLE_MAX_LINES,
+            )?,
+            artist_height: self.measured_text_height(
+                &track.artist,
+                &self.text.result_artist,
+                RESULT_ARTIST_MIN_HEIGHT,
+                RESULT_ARTIST_MAX_LINES,
+            )?,
+        };
+        *self.result_details_cache.borrow_mut() = Some(CachedResultDetailsMetrics {
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            metrics,
+        });
+        Ok(metrics)
     }
 
     unsafe fn draw_main(&self, app: &AppState) -> windows::core::Result<()> {
@@ -3154,6 +3276,8 @@ impl Renderer {
     unsafe fn draw_result_panel(&self, track: &Track, top: f32) -> windows::core::Result<()> {
         let panel = rect(0.0, top, CONTENT_WIDTH as f32, top + TOP_HEIGHT as f32);
         self.fill_gradient_rect(&panel, &self.palette.result_start, top)?;
+        let details = self.result_details_metrics(track)?;
+        let detail_rects = result_details_rects(top, details.title_height, details.artist_height);
         let art = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
             // The image view itself is 150×150pt; do not add UI-144 button-image padding.
             rect: result_artwork_frame(top),
@@ -3171,28 +3295,18 @@ impl Renderer {
         );
         self.text(
             &track.title,
-            rect(
-                RESULT_DETAILS_LEFT,
-                top + 20.0,
-                RESULT_DETAILS_RIGHT,
-                top + 88.0,
-            ),
+            detail_rects.title,
             &self.text.result_title,
             &self.palette.title,
         );
         self.text(
             &track.artist,
-            rect(
-                RESULT_DETAILS_LEFT,
-                top + 91.0,
-                RESULT_DETAILS_RIGHT,
-                top + 137.0,
-            ),
+            detail_rects.artist,
             &self.text.result_artist,
             &self.palette.subtitle,
         );
         let pill = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
-            rect: rect(172.0, top + 145.0, 242.0, top + 165.0),
+            rect: detail_rects.action,
             radiusX: 10.0,
             radiusY: 10.0,
         };
@@ -3200,7 +3314,7 @@ impl Renderer {
             .FillRoundedRectangle(&pill, &self.palette.accent);
         self.text(
             "再生",
-            rect(172.0, top + 145.0, 242.0, top + 165.0),
+            detail_rects.action,
             &self.text.date,
             &self.palette.white_ink,
         );
@@ -5432,10 +5546,10 @@ mod tests {
         composition_root_layer_order, copy_notification_text, gradient_origin_transform,
         history_artwork_frame, history_row_top, inverse_circle_clip_radii, is_offline_failure,
         is_timeout_failure, native_icon_layout, parse_debug_string, parse_match,
-        phase_needs_timeout, point_in_rect, result_artwork_frame, result_panel_top_at,
-        should_start_startup_logo, ui_model, CaptureMode, CompositionRootLayer,
-        HistoryMutationEvent, HistoryMutationTransition, MainPhase, ResultCardAdvance,
-        ResultCardStage, WindowKind, INNER_RIPPLE_DIAMETER, OUTER_BASE_OPACITY,
+        phase_needs_timeout, point_in_rect, result_artwork_frame, result_details_rects,
+        result_panel_top_at, should_start_startup_logo, ui_model, CaptureMode,
+        CompositionRootLayer, HistoryMutationEvent, HistoryMutationTransition, MainPhase,
+        ResultCardAdvance, ResultCardStage, WindowKind, INNER_RIPPLE_DIAMETER, OUTER_BASE_OPACITY,
         RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT,
     };
 
@@ -5869,6 +5983,24 @@ mod tests {
     fn result_details_keep_the_derived_164_point_text_column() {
         assert_eq!(RESULT_DETAILS_LEFT, 172.0);
         assert_eq!(RESULT_DETAILS_RIGHT - RESULT_DETAILS_LEFT, 164.0);
+    }
+
+    #[test]
+    fn result_details_stack_tracks_artwork_center_and_expands_for_wrapping() {
+        let single_line = result_details_rects(10.0, 24.0, 18.0);
+        assert_eq!(single_line.title.top, 66.5);
+        assert_eq!(single_line.title.bottom, 90.5);
+        assert_eq!(single_line.artist.top, 95.5);
+        assert_eq!(single_line.action.top, 123.5);
+        assert_eq!(
+            (single_line.title.top + single_line.action.bottom) * 0.5,
+            105.0
+        );
+
+        let wrapped = result_details_rects(10.0, 48.0, 36.0);
+        assert_eq!(wrapped.title.top, 45.5);
+        assert_eq!(wrapped.action.bottom, 164.5);
+        assert_eq!((wrapped.title.top + wrapped.action.bottom) * 0.5, 105.0);
     }
 
     #[test]
