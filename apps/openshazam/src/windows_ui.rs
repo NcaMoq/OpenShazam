@@ -149,10 +149,6 @@ const SINGLE_CLICK_TIMEOUT_MS: u32 = 280;
 const LONG_PRESS_TIMEOUT_MS: u32 = 500;
 const PHASE_TICK_MS: u32 = 100;
 const ANIMATION_TICK_MS: u32 = 8;
-// [I] The spec confirms four inner CAShape layers and their colors/opacity,
-// but does not identify a line width. Keep this preview width isolated so a
-// measured value can replace it without changing the shape or timeline.
-const INNER_STROKE_WIDTH_PREVIEW: f32 = 2.0;
 const MAIN_WINDOW_WIDTH: f64 = CONTENT_WIDTH;
 const MAIN_WINDOW_HEIGHT: f64 = CONTENT_HEIGHT + POPUP_ARROW_HEIGHT;
 const SETTINGS_WIDTH: f64 = 550.0;
@@ -270,6 +266,7 @@ struct WindowData {
 
 struct Palette {
     white: ID2D1SolidColorBrush,
+    white_ink: ID2D1SolidColorBrush,
     black: ID2D1SolidColorBrush,
     title: ID2D1SolidColorBrush,
     subtitle: ID2D1SolidColorBrush,
@@ -495,6 +492,10 @@ struct CompositionLogo {
 const SHZ_LOGO_SOURCE_SIZE: f32 = 210.0;
 const SHZ_LOGO_REFERENCE_SIZE: f32 = 367.5;
 const SHZ_LOGO_STROKE_WIDTH: f32 = 38.0;
+
+fn composition_scale_for_dpi(dpi: u32) -> f32 {
+    dpi.max(96) as f32 / 96.0
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ShzLogoLayout {
@@ -899,6 +900,42 @@ unsafe fn make_logo_visual<const N: usize>(
     Ok((visual, geometries))
 }
 
+unsafe fn make_inner_ring_geometry(
+    compositor: &Compositor,
+    d2d_factory: &ID2D1Factory,
+    diameter: f32,
+) -> windows::core::Result<CompositionPathGeometry> {
+    let center = Vector2 {
+        X: diameter * 0.5,
+        Y: diameter * 0.5,
+    };
+    let outer = d2d_factory.CreateEllipseGeometry(&D2D1_ELLIPSE {
+        point: center,
+        radiusX: diameter * 0.5,
+        radiusY: diameter * 0.5,
+    })?;
+    let inner = d2d_factory.CreateEllipseGeometry(&D2D1_ELLIPSE {
+        point: center,
+        radiusX: BUTTON_SIZE as f32 * 0.5,
+        radiusY: BUTTON_SIZE as f32 * 0.5,
+    })?;
+    let annulus = d2d_factory.CreatePathGeometry()?;
+    let sink = annulus.Open()?;
+    outer.CombineWithGeometry(
+        &inner,
+        windows::Win32::Graphics::Direct2D::D2D1_COMBINE_MODE_EXCLUDE,
+        None,
+        0.25,
+        &sink,
+    )?;
+    sink.Close()?;
+
+    let annulus: ID2D1Geometry = annulus.cast()?;
+    let source: IGeometrySource2D = D2DCompositionGeometrySource { geometry: annulus }.into();
+    let path = CompositionPath::Create(&source)?;
+    compositor.CreatePathGeometryWithPath(&path)
+}
+
 unsafe fn make_logo_path_geometry<const N: usize>(
     compositor: &Compositor,
     d2d_factory: &ID2D1Factory,
@@ -1217,6 +1254,7 @@ struct CompositionScene {
     ripples_active: bool,
     theme: Theme,
     body_top: f32,
+    dpi: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -1238,6 +1276,7 @@ impl CompositionScene {
         compositor: &Compositor,
         theme: Theme,
         arrow_edge: ArrowEdge,
+        dpi: u32,
     ) -> windows::core::Result<Self> {
         let interop: ICompositorDesktopInterop = compositor.cast()?;
         let target = unsafe { interop.CreateDesktopWindowTarget(hwnd, true)? };
@@ -1245,6 +1284,13 @@ impl CompositionScene {
         root.SetSize(Vector2 {
             X: CONTENT_WIDTH as f32,
             Y: MAIN_WINDOW_HEIGHT as f32,
+        })?;
+        let dpi = dpi.max(96);
+        let composition_scale = composition_scale_for_dpi(dpi);
+        root.SetScale(Vector3 {
+            X: composition_scale,
+            Y: composition_scale,
+            Z: 1.0,
         })?;
         let body_top = if arrow_edge == ArrowEdge::Top {
             POPUP_ARROW_HEIGHT as f32
@@ -1304,11 +1350,7 @@ impl CompositionScene {
             } else {
                 ui_model::OUTER_DIAMETERS[index - 4] as f32
             };
-            let base_stroke_width = if index < 4 {
-                INNER_STROKE_WIDTH_PREVIEW
-            } else {
-                4.0
-            };
+            let base_stroke_width = if index < 4 { 0.0 } else { 4.0 };
             let brush = compositor.CreateColorBrushWithColor(ring_color)?;
             let visual = compositor.CreateContainerVisual()?;
             visual.SetSize(Vector2 {
@@ -1354,9 +1396,18 @@ impl CompositionScene {
                 Y: diameter * 0.5,
                 Z: 0.0,
             })?;
-            let shape = compositor.CreateSpriteShapeWithGeometry(&geometry)?;
-            shape.SetStrokeBrush(&brush)?;
-            shape.SetStrokeThickness(base_stroke_width)?;
+            let shape = if index < 4 {
+                let masked_geometry =
+                    unsafe { make_inner_ring_geometry(compositor, d2d_factory, diameter)? };
+                let shape = compositor.CreateSpriteShapeWithGeometry(&masked_geometry)?;
+                shape.SetFillBrush(&brush)?;
+                shape
+            } else {
+                let shape = compositor.CreateSpriteShapeWithGeometry(&geometry)?;
+                shape.SetStrokeBrush(&brush)?;
+                shape.SetStrokeThickness(base_stroke_width)?;
+                shape
+            };
             shape_visual.Shapes()?.Append(&shape)?;
             let (core_container, sublayer_container) = if index < 4 {
                 let core = compositor.CreateContainerVisual()?;
@@ -1536,9 +1587,9 @@ impl CompositionScene {
             Z: 0.0,
         })?;
         let button_fill =
-            compositor.CreateColorBrushWithColor(composition_color(255, 0, 136, 255))?;
+            compositor.CreateColorBrushWithColor(composition_color(77, 255, 255, 255))?;
         let button_edge =
-            compositor.CreateColorBrushWithColor(composition_color(255, 255, 255, 255))?;
+            compositor.CreateColorBrushWithColor(composition_color(51, 255, 255, 255))?;
         let button_geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
         button_geometry.SetCenter(Vector2 {
             X: BUTTON_SIZE as f32 * 0.5,
@@ -1551,7 +1602,7 @@ impl CompositionScene {
         let button_shape = compositor.CreateSpriteShapeWithGeometry(&button_geometry)?;
         button_shape.SetFillBrush(&button_fill)?;
         button_shape.SetStrokeBrush(&button_edge)?;
-        button_shape.SetStrokeThickness(if theme == Theme::Light { 0.75 } else { 0.0 })?;
+        button_shape.SetStrokeThickness(1.0)?;
         button_shape_visual.Shapes()?.Append(&button_shape)?;
         let mut logo = unsafe { CompositionLogo::new(d2d_factory, compositor, theme)? };
         button.Children()?.InsertAtTop(&button_shape_visual)?;
@@ -1645,6 +1696,21 @@ impl CompositionScene {
             ripples_active: false,
             theme,
             body_top,
+            dpi,
+        })
+    }
+
+    fn set_dpi(&mut self, dpi: u32) -> windows::core::Result<()> {
+        let dpi = dpi.max(96);
+        if self.dpi == dpi {
+            return Ok(());
+        }
+        self.dpi = dpi;
+        let scale = composition_scale_for_dpi(dpi);
+        self.root.SetScale(Vector3 {
+            X: scale,
+            Y: scale,
+            Z: 1.0,
         })
     }
 
@@ -1656,13 +1722,8 @@ impl CompositionScene {
                 brush.SetColor(composition_tagging_color(self.theme))?;
             }
             self.button_fill
-                .SetColor(composition_color(255, 0, 136, 255))?;
-            self.button_shape
-                .SetStrokeThickness(if self.theme == Theme::Light {
-                    0.75
-                } else {
-                    0.0
-                })?;
+                .SetColor(composition_color(77, 255, 255, 255))?;
+            self.button_shape.SetStrokeThickness(1.0)?;
         }
 
         if self.body_top != snapshot.body_top {
@@ -2145,6 +2206,7 @@ impl Renderer {
                 &compositor,
                 theme,
                 ArrowEdge::Top,
+                dpi,
             )?)
         } else {
             None
@@ -2199,9 +2261,14 @@ impl Renderer {
         }
     }
 
-    unsafe fn on_dpi_changed(&mut self, dpi: u32, hwnd: HWND, app: &AppState) {
+    unsafe fn on_dpi_changed(&mut self, dpi: u32, hwnd: HWND, app: &mut AppState) {
         self.dpi = dpi.max(96);
         self.target.SetDpi(self.dpi as f32, self.dpi as f32);
+        if let Some(composition) = self.composition.as_mut() {
+            if let Err(error) = composition.set_dpi(self.dpi) {
+                app.message = Some(format!("Composition DPI update failed: {error}"));
+            }
+        }
         self.on_size(hwnd);
         if let Ok(palette) = create_palette(&self.target, app.theme) {
             self.palette = palette;
@@ -2555,24 +2622,20 @@ impl Renderer {
         combined.cast()
     }
 
-    unsafe fn draw_ready(&self, app: &AppState, body_top: f32) {
+    unsafe fn draw_ready(&self, _app: &AppState, body_top: f32) {
         self.text(
-            "曲をタップして認識",
+            "Click To Shazam",
             rect(
-                10.0,
-                body_top + 144.0,
-                CONTENT_WIDTH as f32 - 10.0,
-                body_top + 168.0,
+                8.0,
+                body_top + 141.0,
+                CONTENT_WIDTH as f32 - 8.0,
+                body_top + 160.0,
             ),
             &self.text.centered_title,
-            if app.theme == Theme::Light {
-                &self.palette.title
-            } else {
-                &self.palette.white
-            },
+            &self.palette.white_ink,
         );
         self.text(
-            "⚙",
+            "\u{2699}",
             rect(343.0, body_top + 20.0, 373.0, body_top + 48.0),
             &self.text.icon,
             &self.palette.subtitle,
@@ -2592,7 +2655,7 @@ impl Renderer {
                 body_top + 170.0,
             ),
             &self.text.centered_title,
-            &self.palette.white,
+            &self.palette.white_ink,
         );
     }
 
@@ -2601,7 +2664,7 @@ impl Renderer {
             "×",
             rect(345.0, body_top + 18.0, 374.0, body_top + 48.0),
             &self.text.icon,
-            &self.palette.white,
+            &self.palette.white_ink,
         );
     }
     unsafe fn draw_skeleton(&self, history: D2D_RECT_F) {
@@ -2663,7 +2726,7 @@ impl Renderer {
                 "♫",
                 rect(20.0, top + 12.0, 85.0, top + 77.0),
                 &self.text.centered_title,
-                &self.palette.white,
+                &self.palette.white_ink,
             );
             let title_color = if app.theme == Theme::Light {
                 &self.palette.title
@@ -2717,7 +2780,7 @@ impl Renderer {
             "♫",
             rect(10.0, top + 20.0, 160.0, top + 170.0),
             &self.text.centered_heavy,
-            &self.palette.white,
+            &self.palette.white_ink,
         );
         self.text(
             &track.title,
@@ -2742,7 +2805,7 @@ impl Renderer {
             "再生",
             rect(172.0, top + 145.0, 242.0, top + 165.0),
             &self.text.date,
-            &self.palette.white,
+            &self.palette.white_ink,
         );
         self.text(
             "×",
@@ -2793,7 +2856,7 @@ impl Renderer {
             "もう一度試す",
             rect(90.0, top + 120.0, 290.0, top + 150.0),
             &self.text.button,
-            &self.palette.white,
+            &self.palette.white_ink,
         );
         self.text(
             "×",
@@ -2816,7 +2879,7 @@ impl Renderer {
             message,
             rect(50.0, body_top + 73.0, 330.0, body_top + 104.0),
             &self.text.centered_body,
-            &self.palette.white,
+            &self.palette.white_ink,
         );
     }
 
@@ -3060,6 +3123,7 @@ unsafe fn create_palette(
         ),
     };
     let white = solid(target, background)?;
+    let white_ink = solid(target, d2d_color(255, 255, 255, 1.0))?;
     let black = solid(target, d2d_color(30, 30, 30, 1.0))?;
     let title = solid(target, foreground)?;
     let subtitle = solid(target, subtitle)?;
@@ -3127,6 +3191,7 @@ unsafe fn create_palette(
     )?;
     Ok(Palette {
         white,
+        white_ink,
         black,
         title,
         subtitle,
@@ -4731,6 +4796,26 @@ mod tests {
         assert_eq!(SHZ_LOGO_BOTTOM_PATH.curves.len(), 4);
         assert_eq!(SHZ_LOGO_TOP_PATH.start, (76.19, 10.38));
         assert_eq!(SHZ_LOGO_BOTTOM_PATH.start, (133.82, 201.02));
+    }
+
+    #[test]
+    fn composition_and_direct2d_share_logical_button_coordinates_at_each_dpi() {
+        use super::*;
+
+        for dpi in [96, 120, 144, 168, 192, 240, 288] {
+            let scale = composition_scale_for_dpi(dpi);
+            let d2d_center_x =
+                ui_model::physical_pixels(BUTTON_X as f64 + BUTTON_SIZE as f64 * 0.5, dpi);
+            let composition_center_x =
+                ((BUTTON_X as f32 + BUTTON_SIZE as f32 * 0.5) * scale).round() as i32;
+            let button_center_y =
+                POPUP_ARROW_HEIGHT as f64 + BUTTON_TOP as f64 + BUTTON_SIZE as f64 * 0.5;
+            let d2d_center_y = ui_model::physical_pixels(button_center_y, dpi);
+            let composition_center_y = (button_center_y as f32 * scale).round() as i32;
+            assert_eq!(composition_center_x, d2d_center_x, "{dpi} DPI x");
+            assert_eq!(composition_center_y, d2d_center_y, "{dpi} DPI y");
+            assert!((scale - ui_model::dpi_scale(dpi) as f32).abs() < f32::EPSILON);
+        }
     }
 
     #[test]
