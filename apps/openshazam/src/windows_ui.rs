@@ -157,9 +157,11 @@ struct NativeIconLayout {
 fn native_icon_layout(body_top: f32) -> NativeIconLayout {
     NativeIconLayout {
         settings_visual: [349.0, body_top + 25.0, 365.0, body_top + 41.0],
-        settings_hit: [342.0, body_top + 20.0, 372.0, body_top + 48.0],
+        // Nib's stored popup frame is y=20..48, but its center constraints
+        // align it to the gear and close glyph at y=33 (final y=19..47).
+        settings_hit: [342.0, body_top + 19.0, 372.0, body_top + 47.0],
         cancel_visual: [351.0, body_top + 27.0, 363.0, body_top + 39.0],
-        cancel_hit: [342.0, body_top + 20.0, 372.0, body_top + 48.0],
+        cancel_hit: [342.0, body_top + 19.0, 372.0, body_top + 47.0],
         result_close_visual: [353.0, body_top + 25.0, 365.0, body_top + 37.0],
         result_close_hit: [353.0, body_top + 25.0, 365.0, body_top + 37.0],
     }
@@ -507,7 +509,7 @@ struct CompositionRing {
     visual: ContainerVisual,
     geometry: Option<CompositionEllipseGeometry>,
     shape: Option<CompositionSpriteShape>,
-    _inner_fill_visual: Option<SpriteVisual>,
+    _inner_fill_visual: Option<ShapeVisual>,
     core_container: Option<ContainerVisual>,
     sublayer_container: Option<ContainerVisual>,
     inner_animations: Option<InnerRingAnimations>,
@@ -1182,7 +1184,7 @@ fn logo_shadow_color(_theme: Theme) -> Color {
     composition_color(51, 255, 255, 255)
 }
 
-const INNER_RIPPLE_DIAMETER: f32 = 288.0;
+const INNER_MASK_BOUNDS: f32 = 336.0;
 const BUTTON_CLEAR_DIAMETER: f32 = 96.0;
 
 fn inverse_circle_clip_radii(size: f32, hole: f32) -> Option<(f32, f32)> {
@@ -1334,7 +1336,9 @@ impl CompositionScene {
         ring_brushes.push(compositor.CreateColorBrushWithColor(ring_color)?);
         let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
         let center_y = body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32;
-        let inner_bounds = INNER_RIPPLE_DIAMETER;
+        // Native uses a 3.5×96pt inverse mask (336pt) around the button.
+        // The largest visible inner fill remains 288pt inside that mask.
+        let inner_bounds = INNER_MASK_BOUNDS;
         let inner_audio_root = compositor.CreateContainerVisual()?;
         inner_audio_root.SetSize(Vector2 {
             X: inner_bounds,
@@ -1417,13 +1421,25 @@ impl CompositionScene {
             visual.SetOpacity(0.0)?;
 
             let (geometry, shape, inner_fill_visual) = if index < 4 {
-                let sprite = compositor.CreateSpriteVisual()?;
-                sprite.SetSize(Vector2 {
+                let fill_geometry: CompositionEllipseGeometry =
+                    compositor.CreateEllipseGeometry()?;
+                fill_geometry.SetCenter(Vector2 {
+                    X: diameter * 0.5,
+                    Y: diameter * 0.5,
+                })?;
+                fill_geometry.SetRadius(Vector2 {
+                    X: diameter * 0.5,
+                    Y: diameter * 0.5,
+                })?;
+                let fill_shape = compositor.CreateSpriteShapeWithGeometry(&fill_geometry)?;
+                fill_shape.SetFillBrush(&ring_brushes[0])?;
+                let fill_visual = compositor.CreateShapeVisual()?;
+                fill_visual.SetSize(Vector2 {
                     X: diameter,
                     Y: diameter,
                 })?;
-                sprite.SetBrush(&ring_brushes[0])?;
-                (None, None, Some(sprite))
+                fill_visual.Shapes()?.Append(&fill_shape)?;
+                (None, None, Some(fill_visual))
             } else {
                 let geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
                 geometry.SetCenter(Vector2 {
@@ -1838,7 +1854,7 @@ impl CompositionScene {
                 self.compositor
                     .CreateInsetClipWithInsets(0.0, 0.0, 0.0, bottom_inset.max(0.0))?;
             self.root.SetClip(&clip)?;
-            let inner_bounds = ui_model::INNER_DIAMETERS[0] as f32;
+            let inner_bounds = INNER_MASK_BOUNDS;
             let outer_bounds = ui_model::OUTER_DIAMETERS[0] as f32;
             let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
             let center_y = snapshot.body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32;
@@ -5621,7 +5637,8 @@ mod tests {
         result_details_rects, result_panel_top_at, should_start_startup_logo, ui_model, ArrowEdge,
         CaptureMode, CompositionRootLayer, HeaderFillScope, HistoryMutationEvent,
         HistoryMutationTransition, MainPhase, ResultCardAdvance, ResultCardStage, WindowKind,
-        INNER_RIPPLE_DIAMETER, OUTER_BASE_OPACITY, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT,
+        BUTTON_CLEAR_DIAMETER, INNER_MASK_BOUNDS, OUTER_BASE_OPACITY, RESULT_DETAILS_LEFT,
+        RESULT_DETAILS_RIGHT,
     };
 
     #[test]
@@ -5840,12 +5857,20 @@ mod tests {
     fn native_icon_visual_frames_and_hit_targets_are_independent() {
         let layout = native_icon_layout(0.0);
         assert_eq!(layout.settings_visual, [349.0, 25.0, 365.0, 41.0]);
-        assert_eq!(layout.settings_hit, [342.0, 20.0, 372.0, 48.0]);
+        assert_eq!(layout.settings_hit, [342.0, 19.0, 372.0, 47.0]);
         assert_eq!(layout.cancel_visual, [351.0, 27.0, 363.0, 39.0]);
         assert_eq!(layout.cancel_hit, layout.settings_hit);
+        assert_eq!(
+            (layout.settings_visual[1] + layout.settings_visual[3]) * 0.5,
+            (layout.settings_hit[1] + layout.settings_hit[3]) * 0.5
+        );
+        assert_eq!(
+            (layout.cancel_visual[1] + layout.cancel_visual[3]) * 0.5,
+            (layout.settings_hit[1] + layout.settings_hit[3]) * 0.5
+        );
         assert_eq!(layout.result_close_visual, [353.0, 25.0, 365.0, 37.0]);
         assert_eq!(layout.result_close_hit, layout.result_close_visual);
-        assert!(point_in_rect(342.0, 20.0, layout.settings_hit));
+        assert!(point_in_rect(342.0, 19.0, layout.settings_hit));
         assert!(!point_in_rect(341.9, 20.0, layout.settings_hit));
         assert!(point_in_rect(353.0, 25.0, layout.result_close_hit));
         assert!(!point_in_rect(352.9, 25.0, layout.result_close_hit));
@@ -6018,8 +6043,14 @@ mod tests {
 
     #[test]
     fn inner_ripple_clip_keeps_a_button_sized_hole_independent_of_child_rings() {
-        assert_eq!(INNER_RIPPLE_DIAMETER as f64, ui_model::INNER_DIAMETERS[0]);
-        assert_eq!(inverse_circle_clip_radii(288.0, 96.0), Some((144.0, 48.0)));
+        assert_eq!(
+            INNER_MASK_BOUNDS,
+            ui_model::INNER_DIAMETERS[0] as f32 + 48.0
+        );
+        assert_eq!(
+            inverse_circle_clip_radii(INNER_MASK_BOUNDS, BUTTON_CLEAR_DIAMETER),
+            Some((168.0, 48.0))
+        );
         assert_eq!(inverse_circle_clip_radii(96.0, 96.0), None);
         assert_eq!(inverse_circle_clip_radii(f32::NAN, 48.0), None);
     }
@@ -6190,19 +6221,23 @@ mod tests {
                 let clip = make_inverse_circle_clip(
                     &compositor,
                     &d2d_factory,
-                    INNER_RIPPLE_DIAMETER,
+                    INNER_MASK_BOUNDS,
                     BUTTON_CLEAR_DIAMETER,
                 )?;
+                assert_eq!(
+                    inverse_circle_clip_radii(INNER_MASK_BOUNDS, BUTTON_CLEAR_DIAMETER),
+                    Some((168.0, 48.0))
+                );
                 let group = compositor.CreateContainerVisual()?;
                 group.SetSize(Vector2 {
-                    X: INNER_RIPPLE_DIAMETER,
-                    Y: INNER_RIPPLE_DIAMETER,
+                    X: INNER_MASK_BOUNDS,
+                    Y: INNER_MASK_BOUNDS,
                 })?;
                 group.SetClip(&clip)?;
                 let ring = compositor.CreateSpriteVisual()?;
                 ring.SetSize(Vector2 {
-                    X: INNER_RIPPLE_DIAMETER,
-                    Y: INNER_RIPPLE_DIAMETER,
+                    X: ui_model::INNER_DIAMETERS[0] as f32,
+                    Y: ui_model::INNER_DIAMETERS[0] as f32,
                 })?;
                 group.Children()?.InsertAtTop(&ring)?;
                 let mut logo = CompositionLogo::new(&d2d_factory, &compositor, Theme::Light, true)?;
