@@ -111,10 +111,10 @@ use windows::{
         Color,
         Composition::{
             AnimationIterationBehavior, CompositionColorBrush, CompositionEllipseGeometry,
-            CompositionPath, CompositionPathGeometry, CompositionSpriteShape, Compositor,
-            ContainerVisual, CubicBezierEasingFunction, Desktop::DesktopWindowTarget,
-            ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual, Vector2KeyFrameAnimation,
-            Vector3KeyFrameAnimation,
+            CompositionPath, CompositionPathGeometry, CompositionSpriteShape,
+            CompositionVisualSurface, Compositor, ContainerVisual, CubicBezierEasingFunction,
+            Desktop::DesktopWindowTarget, DropShadow, ScalarKeyFrameAnimation, ShapeVisual,
+            SpriteVisual, Vector2KeyFrameAnimation, Vector3KeyFrameAnimation,
         },
     },
 };
@@ -509,6 +509,9 @@ struct CompositionAlphaMask {
 struct CompositionLogo {
     visual: ContainerVisual,
     _transparent_visual: ShapeVisual,
+    _transparent_shadow_visual: SpriteVisual,
+    _transparent_shadow_surface: CompositionVisualSurface,
+    transparent_shadow: DropShadow,
     long_visual: ShapeVisual,
     final_visual: ShapeVisual,
     _transparent_geometries: [CompositionPathGeometry; 2],
@@ -611,6 +614,37 @@ impl CompositionLogo {
             .Children()?
             .InsertAtTop(&transparent_visual)?;
 
+        // Capture the transparent stroke's alpha, not its padded rectangular
+        // canvas, so the startup shadow follows the logo outline.
+        let transparent_shadow_surface = compositor.CreateVisualSurface()?;
+        transparent_shadow_surface.SetSourceVisual(&transparent_visual)?;
+        transparent_shadow_surface.SetSourceOffset(Vector2 { X: 0.0, Y: 0.0 })?;
+        transparent_shadow_surface.SetSourceSize(Vector2 {
+            X: SHZ_LOGO_CANVAS_SIZE,
+            Y: SHZ_LOGO_CANVAS_SIZE,
+        })?;
+        let transparent_shadow_brush =
+            compositor.CreateSurfaceBrushWithSurface(&transparent_shadow_surface)?;
+        let transparent_shadow = compositor.CreateDropShadow()?;
+        transparent_shadow.SetBlurRadius(1.0)?;
+        transparent_shadow.SetOffset(Vector3 {
+            X: 0.5,
+            Y: 1.0,
+            Z: 0.0,
+        })?;
+        transparent_shadow.SetOpacity(1.0)?;
+        transparent_shadow.SetColor(logo_shadow_color(theme))?;
+        transparent_shadow.SetSourcePolicy(
+            windows::UI::Composition::CompositionDropShadowSourcePolicy::InheritFromVisualContent,
+        )?;
+        let transparent_shadow_visual = compositor.CreateSpriteVisual()?;
+        transparent_shadow_visual.SetSize(Vector2 {
+            X: SHZ_LOGO_CANVAS_SIZE,
+            Y: SHZ_LOGO_CANVAS_SIZE,
+        })?;
+        transparent_shadow_visual.SetBrush(&transparent_shadow_brush)?;
+        transparent_shadow_visual.SetShadow(&transparent_shadow)?;
+
         let visual = compositor.CreateContainerVisual()?;
         visual.SetSize(Vector2 {
             X: SHZ_LOGO_CANVAS_SIZE,
@@ -632,6 +666,7 @@ impl CompositionLogo {
             Y: layout.scale_y,
             Z: 1.0,
         })?;
+        visual.Children()?.InsertAtTop(&transparent_shadow_visual)?;
         visual.Children()?.InsertAtTop(&transparent_root)?;
         visual.Children()?.InsertAtTop(&long_visual)?;
         visual.Children()?.InsertAtTop(&final_visual)?;
@@ -679,6 +714,9 @@ impl CompositionLogo {
             _solid_brush: solid_brush,
             visual,
             _transparent_visual: transparent_visual,
+            _transparent_shadow_visual: transparent_shadow_visual,
+            _transparent_shadow_surface: transparent_shadow_surface,
+            transparent_shadow,
             long_visual,
             final_visual,
             _transparent_geometries: transparent_geometries,
@@ -736,7 +774,8 @@ impl CompositionLogo {
 
     fn set_theme(&self, theme: Theme) -> windows::core::Result<()> {
         self.transparent_brush
-            .SetColor(logo_transparent_color(theme))
+            .SetColor(logo_transparent_color(theme))?;
+        self.transparent_shadow.SetColor(logo_shadow_color(theme))
     }
 }
 
@@ -1102,6 +1141,12 @@ fn logo_transparent_color(theme: Theme) -> Color {
         Theme::Light => composition_color(255, 27, 148, 250),
         Theme::Dark => composition_color(255, 9, 9, 9),
     }
+}
+
+fn logo_shadow_color(_theme: Theme) -> Color {
+    // Native uses the tagButtonTopBorder color. The dark appearance rendition
+    // is still unmeasured; the current UI uses the confirmed light alpha/color.
+    composition_color(51, 255, 255, 255)
 }
 
 #[derive(Debug)]
