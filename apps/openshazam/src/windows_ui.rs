@@ -495,9 +495,8 @@ struct CompositionLogo {
     transparent_brush: CompositionColorBrush,
     _solid_brush: CompositionColorBrush,
     transparent_trim_animation: ScalarKeyFrameAnimation,
-    solid_trim_animation: ScalarKeyFrameAnimation,
-    long_fade_animation: ScalarKeyFrameAnimation,
-    final_fade_animation: ScalarKeyFrameAnimation,
+    solid_trim_start_animation: ScalarKeyFrameAnimation,
+    solid_trim_end_animation: ScalarKeyFrameAnimation,
     started_at: Option<Instant>,
     stage: ui_model::StartupLogoStage,
 }
@@ -568,7 +567,7 @@ impl CompositionLogo {
             d2d_factory,
             [SHZ_LOGO_TOP_LONG_PATH, SHZ_LOGO_BOTTOM_LONG_PATH],
             &solid_brush,
-            LogoTrim::End,
+            LogoTrim::StartAndEnd,
         )?;
         let (final_visual, _) = make_logo_visual(
             compositor,
@@ -660,7 +659,20 @@ impl CompositionLogo {
             },
             0.0,
         )?;
-        let solid_trim = make_logo_trim_animation(
+        let solid_trim_start = make_logo_trim_animation(
+            compositor,
+            ui_model::STARTUP_LOGO_SOLID_DURATION,
+            0.0,
+            ui_model::STARTUP_LOGO_SOLID_TRIM_START_END,
+            CubicBezier {
+                x1: 0.4,
+                y1: 1.0,
+                x2: 0.41,
+                y2: 1.0,
+            },
+            ui_model::STARTUP_LOGO_SOLID_DELAY,
+        )?;
+        let solid_trim_end = make_logo_trim_animation(
             compositor,
             ui_model::STARTUP_LOGO_SOLID_DURATION,
             0.0,
@@ -672,18 +684,6 @@ impl CompositionLogo {
                 y2: 1.0,
             },
             ui_model::STARTUP_LOGO_SOLID_DELAY,
-        )?;
-        let long_fade = make_logo_stage_switch_animation(
-            compositor,
-            ui_model::STARTUP_LOGO_TOTAL_DURATION,
-            1.0,
-            0.0,
-        )?;
-        let final_fade = make_logo_stage_switch_animation(
-            compositor,
-            ui_model::STARTUP_LOGO_TOTAL_DURATION,
-            0.0,
-            1.0,
         )?;
         Ok(Self {
             transparent_brush,
@@ -698,9 +698,8 @@ impl CompositionLogo {
             _transparent_geometries: transparent_geometries,
             _long_geometries: long_geometries,
             transparent_trim_animation: transparent_trim,
-            solid_trim_animation: solid_trim,
-            long_fade_animation: long_fade,
-            final_fade_animation: final_fade,
+            solid_trim_start_animation: solid_trim_start,
+            solid_trim_end_animation: solid_trim_end,
             started_at: None,
             stage: if animate_on_create {
                 ui_model::StartupLogoStage::TransparentStroke
@@ -711,7 +710,7 @@ impl CompositionLogo {
     }
 
     fn start(&mut self) -> windows::core::Result<()> {
-        if self.started_at.is_some() {
+        if self.started_at.is_some() || self.stage == ui_model::StartupLogoStage::Complete {
             return Ok(());
         }
         let started_at = Instant::now();
@@ -722,12 +721,12 @@ impl CompositionLogo {
             )?;
         }
         for geometry in &self._long_geometries {
-            geometry.StartAnimation(&HSTRING::from("TrimEnd"), &self.solid_trim_animation)?;
+            geometry.StartAnimation(
+                &HSTRING::from("TrimStart"),
+                &self.solid_trim_start_animation,
+            )?;
+            geometry.StartAnimation(&HSTRING::from("TrimEnd"), &self.solid_trim_end_animation)?;
         }
-        self.long_visual
-            .StartAnimation(&HSTRING::from("Opacity"), &self.long_fade_animation)?;
-        self.final_visual
-            .StartAnimation(&HSTRING::from("Opacity"), &self.final_fade_animation)?;
         self.started_at = Some(started_at);
         Ok(())
     }
@@ -740,8 +739,15 @@ impl CompositionLogo {
         if frame.stage != self.stage {
             match frame.stage {
                 ui_model::StartupLogoStage::TransparentStroke => {}
-                ui_model::StartupLogoStage::SolidLongStroke
-                | ui_model::StartupLogoStage::Complete => {}
+                ui_model::StartupLogoStage::SolidLongStroke => {}
+                ui_model::StartupLogoStage::Complete => {
+                    for geometry in &self._long_geometries {
+                        geometry.StopAnimation(&HSTRING::from("TrimStart"))?;
+                        geometry.StopAnimation(&HSTRING::from("TrimEnd"))?;
+                    }
+                    self.long_visual.SetOpacity(0.0)?;
+                    self.final_visual.SetOpacity(1.0)?;
+                }
             }
             self.stage = frame.stage;
         }
@@ -915,7 +921,7 @@ const SHZ_LOGO_BOTTOM_LONG_PATH: LogoPath<8> = LogoPath {
 #[derive(Clone, Copy)]
 enum LogoTrim {
     Start,
-    End,
+    StartAndEnd,
     None,
 }
 
@@ -1056,7 +1062,10 @@ unsafe fn make_logo_path_geometry<const N: usize>(
     let geometry = compositor.CreatePathGeometryWithPath(&path)?;
     match trim {
         LogoTrim::Start => geometry.SetTrimStart(0.0)?,
-        LogoTrim::End => geometry.SetTrimEnd(0.0)?,
+        LogoTrim::StartAndEnd => {
+            geometry.SetTrimStart(0.0)?;
+            geometry.SetTrimEnd(0.0)?;
+        }
         LogoTrim::None => {}
     }
     Ok(geometry)
@@ -1091,24 +1100,6 @@ fn make_logo_trim_animation(
     )?;
     animation.InsertKeyFrame(0.0, from as f32)?;
     animation.InsertKeyFrameWithEasingFunction(1.0, to as f32, &easing)?;
-    Ok(animation)
-}
-
-fn make_logo_stage_switch_animation(
-    compositor: &Compositor,
-    delay_seconds: f64,
-    from: f64,
-    to: f64,
-) -> windows::core::Result<ScalarKeyFrameAnimation> {
-    let animation = compositor.CreateScalarKeyFrameAnimation()?;
-    // Composition rejects animation durations below one millisecond even for
-    // a delayed, effectively instantaneous opacity switch.
-    animation.SetDuration(TimeSpan { Duration: 10_000 })?;
-    animation.SetDelayTime(TimeSpan {
-        Duration: (delay_seconds * 10_000_000.0).round() as i64,
-    })?;
-    animation.InsertKeyFrame(0.0, from as f32)?;
-    animation.InsertKeyFrame(1.0, to as f32)?;
     Ok(animation)
 }
 
@@ -1613,7 +1604,7 @@ impl CompositionScene {
         button_border_shape.SetStrokeBrush(&button_edge)?;
         button_border_shape.SetStrokeThickness(1.0)?;
         button_shape_visual.Shapes()?.Append(&button_border_shape)?;
-        let mut logo =
+        let logo =
             unsafe { CompositionLogo::new(d2d_factory, compositor, theme, animate_startup_logo)? };
         let button_content = compositor.CreateContainerVisual()?;
         button_content.SetSize(Vector2 {
@@ -1720,9 +1711,6 @@ impl CompositionScene {
             &easing,
         )?;
         target.SetRoot(&root)?;
-        if animate_startup_logo {
-            logo.start()?;
-        }
 
         Ok(Self {
             compositor: compositor.clone(),
@@ -2057,6 +2045,10 @@ impl CompositionScene {
 
     fn startup_logo_complete(&self) -> bool {
         self.logo.stage == ui_model::StartupLogoStage::Complete
+    }
+
+    fn start_startup_logo(&mut self) -> windows::core::Result<()> {
+        self.logo.start()
     }
 
     fn start_no_match_idle_restore(&self, from_scale: f32) -> windows::core::Result<()> {
@@ -2591,6 +2583,14 @@ impl Renderer {
             scene.update(snapshot)?;
         }
         Ok(())
+    }
+
+    fn start_startup_logo(&mut self) -> windows::core::Result<bool> {
+        let Some(scene) = self.composition.as_mut() else {
+            return Ok(true);
+        };
+        scene.start_startup_logo()?;
+        Ok(scene.startup_logo_complete())
     }
 
     unsafe fn fill_rect(&self, area: D2D_RECT_F, brush: &ID2D1SolidColorBrush) {
@@ -4539,7 +4539,16 @@ fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> 
     startup_animation_pending || phase_needs_frame(phase)
 }
 
-unsafe fn show_main(app: &mut AppState) {
+unsafe fn show_main(app: &mut AppState, renderer: Option<&mut Renderer>) {
+    if let Some(renderer) = renderer {
+        match renderer.start_startup_logo() {
+            Ok(complete) => app.startup_animation_pending = !complete,
+            Err(error) => {
+                app.startup_animation_pending = false;
+                app.message = Some(format!("Startup logo animation failed: {error}"));
+            }
+        }
+    }
     let changed = update_phase_timers(app);
     anchor_popup(app);
     if changed {
@@ -4615,7 +4624,7 @@ unsafe extern "system" fn window_proc(
 
     match message {
         WM_SHOW_INITIAL_POPUP if data.kind == WindowKind::Main => {
-            show_main(app);
+            show_main(app, data.renderer.as_mut());
             LRESULT(0)
         }
         WM_CREATE => {
@@ -4697,7 +4706,7 @@ unsafe extern "system" fn window_proc(
                 if app.visible {
                     hide_main(app);
                 } else {
-                    show_main(app);
+                    show_main(app, data.renderer.as_mut());
                 }
             }
             LRESULT(0)
