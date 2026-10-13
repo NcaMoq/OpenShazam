@@ -104,6 +104,28 @@ use windows::{
     },
 };
 
+#[cfg(test)]
+use windows::{
+    Foundation::Size,
+    Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat},
+    Win32::{
+        Graphics::{
+            Direct2D::{
+                D2D1CreateDevice, ID2D1Device, ID2D1DeviceContext, D2D1_PRIMITIVE_BLEND_COPY,
+                D2D1_PRIMITIVE_BLEND_SOURCE_OVER,
+            },
+            Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0},
+            Direct3D11::{
+                D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_SDK_VERSION,
+            },
+            Dxgi::IDXGIDevice,
+        },
+        System::WinRT::Composition::{ICompositionDrawingSurfaceInterop, ICompositorInterop},
+    },
+    UI::Composition::{CompositionDrawingSurface, CompositionMaskBrush, CompositionSurfaceBrush},
+};
+
 use windows_numerics::{Vector2, Vector3};
 
 use crate::ui_model::{
@@ -304,6 +326,207 @@ struct InnerRingAnimations {
     core_opacity: ScalarKeyFrameAnimation,
     sublayer_scale: Vector3KeyFrameAnimation,
     scale_null: Vector3KeyFrameAnimation,
+}
+
+/// Cached GPU alpha mask backed by a Composition drawing surface. The mask is
+/// opaque outside a centered circular cutout; the surface is authored once and
+/// can be sampled by independent CompositionMaskBrush instances/transforms.
+#[cfg(test)]
+#[derive(Debug)]
+struct CompositionAlphaMask {
+    _surface: CompositionDrawingSurface,
+    _surface_brush: CompositionSurfaceBrush,
+    brush: CompositionMaskBrush,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct CompositionMaskFactory {
+    compositor: Compositor,
+    _d3d_device: ID3D11Device,
+    _d2d_device: ID2D1Device,
+    graphics_device: windows::UI::Composition::CompositionGraphicsDevice,
+}
+
+#[cfg(test)]
+impl CompositionMaskFactory {
+    unsafe fn new(compositor: &Compositor) -> windows::core::Result<Self> {
+        let d3d_device =
+            create_mask_d3d_device().map_err(|error| mask_error(error, "D3D11 mask device"))?;
+        let dxgi_device: IDXGIDevice = d3d_device
+            .cast()
+            .map_err(|error| mask_error(error, "DXGI mask device interface"))?;
+        let d2d_device: ID2D1Device = D2D1CreateDevice(&dxgi_device, None)
+            .map_err(|error| mask_error(error, "Direct2D mask device"))?;
+        let interop: ICompositorInterop = compositor
+            .cast()
+            .map_err(|error| mask_error(error, "Composition graphics interop"))?;
+        let graphics_device = interop
+            .CreateGraphicsDevice(&d2d_device)
+            .map_err(|error| mask_error(error, "Composition graphics device"))?;
+        Ok(Self {
+            compositor: compositor.clone(),
+            _d3d_device: d3d_device,
+            _d2d_device: d2d_device,
+            graphics_device,
+        })
+    }
+
+    unsafe fn inverse_circle(
+        &self,
+        size_dips: f32,
+        hole_diameter_dips: f32,
+        dpi: u32,
+    ) -> windows::core::Result<CompositionAlphaMask> {
+        CompositionAlphaMask::inverse_circle(self, size_dips, hole_diameter_dips, dpi)
+    }
+}
+
+#[cfg(test)]
+impl CompositionAlphaMask {
+    unsafe fn inverse_circle(
+        factory: &CompositionMaskFactory,
+        size_dips: f32,
+        hole_diameter_dips: f32,
+        dpi: u32,
+    ) -> windows::core::Result<Self> {
+        let pixel_size = ui_model::physical_pixels(size_dips as f64, dpi.max(96));
+        let surface = factory
+            .graphics_device
+            .CreateDrawingSurface(
+                Size {
+                    Width: pixel_size as f32,
+                    Height: pixel_size as f32,
+                },
+                DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                DirectXAlphaMode::Premultiplied,
+            )
+            .map_err(|error| mask_error(error, "Composition drawing surface"))?;
+        let surface_interop: ICompositionDrawingSurfaceInterop = surface
+            .cast()
+            .map_err(|error| mask_error(error, "Drawing surface interop"))?;
+        let mut update_offset = POINT::default();
+        let draw_context: ID2D1DeviceContext = surface_interop
+            .BeginDraw(None, &mut update_offset)
+            .map_err(|error| mask_error(error, "Drawing surface BeginDraw"))?;
+        let draw_result = (|| -> windows::core::Result<()> {
+            draw_context.SetDpi(dpi.max(96) as f32, dpi.max(96) as f32);
+            draw_context.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
+            let opaque = draw_context.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
+                None,
+            )?;
+            let transparent = draw_context.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                },
+                None,
+            )?;
+            let bounds = D2D_RECT_F {
+                left: update_offset.x as f32 * 96.0 / dpi.max(96) as f32,
+                top: update_offset.y as f32 * 96.0 / dpi.max(96) as f32,
+                right: update_offset.x as f32 * 96.0 / dpi.max(96) as f32 + size_dips,
+                bottom: update_offset.y as f32 * 96.0 / dpi.max(96) as f32 + size_dips,
+            };
+            draw_context.FillRectangle(&bounds, &opaque);
+            draw_context.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+            let radius = hole_diameter_dips.max(0.0) * 0.5;
+            draw_context.FillEllipse(
+                &D2D1_ELLIPSE {
+                    point: Vector2 {
+                        X: (bounds.left + bounds.right) * 0.5,
+                        Y: (bounds.top + bounds.bottom) * 0.5,
+                    },
+                    radiusX: radius,
+                    radiusY: radius,
+                },
+                &transparent,
+            );
+            draw_context.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+            Ok(())
+        })();
+        let end_draw = surface_interop.EndDraw();
+        draw_result?;
+        end_draw?;
+
+        let surface_brush = factory
+            .compositor
+            .CreateSurfaceBrushWithSurface(&surface)
+            .map_err(|error| mask_error(error, "Composition surface brush"))?;
+        let brush = factory
+            .compositor
+            .CreateMaskBrush()
+            .map_err(|error| mask_error(error, "Composition mask brush"))?;
+        brush
+            .SetMask(&surface_brush)
+            .map_err(|error| mask_error(error, "Composition mask input"))?;
+        let source = factory
+            .compositor
+            .CreateColorBrushWithColor(composition_color(255, 255, 255, 255))
+            .map_err(|error| mask_error(error, "Composition mask source brush"))?;
+        brush
+            .SetSource(&source)
+            .map_err(|error| mask_error(error, "Composition mask content source"))?;
+        Ok(Self {
+            _surface: surface,
+            _surface_brush: surface_brush,
+            brush,
+        })
+    }
+
+    fn brush(&self) -> &CompositionMaskBrush {
+        &self.brush
+    }
+}
+
+#[cfg(test)]
+fn mask_error(error: Error, context: &str) -> Error {
+    Error::new(error.code(), format!("{context}: {error}"))
+}
+
+#[cfg(test)]
+unsafe fn create_mask_d3d_device() -> windows::core::Result<ID3D11Device> {
+    let feature_levels = [D3D_FEATURE_LEVEL_11_0];
+    let mut device = None;
+    if D3D11CreateDevice(
+        None,
+        D3D_DRIVER_TYPE_HARDWARE,
+        windows::Win32::Foundation::HMODULE::default(),
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        Some(&feature_levels),
+        D3D11_SDK_VERSION,
+        Some(&mut device),
+        None,
+        None,
+    )
+    .is_err()
+    {
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_WARP,
+            windows::Win32::Foundation::HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&feature_levels),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )?;
+    }
+    device.ok_or_else(Error::from_thread)
 }
 
 struct CompositionScene {
@@ -3562,6 +3785,39 @@ mod tests {
                 stroke.InsertKeyFrame(0.0, 0.0)?;
                 stroke.InsertKeyFrame(1.0, 4.0)?;
                 shape.StartAnimation(&HSTRING::from("StrokeThickness"), &stroke)?;
+                Ok(())
+            })();
+            drop(dispatcher);
+            CoUninitialize();
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Windows Composition dispatcher and D3D device; run explicitly to verify alpha-mask surface interop"]
+    fn composition_drawing_surface_builds_a_cached_inverse_alpha_mask() {
+        use super::*;
+
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).unwrap();
+            let dispatcher = CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })
+            .unwrap();
+            let result = (|| -> windows::core::Result<()> {
+                let compositor = Compositor::new()?;
+                let factory = CompositionMaskFactory::new(&compositor)?;
+                let _masks = [
+                    factory.inverse_circle(336.0, 96.0, 144)?,
+                    factory.inverse_circle(336.0, 96.0, 144)?,
+                    factory.inverse_circle(336.0, 96.0, 144)?,
+                ];
+                for dpi in [96, 120, 144, 168, 192, 240, 288] {
+                    let mask = factory.inverse_circle(336.0, 96.0, dpi)?;
+                    let _brush = mask.brush();
+                }
                 Ok(())
             })();
             drop(dispatcher);
