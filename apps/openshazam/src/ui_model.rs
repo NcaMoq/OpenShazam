@@ -645,6 +645,31 @@ mod tests {
     }
 
     #[test]
+    fn outer_core_tracks_preserve_second_phase_and_shape_separation() {
+        let initial = wave_frame_at(TaggingMode::Manual, 0.0, UiLevels::default());
+        assert_eq!(initial.outer[0].container_scale, 0.85);
+        assert_eq!(initial.outer[1].container_scale, 0.85);
+
+        let second_starts =
+            wave_frame_at(TaggingMode::Manual, OUTER_SECOND_PHASE, UiLevels::default());
+        assert_eq!(second_starts.outer[1].container_scale, 0.85);
+        assert_eq!(second_starts.outer[1].core_size_scale, 0.615_384_6);
+
+        let second_peak = wave_frame_at(
+            TaggingMode::Manual,
+            OUTER_SECOND_PHASE + 0.75 * OUTER_CORE_DURATION,
+            UiLevels::default(),
+        );
+        assert_eq!(second_peak.outer[1].container_scale, 0.9);
+        assert_eq!(second_peak.outer[1].core_size_scale, 1.0);
+        assert_eq!(second_peak.outer[1].shape_diameter, OUTER_DIAMETERS[1]);
+        assert_ne!(
+            second_peak.outer[1].diameter,
+            second_peak.outer[1].shape_diameter
+        );
+    }
+
+    #[test]
     fn arbitrary_times_repeat_without_accumulated_frame_error() {
         let a = wave_frame_at(TaggingMode::Manual, 0.123, UiLevels::default());
         let b = wave_frame_at(
