@@ -3160,10 +3160,7 @@ impl Renderer {
 
     unsafe fn draw_ready(&self, _app: &AppState, body_top: f32) {
         self.text(
-            match ui_language() {
-                UiLanguage::Japanese => "クリックしてShazamする",
-                UiLanguage::English => "Click to Shazam",
-            },
+            localized_ui_text(UiTextKey::Ready, ui_language()),
             rect(
                 8.0,
                 body_top + 141.0,
@@ -3179,10 +3176,7 @@ impl Renderer {
     unsafe fn draw_listening_status(&self, body_top: f32, mode: CaptureMode) {
         self.text(
             match mode {
-                CaptureMode::Manual => match ui_language() {
-                    UiLanguage::Japanese => "聞き取り中",
-                    UiLanguage::English => "Listening",
-                },
+                CaptureMode::Manual => localized_ui_text(UiTextKey::Listening, ui_language()),
                 CaptureMode::Auto => "Auto Shazam",
             },
             rect(
@@ -3393,10 +3387,7 @@ impl Renderer {
         self.target
             .FillRoundedRectangle(&button, &self.palette.accent);
         self.text(
-            match ui_language() {
-                UiLanguage::Japanese => "再度試す",
-                UiLanguage::English => "Try Again",
-            },
+            localized_ui_text(UiTextKey::TryAgain, ui_language()),
             rect(90.0, top + 120.0, 290.0, top + 150.0),
             &self.text.button,
             &self.palette.white_ink,
@@ -4637,36 +4628,69 @@ fn detect_ui_language() -> UiLanguage {
     select_ui_language_from_multisz(&languages[..character_count as usize])
 }
 
-fn no_match_copy(offline: bool, language: UiLanguage) -> (&'static str, &'static str) {
-    match (offline, language) {
-        (true, UiLanguage::Japanese) => (
-            "\u{7d50}\u{679c}\u{306a}\u{3057}",
-            "\u{63a5}\u{7d9a}\u{3092}\u{78ba}\u{8a8d}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}",
-        ),
-        (true, UiLanguage::English) => ("No Result", "Please check your connection"),
-        (false, UiLanguage::Japanese) => (
-            "\u{7d50}\u{679c}\u{306a}\u{3057}",
-            "\u{8a8d}\u{8b58}\u{3067}\u{304d}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\u{305f}\u{3002}\u{3082}\u{3046}\u{4e00}\u{5ea6}\u{304a}\u{8a66}\u{3057}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
-        ),
-        (false, UiLanguage::English) => {
-            ("No Result", "We didn’t quite catch that. Please try again.")
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiTextKey {
+    Ready,
+    Listening,
+    NoMatchTitle,
+    NoMatchBody,
+    OfflineBody,
+    TryAgain,
+    TimeoutDescription,
+    TimeoutDismiss,
+    TimeoutRestart,
+}
+
+fn localized_ui_text(key: UiTextKey, language: UiLanguage) -> &'static str {
+    match (key, language) {
+        (UiTextKey::Ready, UiLanguage::Japanese) => "クリックしてShazamする",
+        (UiTextKey::Ready, UiLanguage::English) => "Click to Shazam",
+        (UiTextKey::Listening, UiLanguage::Japanese) => "聞き取り中",
+        (UiTextKey::Listening, UiLanguage::English) => "Listening",
+        (UiTextKey::NoMatchTitle, UiLanguage::Japanese) => "結果なし",
+        (UiTextKey::NoMatchTitle, UiLanguage::English) => "No Result",
+        (UiTextKey::NoMatchBody, UiLanguage::Japanese) => {
+            "認識できませんでした。もう一度お試しください。"
         }
+        (UiTextKey::NoMatchBody, UiLanguage::English) => {
+            "We didn’t quite catch that. Please try again."
+        }
+        (UiTextKey::OfflineBody, UiLanguage::Japanese) => "接続を確認してください",
+        (UiTextKey::OfflineBody, UiLanguage::English) => "Please check your connection",
+        (UiTextKey::TryAgain, UiLanguage::Japanese) => "再度試す",
+        (UiTextKey::TryAgain, UiLanguage::English) => "Try Again",
+        (UiTextKey::TimeoutDescription, UiLanguage::Japanese) => {
+            "引き続き聴きたい？「再起動」をクリックして Shazam を続けましょう！"
+        }
+        (UiTextKey::TimeoutDescription, UiLanguage::English) => {
+            "Still listening? Click ‘Restart’ to keep Shazaming!"
+        }
+        (UiTextKey::TimeoutDismiss, UiLanguage::Japanese) => "閉じる",
+        (UiTextKey::TimeoutDismiss, UiLanguage::English) => "Dismiss",
+        (UiTextKey::TimeoutRestart, UiLanguage::Japanese) => "再起動",
+        (UiTextKey::TimeoutRestart, UiLanguage::English) => "Restart",
     }
 }
 
+fn no_match_copy(offline: bool, language: UiLanguage) -> (&'static str, &'static str) {
+    let title = localized_ui_text(UiTextKey::NoMatchTitle, language);
+    let body = localized_ui_text(
+        if offline {
+            UiTextKey::OfflineBody
+        } else {
+            UiTextKey::NoMatchBody
+        },
+        language,
+    );
+    (title, body)
+}
+
 fn timeout_copy(language: UiLanguage) -> (&'static str, &'static str, &'static str) {
-    match language {
-        UiLanguage::Japanese => (
-            "\u{5f15}\u{304d}\u{7d9a}\u{304d}\u{8074}\u{304d}\u{305f}\u{3044}\u{ff1f}\u{300c}\u{518d}\u{8d77}\u{52d5}\u{300d}\u{3092}\u{30af}\u{30ea}\u{30c3}\u{30af}\u{3057}\u{3066} Shazam \u{3092}\u{7d9a}\u{3051}\u{307e}\u{3057}\u{3087}\u{3046}\u{ff01}",
-            "\u{9589}\u{3058}\u{308b}",
-            "\u{518d}\u{8d77}\u{52d5}",
-        ),
-        UiLanguage::English => (
-            "Still listening? Click ‘Restart’ to keep Shazaming!",
-            "Dismiss",
-            "Restart",
-        ),
-    }
+    (
+        localized_ui_text(UiTextKey::TimeoutDescription, language),
+        localized_ui_text(UiTextKey::TimeoutDismiss, language),
+        localized_ui_text(UiTextKey::TimeoutRestart, language),
+    )
 }
 
 fn parse_match(output: &str) -> Option<(String, String)> {
@@ -5672,14 +5696,14 @@ mod tests {
         advance_result_card_stage, animation_needs_frame, button_border_arc_points,
         composition_root_layer_order, copy_notification_text, gradient_origin_transform,
         header_fill_scope, history_artwork_frame, history_row_top, inverse_circle_clip_radii,
-        is_offline_failure, is_timeout_failure, native_icon_layout, no_match_copy,
-        parse_debug_string, parse_match, phase_needs_timeout, point_in_rect, result_artwork_frame,
-        result_details_rects, result_panel_top_at, select_ui_language_from_multisz,
-        should_start_startup_logo, timeout_copy, ui_model, ArrowEdge, CaptureMode,
-        CompositionRootLayer, HeaderFillScope, HistoryMutationEvent, HistoryMutationTransition,
-        MainPhase, ResultCardAdvance, ResultCardStage, UiLanguage, WindowKind,
-        BUTTON_CLEAR_DIAMETER, INNER_MASK_BOUNDS, OUTER_BASE_OPACITY, RESULT_DETAILS_LEFT,
-        RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, WHITE_CLOSE_ICON_PIXELS,
+        is_offline_failure, is_timeout_failure, localized_ui_text, native_icon_layout,
+        no_match_copy, parse_debug_string, parse_match, phase_needs_timeout, point_in_rect,
+        result_artwork_frame, result_details_rects, result_panel_top_at,
+        select_ui_language_from_multisz, should_start_startup_logo, timeout_copy, ui_model,
+        ArrowEdge, CaptureMode, CompositionRootLayer, HeaderFillScope, HistoryMutationEvent,
+        HistoryMutationTransition, MainPhase, ResultCardAdvance, ResultCardStage, UiLanguage,
+        UiTextKey, WindowKind, BUTTON_CLEAR_DIAMETER, INNER_MASK_BOUNDS, OUTER_BASE_OPACITY,
+        RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, WHITE_CLOSE_ICON_PIXELS,
     };
 
     #[test]
@@ -6094,6 +6118,14 @@ mod tests {
 
     #[test]
     fn localized_recognition_copy_uses_source_keys_for_both_languages() {
+        assert_eq!(
+            localized_ui_text(UiTextKey::Ready, UiLanguage::Japanese),
+            "クリックしてShazamする"
+        );
+        assert_eq!(
+            localized_ui_text(UiTextKey::Listening, UiLanguage::English),
+            "Listening"
+        );
         assert_eq!(
             no_match_copy(false, UiLanguage::Japanese),
             ("結果なし", "認識できませんでした。もう一度お試しください。")
