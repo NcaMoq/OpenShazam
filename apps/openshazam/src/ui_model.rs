@@ -118,6 +118,12 @@ pub enum InnerTrack {
     ScaleNull,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OuterTrack {
+    CoreSize,
+    BorderWidth,
+}
+
 /// Outer-circle values retain the three independently animated native scale
 /// tracks. `diameter` is their composed logical result for the current frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -313,6 +319,119 @@ fn shifted_track_keyframes(
         });
     }
     keyframes
+}
+
+/// Translate a delayed outer-circle child track into the parent's repeating
+/// time coordinate. Before the child starts, the track holds its first value.
+fn delayed_track_keyframes(
+    values: &[f64],
+    key_times: &[f64],
+    bezier_segments: &[bool],
+    duration: f64,
+    delay: f64,
+    loop_duration: f64,
+) -> Vec<TimedTrackKeyframe> {
+    debug_assert_eq!(values.len(), key_times.len());
+    debug_assert_eq!(bezier_segments.len() + 1, values.len());
+    debug_assert!(duration > 0.0 && loop_duration > 0.0 && delay >= 0.0);
+
+    let mut keyframes = vec![TimedTrackKeyframe {
+        progress: 0.0,
+        value: values[0],
+        easing: None,
+    }];
+    if delay > 0.0 && delay < loop_duration {
+        keyframes.push(TimedTrackKeyframe {
+            progress: delay / loop_duration,
+            value: values[0],
+            easing: None,
+        });
+    }
+
+    for segment in 0..bezier_segments.len() {
+        let source_start = delay + key_times[segment] * duration;
+        let source_end = delay + key_times[segment + 1] * duration;
+        if source_end <= source_start {
+            continue;
+        }
+        let clipped_start = source_start.max(delay);
+        let clipped_end = loop_duration.min(source_end);
+        if clipped_end <= clipped_start {
+            continue;
+        }
+
+        let local_start = (clipped_start - source_start) / (source_end - source_start);
+        let local_end = (clipped_end - source_start) / (source_end - source_start);
+        let progress = (clipped_end / loop_duration).clamp(0.0, 1.0);
+        if progress <= 1e-12 {
+            continue;
+        }
+        let easing = bezier_segments[segment].then(|| split_native_bezier(local_start, local_end));
+        let source_progress = ((clipped_end - delay) / duration).max(0.0);
+        let value = sample_track(values, key_times, source_progress, bezier_segments);
+        if (progress - 1.0).abs() <= 1e-12 {
+            keyframes.push(TimedTrackKeyframe {
+                progress: 1.0,
+                value,
+                easing,
+            });
+            return keyframes;
+        }
+        keyframes.push(TimedTrackKeyframe {
+            progress,
+            value,
+            easing,
+        });
+    }
+
+    if keyframes
+        .last()
+        .is_some_and(|keyframe| keyframe.progress < 1.0 - 1e-12)
+    {
+        let local_time = (loop_duration - delay).max(0.0);
+        keyframes.push(TimedTrackKeyframe {
+            progress: 1.0,
+            value: sample_track(values, key_times, local_time / duration, bezier_segments),
+            easing: None,
+        });
+    }
+    keyframes
+}
+
+/// Return an outer geometry track aligned to the two circle core offsets.
+pub fn delayed_outer_track(track: OuterTrack, circle_index: usize) -> Vec<TimedTrackKeyframe> {
+    assert!(circle_index < OUTER_DIAMETERS.len());
+    let delay = if circle_index == 0 {
+        0.0
+    } else {
+        OUTER_SECOND_PHASE
+    };
+    let (values, key_times, bezier) = match track {
+        OuterTrack::CoreSize => (
+            &[0.615_384_6, 1.0, 1.0][..],
+            &[0.0, 0.75, 1.0][..],
+            &[true, false][..],
+        ),
+        OuterTrack::BorderWidth => (
+            &[0.0, 4.0, 4.0, 0.0, 0.0][..],
+            &[
+                0.0,
+                0.138_888_895_511_627_2,
+                0.416_666_656_732_559_2,
+                0.888_888_895_511_627_2,
+                1.0,
+            ][..],
+            &[true, false, true, false][..],
+        ),
+    };
+    delayed_track_keyframes(
+        values,
+        key_times,
+        bezier,
+        OUTER_CORE_DURATION,
+        delay,
+        OUTER_LOOP_DURATION,
+    )
 }
 
 /// Return one inner-circle track shifted into the 1.9099-second parent loop
@@ -923,6 +1042,27 @@ mod tests {
             second_peak.outer[1].diameter,
             second_peak.outer[1].shape_diameter
         );
+    }
+
+    #[test]
+    fn shifted_outer_geometry_tracks_match_delayed_model_tracks() {
+        for index in 0..OUTER_DIAMETERS.len() {
+            for track in [OuterTrack::CoreSize, OuterTrack::BorderWidth] {
+                let keyframes = delayed_outer_track(track, index);
+                for step in 0..1_000 {
+                    let elapsed = OUTER_LOOP_DURATION * f64::from(step) / 1_000.0;
+                    let frame = wave_frame_at(TaggingMode::Manual, elapsed, UiLevels::default())
+                        .outer[index];
+                    let expected = match track {
+                        OuterTrack::CoreSize => frame.core_size_scale,
+                        OuterTrack::BorderWidth => frame.stroke_width,
+                    };
+                    let actual =
+                        evaluate_track_keyframes(&keyframes, elapsed / OUTER_LOOP_DURATION);
+                    close(actual, expected, 2e-8);
+                }
+            }
+        }
     }
 
     #[test]

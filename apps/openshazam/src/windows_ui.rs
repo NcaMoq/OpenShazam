@@ -99,7 +99,7 @@ use windows::{
             AnimationIterationBehavior, CompositionColorBrush, CompositionEllipseGeometry,
             CompositionLineGeometry, CompositionSpriteShape, CompositionStrokeCap, Compositor,
             ContainerVisual, Desktop::DesktopWindowTarget, ScalarKeyFrameAnimation, ShapeVisual,
-            Vector3KeyFrameAnimation,
+            Vector2KeyFrameAnimation, Vector3KeyFrameAnimation,
         },
     },
 };
@@ -291,6 +291,8 @@ struct CompositionRing {
     sublayer_container: Option<ContainerVisual>,
     inner_animations: Option<InnerRingAnimations>,
     core_scale_animation: Option<Vector3KeyFrameAnimation>,
+    geometry_animation: Option<Vector2KeyFrameAnimation>,
+    border_animation: Option<ScalarKeyFrameAnimation>,
     diameter: f32,
     base_stroke_width: f32,
 }
@@ -573,6 +575,25 @@ impl CompositionScene {
             } else {
                 None
             };
+            let geometry_animation = if index >= 4 {
+                Some(create_vector2_track_animation(
+                    compositor,
+                    ui_model::delayed_outer_track(ui_model::OuterTrack::CoreSize, index - 4),
+                    diameter * 0.5,
+                    ui_model::OUTER_LOOP_DURATION,
+                )?)
+            } else {
+                None
+            };
+            let border_animation = if index >= 4 {
+                Some(create_scalar_track_animation(
+                    compositor,
+                    ui_model::delayed_outer_track(ui_model::OuterTrack::BorderWidth, index - 4),
+                    ui_model::OUTER_LOOP_DURATION,
+                )?)
+            } else {
+                None
+            };
             ring_brushes.push(brush);
             rings.push(CompositionRing {
                 visual,
@@ -582,6 +603,8 @@ impl CompositionScene {
                 sublayer_container,
                 inner_animations,
                 core_scale_animation,
+                geometry_animation,
+                border_animation,
                 diameter,
                 base_stroke_width,
             });
@@ -824,6 +847,15 @@ impl CompositionScene {
                 ) {
                     container.StartAnimation(&HSTRING::from("Scale"), scale)?;
                 }
+                if let (Some(size), Some(border)) = (
+                    ring.geometry_animation.as_ref(),
+                    ring.border_animation.as_ref(),
+                ) {
+                    ring.geometry
+                        .StartAnimation(&HSTRING::from("Radius"), size)?;
+                    ring.shape
+                        .StartAnimation(&HSTRING::from("StrokeThickness"), border)?;
+                }
             }
             self.ripples_active = true;
         } else if !snapshot.show_ripples && self.ripples_active {
@@ -847,6 +879,9 @@ impl CompositionScene {
                 if let Some(container) = &ring.core_container {
                     container.StopAnimation(&HSTRING::from("Scale"))?;
                 }
+                ring.geometry.StopAnimation(&HSTRING::from("Radius"))?;
+                ring.shape
+                    .StopAnimation(&HSTRING::from("StrokeThickness"))?;
                 ring.visual.SetScale(Vector3 {
                     X: 1.0,
                     Y: 1.0,
@@ -921,14 +956,6 @@ impl CompositionScene {
             })?;
             self.outer_audio_root
                 .SetOpacity(frame.outer_audio_opacity as f32)?;
-            for (index, circle) in frame.outer.iter().enumerate() {
-                let ring = &self.rings[index + 4];
-                ring.geometry.SetRadius(Vector2 {
-                    X: circle.shape_diameter as f32 * 0.5,
-                    Y: circle.shape_diameter as f32 * 0.5,
-                })?;
-                ring.shape.SetStrokeThickness(circle.stroke_width as f32)?;
-            }
         }
 
         if snapshot.mode == TaggingMode::Ready {
@@ -977,6 +1004,7 @@ fn make_inner_ring_animations(
     let core_opacity = create_scalar_track_animation(
         compositor,
         ui_model::shifted_inner_track(ui_model::InnerTrack::CoreOpacity, circle_index),
+        ui_model::INNER_OUTER_LOOP,
     )?;
     let sublayer_scale = create_vector_track_animation(
         compositor,
@@ -1031,10 +1059,11 @@ fn create_vector_track_animation(
 fn create_scalar_track_animation(
     compositor: &Compositor,
     keyframes: Vec<ui_model::TimedTrackKeyframe>,
+    duration_seconds: f64,
 ) -> windows::core::Result<ScalarKeyFrameAnimation> {
     let animation = compositor.CreateScalarKeyFrameAnimation()?;
     animation.SetDuration(TimeSpan {
-        Duration: (ui_model::INNER_OUTER_LOOP * 10_000_000.0).round() as i64,
+        Duration: (duration_seconds * 10_000_000.0).round() as i64,
     })?;
     animation.SetIterationBehavior(AnimationIterationBehavior::Forever)?;
     for keyframe in keyframes {
@@ -1056,6 +1085,41 @@ fn create_scalar_track_animation(
             )?;
         } else {
             animation.InsertKeyFrame(keyframe.progress as f32, keyframe.value as f32)?;
+        }
+    }
+    Ok(animation)
+}
+
+fn create_vector2_track_animation(
+    compositor: &Compositor,
+    keyframes: Vec<ui_model::TimedTrackKeyframe>,
+    base_radius: f32,
+    duration_seconds: f64,
+) -> windows::core::Result<Vector2KeyFrameAnimation> {
+    let animation = compositor.CreateVector2KeyFrameAnimation()?;
+    animation.SetDuration(TimeSpan {
+        Duration: (duration_seconds * 10_000_000.0).round() as i64,
+    })?;
+    animation.SetIterationBehavior(AnimationIterationBehavior::Forever)?;
+    for keyframe in keyframes {
+        let value = Vector2 {
+            X: base_radius * keyframe.value as f32,
+            Y: base_radius * keyframe.value as f32,
+        };
+        if let Some(curve) = keyframe.easing {
+            let easing = compositor.CreateCubicBezierEasingFunction(
+                Vector2 {
+                    X: curve.x1 as f32,
+                    Y: curve.y1 as f32,
+                },
+                Vector2 {
+                    X: curve.x2 as f32,
+                    Y: curve.y2 as f32,
+                },
+            )?;
+            animation.InsertKeyFrameWithEasingFunction(keyframe.progress as f32, value, &easing)?;
+        } else {
+            animation.InsertKeyFrame(keyframe.progress as f32, value)?;
         }
     }
     Ok(animation)
@@ -3456,5 +3520,48 @@ mod tests {
         let (decoded, rest) = parse_debug_string("\"Line\\n\\\"One\\\"\" artist=\"A\"").unwrap();
         assert_eq!(decoded, "Line\n\"One\"");
         assert_eq!(rest, " artist=\"A\"");
+    }
+
+    #[test]
+    #[ignore = "requires a Windows Composition dispatcher; run explicitly to verify native property support"]
+    fn composition_animates_ellipse_radius_and_sprite_stroke_without_a_window() {
+        use super::*;
+
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).unwrap();
+            let dispatcher = CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })
+            .unwrap();
+            let result = (|| -> windows::core::Result<()> {
+                let compositor = Compositor::new()?;
+                let geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
+                let radius = compositor.CreateVector2KeyFrameAnimation()?;
+                radius.SetDuration(TimeSpan {
+                    Duration: 10_000_000,
+                })?;
+                radius.InsertKeyFrame(0.0, Vector2 { X: 48.0, Y: 48.0 })?;
+                radius.InsertKeyFrame(1.0, Vector2 { X: 64.0, Y: 64.0 })?;
+                geometry.StartAnimation(&HSTRING::from("Radius"), &radius)?;
+
+                let brush =
+                    compositor.CreateColorBrushWithColor(composition_color(255, 255, 255, 255))?;
+                let shape = compositor.CreateSpriteShapeWithGeometry(&geometry)?;
+                shape.SetStrokeBrush(&brush)?;
+                let stroke = compositor.CreateScalarKeyFrameAnimation()?;
+                stroke.SetDuration(TimeSpan {
+                    Duration: 10_000_000,
+                })?;
+                stroke.InsertKeyFrame(0.0, 0.0)?;
+                stroke.InsertKeyFrame(1.0, 4.0)?;
+                shape.StartAnimation(&HSTRING::from("StrokeThickness"), &stroke)?;
+                Ok(())
+            })();
+            drop(dispatcher);
+            CoUninitialize();
+            result.unwrap();
+        }
     }
 }
