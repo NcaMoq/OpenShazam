@@ -1453,6 +1453,7 @@ fn logo_shadow_color(_theme: Theme) -> Color {
 
 const INNER_MASK_BOUNDS: f32 = 336.0;
 const BUTTON_CLEAR_DIAMETER: f32 = 96.0;
+const INNER_MASK_GEOMETRY_TOLERANCE: f32 = 0.01;
 
 fn inverse_circle_clip_radii(size: f32, hole: f32) -> Option<(f32, f32)> {
     (size.is_finite() && hole.is_finite() && size > 0.0 && hole >= 0.0 && hole < size)
@@ -1490,7 +1491,16 @@ unsafe fn make_inverse_circle_clip(
     })?;
     let geometry = d2d_factory.CreatePathGeometry()?;
     let sink = geometry.Open()?;
-    outer.CombineWithGeometry(&inner, D2D1_COMBINE_MODE_EXCLUDE, None, 0.25, &sink)?;
+    // This mask cuts a circle exactly at the Shazam button edge. The default
+    // 0.25-DIP flattening tolerance can leave visible facets at 125% DPI when
+    // the translucent listening ripples meet the button's translucent fill.
+    outer.CombineWithGeometry(
+        &inner,
+        D2D1_COMBINE_MODE_EXCLUDE,
+        None,
+        INNER_MASK_GEOMETRY_TOLERANCE,
+        &sink,
+    )?;
     sink.Close()?;
 
     let geometry: ID2D1Geometry = geometry.cast()?;
