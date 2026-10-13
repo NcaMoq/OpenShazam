@@ -3915,7 +3915,10 @@ fn phase_needs_timeout(phase: &MainPhase) -> bool {
 
 fn phase_needs_frame(phase: &MainPhase) -> bool {
     match phase {
-        MainPhase::Listening { .. } => true,
+        // Listening ripples are continuous Windows Composition keyframes.
+        // They do not need an 8 ms UI-thread timer; future meter values enter
+        // through a change event and update the audio transforms once per value.
+        MainPhase::Listening { .. } => false,
         MainPhase::Matched { entered_at, .. } => entered_at.elapsed() < Duration::from_millis(350),
         MainPhase::NoMatch {
             entered_at,
@@ -4753,7 +4756,7 @@ mod tests {
             mode: CaptureMode::Manual,
             started_at: std::time::Instant::now(),
         };
-        assert!(animation_needs_frame(&listening, false));
+        assert!(!animation_needs_frame(&listening, false));
     }
 
     #[test]
