@@ -78,6 +78,9 @@ impl UiLevels {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CircleFrame {
     pub diameter: f64,
+    /// Geometry diameter before the UI-level Bass transform.
+    pub shape_diameter: f64,
+    pub audio_scale: f64,
     pub opacity: f64,
     pub stroke_width: f64,
     /// Local child animation time is retained for deterministic inspection.
@@ -89,6 +92,8 @@ pub struct CircleFrame {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct OuterCircleFrame {
     pub diameter: f64,
+    /// Circle geometry size; container, ScaleNull and audio scales stay apart.
+    pub shape_diameter: f64,
     pub opacity: f64,
     pub stroke_width: f64,
     pub core_size_scale: f64,
@@ -361,15 +366,17 @@ pub fn wave_frame_at_with_auto_spring(
         let core_scale = inner_core_scale(core_local);
         let core_child_scale = inner_core_sublayer_scale(core_local);
         let null_scale = inner_scale_null(null_local);
-        let diameter = INNER_DIAMETERS[index]
+        let shape_diameter = INNER_DIAMETERS[index]
             * (inner_container_factor / 3.0)
-            * bass_scale
             * core_scale
             * core_child_scale
             * null_scale;
+        let diameter = shape_diameter * bass_scale;
         let opacity = INNER_BASE_OPACITY[index] * bass_opacity * inner_core_opacity(core_local);
         CircleFrame {
             diameter,
+            shape_diameter,
+            audio_scale: bass_scale,
             opacity: opacity.clamp(0.0, 1.0),
             stroke_width: 0.0,
             local_time: core_local,
@@ -394,6 +401,7 @@ pub fn wave_frame_at_with_auto_spring(
                 * core_size_scale
                 * scale_null
                 * treble_scale,
+            shape_diameter: OUTER_DIAMETERS[index] * core_size_scale,
             opacity: treble_opacity,
             stroke_width: outer_border_width(local),
             core_size_scale,
@@ -590,10 +598,24 @@ mod tests {
         assert_eq!(high.inner_audio_scale, 1.3);
         assert_eq!(low.inner_audio_opacity, 0.5);
         assert_eq!(high.inner_audio_opacity, 0.9);
+        close(
+            low.inner[0].shape_diameter,
+            high.inner[0].shape_diameter,
+            1e-12,
+        );
+        assert_eq!(low.inner[0].audio_scale, 0.7);
+        assert_eq!(high.inner[0].audio_scale, 1.3);
         assert_eq!(low.button_child_scale, 0.75);
         assert_eq!(high.button_child_scale, 1.1);
         assert_eq!(low.outer_audio_scale, 0.9);
         assert_eq!(high.outer_audio_scale, 1.1);
+        close(
+            low.outer[0].shape_diameter,
+            high.outer[0].shape_diameter,
+            1e-12,
+        );
+        assert_eq!(low.outer[0].audio_scale, 0.9);
+        assert_eq!(high.outer[0].audio_scale, 1.1);
         assert_eq!(low.inner_container_factor, 3.0);
         assert_eq!(low.outer_container_factor, 6.3);
     }

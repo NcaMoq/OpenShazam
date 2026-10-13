@@ -283,8 +283,10 @@ struct Renderer {
 
 #[derive(Debug)]
 struct CompositionRing {
-    visual: ShapeVisual,
+    visual: ContainerVisual,
+    geometry: CompositionEllipseGeometry,
     shape: CompositionSpriteShape,
+    core_container: Option<ContainerVisual>,
     diameter: f32,
     base_stroke_width: f32,
 }
@@ -293,13 +295,16 @@ struct CompositionScene {
     compositor: Compositor,
     _target: DesktopWindowTarget,
     root: ContainerVisual,
+    outer_audio_root: ContainerVisual,
     rings: [CompositionRing; 6],
     button: ShapeVisual,
     button_shape: CompositionSpriteShape,
     button_fill: CompositionColorBrush,
     ring_brushes: [CompositionColorBrush; 6],
     idle_animation: Vector3KeyFrameAnimation,
+    outer_scale_null_animation: Vector3KeyFrameAnimation,
     idle_active: bool,
+    ripples_active: bool,
     theme: Theme,
     body_top: f32,
 }
@@ -344,6 +349,23 @@ impl CompositionScene {
         let mut ring_brushes = Vec::with_capacity(6);
         let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
         let center_y = body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32;
+        let outer_bounds = ui_model::OUTER_DIAMETERS[0] as f32;
+        let outer_audio_root = compositor.CreateContainerVisual()?;
+        outer_audio_root.SetSize(Vector2 {
+            X: outer_bounds,
+            Y: outer_bounds,
+        })?;
+        outer_audio_root.SetCenterPoint(Vector3 {
+            X: outer_bounds * 0.5,
+            Y: outer_bounds * 0.5,
+            Z: 0.0,
+        })?;
+        outer_audio_root.SetOffset(Vector3 {
+            X: center_x - outer_bounds * 0.5,
+            Y: center_y - outer_bounds * 0.5,
+            Z: 0.0,
+        })?;
+        outer_audio_root.SetOpacity(0.0)?;
         for index in 0..6 {
             let diameter = if index < 4 {
                 ui_model::INNER_DIAMETERS[index] as f32
@@ -356,7 +378,7 @@ impl CompositionScene {
                 4.0
             };
             let brush = compositor.CreateColorBrushWithColor(ring_color)?;
-            let visual = compositor.CreateShapeVisual()?;
+            let visual = compositor.CreateContainerVisual()?;
             visual.SetSize(Vector2 {
                 X: diameter,
                 Y: diameter,
@@ -367,8 +389,16 @@ impl CompositionScene {
                 Z: 0.0,
             })?;
             visual.SetOffset(Vector3 {
-                X: center_x - diameter * 0.5,
-                Y: center_y - diameter * 0.5,
+                X: if index < 4 {
+                    center_x - diameter * 0.5
+                } else {
+                    (outer_bounds - diameter) * 0.5
+                },
+                Y: if index < 4 {
+                    center_y - diameter * 0.5
+                } else {
+                    (outer_bounds - diameter) * 0.5
+                },
                 Z: 0.0,
             })?;
             visual.SetOpacity(0.0)?;
@@ -382,14 +412,45 @@ impl CompositionScene {
                 X: diameter * 0.5,
                 Y: diameter * 0.5,
             })?;
+            let shape_visual = compositor.CreateShapeVisual()?;
+            shape_visual.SetSize(Vector2 {
+                X: diameter,
+                Y: diameter,
+            })?;
+            shape_visual.SetCenterPoint(Vector3 {
+                X: diameter * 0.5,
+                Y: diameter * 0.5,
+                Z: 0.0,
+            })?;
             let shape = compositor.CreateSpriteShapeWithGeometry(&geometry)?;
             shape.SetStrokeBrush(&brush)?;
             shape.SetStrokeThickness(base_stroke_width)?;
-            visual.Shapes()?.Append(&shape)?;
+            shape_visual.Shapes()?.Append(&shape)?;
+            let core_container = if index < 4 {
+                visual.Children()?.InsertAtTop(&shape_visual)?;
+                None
+            } else {
+                let container = compositor.CreateContainerVisual()?;
+                container.SetSize(Vector2 {
+                    X: diameter,
+                    Y: diameter,
+                })?;
+                container.SetCenterPoint(Vector3 {
+                    X: diameter * 0.5,
+                    Y: diameter * 0.5,
+                    Z: 0.0,
+                })?;
+                container.Children()?.InsertAtTop(&shape_visual)?;
+                visual.Children()?.InsertAtTop(&container)?;
+                outer_audio_root.Children()?.InsertAtTop(&visual)?;
+                Some(container)
+            };
             ring_brushes.push(brush);
             rings.push(CompositionRing {
                 visual,
+                geometry,
                 shape,
+                core_container,
                 diameter,
                 base_stroke_width,
             });
@@ -467,9 +528,7 @@ impl CompositionScene {
             children.InsertAtTop(&ring.visual)?;
         }
         children.InsertAtTop(&button)?;
-        for ring in &rings[4..] {
-            children.InsertAtTop(&ring.visual)?;
-        }
+        children.InsertAtTop(&outer_audio_root)?;
 
         let easing = compositor.CreateCubicBezierEasingFunction(
             Vector2 { X: 0.44, Y: 0.05 },
@@ -506,19 +565,53 @@ impl CompositionScene {
             },
             &easing,
         )?;
+        let outer_scale_null_animation = compositor.CreateVector3KeyFrameAnimation()?;
+        outer_scale_null_animation.SetDuration(TimeSpan {
+            // Windows.Foundation.TimeSpan uses 100ns ticks.
+            Duration: 15_833_334,
+        })?;
+        outer_scale_null_animation.SetIterationBehavior(AnimationIterationBehavior::Forever)?;
+        outer_scale_null_animation.InsertKeyFrame(
+            0.0,
+            Vector3 {
+                X: 1.0,
+                Y: 1.0,
+                Z: 1.0,
+            },
+        )?;
+        outer_scale_null_animation.InsertKeyFrame(
+            0.657_894_73,
+            Vector3 {
+                X: 1.0,
+                Y: 1.0,
+                Z: 1.0,
+            },
+        )?;
+        outer_scale_null_animation.InsertKeyFrameWithEasingFunction(
+            1.0,
+            Vector3 {
+                X: 0.93,
+                Y: 0.93,
+                Z: 1.0,
+            },
+            &easing,
+        )?;
         target.SetRoot(&root)?;
 
         Ok(Self {
             compositor: compositor.clone(),
             _target: target,
             root,
+            outer_audio_root,
             rings,
             button,
             button_shape,
             button_fill,
             ring_brushes,
             idle_animation,
+            outer_scale_null_animation,
             idle_active: false,
+            ripples_active: false,
             theme,
             body_top,
         })
@@ -547,11 +640,18 @@ impl CompositionScene {
                 self.compositor
                     .CreateInsetClipWithInsets(0.0, 0.0, 0.0, bottom_inset.max(0.0))?;
             self.root.SetClip(&clip)?;
-            for ring in &self.rings {
+            let outer_bounds = ui_model::OUTER_DIAMETERS[0] as f32;
+            let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
+            let center_y = snapshot.body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32;
+            self.outer_audio_root.SetOffset(Vector3 {
+                X: center_x - outer_bounds * 0.5,
+                Y: center_y - outer_bounds * 0.5,
+                Z: 0.0,
+            })?;
+            for ring in &self.rings[..4] {
                 ring.visual.SetOffset(Vector3 {
-                    X: (BUTTON_X + BUTTON_SIZE * 0.5) as f32 - ring.diameter * 0.5,
-                    Y: snapshot.body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32
-                        - ring.diameter * 0.5,
+                    X: center_x - ring.diameter * 0.5,
+                    Y: center_y - ring.diameter * 0.5,
                     Z: 0.0,
                 })?;
             }
@@ -565,7 +665,31 @@ impl CompositionScene {
         self.button
             .SetOpacity(if snapshot.show_button { 1.0 } else { 0.0 })?;
 
+        if snapshot.show_ripples && !self.ripples_active {
+            for ring in &self.rings[4..] {
+                ring.visual
+                    .StartAnimation(&HSTRING::from("Scale"), &self.outer_scale_null_animation)?;
+            }
+            self.ripples_active = true;
+        } else if !snapshot.show_ripples && self.ripples_active {
+            for ring in &self.rings[4..] {
+                ring.visual.StopAnimation(&HSTRING::from("Scale"))?;
+                ring.visual.SetScale(Vector3 {
+                    X: 1.0,
+                    Y: 1.0,
+                    Z: 1.0,
+                })?;
+            }
+            self.ripples_active = false;
+        }
+
         if !snapshot.show_ripples {
+            self.outer_audio_root.SetOpacity(0.0)?;
+            self.outer_audio_root.SetScale(Vector3 {
+                X: 1.0,
+                Y: 1.0,
+                Z: 1.0,
+            })?;
             for ring in &self.rings {
                 ring.visual.SetOpacity(0.0)?;
                 ring.visual.SetScale(Vector3 {
@@ -574,6 +698,17 @@ impl CompositionScene {
                     Z: 1.0,
                 })?;
                 ring.shape.SetStrokeThickness(ring.base_stroke_width)?;
+                ring.geometry.SetRadius(Vector2 {
+                    X: ring.diameter * 0.5,
+                    Y: ring.diameter * 0.5,
+                })?;
+                if let Some(container) = &ring.core_container {
+                    container.SetScale(Vector3 {
+                        X: 1.0,
+                        Y: 1.0,
+                        Z: 1.0,
+                    })?;
+                }
             }
         } else {
             if self.idle_active {
@@ -588,26 +723,41 @@ impl CompositionScene {
             );
             for index in 0..4 {
                 let circle = frame.inner[index];
-                let scale = (circle.diameter as f32 / self.rings[index].diameter).max(0.0);
+                let ring = &self.rings[index];
+                ring.geometry.SetRadius(Vector2 {
+                    X: circle.shape_diameter as f32 * 0.5,
+                    Y: circle.shape_diameter as f32 * 0.5,
+                })?;
                 self.rings[index].visual.SetScale(Vector3 {
-                    X: scale,
-                    Y: scale,
+                    X: circle.audio_scale as f32,
+                    Y: circle.audio_scale as f32,
                     Z: 1.0,
                 })?;
                 self.rings[index].visual.SetOpacity(circle.opacity as f32)?;
             }
+            self.outer_audio_root.SetScale(Vector3 {
+                X: frame.outer_audio_scale as f32,
+                Y: frame.outer_audio_scale as f32,
+                Z: 1.0,
+            })?;
+            self.outer_audio_root
+                .SetOpacity(frame.outer_audio_opacity as f32)?;
             for index in 0..2 {
                 let ring_index = index + 4;
                 let circle = frame.outer[index];
-                let scale = (circle.diameter as f32 / self.rings[ring_index].diameter).max(0.0);
-                self.rings[ring_index].visual.SetScale(Vector3 {
-                    X: scale,
-                    Y: scale,
-                    Z: 1.0,
+                let ring = &self.rings[ring_index];
+                ring.visual.SetOpacity(1.0)?;
+                ring.geometry.SetRadius(Vector2 {
+                    X: circle.shape_diameter as f32 * 0.5,
+                    Y: circle.shape_diameter as f32 * 0.5,
                 })?;
-                self.rings[ring_index]
-                    .visual
-                    .SetOpacity(circle.opacity as f32)?;
+                if let Some(container) = &ring.core_container {
+                    container.SetScale(Vector3 {
+                        X: circle.container_scale as f32,
+                        Y: circle.container_scale as f32,
+                        Z: 1.0,
+                    })?;
+                }
                 self.rings[ring_index]
                     .shape
                     .SetStrokeThickness(circle.stroke_width as f32)?;
