@@ -25,6 +25,7 @@ use windows::{
     System::DispatcherQueueController,
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Globalization::GetUserDefaultUILanguage,
         Graphics::{
             Direct2D::{
                 Common::{
@@ -33,14 +34,20 @@ use windows::{
                     D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP,
                     D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
                 },
-                D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1Geometry,
-                ID2D1HwndRenderTarget, ID2D1Layer, ID2D1LinearGradientBrush, ID2D1RenderTarget,
-                ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_COMBINE_MODE_UNION,
-                D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                D2D1_GAMMA_2_2, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_OPTIONS_NONE,
+                D2D1CreateDevice, D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Device,
+                ID2D1DeviceContext, ID2D1Factory, ID2D1Geometry, ID2D1HwndRenderTarget, ID2D1Layer,
+                ID2D1LinearGradientBrush, ID2D1RenderTarget, ID2D1SolidColorBrush,
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_COMBINE_MODE_UNION, D2D1_ELLIPSE,
+                D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
+                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_OPTIONS_NONE,
                 D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 D2D1_RENDER_TARGET_USAGE_NONE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+            },
+            Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0},
+            Direct3D11::{
+                D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_SDK_VERSION,
             },
             DirectWrite::{
                 DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
@@ -51,6 +58,7 @@ use windows::{
                 DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_WORD_WRAPPING_WRAP,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Dxgi::IDXGIDevice,
             Gdi::{
                 BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
                 GetMonitorInfoW, InvalidateRect, MonitorFromRect, SelectObject, AC_SRC_ALPHA,
@@ -104,28 +112,17 @@ use windows::{
         Composition::{
             AnimationIterationBehavior, CompositionColorBrush, CompositionEllipseGeometry,
             CompositionPath, CompositionPathGeometry, CompositionSpriteShape, Compositor,
-            ContainerVisual, CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow,
-            ScalarKeyFrameAnimation, ShapeVisual, Vector2KeyFrameAnimation,
+            ContainerVisual, CubicBezierEasingFunction, Desktop::DesktopWindowTarget,
+            ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual, Vector2KeyFrameAnimation,
             Vector3KeyFrameAnimation,
         },
     },
 };
 
-#[cfg(test)]
 use windows::{
     Foundation::Size,
     Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat},
-    Win32::Graphics::Direct2D::{
-        D2D1CreateDevice, ID2D1Device, ID2D1DeviceContext, D2D1_PRIMITIVE_BLEND_COPY,
-        D2D1_PRIMITIVE_BLEND_SOURCE_OVER,
-    },
-    Win32::Graphics::{
-        Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0},
-        Direct3D11::{
-            D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-        },
-        Dxgi::IDXGIDevice,
-    },
+    Win32::Graphics::Direct2D::{D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER},
     Win32::System::WinRT::Composition::{ICompositionDrawingSurfaceInterop, ICompositorInterop},
     UI::Composition::{CompositionDrawingSurface, CompositionMaskBrush, CompositionSurfaceBrush},
 };
@@ -158,6 +155,28 @@ const ABOUT_WIDTH: f64 = 600.0;
 const ABOUT_HEIGHT: f64 = 320.0;
 const MIC_INFO_WIDTH: f64 = CONTENT_WIDTH;
 const MIC_INFO_HEIGHT: f64 = 190.0;
+const OUTER_BASE_OPACITY: [f32; 2] = [0.4, 0.6];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NativeIconLayout {
+    settings_visual: [f32; 4],
+    settings_hit: [f32; 4],
+    cancel_visual: [f32; 4],
+    cancel_hit: [f32; 4],
+}
+
+fn native_icon_layout(body_top: f32) -> NativeIconLayout {
+    NativeIconLayout {
+        settings_visual: [349.0, body_top + 25.0, 365.0, body_top + 41.0],
+        settings_hit: [342.0, body_top + 20.0, 372.0, body_top + 48.0],
+        cancel_visual: [351.0, body_top + 27.0, 363.0, body_top + 39.0],
+        cancel_hit: [342.0, body_top + 20.0, 372.0, body_top + 48.0],
+    }
+}
+
+fn point_in_rect(point_x: f32, point_y: f32, bounds: [f32; 4]) -> bool {
+    (bounds[0]..=bounds[2]).contains(&point_x) && (bounds[1]..=bounds[3]).contains(&point_y)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowKind {
@@ -210,6 +229,14 @@ enum MainPhase {
     Error {
         message: String,
         entered_at: Instant,
+    },
+    Timeout {
+        mode: CaptureMode,
+        entered_at: Instant,
+    },
+    Offline {
+        entered_at: Instant,
+        returned_to_ready_at: Option<Instant>,
     },
 }
 
@@ -420,8 +447,9 @@ impl Drop for LayeredSurface {
 #[derive(Debug)]
 struct CompositionRing {
     visual: ContainerVisual,
-    geometry: CompositionEllipseGeometry,
-    shape: CompositionSpriteShape,
+    geometry: Option<CompositionEllipseGeometry>,
+    shape: Option<CompositionSpriteShape>,
+    _masked_fill: Option<SpriteVisual>,
     core_container: Option<ContainerVisual>,
     sublayer_container: Option<ContainerVisual>,
     inner_animations: Option<InnerRingAnimations>,
@@ -430,6 +458,7 @@ struct CompositionRing {
     border_animation: Option<ScalarKeyFrameAnimation>,
     diameter: f32,
     base_stroke_width: f32,
+    base_opacity: f32,
 }
 
 #[derive(Debug)]
@@ -460,15 +489,15 @@ impl IGeometrySource2DInterop_Impl for D2DCompositionGeometrySource_Impl {
     }
 }
 
-/// Cached GPU alpha mask backed by a Composition drawing surface. The mask is
-/// opaque outside a centered circular cutout; the surface is authored once and
-/// can be sampled by independent CompositionMaskBrush instances/transforms.
-#[cfg(test)]
+/// Cached GPU alpha mask backed by a Composition drawing surface. Each surface
+/// contains a filled circle with a centered transparent cutout at the requested
+/// DPI, ready for a SpriteVisual and a CompositionMaskBrush.
 #[derive(Debug)]
 struct CompositionAlphaMask {
     _surface: CompositionDrawingSurface,
     _surface_brush: CompositionSurfaceBrush,
     brush: CompositionMaskBrush,
+    source: CompositionColorBrush,
 }
 
 #[derive(Debug)]
@@ -481,7 +510,6 @@ struct CompositionLogo {
     _long_geometries: [CompositionPathGeometry; 2],
     transparent_brush: CompositionColorBrush,
     _solid_brush: CompositionColorBrush,
-    shadow: DropShadow,
     transparent_trim_animation: ScalarKeyFrameAnimation,
     solid_trim_animation: ScalarKeyFrameAnimation,
     long_fade_animation: ScalarKeyFrameAnimation,
@@ -564,15 +592,6 @@ impl CompositionLogo {
         long_visual.SetOpacity(1.0)?;
         final_visual.SetOpacity(0.0)?;
 
-        let shadow = compositor.CreateDropShadow()?;
-        shadow.SetBlurRadius(1.0)?;
-        shadow.SetOffset(Vector3 {
-            X: 0.5,
-            Y: 1.0,
-            Z: 0.0,
-        })?;
-        shadow.SetOpacity(1.0)?;
-        shadow.SetColor(logo_shadow_color(theme))?;
         let transparent_root = compositor.CreateLayerVisual()?;
         transparent_root.SetSize(Vector2 {
             X: SHZ_LOGO_SOURCE_SIZE,
@@ -581,7 +600,6 @@ impl CompositionLogo {
         transparent_root
             .Children()?
             .InsertAtTop(&transparent_visual)?;
-        transparent_root.SetShadow(&shadow)?;
 
         let visual = compositor.CreateContainerVisual()?;
         visual.SetSize(Vector2 {
@@ -649,7 +667,6 @@ impl CompositionLogo {
         Ok(Self {
             transparent_brush,
             _solid_brush: solid_brush,
-            shadow,
             visual,
             _transparent_visual: transparent_visual,
             long_visual,
@@ -705,8 +722,7 @@ impl CompositionLogo {
 
     fn set_theme(&self, theme: Theme) -> windows::core::Result<()> {
         self.transparent_brush
-            .SetColor(logo_transparent_color(theme))?;
-        self.shadow.SetColor(logo_shadow_color(theme))
+            .SetColor(logo_transparent_color(theme))
     }
 }
 
@@ -901,40 +917,71 @@ unsafe fn make_logo_visual<const N: usize>(
     Ok((visual, geometries))
 }
 
-unsafe fn make_inner_ring_geometry(
+fn button_border_arc_points() -> [(f32, f32); 4] {
+    let center_x = BUTTON_SIZE * 0.5;
+    let center_y = BUTTON_SIZE * 0.5 + 2.0;
+    let radius = BUTTON_SIZE * 0.5 + 1.0;
+    // NSBezierPath's appendArc selector uses degrees. The native value π is
+    // therefore a 3.14159-degree arc, not a half-circle.
+    let start_angle = 0.0f64;
+    let end_angle = std::f64::consts::PI.to_radians();
+    let tangent = (end_angle - start_angle) * 0.25;
+    let control_scale = 4.0 / 3.0 * tangent.tan();
+    let point = |angle: f64| {
+        (
+            (center_x + radius * angle.cos()) as f32,
+            (center_y + radius * angle.sin()) as f32,
+        )
+    };
+    let derivative = |angle: f64| (-radius * angle.sin(), radius * angle.cos());
+    let p0 = point(start_angle);
+    let p3 = point(end_angle);
+    let d0 = derivative(start_angle);
+    let d1 = derivative(end_angle);
+    [
+        p0,
+        (
+            (p0.0 as f64 + control_scale * d0.0) as f32,
+            (p0.1 as f64 + control_scale * d0.1) as f32,
+        ),
+        (
+            (p3.0 as f64 - control_scale * d1.0) as f32,
+            (p3.1 as f64 - control_scale * d1.1) as f32,
+        ),
+        p3,
+    ]
+}
+
+unsafe fn make_button_border_arc_geometry(
     compositor: &Compositor,
     d2d_factory: &ID2D1Factory,
-    diameter: f32,
 ) -> windows::core::Result<CompositionPathGeometry> {
-    let center = Vector2 {
-        X: diameter * 0.5,
-        Y: diameter * 0.5,
-    };
-    let outer = d2d_factory.CreateEllipseGeometry(&D2D1_ELLIPSE {
-        point: center,
-        radiusX: diameter * 0.5,
-        radiusY: diameter * 0.5,
-    })?;
-    let inner = d2d_factory.CreateEllipseGeometry(&D2D1_ELLIPSE {
-        point: center,
-        radiusX: BUTTON_SIZE as f32 * 0.5,
-        radiusY: BUTTON_SIZE as f32 * 0.5,
-    })?;
-    let annulus = d2d_factory.CreatePathGeometry()?;
-    let sink = annulus.Open()?;
-    outer.CombineWithGeometry(
-        &inner,
-        windows::Win32::Graphics::Direct2D::D2D1_COMBINE_MODE_EXCLUDE,
-        None,
-        0.25,
-        &sink,
-    )?;
+    let [start, control1, control2, end] = button_border_arc_points();
+    let geometry = d2d_factory.CreatePathGeometry()?;
+    let sink = geometry.Open()?;
+    sink.BeginFigure(
+        Vector2 {
+            X: start.0,
+            Y: start.1,
+        },
+        D2D1_FIGURE_BEGIN_HOLLOW,
+    );
+    sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+        point1: Vector2 {
+            X: control1.0,
+            Y: control1.1,
+        },
+        point2: Vector2 {
+            X: control2.0,
+            Y: control2.1,
+        },
+        point3: Vector2 { X: end.0, Y: end.1 },
+    });
+    sink.EndFigure(D2D1_FIGURE_END_OPEN);
     sink.Close()?;
-
-    let annulus: ID2D1Geometry = annulus.cast()?;
-    let source: IGeometrySource2D = D2DCompositionGeometrySource { geometry: annulus }.into();
-    let path = CompositionPath::Create(&source)?;
-    compositor.CreatePathGeometryWithPath(&path)
+    let geometry: ID2D1Geometry = geometry.cast()?;
+    let source: IGeometrySource2D = D2DCompositionGeometrySource { geometry }.into();
+    compositor.CreatePathGeometryWithPath(&CompositionPath::Create(&source)?)
 }
 
 unsafe fn make_logo_path_geometry<const N: usize>(
@@ -1039,14 +1086,6 @@ fn logo_transparent_color(theme: Theme) -> Color {
     }
 }
 
-fn logo_shadow_color(theme: Theme) -> Color {
-    match theme {
-        Theme::Light => composition_color(51, 255, 255, 255),
-        Theme::Dark => composition_color(255, 0, 0, 0),
-    }
-}
-
-#[cfg(test)]
 #[derive(Debug)]
 struct CompositionMaskFactory {
     _compositor: Compositor,
@@ -1055,7 +1094,6 @@ struct CompositionMaskFactory {
     graphics_device: windows::UI::Composition::CompositionGraphicsDevice,
 }
 
-#[cfg(test)]
 impl CompositionMaskFactory {
     unsafe fn new(compositor: &Compositor) -> windows::core::Result<Self> {
         let d3d_device =
@@ -1079,7 +1117,6 @@ impl CompositionMaskFactory {
         })
     }
 
-    #[cfg(test)]
     unsafe fn inverse_circle(
         &self,
         size_dips: f32,
@@ -1090,7 +1127,6 @@ impl CompositionMaskFactory {
     }
 }
 
-#[cfg(test)]
 impl CompositionAlphaMask {
     unsafe fn inverse_circle(
         factory: &CompositionMaskFactory,
@@ -1149,15 +1185,24 @@ impl CompositionAlphaMask {
                 right: update_offset.x as f32 * 96.0 / dpi.max(96) as f32 + size_dips,
                 bottom: update_offset.y as f32 * 96.0 / dpi.max(96) as f32 + size_dips,
             };
-            draw_context.FillRectangle(&bounds, &opaque);
+            let center = Vector2 {
+                X: (bounds.left + bounds.right) * 0.5,
+                Y: (bounds.top + bounds.bottom) * 0.5,
+            };
+            let outer_radius = size_dips.max(0.0) * 0.5;
+            draw_context.FillEllipse(
+                &D2D1_ELLIPSE {
+                    point: center,
+                    radiusX: outer_radius,
+                    radiusY: outer_radius,
+                },
+                &opaque,
+            );
             draw_context.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
             let radius = hole_diameter_dips.max(0.0) * 0.5;
             draw_context.FillEllipse(
                 &D2D1_ELLIPSE {
-                    point: Vector2 {
-                        X: (bounds.left + bounds.right) * 0.5,
-                        Y: (bounds.top + bounds.bottom) * 0.5,
-                    },
+                    point: center,
                     radiusX: radius,
                     radiusY: radius,
                 },
@@ -1192,20 +1237,23 @@ impl CompositionAlphaMask {
             _surface: surface,
             _surface_brush: surface_brush,
             brush,
+            source,
         })
     }
 
     fn brush(&self) -> &CompositionMaskBrush {
         &self.brush
     }
+
+    fn set_color(&self, color: Color) -> windows::core::Result<()> {
+        self.source.SetColor(color)
+    }
 }
 
-#[cfg(test)]
 fn mask_error(error: Error, context: &str) -> Error {
     Error::new(error.code(), format!("{context}: {error}"))
 }
 
-#[cfg(test)]
 unsafe fn create_mask_d3d_device() -> windows::core::Result<ID3D11Device> {
     let feature_levels = [D3D_FEATURE_LEVEL_11_0];
     let mut device = None;
@@ -1246,11 +1294,12 @@ struct CompositionScene {
     rings: [CompositionRing; 6],
     button: ContainerVisual,
     button_content: ContainerVisual,
-    button_shape: CompositionSpriteShape,
     button_fill: CompositionColorBrush,
     logo: CompositionLogo,
     no_match_icon_transform: ContainerVisual,
-    ring_brushes: [CompositionColorBrush; 6],
+    ring_brushes: [CompositionColorBrush; 2],
+    inner_alpha_masks: [CompositionAlphaMask; 4],
+    _mask_factory: CompositionMaskFactory,
     idle_animation: Vector3KeyFrameAnimation,
     outer_scale_null_animation: Vector3KeyFrameAnimation,
     idle_active: bool,
@@ -1310,12 +1359,24 @@ impl CompositionScene {
         root.SetClip(&clip)?;
 
         let ring_color = composition_tagging_color(theme);
+        let mask_factory = unsafe { CompositionMaskFactory::new(compositor)? };
+        let inner_alpha_masks: [CompositionAlphaMask; 4] = ui_model::INNER_DIAMETERS
+            .iter()
+            .map(|diameter| unsafe {
+                mask_factory.inverse_circle(*diameter as f32, BUTTON_SIZE as f32, dpi)
+            })
+            .collect::<windows::core::Result<Vec<_>>>()?
+            .try_into()
+            .expect("four cached inner circle masks");
+        for mask in &inner_alpha_masks {
+            mask.set_color(ring_color)?;
+        }
         let easing = compositor.CreateCubicBezierEasingFunction(
             Vector2 { X: 0.44, Y: 0.05 },
             Vector2 { X: 0.55, Y: 0.95 },
         )?;
         let mut rings = Vec::with_capacity(6);
-        let mut ring_brushes = Vec::with_capacity(6);
+        let mut ring_brushes = Vec::with_capacity(2);
         let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
         let center_y = body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32;
         let inner_bounds = ui_model::INNER_DIAMETERS[0] as f32;
@@ -1352,6 +1413,8 @@ impl CompositionScene {
             Z: 0.0,
         })?;
         outer_audio_root.SetOpacity(0.0)?;
+        #[allow(clippy::needless_range_loop)]
+        // Scene indices also select paired native animation tracks.
         for index in 0..6 {
             let diameter = if index < 4 {
                 ui_model::INNER_DIAMETERS[index] as f32
@@ -1359,7 +1422,16 @@ impl CompositionScene {
                 ui_model::OUTER_DIAMETERS[index - 4] as f32
             };
             let base_stroke_width = if index < 4 { 0.0 } else { 4.0 };
-            let brush = compositor.CreateColorBrushWithColor(ring_color)?;
+            let base_opacity = if index < 4 {
+                1.0
+            } else {
+                OUTER_BASE_OPACITY[index - 4]
+            };
+            let brush = if index >= 4 {
+                Some(compositor.CreateColorBrushWithColor(ring_color)?)
+            } else {
+                None
+            };
             let visual = compositor.CreateContainerVisual()?;
             visual.SetSize(Vector2 {
                 X: diameter,
@@ -1385,38 +1457,41 @@ impl CompositionScene {
             })?;
             visual.SetOpacity(0.0)?;
 
-            let geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
-            geometry.SetCenter(Vector2 {
-                X: diameter * 0.5,
-                Y: diameter * 0.5,
-            })?;
-            geometry.SetRadius(Vector2 {
-                X: diameter * 0.5,
-                Y: diameter * 0.5,
-            })?;
-            let shape_visual = compositor.CreateShapeVisual()?;
-            shape_visual.SetSize(Vector2 {
-                X: diameter,
-                Y: diameter,
-            })?;
-            shape_visual.SetCenterPoint(Vector3 {
-                X: diameter * 0.5,
-                Y: diameter * 0.5,
-                Z: 0.0,
-            })?;
-            let shape = if index < 4 {
-                let masked_geometry =
-                    unsafe { make_inner_ring_geometry(compositor, d2d_factory, diameter)? };
-                let shape = compositor.CreateSpriteShapeWithGeometry(&masked_geometry)?;
-                shape.SetFillBrush(&brush)?;
-                shape
+            let (geometry, shape, masked_fill) = if index < 4 {
+                let sprite = compositor.CreateSpriteVisual()?;
+                sprite.SetSize(Vector2 {
+                    X: diameter,
+                    Y: diameter,
+                })?;
+                sprite.SetBrush(inner_alpha_masks[index].brush())?;
+                (None, None, Some(sprite))
             } else {
+                let geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
+                geometry.SetCenter(Vector2 {
+                    X: diameter * 0.5,
+                    Y: diameter * 0.5,
+                })?;
+                geometry.SetRadius(Vector2 {
+                    X: diameter * 0.5,
+                    Y: diameter * 0.5,
+                })?;
+                let shape_visual = compositor.CreateShapeVisual()?;
+                shape_visual.SetSize(Vector2 {
+                    X: diameter,
+                    Y: diameter,
+                })?;
+                shape_visual.SetCenterPoint(Vector3 {
+                    X: diameter * 0.5,
+                    Y: diameter * 0.5,
+                    Z: 0.0,
+                })?;
+                let brush = brush.as_ref().expect("outer ring brush");
                 let shape = compositor.CreateSpriteShapeWithGeometry(&geometry)?;
-                shape.SetStrokeBrush(&brush)?;
+                shape.SetStrokeBrush(brush)?;
                 shape.SetStrokeThickness(base_stroke_width)?;
-                shape
+                shape_visual.Shapes()?.Append(&shape)?;
+                (Some(geometry), Some(shape), None)
             };
-            shape_visual.Shapes()?.Append(&shape)?;
             let (core_container, sublayer_container) = if index < 4 {
                 let core = compositor.CreateContainerVisual()?;
                 core.SetSize(Vector2 {
@@ -1438,7 +1513,9 @@ impl CompositionScene {
                     Y: diameter * 0.5,
                     Z: 0.0,
                 })?;
-                sublayer.Children()?.InsertAtTop(&shape_visual)?;
+                sublayer
+                    .Children()?
+                    .InsertAtTop(masked_fill.as_ref().expect("inner masked fill"))?;
                 core.Children()?.InsertAtTop(&sublayer)?;
                 visual.Children()?.InsertAtTop(&core)?;
                 inner_audio_root.Children()?.InsertAtTop(&visual)?;
@@ -1454,6 +1531,19 @@ impl CompositionScene {
                     Y: diameter * 0.5,
                     Z: 0.0,
                 })?;
+                let shape_visual = compositor.CreateShapeVisual()?;
+                shape_visual.SetSize(Vector2 {
+                    X: diameter,
+                    Y: diameter,
+                })?;
+                shape_visual.SetCenterPoint(Vector3 {
+                    X: diameter * 0.5,
+                    Y: diameter * 0.5,
+                    Z: 0.0,
+                })?;
+                shape_visual
+                    .Shapes()?
+                    .Append(shape.as_ref().expect("outer ring shape"))?;
                 container.Children()?.InsertAtTop(&shape_visual)?;
                 visual.Children()?.InsertAtTop(&container)?;
                 outer_audio_root.Children()?.InsertAtTop(&visual)?;
@@ -1549,11 +1639,14 @@ impl CompositionScene {
             } else {
                 None
             };
-            ring_brushes.push(brush);
+            if let Some(brush) = brush {
+                ring_brushes.push(brush);
+            }
             rings.push(CompositionRing {
                 visual,
                 geometry,
                 shape,
+                _masked_fill: masked_fill,
                 core_container,
                 sublayer_container,
                 inner_animations,
@@ -1562,12 +1655,13 @@ impl CompositionScene {
                 border_animation,
                 diameter,
                 base_stroke_width,
+                base_opacity,
             });
         }
         let rings: [CompositionRing; 6] = rings.try_into().expect("six composition ring visuals");
-        let ring_brushes: [CompositionColorBrush; 6] = ring_brushes
+        let ring_brushes: [CompositionColorBrush; 2] = ring_brushes
             .try_into()
-            .expect("six composition ring brushes");
+            .expect("two outer composition ring brushes");
 
         let button = compositor.CreateContainerVisual()?;
         button.SetSize(Vector2 {
@@ -1609,9 +1703,14 @@ impl CompositionScene {
         })?;
         let button_shape = compositor.CreateSpriteShapeWithGeometry(&button_geometry)?;
         button_shape.SetFillBrush(&button_fill)?;
-        button_shape.SetStrokeBrush(&button_edge)?;
-        button_shape.SetStrokeThickness(1.0)?;
         button_shape_visual.Shapes()?.Append(&button_shape)?;
+        let button_border_geometry =
+            unsafe { make_button_border_arc_geometry(compositor, d2d_factory)? };
+        let button_border_shape =
+            compositor.CreateSpriteShapeWithGeometry(&button_border_geometry)?;
+        button_border_shape.SetStrokeBrush(&button_edge)?;
+        button_border_shape.SetStrokeThickness(1.0)?;
+        button_shape_visual.Shapes()?.Append(&button_border_shape)?;
         let mut logo = unsafe { CompositionLogo::new(d2d_factory, compositor, theme)? };
         let button_content = compositor.CreateContainerVisual()?;
         button_content.SetSize(Vector2 {
@@ -1725,11 +1824,12 @@ impl CompositionScene {
             rings,
             button,
             button_content,
-            button_shape,
             button_fill,
             logo,
             no_match_icon_transform,
             ring_brushes,
+            inner_alpha_masks,
+            _mask_factory: mask_factory,
             idle_animation,
             outer_scale_null_animation,
             idle_active: false,
@@ -1749,6 +1849,25 @@ impl CompositionScene {
         if self.dpi == dpi {
             return Ok(());
         }
+        let masks: [CompositionAlphaMask; 4] = ui_model::INNER_DIAMETERS
+            .iter()
+            .map(|diameter| unsafe {
+                self._mask_factory
+                    .inverse_circle(*diameter as f32, BUTTON_SIZE as f32, dpi)
+            })
+            .collect::<windows::core::Result<Vec<_>>>()?
+            .try_into()
+            .expect("four cached inner circle masks");
+        for mask in &masks {
+            mask.set_color(composition_tagging_color(self.theme))?;
+        }
+        for (ring, mask) in self.rings[..4].iter().zip(&masks) {
+            ring._masked_fill
+                .as_ref()
+                .expect("inner ring masked fill")
+                .SetBrush(mask.brush())?;
+        }
+        self.inner_alpha_masks = masks;
         self.dpi = dpi;
         let scale = composition_scale_for_dpi(dpi);
         self.root.SetScale(Vector3 {
@@ -1765,9 +1884,11 @@ impl CompositionScene {
             for brush in &self.ring_brushes {
                 brush.SetColor(composition_tagging_color(self.theme))?;
             }
+            for mask in &self.inner_alpha_masks {
+                mask.set_color(composition_tagging_color(self.theme))?;
+            }
             self.button_fill
                 .SetColor(composition_color(77, 255, 255, 255))?;
-            self.button_shape.SetStrokeThickness(1.0)?;
         }
 
         if self.body_top != snapshot.body_top {
@@ -1877,7 +1998,7 @@ impl CompositionScene {
                 }
             }
             for ring in &self.rings[4..] {
-                ring.visual.SetOpacity(1.0)?;
+                ring.visual.SetOpacity(ring.base_opacity)?;
                 ring.visual
                     .StartAnimation(&HSTRING::from("Scale"), &self.outer_scale_null_animation)?;
                 if let (Some(container), Some(scale)) = (
@@ -1891,8 +2012,12 @@ impl CompositionScene {
                     ring.border_animation.as_ref(),
                 ) {
                     ring.geometry
+                        .as_ref()
+                        .expect("outer ring geometry")
                         .StartAnimation(&HSTRING::from("Radius"), size)?;
                     ring.shape
+                        .as_ref()
+                        .expect("outer ring shape")
                         .StartAnimation(&HSTRING::from("StrokeThickness"), border)?;
                 }
             }
@@ -1918,9 +2043,12 @@ impl CompositionScene {
                 if let Some(container) = &ring.core_container {
                     container.StopAnimation(&HSTRING::from("Scale"))?;
                 }
-                ring.geometry.StopAnimation(&HSTRING::from("Radius"))?;
-                ring.shape
-                    .StopAnimation(&HSTRING::from("StrokeThickness"))?;
+                if let Some(geometry) = &ring.geometry {
+                    geometry.StopAnimation(&HSTRING::from("Radius"))?;
+                }
+                if let Some(shape) = &ring.shape {
+                    shape.StopAnimation(&HSTRING::from("StrokeThickness"))?;
+                }
                 ring.visual.SetScale(Vector3 {
                     X: 1.0,
                     Y: 1.0,
@@ -1945,11 +2073,15 @@ impl CompositionScene {
             })?;
             for ring in &self.rings {
                 ring.visual.SetOpacity(0.0)?;
-                ring.shape.SetStrokeThickness(ring.base_stroke_width)?;
-                ring.geometry.SetRadius(Vector2 {
-                    X: ring.diameter * 0.5,
-                    Y: ring.diameter * 0.5,
-                })?;
+                if let Some(shape) = &ring.shape {
+                    shape.SetStrokeThickness(ring.base_stroke_width)?;
+                }
+                if let Some(geometry) = &ring.geometry {
+                    geometry.SetRadius(Vector2 {
+                        X: ring.diameter * 0.5,
+                        Y: ring.diameter * 0.5,
+                    })?;
+                }
                 if let Some(container) = &ring.core_container {
                     container.SetScale(Vector3 {
                         X: 1.0,
@@ -2636,7 +2768,7 @@ impl Renderer {
             // UI-156: the tagging view owns this gradient from its initial
             // Ready state onward. Listening and Auto use the same colors;
             // result and NoMatch panels are separate overlays below.
-            MainPhase::Ready | MainPhase::Error { .. } => {
+            MainPhase::Ready | MainPhase::Error { .. } | MainPhase::Timeout { .. } => {
                 self.fill_gradient_rect(
                     &rect(
                         0.0,
@@ -2655,7 +2787,7 @@ impl Renderer {
                     body_top,
                 )?;
             }
-            MainPhase::Matched { .. } | MainPhase::NoMatch { .. } => {
+            MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. } => {
                 self.fill_gradient_geometry(
                     &self.popup_header(app)?,
                     &self.palette.result_start,
@@ -2703,12 +2835,25 @@ impl Renderer {
                     body_top,
                     entered_at.elapsed().as_secs_f64(),
                     *returned_to_ready_at,
+                    false,
+                )?;
+            }
+            MainPhase::Offline {
+                entered_at,
+                returned_to_ready_at,
+            } => {
+                self.draw_no_match_panel(
+                    body_top,
+                    entered_at.elapsed().as_secs_f64(),
+                    *returned_to_ready_at,
+                    true,
                 )?;
             }
             MainPhase::Error { ref message, .. } => {
                 self.draw_ready(app, body_top);
                 self.draw_error_banner(message, body_top);
             }
+            MainPhase::Timeout { .. } => self.draw_timeout_dialog(body_top),
         }
         self.draw_file_hint(body_bottom);
         Ok(())
@@ -2863,12 +3008,7 @@ impl Renderer {
             &self.text.centered_title,
             &self.palette.white_ink,
         );
-        self.text(
-            "\u{2699}",
-            rect(343.0, body_top + 20.0, 373.0, body_top + 48.0),
-            &self.text.icon,
-            &self.palette.subtitle,
-        );
+        self.draw_settings_icon(body_top);
     }
 
     unsafe fn draw_listening_status(&self, body_top: f32, mode: CaptureMode) {
@@ -2889,13 +3029,86 @@ impl Renderer {
     }
 
     unsafe fn draw_cancel_button(&self, body_top: f32) {
-        self.text(
-            "×",
-            rect(345.0, body_top + 18.0, 374.0, body_top + 48.0),
-            &self.text.icon,
+        let [left, top, right, bottom] = native_icon_layout(body_top).cancel_visual;
+        self.target.DrawLine(
+            Vector2 {
+                X: left + 1.5,
+                Y: top + 1.5,
+            },
+            Vector2 {
+                X: right - 1.5,
+                Y: bottom - 1.5,
+            },
             &self.palette.white_ink,
+            1.4,
+            None,
+        );
+        self.target.DrawLine(
+            Vector2 {
+                X: right - 1.5,
+                Y: top + 1.5,
+            },
+            Vector2 {
+                X: left + 1.5,
+                Y: bottom - 1.5,
+            },
+            &self.palette.white_ink,
+            1.4,
+            None,
         );
     }
+
+    unsafe fn draw_settings_icon(&self, body_top: f32) {
+        let [left, top, right, _bottom] = native_icon_layout(body_top).settings_visual;
+        let center = Vector2 {
+            X: (left + right) * 0.5,
+            Y: (top + _bottom) * 0.5,
+        };
+        for spoke in 0..8 {
+            let angle = std::f32::consts::TAU * spoke as f32 / 8.0;
+            let (sin, cos) = angle.sin_cos();
+            self.target.DrawLine(
+                Vector2 {
+                    X: center.X + cos * 5.0,
+                    Y: center.Y + sin * 5.0,
+                },
+                Vector2 {
+                    X: center.X + cos * 7.0,
+                    Y: center.Y + sin * 7.0,
+                },
+                &self.palette.subtitle,
+                1.6,
+                None,
+            );
+        }
+        self.target.DrawEllipse(
+            &D2D1_ELLIPSE {
+                point: Vector2 {
+                    X: center.X,
+                    Y: center.Y,
+                },
+                radiusX: 4.8,
+                radiusY: 4.8,
+            },
+            &self.palette.subtitle,
+            1.5,
+            None,
+        );
+        self.target.DrawEllipse(
+            &D2D1_ELLIPSE {
+                point: Vector2 {
+                    X: center.X,
+                    Y: center.Y,
+                },
+                radiusX: 1.8,
+                radiusY: 1.8,
+            },
+            &self.palette.subtitle,
+            1.4,
+            None,
+        );
+    }
+
     unsafe fn draw_skeleton(&self, history: D2D_RECT_F) {
         let rows = [0.0f32, 93.0, 187.0, 281.0, 375.0];
         for top in rows {
@@ -3050,6 +3263,7 @@ impl Renderer {
         body_top: f32,
         elapsed: f64,
         returned_to_ready_at: Option<Instant>,
+        offline: bool,
     ) -> windows::core::Result<()> {
         let entrance = ui_model::native_bezier((elapsed / 0.3).clamp(0.0, 1.0)) as f32;
         let closing = returned_to_ready_at
@@ -3062,14 +3276,22 @@ impl Renderer {
         let top = body_top + y_offset;
         let panel = rect(0.0, top, CONTENT_WIDTH as f32, top + TOP_HEIGHT as f32);
         self.fill_gradient_rect(&panel, &self.palette.result_start, top)?;
+        let (title, body) = if offline {
+            offline_copy()
+        } else {
+            (
+                "\u{8a8d}\u{8b58}\u{3067}\u{304d}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\u{305f}\u{3002}",
+                "\u{97f3}\u{697d}\u{304c}\u{306f}\u{3063}\u{304d}\u{308a}\u{8074}\u{3053}\u{3048}\u{308b}\u{5834}\u{6240}\u{3067}\u{3082}\u{3046}\u{4e00}\u{5ea6}\u{304a}\u{8a66}\u{3057}\u{304f}\u{3060}\u{3055}\u{3044}",
+            )
+        };
         self.text(
-            "見つかりませんでした",
+            title,
             rect(15.0, top + 55.0, 365.0, top + 84.0),
             &self.text.centered_heavy,
             &self.palette.title,
         );
         self.text(
-            "音楽がはっきり聞こえる場所でもう一度お試しください",
+            body,
             rect(15.0, top + 84.0, 365.0, top + 110.0),
             &self.text.centered_body,
             &self.palette.subtitle,
@@ -3109,6 +3331,49 @@ impl Renderer {
             rect(50.0, body_top + 73.0, 330.0, body_top + 104.0),
             &self.text.centered_body,
             &self.palette.white_ink,
+        );
+    }
+
+    unsafe fn draw_timeout_dialog(&self, body_top: f32) {
+        let (description, dismiss, restart) = timeout_copy();
+        let dialog = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+            rect: rect(24.0, body_top + 48.0, 356.0, body_top + 168.0),
+            radiusX: 10.0,
+            radiusY: 10.0,
+        };
+        self.target
+            .FillRoundedRectangle(&dialog, &self.palette.white);
+        self.text(
+            description,
+            rect(42.0, body_top + 60.0, 338.0, body_top + 116.0),
+            &self.text.centered_body,
+            &self.palette.title,
+        );
+        let restart_button = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+            rect: rect(70.0, body_top + 126.0, 190.0, body_top + 160.0),
+            radiusX: 7.0,
+            radiusY: 7.0,
+        };
+        self.target
+            .FillRoundedRectangle(&restart_button, &self.palette.accent);
+        let dismiss_button = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+            rect: rect(200.0, body_top + 126.0, 310.0, body_top + 160.0),
+            radiusX: 7.0,
+            radiusY: 7.0,
+        };
+        self.target
+            .DrawRoundedRectangle(&dismiss_button, &self.palette.subtitle, 1.0, None);
+        self.text(
+            restart,
+            rect(70.0, body_top + 126.0, 190.0, body_top + 160.0),
+            &self.text.button,
+            &self.palette.white_ink,
+        );
+        self.text(
+            dismiss,
+            rect(200.0, body_top + 126.0, 310.0, body_top + 160.0),
+            &self.text.button,
+            &self.palette.title,
         );
     }
 
@@ -3560,8 +3825,11 @@ fn phase_elapsed(phase: &MainPhase) -> f64 {
         MainPhase::Ready => return 0.0,
         MainPhase::Listening { started_at, .. } => *started_at,
         MainPhase::Matched { entered_at, .. } => *entered_at,
-        MainPhase::NoMatch { entered_at, .. } => *entered_at,
+        MainPhase::NoMatch { entered_at, .. } | MainPhase::Offline { entered_at, .. } => {
+            *entered_at
+        }
         MainPhase::Error { entered_at, .. } => *entered_at,
+        MainPhase::Timeout { entered_at, .. } => *entered_at,
     };
     start.elapsed().as_secs_f64()
 }
@@ -3739,28 +4007,42 @@ unsafe fn window_data(hwnd: HWND) -> Option<&'static mut WindowData> {
 unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHit {
     if matches!(
         app.phase,
-        MainPhase::Matched { .. } | MainPhase::NoMatch { .. }
+        MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
     ) && x >= 340.0
         && y <= body_top + 50.0
     {
         return MainHit::CloseResult;
     }
-    if let MainPhase::NoMatch { .. } = app.phase {
-        if (90.0..=290.0).contains(&x) && y >= body_top + 115.0 && y <= body_top + 155.0 {
-            return MainHit::TryAgain;
+    if let MainPhase::Timeout { .. } = app.phase {
+        if (70.0..=190.0).contains(&x) && (body_top + 126.0..=body_top + 160.0).contains(&y) {
+            return MainHit::TimeoutRestart;
         }
+        if (200.0..=310.0).contains(&x) && (body_top + 126.0..=body_top + 160.0).contains(&y) {
+            return MainHit::TimeoutDismiss;
+        }
+        return MainHit::Other;
+    }
+    if matches!(
+        app.phase,
+        MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
+    ) && (90.0..=290.0).contains(&x)
+        && y >= body_top + 115.0
+        && y <= body_top + 155.0
+    {
+        return MainHit::TryAgain;
     }
     let file_hint_top = body_top + CONTENT_HEIGHT as f32 - 30.0;
     if (10.0..=220.0).contains(&x) && y >= file_hint_top {
         return MainHit::OpenFile;
     }
-    if x >= 340.0 && y >= body_top + 15.0 && y <= body_top + 53.0 {
-        if matches!(app.phase, MainPhase::Listening { .. }) {
-            return MainHit::Cancel;
-        }
-        if matches!(app.phase, MainPhase::Ready | MainPhase::Error { .. }) {
-            return MainHit::Settings;
-        }
+    let icons = native_icon_layout(body_top);
+    if matches!(app.phase, MainPhase::Listening { .. }) && point_in_rect(x, y, icons.cancel_hit) {
+        return MainHit::Cancel;
+    }
+    if point_in_rect(x, y, icons.settings_hit)
+        && matches!(app.phase, MainPhase::Ready | MainPhase::Error { .. })
+    {
+        return MainHit::Settings;
     }
     let button_x = BUTTON_X as f32..=(BUTTON_X + BUTTON_SIZE) as f32;
     let button_y = body_top + BUTTON_TOP as f32..=body_top + (BUTTON_TOP + BUTTON_SIZE) as f32;
@@ -3768,7 +4050,7 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
         && button_y.contains(&y)
         && !matches!(
             app.phase,
-            MainPhase::Matched { .. } | MainPhase::NoMatch { .. }
+            MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
         )
     {
         return MainHit::CenterButton;
@@ -3782,6 +4064,8 @@ enum MainHit {
     OpenFile,
     Settings,
     Cancel,
+    TimeoutRestart,
+    TimeoutDismiss,
     TryAgain,
     CloseResult,
     Other,
@@ -4032,23 +4316,108 @@ fn complete_capture(app: &mut AppState, finished: CaptureFinished) {
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            app.phase = MainPhase::Error {
-                message: if stderr.is_empty() {
-                    format!("認識処理が終了コード {} で失敗しました", output.status)
-                } else {
-                    stderr.chars().take(100).collect()
-                },
-                entered_at: Instant::now(),
-            };
+            if is_timeout_failure(&stderr) {
+                app.phase = MainPhase::Timeout {
+                    mode: finished.captured_mode,
+                    entered_at: Instant::now(),
+                };
+            } else if is_offline_failure(&stderr) {
+                app.phase = MainPhase::Offline {
+                    entered_at: Instant::now(),
+                    returned_to_ready_at: None,
+                };
+            } else {
+                app.phase = MainPhase::Error {
+                    message: if stderr.is_empty() {
+                        format!("認識処理が終了コード {} で失敗しました", output.status)
+                    } else {
+                        stderr.chars().take(100).collect()
+                    },
+                    entered_at: Instant::now(),
+                };
+            }
         }
         Err(error) => {
-            app.phase = MainPhase::Error {
-                message: error,
-                entered_at: Instant::now(),
-            };
+            if is_timeout_failure(&error) {
+                app.phase = MainPhase::Timeout {
+                    mode: finished.captured_mode,
+                    entered_at: Instant::now(),
+                };
+            } else if is_offline_failure(&error) {
+                app.phase = MainPhase::Offline {
+                    entered_at: Instant::now(),
+                    returned_to_ready_at: None,
+                };
+            } else {
+                app.phase = MainPhase::Error {
+                    message: error,
+                    entered_at: Instant::now(),
+                };
+            }
         }
     }
     let _mode = finished.captured_mode;
+}
+
+fn is_timeout_failure(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "timedout",
+        "deadline exceeded",
+        "タイムアウト",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn is_offline_failure(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    [
+        "offline",
+        "no internet",
+        "network is unreachable",
+        "connection refused",
+        "could not resolve",
+        "dns error",
+        "接続できません",
+        "インターネットに接続",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn timeout_copy() -> (&'static str, &'static str, &'static str) {
+    let language = unsafe { GetUserDefaultUILanguage() } & 0x03ff;
+    if language == 0x0011 {
+        (
+            "引き続き聴きたい？「再起動」をクリックして Shazam を続けましょう！",
+            "閉じる",
+            "再起動",
+        )
+    } else {
+        (
+            "Still listening? Click ‘Restart’ to keep Shazaming!",
+            "Dismiss",
+            "Restart",
+        )
+    }
+}
+
+fn offline_copy() -> (&'static str, &'static str) {
+    let language = unsafe { GetUserDefaultUILanguage() } & 0x03ff;
+    if language == 0x0011 {
+        (
+            "\u{63a5}\u{7d9a}\u{3092}\u{78ba}\u{8a8d}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}",
+            "\u{30a4}\u{30f3}\u{30bf}\u{30fc}\u{30cd}\u{30c3}\u{30c8}\u{63a5}\u{7d9a}\u{3092}\u{78ba}\u{8a8d}\u{3057}\u{3066}\u{518d}\u{8a66}\u{884c}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}",
+        )
+    } else {
+        (
+            "Check your connection",
+            "Check your internet connection and try again",
+        )
+    }
 }
 
 fn parse_match(output: &str) -> Option<(String, String)> {
@@ -4150,8 +4519,11 @@ fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
             mode: CaptureMode::Auto,
             ..
         } => (TaggingMode::Auto, true, true),
-        MainPhase::Matched { .. } | MainPhase::NoMatch { .. } => (TaggingMode::Ready, false, false),
+        MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. } => {
+            (TaggingMode::Ready, false, false)
+        }
         MainPhase::Ready | MainPhase::Error { .. } => (TaggingMode::Ready, true, false),
+        MainPhase::Timeout { .. } => (TaggingMode::Ready, false, false),
     };
     AnimationSnapshot {
         mode,
@@ -4167,7 +4539,9 @@ fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
         levels: app.ui_levels,
         auto_spring: app.auto_spring,
         no_match_elapsed: match &app.phase {
-            MainPhase::NoMatch { entered_at, .. } => Some(entered_at.elapsed().as_secs_f64()),
+            MainPhase::NoMatch { entered_at, .. } | MainPhase::Offline { entered_at, .. } => {
+                Some(entered_at.elapsed().as_secs_f64())
+            }
             _ => None,
         },
     }
@@ -4207,7 +4581,10 @@ unsafe fn sync_main_timers(app: &mut AppState) {
 fn phase_needs_timeout(phase: &MainPhase) -> bool {
     matches!(
         phase,
-        MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Error { .. }
+        MainPhase::Matched { .. }
+            | MainPhase::NoMatch { .. }
+            | MainPhase::Offline { .. }
+            | MainPhase::Error { .. }
     )
 }
 
@@ -4221,6 +4598,10 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
         MainPhase::NoMatch {
             entered_at,
             returned_to_ready_at,
+        }
+        | MainPhase::Offline {
+            entered_at,
+            returned_to_ready_at,
         } => {
             // Keep UI-thread redraws only for the 300 ms panel transition and
             // the 180 ms deferred spring kickoff. The position/scale tracks
@@ -4229,7 +4610,7 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
                 || returned_to_ready_at
                     .is_some_and(|start| start.elapsed() < Duration::from_millis(350))
         }
-        MainPhase::Ready | MainPhase::Error { .. } => false,
+        MainPhase::Ready | MainPhase::Error { .. } | MainPhase::Timeout { .. } => false,
     }
 }
 
@@ -4250,6 +4631,12 @@ unsafe fn process_main_hit(app: &mut AppState, hit: MainHit) {
     match hit {
         MainHit::Settings => open_settings(app),
         MainHit::Cancel => cancel_capture(app),
+        MainHit::TimeoutRestart => {
+            if let MainPhase::Timeout { mode, .. } = app.phase {
+                start_capture(app, mode, None);
+            }
+        }
+        MainHit::TimeoutDismiss => app.phase = MainPhase::Ready,
         MainHit::TryAgain => start_capture(app, CaptureMode::Manual, None),
         MainHit::CloseResult => {
             app.phase = MainPhase::Ready;
@@ -4471,7 +4858,9 @@ unsafe extern "system" fn window_proc(
                 }
                 if matches!(
                     app.phase,
-                    MainPhase::Matched { .. } | MainPhase::NoMatch { .. }
+                    MainPhase::Matched { .. }
+                        | MainPhase::NoMatch { .. }
+                        | MainPhase::Offline { .. }
                 ) {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -4834,6 +5223,10 @@ fn update_phase_timers(app: &mut AppState) -> bool {
         MainPhase::NoMatch {
             entered_at,
             returned_to_ready_at,
+        }
+        | MainPhase::Offline {
+            entered_at,
+            returned_to_ready_at,
         } => {
             if returned_to_ready_at.is_none()
                 && now.duration_since(*entered_at) >= Duration::from_secs(10)
@@ -4863,8 +5256,10 @@ fn _assert_only_ui_dependencies_are_used(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        animation_needs_frame, gradient_origin_transform, parse_debug_string, parse_match,
-        CaptureMode, MainPhase,
+        animation_needs_frame, button_border_arc_points, gradient_origin_transform,
+        is_offline_failure, is_timeout_failure, native_icon_layout, parse_debug_string,
+        parse_match, phase_needs_timeout, point_in_rect, CaptureMode, MainPhase,
+        OUTER_BASE_OPACITY,
     };
 
     #[test]
@@ -5055,6 +5450,55 @@ mod tests {
     }
 
     #[test]
+    fn button_arc_preserves_native_degree_value_and_geometry() {
+        let [start, _, _, end] = button_border_arc_points();
+        assert_eq!(start, (97.0, 50.0));
+        assert!((end.0 - 96.926_4).abs() < 0.001);
+        assert!((end.1 - 52.685_3).abs() < 0.001);
+        assert!(end.1 > start.1);
+    }
+
+    #[test]
+    fn native_icon_visual_frames_and_hit_targets_are_independent() {
+        let layout = native_icon_layout(0.0);
+        assert_eq!(layout.settings_visual, [349.0, 25.0, 365.0, 41.0]);
+        assert_eq!(layout.settings_hit, [342.0, 20.0, 372.0, 48.0]);
+        assert_eq!(layout.cancel_visual, [351.0, 27.0, 363.0, 39.0]);
+        assert_eq!(layout.cancel_hit, layout.settings_hit);
+        assert!(point_in_rect(342.0, 20.0, layout.settings_hit));
+        assert!(!point_in_rect(341.9, 20.0, layout.settings_hit));
+    }
+
+    #[test]
+    fn timeout_markers_are_separated_from_generic_failures_and_no_match() {
+        assert!(is_timeout_failure("request timed out"));
+        assert!(is_timeout_failure("recognition timeout"));
+        assert!(is_timeout_failure("タイムアウト"));
+        assert!(!is_timeout_failure("network connection failed"));
+        assert!(!is_timeout_failure("no match"));
+        let timeout = MainPhase::Timeout {
+            mode: CaptureMode::Manual,
+            entered_at: std::time::Instant::now(),
+        };
+        assert!(!phase_needs_timeout(&timeout));
+        assert!(!animation_needs_frame(&timeout, false));
+    }
+
+    #[test]
+    fn offline_markers_are_separated_from_timeout_and_no_match() {
+        assert!(is_offline_failure("network is unreachable"));
+        assert!(is_offline_failure("could not resolve host"));
+        assert!(!is_offline_failure("request timed out"));
+        assert!(!is_offline_failure("no match"));
+        assert!(!is_offline_failure("unexpected parser failure"));
+    }
+
+    #[test]
+    fn outer_circle_children_keep_native_base_opacities() {
+        assert_eq!(OUTER_BASE_OPACITY, [0.4, 0.6]);
+    }
+
+    #[test]
     fn gradient_origin_translation_preserves_dip_scale_and_tracks_panel_top() {
         for top in [0.0, 10.0, 27.5, 180.0] {
             let transform = gradient_origin_transform(top);
@@ -5157,15 +5601,28 @@ mod tests {
                 let d2d_factory: ID2D1Factory =
                     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
                 let _masks = [
-                    factory.inverse_circle(336.0, 96.0, 144)?,
-                    factory.inverse_circle(336.0, 96.0, 144)?,
-                    factory.inverse_circle(336.0, 96.0, 144)?,
+                    factory.inverse_circle(288.0, 96.0, 144)?,
+                    factory.inverse_circle(222.545, 96.0, 144)?,
+                    factory.inverse_circle(170.182, 96.0, 144)?,
+                    factory.inverse_circle(130.909, 96.0, 144)?,
                 ];
+                for (mask, diameter) in _masks.iter().zip(ui_model::INNER_DIAMETERS) {
+                    let sprite = compositor.CreateSpriteVisual()?;
+                    sprite.SetSize(Vector2 {
+                        X: diameter as f32,
+                        Y: diameter as f32,
+                    })?;
+                    sprite.SetBrush(mask.brush())?;
+                    let host = compositor.CreateContainerVisual()?;
+                    host.Children()?.InsertAtTop(&sprite)?;
+                }
                 let mut logo = CompositionLogo::new(&d2d_factory, &compositor, Theme::Light)?;
                 logo.start()?;
                 for dpi in [96, 120, 144, 168, 192, 240, 288] {
-                    let mask = factory.inverse_circle(336.0, 96.0, dpi)?;
-                    let _brush = mask.brush();
+                    let mask = factory.inverse_circle(288.0, 96.0, dpi)?;
+                    let sprite = compositor.CreateSpriteVisual()?;
+                    sprite.SetSize(Vector2 { X: 288.0, Y: 288.0 })?;
+                    sprite.SetBrush(mask.brush())?;
                 }
                 Ok(())
             })();
