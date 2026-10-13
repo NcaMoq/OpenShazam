@@ -202,6 +202,50 @@ enum CaptureMode {
     Auto,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ResultCardStage {
+    Entering {
+        started_at: Instant,
+    },
+    Holding {
+        started_at: Instant,
+    },
+    Exiting {
+        started_at: Instant,
+        from_offset: f32,
+    },
+}
+
+// Native history delivers these independently through Core Data change types.
+// This UI currently receives inserts only; updates/deletes stay available for
+// the UI adapter without widening service or persistence APIs.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+enum HistoryMutationEvent {
+    Insert { index: usize, previous_count: usize },
+    Update { index: usize },
+    Delete { index: usize },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HistoryMutationTransition {
+    started_at: Instant,
+    event: HistoryMutationEvent,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResultCardAdvance {
+    Unchanged,
+    Stage(ResultCardStage),
+    Ready,
+}
+
+const RESULT_CARD_TRANSITION: Duration = Duration::from_millis(300);
+const RESULT_CARD_HOLD: Duration = Duration::from_secs(10);
+// [I/U] Native NSTableView slide duration was not recovered. Keep this
+// implementation value replaceable rather than presenting it as native data.
+const HISTORY_INSERT_TRANSITION: Duration = Duration::from_millis(250);
+
 #[derive(Debug)]
 enum MainPhase {
     Ready,
@@ -211,8 +255,7 @@ enum MainPhase {
     },
     Matched {
         track: Track,
-        entered_at: Instant,
-        returned_to_ready_at: Option<Instant>,
+        stage: ResultCardStage,
     },
     NoMatch {
         entered_at: Instant,
@@ -250,6 +293,7 @@ struct AppState {
     _dispatcher_queue: DispatcherQueueController,
     phase: MainPhase,
     history: Vec<Track>,
+    history_transition: Option<HistoryMutationTransition>,
     scroll_offset: f32,
     hovered_row: Option<usize>,
     // UI-only adapter points. No service meter output is assumed or inferred.
@@ -2704,11 +2748,21 @@ impl Renderer {
             &clip,
             windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
         );
-        if app.history.is_empty() {
+        let now = Instant::now();
+        if app.history.is_empty()
+            || app.history_transition.is_some_and(|transition| {
+                matches!(
+                    transition.event,
+                    HistoryMutationEvent::Insert {
+                        previous_count: 0,
+                        ..
+                    }
+                )
+            })
+        {
             self.draw_skeleton(history_rect);
-        } else {
-            self.draw_history(app, history_top);
         }
+        self.draw_history(app, history_top, now);
         self.target.PopAxisAlignedClip();
 
         match &app.phase {
@@ -3029,10 +3083,15 @@ impl Renderer {
             .FillRectangle(&history, &self.palette.empty_overlay);
     }
 
-    unsafe fn draw_history(&self, app: &AppState, history_top: f32) {
-        let row_pitch = 91.0f32;
+    unsafe fn draw_history(&self, app: &AppState, history_top: f32, now: Instant) {
         for (index, track) in app.history.iter().enumerate() {
-            let top = history_top + index as f32 * row_pitch - app.scroll_offset;
+            let top = history_row_top(
+                index,
+                app.history_transition,
+                history_top,
+                app.scroll_offset,
+                now,
+            );
             if top + 89.0 < history_top || top > history_top + HISTORY_HEIGHT as f32 {
                 continue;
             }
@@ -3704,7 +3763,11 @@ fn phase_elapsed(phase: &MainPhase) -> f64 {
     let start = match phase {
         MainPhase::Ready => return 0.0,
         MainPhase::Listening { started_at, .. } => *started_at,
-        MainPhase::Matched { entered_at, .. } => *entered_at,
+        MainPhase::Matched { stage, .. } => match stage {
+            ResultCardStage::Entering { started_at }
+            | ResultCardStage::Holding { started_at }
+            | ResultCardStage::Exiting { started_at, .. } => *started_at,
+        },
         MainPhase::NoMatch { entered_at, .. } | MainPhase::Offline { entered_at, .. } => {
             *entered_at
         }
@@ -4183,13 +4246,29 @@ fn complete_capture(app: &mut AppState, finished: CaptureFinished) {
                     artist,
                     recognized_at: Instant::now(),
                 };
+                let history_started_at = Instant::now();
+                let previous_count = app.history.len();
                 app.history.insert(0, track.clone());
+                app.history_transition = Some(HistoryMutationTransition {
+                    started_at: history_started_at,
+                    event: HistoryMutationEvent::Insert {
+                        index: 0,
+                        previous_count,
+                    },
+                });
                 app.history.truncate(40);
-                app.phase = MainPhase::Matched {
-                    track,
-                    entered_at: Instant::now(),
-                    returned_to_ready_at: None,
-                };
+                if app.visible {
+                    app.phase = MainPhase::Matched {
+                        track,
+                        stage: ResultCardStage::Entering {
+                            started_at: Instant::now(),
+                        },
+                    };
+                } else {
+                    // Native posts a notification when the popup is hidden;
+                    // do not surface the result card in a popup the user closed.
+                    app.phase = MainPhase::Ready;
+                }
             } else {
                 app.phase = MainPhase::NoMatch {
                     entered_at: Instant::now(),
@@ -4433,7 +4512,7 @@ fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
 unsafe fn sync_main_timers(app: &mut AppState) {
     let hwnd = app.main_hwnd;
     if app.visible && !hwnd.0.is_null() {
-        let track_phase = phase_needs_timeout(&app.phase);
+        let track_phase = phase_needs_timeout(&app.phase) || app.history_transition.is_some();
         if track_phase && !app.phase_timer_active {
             let _ = SetTimer(Some(hwnd), TIMER_PHASE, PHASE_TICK_MS, None);
             app.phase_timer_active = true;
@@ -4441,7 +4520,11 @@ unsafe fn sync_main_timers(app: &mut AppState) {
             let _ = KillTimer(Some(hwnd), TIMER_PHASE);
             app.phase_timer_active = false;
         }
-        let animate = animation_needs_frame(&app.phase, app.startup_animation_pending);
+        let animate = animation_needs_frame(&app.phase, app.startup_animation_pending)
+            || app.history_transition.is_some_and(|transition| {
+                Instant::now().saturating_duration_since(transition.started_at)
+                    < HISTORY_INSERT_TRANSITION
+            });
         if animate && !app.animation_timer_active {
             let _ = SetTimer(Some(hwnd), TIMER_ANIMATION, ANIMATION_TICK_MS, None);
             app.animation_timer_active = true;
@@ -4477,15 +4560,13 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
         // They do not need an 8 ms UI-thread timer; future meter values enter
         // through a change event and update the audio transforms once per value.
         MainPhase::Listening { .. } => false,
-        MainPhase::Matched {
-            entered_at,
-            returned_to_ready_at,
-            ..
-        } => {
-            entered_at.elapsed() < Duration::from_millis(350)
-                || returned_to_ready_at
-                    .is_some_and(|start| start.elapsed() < Duration::from_millis(350))
-        }
+        MainPhase::Matched { stage, .. } => match stage {
+            ResultCardStage::Entering { started_at }
+            | ResultCardStage::Exiting { started_at, .. } => {
+                started_at.elapsed() < RESULT_CARD_TRANSITION
+            }
+            ResultCardStage::Holding { .. } => false,
+        },
         MainPhase::NoMatch {
             entered_at,
             returned_to_ready_at,
@@ -4506,13 +4587,24 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
 }
 
 fn result_panel_top_at(phase: &MainPhase, body_top: f32, now: Instant) -> Option<f32> {
+    if let MainPhase::Matched { stage, .. } = phase {
+        return Some(match stage {
+            ResultCardStage::Entering { started_at } => {
+                let progress = linear_transition_progress(*started_at, now, RESULT_CARD_TRANSITION);
+                body_top - (1.0 - progress) * TOP_HEIGHT as f32
+            }
+            ResultCardStage::Holding { .. } => body_top,
+            ResultCardStage::Exiting {
+                started_at,
+                from_offset,
+            } => {
+                let progress = linear_transition_progress(*started_at, now, RESULT_CARD_TRANSITION);
+                body_top + *from_offset * (1.0 - progress) + TOP_HEIGHT as f32 * progress
+            }
+        });
+    }
     let (entered_at, returned_to_ready_at) = match phase {
-        MainPhase::Matched {
-            entered_at,
-            returned_to_ready_at,
-            ..
-        }
-        | MainPhase::NoMatch {
+        MainPhase::NoMatch {
             entered_at,
             returned_to_ready_at,
         }
@@ -4533,6 +4625,40 @@ fn result_panel_top_at(phase: &MainPhase, body_top: f32, now: Instant) -> Option
         })
         .unwrap_or(0.0);
     Some(body_top - (1.0 - entrance) * TOP_HEIGHT as f32 + exit * TOP_HEIGHT as f32)
+}
+
+fn linear_transition_progress(started_at: Instant, now: Instant, duration: Duration) -> f32 {
+    // Native NSAnimationContext's default timing function is not established in
+    // the reference, so keep this Windows interpolation deterministic and
+    // replaceable instead of reusing another feature's measured Bezier curve.
+    (now.saturating_duration_since(started_at).as_secs_f32() / duration.as_secs_f32())
+        .clamp(0.0, 1.0)
+}
+
+fn advance_result_card_stage(stage: ResultCardStage, now: Instant) -> ResultCardAdvance {
+    match stage {
+        ResultCardStage::Entering { started_at }
+            if now.saturating_duration_since(started_at) >= RESULT_CARD_TRANSITION =>
+        {
+            ResultCardAdvance::Stage(ResultCardStage::Holding {
+                started_at: started_at + RESULT_CARD_TRANSITION,
+            })
+        }
+        ResultCardStage::Holding { started_at }
+            if now.saturating_duration_since(started_at) >= RESULT_CARD_HOLD =>
+        {
+            ResultCardAdvance::Stage(ResultCardStage::Exiting {
+                started_at: started_at + RESULT_CARD_HOLD,
+                from_offset: 0.0,
+            })
+        }
+        ResultCardStage::Exiting { started_at, .. }
+            if now.saturating_duration_since(started_at) >= RESULT_CARD_TRANSITION =>
+        {
+            ResultCardAdvance::Ready
+        }
+        _ => ResultCardAdvance::Unchanged,
+    }
 }
 
 fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> bool {
@@ -4570,12 +4696,22 @@ unsafe fn process_main_hit(app: &mut AppState, hit: MainHit) {
         MainHit::TryAgain => start_capture(app, CaptureMode::Manual, None),
         MainHit::CloseResult => {
             let now = Instant::now();
+            let body_top = if app.arrow_edge == ArrowEdge::Top {
+                POPUP_ARROW_HEIGHT as f32
+            } else {
+                0.0
+            };
+            let from_offset = result_panel_top_at(&app.phase, body_top, now)
+                .map(|top| top - body_top)
+                .unwrap_or(0.0);
             match &mut app.phase {
-                MainPhase::Matched {
-                    returned_to_ready_at,
-                    ..
+                MainPhase::Matched { stage, .. } => {
+                    *stage = ResultCardStage::Exiting {
+                        started_at: now,
+                        from_offset,
+                    };
                 }
-                | MainPhase::NoMatch {
+                MainPhase::NoMatch {
                     returned_to_ready_at,
                     ..
                 }
@@ -5084,6 +5220,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             _dispatcher_queue: dispatcher_queue,
             phase: MainPhase::Ready,
             history: Vec::new(),
+            history_transition: None,
             scroll_offset: 0.0,
             hovered_row: None,
             ui_levels: UiLevels::default(),
@@ -5166,23 +5303,17 @@ fn update_phase_timers(app: &mut AppState) -> bool {
     let now = Instant::now();
     let mut changed = false;
     match &mut app.phase {
-        MainPhase::Matched {
-            entered_at,
-            returned_to_ready_at,
-            ..
-        } => {
-            if returned_to_ready_at.is_none()
-                && now.duration_since(*entered_at) >= Duration::from_secs(10)
-            {
-                *returned_to_ready_at = Some(now);
+        MainPhase::Matched { stage, .. } => match advance_result_card_stage(*stage, now) {
+            ResultCardAdvance::Unchanged => {}
+            ResultCardAdvance::Stage(next) => {
+                *stage = next;
                 changed = true;
-            } else if returned_to_ready_at
-                .is_some_and(|start| now.duration_since(start) >= Duration::from_millis(300))
-            {
+            }
+            ResultCardAdvance::Ready => {
                 app.phase = MainPhase::Ready;
                 changed = true;
             }
-        }
+        },
         MainPhase::NoMatch {
             entered_at,
             returned_to_ready_at,
@@ -5211,7 +5342,39 @@ fn update_phase_timers(app: &mut AppState) -> bool {
         }
         _ => {}
     }
+    if app.history_transition.is_some_and(|transition| {
+        now.saturating_duration_since(transition.started_at) >= HISTORY_INSERT_TRANSITION
+    }) {
+        app.history_transition = None;
+        changed = true;
+    }
     changed
+}
+
+fn history_row_top(
+    index: usize,
+    transition: Option<HistoryMutationTransition>,
+    history_top: f32,
+    scroll_offset: f32,
+    now: Instant,
+) -> f32 {
+    let base = history_top + index as f32 * 91.0 - scroll_offset;
+    let Some(transition) = transition else {
+        return base;
+    };
+    let progress =
+        linear_transition_progress(transition.started_at, now, HISTORY_INSERT_TRANSITION);
+    match transition.event {
+        HistoryMutationEvent::Insert {
+            index: inserted, ..
+        } if index >= inserted => base - 91.0 * (1.0 - progress),
+        HistoryMutationEvent::Delete { index: deleted } if index >= deleted => {
+            base + 91.0 * (1.0 - progress)
+        }
+        HistoryMutationEvent::Insert { .. }
+        | HistoryMutationEvent::Update { .. }
+        | HistoryMutationEvent::Delete { .. } => base,
+    }
 }
 
 fn _assert_only_ui_dependencies_are_used(_: &Path) {}
@@ -5219,12 +5382,14 @@ fn _assert_only_ui_dependencies_are_used(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        animation_needs_frame, button_border_arc_points, composition_root_layer_order,
-        gradient_origin_transform, history_artwork_frame, inverse_circle_clip_radii,
-        is_offline_failure, is_timeout_failure, native_icon_layout, parse_debug_string,
-        parse_match, phase_needs_timeout, point_in_rect, result_artwork_frame, result_panel_top_at,
-        should_start_startup_logo, ui_model, CaptureMode, CompositionRootLayer, MainPhase,
-        WindowKind, INNER_RIPPLE_DIAMETER, OUTER_BASE_OPACITY,
+        advance_result_card_stage, animation_needs_frame, button_border_arc_points,
+        composition_root_layer_order, gradient_origin_transform, history_artwork_frame,
+        history_row_top, inverse_circle_clip_radii, is_offline_failure, is_timeout_failure,
+        native_icon_layout, parse_debug_string, parse_match, phase_needs_timeout, point_in_rect,
+        result_artwork_frame, result_panel_top_at, should_start_startup_logo, ui_model,
+        CaptureMode, CompositionRootLayer, HistoryMutationEvent, HistoryMutationTransition,
+        MainPhase, ResultCardAdvance, ResultCardStage, WindowKind, INNER_RIPPLE_DIAMETER,
+        OUTER_BASE_OPACITY,
     };
 
     #[test]
@@ -5454,8 +5619,9 @@ mod tests {
                 artist: String::new(),
                 recognized_at: entered_at,
             },
-            entered_at,
-            returned_to_ready_at: Some(returned_at),
+            stage: ResultCardStage::Entering {
+                started_at: entered_at,
+            },
         };
         let body_top = 42.0;
 
@@ -5471,14 +5637,99 @@ mod tests {
             ),
             Some(body_top)
         );
+        let exiting = MainPhase::Matched {
+            track: super::Track {
+                title: String::new(),
+                artist: String::new(),
+                recognized_at: entered_at,
+            },
+            stage: ResultCardStage::Exiting {
+                started_at: returned_at,
+                from_offset: 0.0,
+            },
+        };
+        assert_eq!(
+            result_panel_top_at(&exiting, body_top, returned_at),
+            Some(body_top)
+        );
         assert_eq!(
             result_panel_top_at(
-                &phase,
+                &exiting,
                 body_top,
                 returned_at + std::time::Duration::from_millis(300)
             ),
             Some(body_top + super::TOP_HEIGHT as f32)
         );
+    }
+
+    #[test]
+    fn result_card_holds_ten_seconds_after_entrance_then_exits() {
+        let start = std::time::Instant::now();
+        let holding_start = start + std::time::Duration::from_millis(300);
+        let exit_start = holding_start + std::time::Duration::from_secs(10);
+        assert!(matches!(
+            advance_result_card_stage(ResultCardStage::Entering { started_at: start }, holding_start),
+            ResultCardAdvance::Stage(ResultCardStage::Holding { started_at }) if started_at == holding_start
+        ));
+        assert!(matches!(
+            advance_result_card_stage(ResultCardStage::Holding { started_at: holding_start }, exit_start),
+            ResultCardAdvance::Stage(ResultCardStage::Exiting { started_at, from_offset: 0.0 }) if started_at == exit_start
+        ));
+        assert!(matches!(
+            advance_result_card_stage(
+                ResultCardStage::Exiting {
+                    started_at: exit_start,
+                    from_offset: 0.0
+                },
+                exit_start + std::time::Duration::from_millis(300)
+            ),
+            ResultCardAdvance::Ready
+        ));
+    }
+
+    #[test]
+    fn history_insert_rows_slide_independently_of_result_card() {
+        let started_at = std::time::Instant::now();
+        let transition = Some(HistoryMutationTransition {
+            started_at,
+            event: HistoryMutationEvent::Insert {
+                index: 0,
+                previous_count: 2,
+            },
+        });
+        assert_eq!(history_row_top(0, transition, 100.0, 0.0, started_at), 9.0);
+        assert_eq!(
+            history_row_top(1, transition, 100.0, 0.0, started_at),
+            100.0
+        );
+        assert_eq!(
+            history_row_top(
+                0,
+                transition,
+                100.0,
+                0.0,
+                started_at + std::time::Duration::from_millis(250)
+            ),
+            100.0
+        );
+        let first_row = Some(HistoryMutationTransition {
+            started_at,
+            event: HistoryMutationEvent::Insert {
+                index: 0,
+                previous_count: 0,
+            },
+        });
+        assert_eq!(history_row_top(0, first_row, 100.0, 0.0, started_at), 9.0);
+        let deletion = Some(HistoryMutationTransition {
+            started_at,
+            event: HistoryMutationEvent::Delete { index: 1 },
+        });
+        assert_eq!(history_row_top(1, deletion, 100.0, 0.0, started_at), 282.0);
+        let update = Some(HistoryMutationTransition {
+            started_at,
+            event: HistoryMutationEvent::Update { index: 1 },
+        });
+        assert_eq!(history_row_top(1, update, 100.0, 0.0, started_at), 191.0);
     }
 
     #[test]
