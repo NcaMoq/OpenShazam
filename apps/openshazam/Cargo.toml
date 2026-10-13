@@ -14,6 +14,7 @@ sigx-format = { path = "../../crates/sigx-format" }
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.25.0"
+windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Foundation_Numerics",
@@ -34,6 +35,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Composition",
+    "Win32_System_WinRT_Graphics_Direct2D",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

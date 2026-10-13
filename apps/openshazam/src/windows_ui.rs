@@ -5,6 +5,7 @@
 //! output to UI state.
 
 use std::{
+    cell::RefCell,
     ffi::c_void,
     mem::size_of,
     path::{Path, PathBuf},
@@ -18,8 +19,9 @@ use std::{
 };
 
 use windows::{
-    core::{Error, Interface, HSTRING, PCWSTR},
-    Foundation::{Size, TimeSpan},
+    core::{implement, Error, Interface, Ref, HSTRING, PCWSTR},
+    Foundation::TimeSpan,
+    Graphics::IGeometrySource2D,
     System::DispatcherQueueController,
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -31,19 +33,14 @@ use windows::{
                     D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP,
                     D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
                 },
-                D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1HwndRenderTarget,
-                ID2D1LinearGradientBrush, ID2D1RenderTarget, ID2D1SolidColorBrush,
-                D2D1_CAP_STYLE_ROUND, D2D1_DASH_STYLE_SOLID, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
-                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
+                D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1Geometry,
+                ID2D1HwndRenderTarget, ID2D1LinearGradientBrush, ID2D1RenderTarget,
+                ID2D1SolidColorBrush, D2D1_COMBINE_MODE_UNION, D2D1_ELLIPSE,
+                D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
                 D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
-                D2D1_LINE_JOIN_ROUND, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
+                D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
                 D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
-                D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-            },
-            Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0},
-            Direct3D11::{
-                D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                D3D11_SDK_VERSION,
+                D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
             },
             DirectWrite::{
                 DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
@@ -54,7 +51,7 @@ use windows::{
                 DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_WORD_WRAPPING_WRAP,
             },
             Dwm::DwmFlush,
-            Dxgi::{Common::DXGI_FORMAT_B8G8R8A8_UNORM, IDXGIDevice},
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
                 BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
                 GetMonitorInfoW, InvalidateRect, MonitorFromRect, SelectObject, AC_SRC_ALPHA,
@@ -65,9 +62,8 @@ use windows::{
         System::{
             Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
             LibraryLoader::GetModuleHandleW,
-            WinRT::Composition::{
-                ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
-            },
+            WinRT::Composition::ICompositorDesktopInterop,
+            WinRT::Graphics::Direct2D::{IGeometrySource2DInterop, IGeometrySource2DInterop_Impl},
             WinRT::{
                 CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_STA,
                 DQTYPE_THREAD_CURRENT,
@@ -108,32 +104,37 @@ use windows::{
         Color,
         Composition::{
             AnimationIterationBehavior, CompositionColorBrush, CompositionEllipseGeometry,
-            CompositionSpriteShape, Compositor, ContainerVisual, Desktop::DesktopWindowTarget,
-            ScalarKeyFrameAnimation, SpriteVisual, Vector2KeyFrameAnimation,
-            Vector3KeyFrameAnimation,
+            CompositionPath, CompositionPathGeometry, CompositionSpriteShape, Compositor,
+            ContainerVisual, Desktop::DesktopWindowTarget, DropShadow, ScalarKeyFrameAnimation,
+            ShapeVisual, Vector2KeyFrameAnimation, Vector3KeyFrameAnimation,
         },
     },
 };
 
+#[cfg(test)]
 use windows::{
+    Foundation::Size,
     Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat},
-    Win32::Graphics::Direct2D::{D2D1CreateDevice, ID2D1Device, ID2D1DeviceContext},
-    UI::Composition::{CompositionDrawingSurface, CompositionSurfaceBrush},
-};
-
-#[cfg(test)]
-use windows::UI::Composition::CompositionMaskBrush;
-
-#[cfg(test)]
-use windows::Win32::Graphics::Direct2D::{
-    D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER,
+    Win32::Graphics::Direct2D::{
+        D2D1CreateDevice, ID2D1Device, ID2D1DeviceContext, D2D1_PRIMITIVE_BLEND_COPY,
+        D2D1_PRIMITIVE_BLEND_SOURCE_OVER,
+    },
+    Win32::Graphics::{
+        Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0},
+        Direct3D11::{
+            D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+        },
+        Dxgi::IDXGIDevice,
+    },
+    Win32::System::WinRT::Composition::{ICompositionDrawingSurfaceInterop, ICompositorInterop},
+    UI::Composition::{CompositionDrawingSurface, CompositionMaskBrush, CompositionSurfaceBrush},
 };
 
 use windows_numerics::{Vector2, Vector3};
 
 use crate::ui_model::{
-    self, TaggingMode, UiLevels, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, CONTENT_HEIGHT, CONTENT_WIDTH,
-    HISTORY_HEIGHT, POPUP_ARROW_HEIGHT, POPUP_CORNER_RADIUS, TOP_HEIGHT,
+    self, CubicBezier, TaggingMode, UiLevels, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, CONTENT_HEIGHT,
+    CONTENT_WIDTH, HISTORY_HEIGHT, POPUP_ARROW_HEIGHT, POPUP_CORNER_RADIUS, TOP_HEIGHT,
 };
 
 const CLASS_NAME: &str = "OpenShazamNativeUiWindow";
@@ -309,6 +310,8 @@ struct Renderer {
     dpi: u32,
     theme_generation: u64,
     composition: Option<CompositionScene>,
+    popup_outline: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
+    popup_header: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
 }
 
 /// Premultiplied BGRA backing for the popup's per-pixel alpha presentation.
@@ -438,6 +441,26 @@ struct InnerRingAnimations {
     scale_null: Vector3KeyFrameAnimation,
 }
 
+#[implement(IGeometrySource2D, IGeometrySource2DInterop)]
+struct D2DCompositionGeometrySource {
+    geometry: ID2D1Geometry,
+}
+
+impl windows::Graphics::IGeometrySource2D_Impl for D2DCompositionGeometrySource_Impl {}
+
+impl IGeometrySource2DInterop_Impl for D2DCompositionGeometrySource_Impl {
+    fn GetGeometry(&self) -> windows::core::Result<ID2D1Geometry> {
+        Ok(self.geometry.clone())
+    }
+
+    fn TryGetGeometryUsingFactory(
+        &self,
+        _factory: Ref<ID2D1Factory>,
+    ) -> windows::core::Result<ID2D1Geometry> {
+        Ok(self.geometry.clone())
+    }
+}
+
 /// Cached GPU alpha mask backed by a Composition drawing surface. The mask is
 /// opaque outside a centered circular cutout; the surface is authored once and
 /// can be sampled by independent CompositionMaskBrush instances/transforms.
@@ -451,9 +474,21 @@ struct CompositionAlphaMask {
 
 #[derive(Debug)]
 struct CompositionLogo {
-    _surface: CompositionDrawingSurface,
-    _surface_brush: CompositionSurfaceBrush,
-    visual: SpriteVisual,
+    visual: ContainerVisual,
+    _transparent_visual: ShapeVisual,
+    long_visual: ShapeVisual,
+    final_visual: ShapeVisual,
+    _transparent_geometries: [CompositionPathGeometry; 2],
+    _long_geometries: [CompositionPathGeometry; 2],
+    transparent_brush: CompositionColorBrush,
+    _solid_brush: CompositionColorBrush,
+    shadow: DropShadow,
+    transparent_trim_animation: ScalarKeyFrameAnimation,
+    solid_trim_animation: ScalarKeyFrameAnimation,
+    long_fade_animation: ScalarKeyFrameAnimation,
+    final_fade_animation: ScalarKeyFrameAnimation,
+    started_at: Option<Instant>,
+    stage: ui_model::StartupLogoStage,
 }
 
 const SHZ_LOGO_SOURCE_SIZE: f32 = 210.0;
@@ -466,91 +501,59 @@ fn shz_logo_scale(button_size: f32) -> f32 {
 
 impl CompositionLogo {
     unsafe fn new(
-        factory: &CompositionMaskFactory,
         d2d_factory: &ID2D1Factory,
         compositor: &Compositor,
-        dpi: u32,
+        theme: Theme,
     ) -> windows::core::Result<Self> {
-        let dpi = dpi.max(96);
-        let pixels = ui_model::physical_pixels(SHZ_LOGO_SOURCE_SIZE as f64, dpi) as f32;
-        let surface = factory.graphics_device.CreateDrawingSurface(
-            Size {
-                Width: pixels,
-                Height: pixels,
-            },
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            DirectXAlphaMode::Premultiplied,
+        let transparent_brush =
+            compositor.CreateColorBrushWithColor(logo_transparent_color(theme))?;
+        let solid_brush =
+            compositor.CreateColorBrushWithColor(composition_color(255, 255, 255, 255))?;
+        let (transparent_visual, transparent_geometries) = make_logo_visual(
+            compositor,
+            d2d_factory,
+            [SHZ_LOGO_TOP_PATH, SHZ_LOGO_BOTTOM_PATH],
+            &transparent_brush,
+            LogoTrim::Start,
         )?;
-        let interop: ICompositionDrawingSurfaceInterop = surface.cast()?;
-        let mut offset = POINT::default();
-        let context: ID2D1DeviceContext = interop.BeginDraw(None, &mut offset)?;
-        let draw_result = (|| -> windows::core::Result<()> {
-            context.SetDpi(dpi as f32, dpi as f32);
-            context.Clear(Some(&D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            }));
-            let brush = context.CreateSolidColorBrush(
-                &D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 1.0,
-                },
-                None,
-            )?;
-            let stroke = d2d_factory.CreateStrokeStyle(
-                &D2D1_STROKE_STYLE_PROPERTIES {
-                    startCap: D2D1_CAP_STYLE_ROUND,
-                    endCap: D2D1_CAP_STYLE_ROUND,
-                    dashCap: D2D1_CAP_STYLE_ROUND,
-                    lineJoin: D2D1_LINE_JOIN_ROUND,
-                    miterLimit: 10.0,
-                    dashStyle: D2D1_DASH_STYLE_SOLID,
-                    dashOffset: 0.0,
-                },
-                None,
-            )?;
-            for path in [SHZ_LOGO_TOP_PATH, SHZ_LOGO_BOTTOM_PATH] {
-                let geometry = d2d_factory.CreatePathGeometry()?;
-                let sink = geometry.Open()?;
-                sink.BeginFigure(
-                    Vector2 {
-                        X: path.start.0,
-                        Y: path.start.1,
-                    },
-                    D2D1_FIGURE_BEGIN_HOLLOW,
-                );
-                let beziers = path.curves.map(|curve| D2D1_BEZIER_SEGMENT {
-                    point1: Vector2 {
-                        X: curve.control1.0,
-                        Y: curve.control1.1,
-                    },
-                    point2: Vector2 {
-                        X: curve.control2.0,
-                        Y: curve.control2.1,
-                    },
-                    point3: Vector2 {
-                        X: curve.end.0,
-                        Y: curve.end.1,
-                    },
-                });
-                sink.AddBeziers(&beziers);
-                sink.EndFigure(D2D1_FIGURE_END_OPEN);
-                sink.Close()?;
-                context.DrawGeometry(&geometry, &brush, SHZ_LOGO_STROKE_WIDTH, &stroke);
-            }
-            Ok(())
-        })();
-        let end_result = interop.EndDraw();
-        draw_result?;
-        end_result?;
+        let (long_visual, long_geometries) = make_logo_visual(
+            compositor,
+            d2d_factory,
+            [SHZ_LOGO_TOP_LONG_PATH, SHZ_LOGO_BOTTOM_LONG_PATH],
+            &solid_brush,
+            LogoTrim::End,
+        )?;
+        let (final_visual, _) = make_logo_visual(
+            compositor,
+            d2d_factory,
+            [SHZ_LOGO_TOP_PATH, SHZ_LOGO_BOTTOM_PATH],
+            &solid_brush,
+            LogoTrim::None,
+        )?;
+        transparent_visual.SetOpacity(1.0)?;
+        long_visual.SetOpacity(1.0)?;
+        final_visual.SetOpacity(0.0)?;
 
-        let surface_brush = compositor.CreateSurfaceBrushWithSurface(&surface)?;
-        let visual = compositor.CreateSpriteVisual()?;
-        visual.SetBrush(&surface_brush)?;
+        let shadow = compositor.CreateDropShadow()?;
+        shadow.SetBlurRadius(1.0)?;
+        shadow.SetOffset(Vector3 {
+            X: 0.5,
+            Y: 1.0,
+            Z: 0.0,
+        })?;
+        shadow.SetOpacity(1.0)?;
+        shadow.SetColor(logo_shadow_color(theme))?;
+        let transparent_root = compositor.CreateLayerVisual()?;
+        transparent_root.SetSize(Vector2 {
+            X: SHZ_LOGO_SOURCE_SIZE,
+            Y: SHZ_LOGO_SOURCE_SIZE,
+        })?;
+        transparent_root
+            .Children()?
+            .InsertAtTop(&transparent_visual)?;
+        transparent_root.SetShadow(&shadow)?;
+
+        let visual = compositor.CreateContainerVisual()?;
         visual.SetSize(Vector2 {
             X: SHZ_LOGO_SOURCE_SIZE,
             Y: SHZ_LOGO_SOURCE_SIZE,
@@ -572,11 +575,109 @@ impl CompositionLogo {
             Y: scale,
             Z: 1.0,
         })?;
+        visual.Children()?.InsertAtTop(&transparent_root)?;
+        visual.Children()?.InsertAtTop(&long_visual)?;
+        visual.Children()?.InsertAtTop(&final_visual)?;
+
+        let transparent_trim = make_logo_trim_animation(
+            compositor,
+            ui_model::STARTUP_LOGO_TRANSPARENT_DURATION,
+            0.0,
+            1.0,
+            CubicBezier {
+                x1: 1.0,
+                y1: 0.0,
+                x2: 1.0,
+                y2: 1.0,
+            },
+            0.0,
+        )?;
+        let solid_trim = make_logo_trim_animation(
+            compositor,
+            ui_model::STARTUP_LOGO_SOLID_DURATION,
+            0.0,
+            1.0,
+            CubicBezier {
+                x1: 0.4,
+                y1: 1.0,
+                x2: 0.41,
+                y2: 1.0,
+            },
+            ui_model::STARTUP_LOGO_SOLID_DELAY,
+        )?;
+        let long_fade = make_logo_stage_switch_animation(
+            compositor,
+            ui_model::STARTUP_LOGO_TOTAL_DURATION,
+            1.0,
+            0.0,
+        )?;
+        let final_fade = make_logo_stage_switch_animation(
+            compositor,
+            ui_model::STARTUP_LOGO_TOTAL_DURATION,
+            0.0,
+            1.0,
+        )?;
         Ok(Self {
-            _surface: surface,
-            _surface_brush: surface_brush,
+            transparent_brush,
+            _solid_brush: solid_brush,
+            shadow,
             visual,
+            _transparent_visual: transparent_visual,
+            long_visual,
+            final_visual,
+            _transparent_geometries: transparent_geometries,
+            _long_geometries: long_geometries,
+            transparent_trim_animation: transparent_trim,
+            solid_trim_animation: solid_trim,
+            long_fade_animation: long_fade,
+            final_fade_animation: final_fade,
+            started_at: None,
+            stage: ui_model::StartupLogoStage::TransparentStroke,
         })
+    }
+
+    fn start(&mut self) -> windows::core::Result<()> {
+        if self.started_at.is_some() {
+            return Ok(());
+        }
+        let started_at = Instant::now();
+        for geometry in &self._transparent_geometries {
+            geometry.StartAnimation(
+                &HSTRING::from("TrimStart"),
+                &self.transparent_trim_animation,
+            )?;
+        }
+        for geometry in &self._long_geometries {
+            geometry.StartAnimation(&HSTRING::from("TrimEnd"), &self.solid_trim_animation)?;
+        }
+        self.long_visual
+            .StartAnimation(&HSTRING::from("Opacity"), &self.long_fade_animation)?;
+        self.final_visual
+            .StartAnimation(&HSTRING::from("Opacity"), &self.final_fade_animation)?;
+        self.started_at = Some(started_at);
+        Ok(())
+    }
+
+    fn advance(&mut self) -> windows::core::Result<bool> {
+        let Some(started_at) = self.started_at else {
+            return Ok(false);
+        };
+        let frame = ui_model::startup_logo_frame_at(started_at.elapsed().as_secs_f64());
+        if frame.stage != self.stage {
+            match frame.stage {
+                ui_model::StartupLogoStage::TransparentStroke => {}
+                ui_model::StartupLogoStage::SolidLongStroke
+                | ui_model::StartupLogoStage::Complete => {}
+            }
+            self.stage = frame.stage;
+        }
+        Ok(self.stage == ui_model::StartupLogoStage::Complete)
+    }
+
+    fn set_theme(&self, theme: Theme) -> windows::core::Result<()> {
+        self.transparent_brush
+            .SetColor(logo_transparent_color(theme))?;
+        self.shadow.SetColor(logo_shadow_color(theme))
     }
 }
 
@@ -588,12 +689,12 @@ struct LogoBezier {
 }
 
 #[derive(Clone, Copy)]
-struct LogoPath {
+struct LogoPath<const N: usize> {
     start: (f32, f32),
-    curves: [LogoBezier; 4],
+    curves: [LogoBezier; N],
 }
 
-const SHZ_LOGO_TOP_PATH: LogoPath = LogoPath {
+const SHZ_LOGO_TOP_PATH: LogoPath<4> = LogoPath {
     start: (76.19, 10.38),
     curves: [
         LogoBezier {
@@ -619,7 +720,7 @@ const SHZ_LOGO_TOP_PATH: LogoPath = LogoPath {
     ],
 };
 
-const SHZ_LOGO_BOTTOM_PATH: LogoPath = LogoPath {
+const SHZ_LOGO_BOTTOM_PATH: LogoPath<4> = LogoPath {
     start: (133.82, 201.02),
     curves: [
         LogoBezier {
@@ -645,6 +746,242 @@ const SHZ_LOGO_BOTTOM_PATH: LogoPath = LogoPath {
     ],
 };
 
+const SHZ_LOGO_TOP_LONG_PATH: LogoPath<8> = LogoPath {
+    start: (133.6, 117.9),
+    curves: [
+        LogoBezier {
+            control1: (144.05, 107.41),
+            control2: (155.21, 96.08),
+            end: (161.2, 89.7),
+        },
+        LogoBezier {
+            control1: (181.72, 67.84),
+            control2: (180.89, 30.51),
+            end: (159.4, 9.7),
+        },
+        LogoBezier {
+            control1: (136.89, -13.49),
+            control2: (100.97, -11.49),
+            end: (80.7, 6.17),
+        },
+        LogoBezier {
+            control1: (80.7, 6.17),
+            control2: (77.6, 9.12),
+            end: (76.3, 10.4),
+        },
+        LogoBezier {
+            control1: (62.4, 24.48),
+            control2: (41.85, 44.71),
+            end: (32.49, 54.68),
+        },
+        LogoBezier {
+            control1: (11.96, 76.54),
+            control2: (12.8, 113.87),
+            end: (34.29, 134.68),
+        },
+        LogoBezier {
+            control1: (56.8, 157.87),
+            control2: (93.03, 156.21),
+            end: (113.29, 138.21),
+        },
+        LogoBezier {
+            control1: (119.79, 132.0),
+            control2: (133.69, 117.88),
+            end: (133.69, 117.88),
+        },
+    ],
+};
+
+const SHZ_LOGO_BOTTOM_LONG_PATH: LogoPath<8> = LogoPath {
+    start: (76.4, 93.5),
+    curves: [
+        LogoBezier {
+            control1: (65.95, 103.99),
+            control2: (55.21, 114.99),
+            end: (49.22, 121.37),
+        },
+        LogoBezier {
+            control1: (28.69, 143.24),
+            control2: (29.53, 180.57),
+            end: (51.02, 201.37),
+        },
+        LogoBezier {
+            control1: (73.53, 224.57),
+            control2: (109.45, 222.57),
+            end: (129.72, 204.9),
+        },
+        LogoBezier {
+            control1: (129.72, 204.9),
+            control2: (132.31, 202.48),
+            end: (133.62, 201.2),
+        },
+        LogoBezier {
+            control1: (147.6, 186.93),
+            control2: (168.16, 166.7),
+            end: (177.52, 156.72),
+        },
+        LogoBezier {
+            control1: (198.04, 134.86),
+            control2: (197.21, 97.53),
+            end: (175.72, 76.72),
+        },
+        LogoBezier {
+            control1: (153.21, 53.53),
+            control2: (116.98, 55.2),
+            end: (96.72, 73.2),
+        },
+        LogoBezier {
+            control1: (90.22, 79.4),
+            control2: (76.32, 93.52),
+            end: (76.32, 93.52),
+        },
+    ],
+};
+
+#[derive(Clone, Copy)]
+enum LogoTrim {
+    Start,
+    End,
+    None,
+}
+
+unsafe fn make_logo_visual<const N: usize>(
+    compositor: &Compositor,
+    d2d_factory: &ID2D1Factory,
+    paths: [LogoPath<N>; 2],
+    brush: &CompositionColorBrush,
+    trim: LogoTrim,
+) -> windows::core::Result<(ShapeVisual, [CompositionPathGeometry; 2])> {
+    let visual = compositor.CreateShapeVisual()?;
+    visual.SetSize(Vector2 {
+        X: SHZ_LOGO_SOURCE_SIZE,
+        Y: SHZ_LOGO_SOURCE_SIZE,
+    })?;
+    let geometries = [
+        make_logo_path_geometry(compositor, d2d_factory, paths[0], trim)?,
+        make_logo_path_geometry(compositor, d2d_factory, paths[1], trim)?,
+    ];
+    for geometry in &geometries {
+        let shape = compositor.CreateSpriteShapeWithGeometry(geometry)?;
+        shape.SetStrokeBrush(brush)?;
+        shape.SetStrokeThickness(SHZ_LOGO_STROKE_WIDTH)?;
+        shape.SetStrokeStartCap(windows::UI::Composition::CompositionStrokeCap::Round)?;
+        shape.SetStrokeEndCap(windows::UI::Composition::CompositionStrokeCap::Round)?;
+        visual.Shapes()?.Append(&shape)?;
+    }
+    Ok((visual, geometries))
+}
+
+unsafe fn make_logo_path_geometry<const N: usize>(
+    compositor: &Compositor,
+    d2d_factory: &ID2D1Factory,
+    path: LogoPath<N>,
+    trim: LogoTrim,
+) -> windows::core::Result<CompositionPathGeometry> {
+    let geometry = d2d_factory.CreatePathGeometry()?;
+    let sink = geometry.Open()?;
+    sink.BeginFigure(
+        Vector2 {
+            X: path.start.0,
+            Y: path.start.1,
+        },
+        D2D1_FIGURE_BEGIN_HOLLOW,
+    );
+    let beziers = path.curves.map(|curve| D2D1_BEZIER_SEGMENT {
+        point1: Vector2 {
+            X: curve.control1.0,
+            Y: curve.control1.1,
+        },
+        point2: Vector2 {
+            X: curve.control2.0,
+            Y: curve.control2.1,
+        },
+        point3: Vector2 {
+            X: curve.end.0,
+            Y: curve.end.1,
+        },
+    });
+    sink.AddBeziers(&beziers);
+    sink.EndFigure(D2D1_FIGURE_END_OPEN);
+    sink.Close()?;
+
+    let geometry: ID2D1Geometry = geometry.cast()?;
+    let source: IGeometrySource2D = D2DCompositionGeometrySource { geometry }.into();
+    let path = CompositionPath::Create(&source)?;
+    let geometry = compositor.CreatePathGeometryWithPath(&path)?;
+    match trim {
+        LogoTrim::Start => geometry.SetTrimStart(0.0)?,
+        LogoTrim::End => geometry.SetTrimEnd(0.0)?,
+        LogoTrim::None => {}
+    }
+    Ok(geometry)
+}
+
+fn make_logo_trim_animation(
+    compositor: &Compositor,
+    duration_seconds: f64,
+    from: f64,
+    to: f64,
+    curve: CubicBezier,
+    delay_seconds: f64,
+) -> windows::core::Result<ScalarKeyFrameAnimation> {
+    let animation = compositor.CreateScalarKeyFrameAnimation()?;
+    animation.SetDuration(TimeSpan {
+        Duration: (duration_seconds * 10_000_000.0).round() as i64,
+    })?;
+    if delay_seconds > 0.0 {
+        animation.SetDelayTime(TimeSpan {
+            Duration: (delay_seconds * 10_000_000.0).round() as i64,
+        })?;
+    }
+    let easing = compositor.CreateCubicBezierEasingFunction(
+        Vector2 {
+            X: curve.x1 as f32,
+            Y: curve.y1 as f32,
+        },
+        Vector2 {
+            X: curve.x2 as f32,
+            Y: curve.y2 as f32,
+        },
+    )?;
+    animation.InsertKeyFrame(0.0, from as f32)?;
+    animation.InsertKeyFrameWithEasingFunction(1.0, to as f32, &easing)?;
+    Ok(animation)
+}
+
+fn make_logo_stage_switch_animation(
+    compositor: &Compositor,
+    delay_seconds: f64,
+    from: f64,
+    to: f64,
+) -> windows::core::Result<ScalarKeyFrameAnimation> {
+    let animation = compositor.CreateScalarKeyFrameAnimation()?;
+    // Composition rejects animation durations below one millisecond even for
+    // a delayed, effectively instantaneous opacity switch.
+    animation.SetDuration(TimeSpan { Duration: 10_000 })?;
+    animation.SetDelayTime(TimeSpan {
+        Duration: (delay_seconds * 10_000_000.0).round() as i64,
+    })?;
+    animation.InsertKeyFrame(0.0, from as f32)?;
+    animation.InsertKeyFrame(1.0, to as f32)?;
+    Ok(animation)
+}
+
+fn logo_transparent_color(theme: Theme) -> Color {
+    match theme {
+        Theme::Light => composition_color(255, 27, 148, 250),
+        Theme::Dark => composition_color(255, 9, 9, 9),
+    }
+}
+
+fn logo_shadow_color(theme: Theme) -> Color {
+    match theme {
+        Theme::Light => composition_color(51, 255, 255, 255),
+        Theme::Dark => composition_color(255, 0, 0, 0),
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 struct CompositionMaskFactory {
     _compositor: Compositor,
@@ -653,6 +990,7 @@ struct CompositionMaskFactory {
     graphics_device: windows::UI::Composition::CompositionGraphicsDevice,
 }
 
+#[cfg(test)]
 impl CompositionMaskFactory {
     unsafe fn new(compositor: &Compositor) -> windows::core::Result<Self> {
         let d3d_device =
@@ -797,10 +1135,12 @@ impl CompositionAlphaMask {
     }
 }
 
+#[cfg(test)]
 fn mask_error(error: Error, context: &str) -> Error {
     Error::new(error.code(), format!("{context}: {error}"))
 }
 
+#[cfg(test)]
 unsafe fn create_mask_d3d_device() -> windows::core::Result<ID3D11Device> {
     let feature_levels = [D3D_FEATURE_LEVEL_11_0];
     let mut device = None;
@@ -834,7 +1174,6 @@ unsafe fn create_mask_d3d_device() -> windows::core::Result<ID3D11Device> {
 
 struct CompositionScene {
     compositor: Compositor,
-    _graphics: CompositionMaskFactory,
     _target: DesktopWindowTarget,
     root: ContainerVisual,
     inner_audio_root: ContainerVisual,
@@ -843,7 +1182,7 @@ struct CompositionScene {
     button: ContainerVisual,
     button_shape: CompositionSpriteShape,
     button_fill: CompositionColorBrush,
-    _logo: CompositionLogo,
+    logo: CompositionLogo,
     ring_brushes: [CompositionColorBrush; 6],
     idle_animation: Vector3KeyFrameAnimation,
     outer_scale_null_animation: Vector3KeyFrameAnimation,
@@ -872,7 +1211,6 @@ impl CompositionScene {
         compositor: &Compositor,
         theme: Theme,
         arrow_edge: ArrowEdge,
-        dpi: u32,
     ) -> windows::core::Result<Self> {
         let interop: ICompositorDesktopInterop = compositor.cast()?;
         let target = unsafe { interop.CreateDesktopWindowTarget(hwnd, true)? };
@@ -1188,8 +1526,7 @@ impl CompositionScene {
         button_shape.SetStrokeBrush(&button_edge)?;
         button_shape.SetStrokeThickness(if theme == Theme::Light { 0.75 } else { 0.0 })?;
         button_shape_visual.Shapes()?.Append(&button_shape)?;
-        let mask_factory = unsafe { CompositionMaskFactory::new(compositor)? };
-        let logo = unsafe { CompositionLogo::new(&mask_factory, d2d_factory, compositor, dpi)? };
+        let mut logo = unsafe { CompositionLogo::new(d2d_factory, compositor, theme)? };
         button.Children()?.InsertAtTop(&button_shape_visual)?;
         button.Children()?.InsertAtTop(&logo.visual)?;
 
@@ -1261,10 +1598,10 @@ impl CompositionScene {
             &easing,
         )?;
         target.SetRoot(&root)?;
+        logo.start()?;
 
         Ok(Self {
             compositor: compositor.clone(),
-            _graphics: mask_factory,
             _target: target,
             root,
             inner_audio_root,
@@ -1273,7 +1610,7 @@ impl CompositionScene {
             button,
             button_shape,
             button_fill,
-            _logo: logo,
+            logo,
             ring_brushes,
             idle_animation,
             outer_scale_null_animation,
@@ -1287,6 +1624,7 @@ impl CompositionScene {
     fn update(&mut self, snapshot: AnimationSnapshot) -> windows::core::Result<()> {
         if self.theme != snapshot.theme {
             self.theme = snapshot.theme;
+            self.logo.set_theme(self.theme)?;
             for brush in &self.ring_brushes {
                 brush.SetColor(composition_tagging_color(self.theme))?;
             }
@@ -1476,8 +1814,9 @@ impl CompositionScene {
                 .SetOpacity(frame.outer_audio_opacity as f32)?;
         }
 
+        let logo_finished = self.logo.advance()?;
         if snapshot.mode == TaggingMode::Ready {
-            if snapshot.show_button && !self.idle_active {
+            if snapshot.show_button && logo_finished && !self.idle_active {
                 self.button.SetScale(Vector3 {
                     X: 1.0,
                     Y: 1.0,
@@ -1486,7 +1825,7 @@ impl CompositionScene {
                 self.button
                     .StartAnimation(&HSTRING::from("Scale"), &self.idle_animation)?;
                 self.idle_active = true;
-            } else if !snapshot.show_button && self.idle_active {
+            } else if (!snapshot.show_button || !logo_finished) && self.idle_active {
                 self.button.StopAnimation(&HSTRING::from("Scale"))?;
                 self.idle_active = false;
             }
@@ -1766,7 +2105,6 @@ impl Renderer {
                 &compositor,
                 theme,
                 ArrowEdge::Top,
-                dpi,
             )?)
         } else {
             None
@@ -1782,6 +2120,8 @@ impl Renderer {
             dpi,
             theme_generation,
             composition,
+            popup_outline: RefCell::new(None),
+            popup_header: RefCell::new(None),
         })
     }
 
@@ -1896,28 +2236,19 @@ impl Renderer {
             &self.palette.black
         };
 
-        let popup = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
-            rect: rect(0.0, body_top, CONTENT_WIDTH as f32, body_bottom),
-            radiusX: POPUP_CORNER_RADIUS as f32,
-            radiusY: POPUP_CORNER_RADIUS as f32,
-        };
-        self.target.FillRoundedRectangle(&popup, bg);
-        self.draw_arrow(app, body_top, body_bottom)?;
-
-        let top_rect = rect(
-            0.0,
-            body_top,
-            CONTENT_WIDTH as f32,
-            body_top + TOP_HEIGHT as f32,
-        );
+        let popup = self.popup_outline(app)?;
+        self.target.FillGeometry(&popup, bg, None);
         match app.phase {
             MainPhase::Listening { .. } => {
                 self.target
-                    .FillRectangle(&top_rect, &self.palette.listening);
+                    .FillGeometry(&self.popup_header(app)?, &self.palette.listening, None);
             }
             MainPhase::Matched { .. } | MainPhase::NoMatch { .. } => {
-                self.target
-                    .FillRectangle(&top_rect, &self.palette.result_start);
+                self.target.FillGeometry(
+                    &self.popup_header(app)?,
+                    &self.palette.result_start,
+                    None,
+                );
             }
             MainPhase::Ready | MainPhase::Error { .. } => {}
         }
@@ -1972,17 +2303,107 @@ impl Renderer {
         Ok(())
     }
 
-    unsafe fn draw_arrow(
-        &self,
-        app: &AppState,
-        body_top: f32,
-        body_bottom: f32,
-    ) -> windows::core::Result<()> {
+    /// Returns one cached union geometry for the rounded panel and its tray
+    /// arrow. A single outer contour keeps the translucent DWM edge continuous
+    /// and avoids independently rasterized edges where the arrow meets panel.
+    unsafe fn popup_outline(&self, app: &AppState) -> windows::core::Result<ID2D1Geometry> {
         let half = 10.0f32;
         let center = app
             .arrow_center
             .clamp(half + 4.0, CONTENT_WIDTH as f32 - half - 4.0);
-        let (tip_y, base_y) = if app.arrow_edge == ArrowEdge::Top {
+        let key = (app.arrow_edge, center.to_bits());
+        if let Some((edge, center_bits, geometry)) = self.popup_outline.borrow().as_ref() {
+            if *edge == key.0 && *center_bits == key.1 {
+                return Ok(geometry.clone());
+            }
+        }
+
+        let body_top = if app.arrow_edge == ArrowEdge::Top {
+            POPUP_ARROW_HEIGHT as f32
+        } else {
+            0.0
+        };
+        let body_bottom = body_top + CONTENT_HEIGHT as f32;
+        let rounded = self.factory.CreateRoundedRectangleGeometry(
+            &windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+                rect: rect(0.0, body_top, CONTENT_WIDTH as f32, body_bottom),
+                radiusX: POPUP_CORNER_RADIUS as f32,
+                radiusY: POPUP_CORNER_RADIUS as f32,
+            },
+        )?;
+        let arrow = self.popup_arrow_geometry(app.arrow_edge, center)?;
+
+        let union = self.factory.CreatePathGeometry()?;
+        let union_sink = union.Open()?;
+        rounded.CombineWithGeometry(&arrow, D2D1_COMBINE_MODE_UNION, None, 0.25, &union_sink)?;
+        union_sink.Close()?;
+        let geometry: ID2D1Geometry = union.cast()?;
+        *self.popup_outline.borrow_mut() = Some((key.0, key.1, geometry.clone()));
+        Ok(geometry)
+    }
+
+    unsafe fn popup_header(&self, app: &AppState) -> windows::core::Result<ID2D1Geometry> {
+        let half = 10.0f32;
+        let center = app
+            .arrow_center
+            .clamp(half + 4.0, CONTENT_WIDTH as f32 - half - 4.0);
+        let key = (app.arrow_edge, center.to_bits());
+        if let Some((edge, center_bits, geometry)) = self.popup_header.borrow().as_ref() {
+            if *edge == key.0 && *center_bits == key.1 {
+                return Ok(geometry.clone());
+            }
+        }
+
+        let body_top = if app.arrow_edge == ArrowEdge::Top {
+            POPUP_ARROW_HEIGHT as f32
+        } else {
+            0.0
+        };
+        let header = self.factory.CreatePathGeometry()?;
+        let header_sink = header.Open()?;
+        header_sink.BeginFigure(
+            Vector2 {
+                X: 0.0,
+                Y: body_top,
+            },
+            D2D1_FIGURE_BEGIN_FILLED,
+        );
+        header_sink.AddLine(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: body_top,
+        });
+        header_sink.AddLine(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: body_top + TOP_HEIGHT as f32,
+        });
+        header_sink.AddLine(Vector2 {
+            X: 0.0,
+            Y: body_top + TOP_HEIGHT as f32,
+        });
+        header_sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        header_sink.Close()?;
+
+        // Merge the colored header and arrow before clipping to the popup's
+        // outer contour so their shared edge is rasterized only once.
+        let arrow = self.popup_arrow_geometry(app.arrow_edge, center)?;
+        let header_with_arrow = self.combine_geometry(&header, &arrow, D2D1_COMBINE_MODE_UNION)?;
+        let outline = self.popup_outline(app)?;
+        let clipped = self.combine_geometry(
+            &header_with_arrow,
+            &outline,
+            windows::Win32::Graphics::Direct2D::D2D1_COMBINE_MODE_INTERSECT,
+        )?;
+        *self.popup_header.borrow_mut() = Some((key.0, key.1, clipped.clone()));
+        Ok(clipped)
+    }
+
+    unsafe fn popup_arrow_geometry(
+        &self,
+        edge: ArrowEdge,
+        center: f32,
+    ) -> windows::core::Result<ID2D1Geometry> {
+        let half = 10.0f32;
+        let (tip_y, base_y) = if edge == ArrowEdge::Top {
             (0.0, POPUP_ARROW_HEIGHT as f32)
         } else {
             (
@@ -1990,9 +2411,8 @@ impl Renderer {
                 CONTENT_HEIGHT as f32,
             )
         };
-        let _ = (body_top, body_bottom);
-        let path = self.factory.CreatePathGeometry()?;
-        let sink = path.Open()?;
+        let arrow = self.factory.CreatePathGeometry()?;
+        let sink = arrow.Open()?;
         sink.BeginFigure(
             Vector2 {
                 X: center - half,
@@ -2010,25 +2430,20 @@ impl Renderer {
         });
         sink.EndFigure(D2D1_FIGURE_END_CLOSED);
         sink.Close()?;
-        match app.phase {
-            MainPhase::Listening { .. } => {
-                self.target
-                    .FillGeometry(&path, &self.palette.listening, None);
-            }
-            MainPhase::Matched { .. } | MainPhase::NoMatch { .. } => {
-                self.target
-                    .FillGeometry(&path, &self.palette.result_start, None);
-            }
-            MainPhase::Ready | MainPhase::Error { .. } => {
-                let background = if app.theme == Theme::Light {
-                    &self.palette.white
-                } else {
-                    &self.palette.black
-                };
-                self.target.FillGeometry(&path, background, None);
-            }
-        }
-        Ok(())
+        arrow.cast()
+    }
+
+    unsafe fn combine_geometry(
+        &self,
+        first: &ID2D1Geometry,
+        second: &ID2D1Geometry,
+        mode: windows::Win32::Graphics::Direct2D::D2D1_COMBINE_MODE,
+    ) -> windows::core::Result<ID2D1Geometry> {
+        let combined = self.factory.CreatePathGeometry()?;
+        let sink = combined.Open()?;
+        first.CombineWithGeometry(second, mode, None, 0.25, &sink)?;
+        sink.Close()?;
+        combined.cast()
     }
 
     unsafe fn draw_ready(&self, app: &AppState, body_top: f32) {
@@ -4031,7 +4446,7 @@ mod tests {
     }
 
     #[test]
-    fn premultiplied_d2d_round_rect_keeps_antialiased_alpha_edges() {
+    fn premultiplied_d2d_popup_union_keeps_antialiased_alpha_edges() {
         use super::*;
 
         unsafe {
@@ -4075,19 +4490,34 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            target.FillRoundedRectangle(
-                &windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F {
-                        left: 0.0,
-                        top: 0.0,
-                        right: 32.0,
-                        bottom: 32.0,
+            let rounded = factory
+                .CreateRoundedRectangleGeometry(
+                    &windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: 0.0,
+                            top: 6.0,
+                            right: 32.0,
+                            bottom: 32.0,
+                        },
+                        radiusX: 8.0,
+                        radiusY: 8.0,
                     },
-                    radiusX: 8.0,
-                    radiusY: 8.0,
-                },
-                &brush,
-            );
+                )
+                .unwrap();
+            let arrow = factory.CreatePathGeometry().unwrap();
+            let arrow_sink = arrow.Open().unwrap();
+            arrow_sink.BeginFigure(Vector2 { X: 12.0, Y: 6.0 }, D2D1_FIGURE_BEGIN_FILLED);
+            arrow_sink.AddLine(Vector2 { X: 16.0, Y: 0.0 });
+            arrow_sink.AddLine(Vector2 { X: 20.0, Y: 6.0 });
+            arrow_sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            arrow_sink.Close().unwrap();
+            let popup = factory.CreatePathGeometry().unwrap();
+            let popup_sink = popup.Open().unwrap();
+            rounded
+                .CombineWithGeometry(&arrow, D2D1_COMBINE_MODE_UNION, None, 0.25, &popup_sink)
+                .unwrap();
+            popup_sink.Close().unwrap();
+            target.FillGeometry(&popup, &brush, None);
             target.EndDraw(None, None).unwrap();
 
             let pixels = surface._pixels.cast::<u8>();
@@ -4185,16 +4615,11 @@ mod tests {
                     factory.inverse_circle(336.0, 96.0, 144)?,
                     factory.inverse_circle(336.0, 96.0, 144)?,
                 ];
-                let mut _logos = Vec::new();
+                let mut logo = CompositionLogo::new(&d2d_factory, &compositor, Theme::Light)?;
+                logo.start()?;
                 for dpi in [96, 120, 144, 168, 192, 240, 288] {
                     let mask = factory.inverse_circle(336.0, 96.0, dpi)?;
                     let _brush = mask.brush();
-                    _logos.push(CompositionLogo::new(
-                        &factory,
-                        &d2d_factory,
-                        &compositor,
-                        dpi,
-                    )?);
                 }
                 Ok(())
             })();

@@ -33,6 +33,24 @@ pub const OUTER_SCALE_NULL_DURATION: f64 = 1.583_333_373_069_763_2;
 pub const OUTER_SECOND_PHASE: f64 = 0.208_333_35;
 pub const OUTER_DIAMETERS: [f64; 2] = [604.8, 514.08];
 
+pub const STARTUP_LOGO_TOTAL_DURATION: f64 = 0.839_999_973_773_956_3;
+pub const STARTUP_LOGO_TRANSPARENT_DURATION: f64 = 0.300_000_034;
+pub const STARTUP_LOGO_SOLID_DURATION: f64 = 0.540_000_018;
+pub const STARTUP_LOGO_SOLID_DELAY: f64 = STARTUP_LOGO_TRANSPARENT_DURATION;
+
+const STARTUP_LOGO_TRANSPARENT_BEZIER: CubicBezier = CubicBezier {
+    x1: 1.0,
+    y1: 0.0,
+    x2: 1.0,
+    y2: 1.0,
+};
+const STARTUP_LOGO_SOLID_BEZIER: CubicBezier = CubicBezier {
+    x1: 0.4,
+    y1: 1.0,
+    x2: 0.41,
+    y2: 1.0,
+};
+
 const BEZIER_X1: f64 = 0.44;
 const BEZIER_Y1: f64 = 0.05;
 const BEZIER_X2: f64 = 0.55;
@@ -99,6 +117,20 @@ pub struct CubicBezier {
     pub y1: f64,
     pub x2: f64,
     pub y2: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupLogoStage {
+    TransparentStroke,
+    SolidLongStroke,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StartupLogoFrame {
+    pub stage: StartupLogoStage,
+    pub transparent_trim_start: f64,
+    pub solid_long_trim_end: f64,
 }
 
 /// One keyframe on a shifted Core Animation child track. `easing` applies
@@ -201,6 +233,60 @@ pub fn native_bezier(progress: f64) -> f64 {
         }
     }
     cubic_component(t, BEZIER_Y1, BEZIER_Y2)
+}
+
+/// Deterministic presentation value for the one-shot UI-154 logo drawing.
+/// The two Core Animation tracks have independent clocks and easing curves.
+pub fn startup_logo_frame_at(elapsed: f64) -> StartupLogoFrame {
+    let elapsed = if elapsed.is_finite() {
+        elapsed.max(0.0)
+    } else {
+        0.0
+    };
+    if elapsed < STARTUP_LOGO_TRANSPARENT_DURATION {
+        StartupLogoFrame {
+            stage: StartupLogoStage::TransparentStroke,
+            transparent_trim_start: bezier_timing(
+                elapsed / STARTUP_LOGO_TRANSPARENT_DURATION,
+                STARTUP_LOGO_TRANSPARENT_BEZIER,
+            ),
+            solid_long_trim_end: 0.0,
+        }
+    } else if elapsed < STARTUP_LOGO_TOTAL_DURATION {
+        let solid_elapsed = (elapsed - STARTUP_LOGO_SOLID_DELAY).max(0.0);
+        StartupLogoFrame {
+            stage: StartupLogoStage::SolidLongStroke,
+            transparent_trim_start: 1.0,
+            solid_long_trim_end: bezier_timing(
+                solid_elapsed / STARTUP_LOGO_SOLID_DURATION,
+                STARTUP_LOGO_SOLID_BEZIER,
+            ),
+        }
+    } else {
+        StartupLogoFrame {
+            stage: StartupLogoStage::Complete,
+            transparent_trim_start: 1.0,
+            solid_long_trim_end: 1.0,
+        }
+    }
+}
+
+fn bezier_timing(progress: f64, curve: CubicBezier) -> f64 {
+    let x = finite_unit(progress);
+    if x == 0.0 || x == 1.0 {
+        return x;
+    }
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..48 {
+        let t = (low + high) * 0.5;
+        if cubic_component(t, curve.x1, curve.x2) < x {
+            low = t;
+        } else {
+            high = t;
+        }
+    }
+    cubic_component((low + high) * 0.5, curve.y1, curve.y2)
 }
 
 fn cubic_component(t: f64, p1: f64, p2: f64) -> f64 {
@@ -940,6 +1026,35 @@ mod tests {
         }
         assert_eq!(native_bezier(0.0), 0.0);
         assert_eq!(native_bezier(1.0), 1.0);
+    }
+
+    #[test]
+    fn startup_logo_tracks_keep_the_two_ui154_clocks_and_easings_separate() {
+        let first = startup_logo_frame_at(0.15);
+        let expected_first = bezier_timing(
+            0.15 / STARTUP_LOGO_TRANSPARENT_DURATION,
+            STARTUP_LOGO_TRANSPARENT_BEZIER,
+        );
+        assert_eq!(first.stage, StartupLogoStage::TransparentStroke);
+        close(first.transparent_trim_start, expected_first, 1e-12);
+        assert_eq!(first.solid_long_trim_end, 0.0);
+
+        let boundary = startup_logo_frame_at(STARTUP_LOGO_TRANSPARENT_DURATION);
+        assert_eq!(boundary.stage, StartupLogoStage::SolidLongStroke);
+        assert_eq!(boundary.transparent_trim_start, 1.0);
+        assert_eq!(boundary.solid_long_trim_end, 0.0);
+
+        let second =
+            startup_logo_frame_at(STARTUP_LOGO_SOLID_DELAY + STARTUP_LOGO_SOLID_DURATION * 0.5);
+        let expected_second = bezier_timing(0.5, STARTUP_LOGO_SOLID_BEZIER);
+        assert_eq!(second.stage, StartupLogoStage::SolidLongStroke);
+        close(second.solid_long_trim_end, expected_second, 1e-12);
+        assert_eq!(second.transparent_trim_start, 1.0);
+
+        let complete = startup_logo_frame_at(STARTUP_LOGO_TOTAL_DURATION);
+        assert_eq!(complete.stage, StartupLogoStage::Complete);
+        assert_eq!(complete.solid_long_trim_end, 1.0);
+        assert_eq!(startup_logo_frame_at(f64::NAN).transparent_trim_start, 0.0);
     }
 
     #[test]
