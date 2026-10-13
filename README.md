@@ -88,6 +88,15 @@ cargo run --locked -p openshazam -- recognize-loopback [device-id]
 cargo run --locked -p openshazam -- capture-signature-loopback <new-output.sig> [device-id]
 ```
 
+The native tray UI uses Windows Composition for the animated scene and
+Direct2D/DirectWrite for the popup. Build both executables so file recognition
+can start the existing `shazam-http-lab` command, then launch the UI:
+
+```sh
+cargo build --locked -p shazam-http-lab -p openshazam
+cargo run --locked -p openshazam -- ui
+```
+
 The existing Windows command remains fixed at 12 seconds. The progressive
 adapter point is the downmixed PCM packet from `capture_loopback_frames`:
 forward it to `ProgressiveSession::push_f32`, then dispatch each returned

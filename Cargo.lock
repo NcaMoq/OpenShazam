@@ -535,6 +535,8 @@ dependencies = [
  "sigx-core",
  "sigx-format",
  "wasapi",
+ "windows",
+ "windows-numerics",
 ]
 
 [[package]]

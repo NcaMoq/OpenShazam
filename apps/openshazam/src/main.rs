@@ -14,6 +14,10 @@ const CAPTURE_RATE: u32 = 16_000;
 const CAPTURE_SECONDS: usize = 12;
 #[cfg(target_os = "macos")]
 mod macos_capture;
+#[cfg(any(windows, test))]
+mod ui_model;
+#[cfg(windows)]
+mod windows_ui;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -41,6 +45,7 @@ fn main() -> ExitCode {
 #[cfg(windows)]
 fn run_windows_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match args.first().map(String::as_str) {
+        Some("ui") if args.len() == 1 => windows_ui::run(),
         Some("list-devices") if args.len() == 1 => list_render_devices(),
         Some("capture-signature-loopback") if (2..=3).contains(&args.len()) => {
             let output = Path::new(&args[1]);
@@ -98,6 +103,7 @@ fn refuse_overwrite(output: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn print_windows_usage() {
+    eprintln!("usage: openshazam ui");
     eprintln!("usage: openshazam list-devices");
     eprintln!("   or: openshazam recognize-loopback [device-id]");
     eprintln!("   or: openshazam capture-signature-loopback <new-output.sig> [device-id]");
