@@ -163,6 +163,8 @@ struct NativeIconLayout {
     settings_hit: [f32; 4],
     cancel_visual: [f32; 4],
     cancel_hit: [f32; 4],
+    result_close_visual: [f32; 4],
+    result_close_hit: [f32; 4],
 }
 
 fn native_icon_layout(body_top: f32) -> NativeIconLayout {
@@ -171,6 +173,8 @@ fn native_icon_layout(body_top: f32) -> NativeIconLayout {
         settings_hit: [342.0, body_top + 20.0, 372.0, body_top + 48.0],
         cancel_visual: [351.0, body_top + 27.0, 363.0, body_top + 39.0],
         cancel_hit: [342.0, body_top + 20.0, 372.0, body_top + 48.0],
+        result_close_visual: [353.0, body_top + 25.0, 365.0, body_top + 37.0],
+        result_close_hit: [353.0, body_top + 25.0, 365.0, body_top + 37.0],
     }
 }
 
@@ -221,6 +225,7 @@ enum MainPhase {
     Matched {
         track: Track,
         entered_at: Instant,
+        returned_to_ready_at: Option<Instant>,
     },
     NoMatch {
         entered_at: Instant,
@@ -320,7 +325,6 @@ struct TextStyles {
     centered_title: IDWriteTextFormat,
     centered_heavy: IDWriteTextFormat,
     trailing_small: IDWriteTextFormat,
-    icon: IDWriteTextFormat,
     logo: IDWriteTextFormat,
 }
 
@@ -2821,33 +2825,20 @@ impl Renderer {
                 self.draw_listening_status(body_top, *mode);
                 self.draw_cancel_button(body_top);
             }
-            MainPhase::Matched {
-                ref track,
-                entered_at,
-            } => {
-                self.draw_result_panel(track, body_top, entered_at.elapsed().as_secs_f64())?;
+            MainPhase::Matched { ref track, .. } => {
+                let top =
+                    result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
+                self.draw_result_panel(track, top)?;
             }
-            MainPhase::NoMatch {
-                entered_at,
-                returned_to_ready_at,
-            } => {
-                self.draw_no_match_panel(
-                    body_top,
-                    entered_at.elapsed().as_secs_f64(),
-                    *returned_to_ready_at,
-                    false,
-                )?;
+            MainPhase::NoMatch { .. } => {
+                let top =
+                    result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
+                self.draw_no_match_panel(top, false)?;
             }
-            MainPhase::Offline {
-                entered_at,
-                returned_to_ready_at,
-            } => {
-                self.draw_no_match_panel(
-                    body_top,
-                    entered_at.elapsed().as_secs_f64(),
-                    *returned_to_ready_at,
-                    true,
-                )?;
+            MainPhase::Offline { .. } => {
+                let top =
+                    result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
+                self.draw_no_match_panel(top, true)?;
             }
             MainPhase::Error { ref message, .. } => {
                 self.draw_ready(app, body_top);
@@ -3201,15 +3192,7 @@ impl Renderer {
         }
     }
 
-    unsafe fn draw_result_panel(
-        &self,
-        track: &Track,
-        body_top: f32,
-        elapsed: f64,
-    ) -> windows::core::Result<()> {
-        let entrance = ui_model::native_bezier((elapsed / 0.3).clamp(0.0, 1.0)) as f32;
-        let y_offset = (1.0 - entrance) * -TOP_HEIGHT as f32;
-        let top = body_top + y_offset;
+    unsafe fn draw_result_panel(&self, track: &Track, top: f32) -> windows::core::Result<()> {
         let panel = rect(0.0, top, CONTENT_WIDTH as f32, top + TOP_HEIGHT as f32);
         self.fill_gradient_rect(&panel, &self.palette.result_start, top)?;
         let art = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
@@ -3249,31 +3232,11 @@ impl Renderer {
             &self.text.date,
             &self.palette.white_ink,
         );
-        self.text(
-            "×",
-            rect(342.0, top + 16.0, 372.0, top + 48.0),
-            &self.text.icon,
-            &self.palette.subtitle,
-        );
+        self.draw_result_close_icon(top);
         Ok(())
     }
 
-    unsafe fn draw_no_match_panel(
-        &self,
-        body_top: f32,
-        elapsed: f64,
-        returned_to_ready_at: Option<Instant>,
-        offline: bool,
-    ) -> windows::core::Result<()> {
-        let entrance = ui_model::native_bezier((elapsed / 0.3).clamp(0.0, 1.0)) as f32;
-        let closing = returned_to_ready_at
-            .map(|start| {
-                1.0 - ui_model::native_bezier((start.elapsed().as_secs_f64() / 0.3).clamp(0.0, 1.0))
-                    as f32
-            })
-            .unwrap_or(1.0);
-        let y_offset = (1.0 - entrance) * -TOP_HEIGHT as f32 + (1.0 - closing) * TOP_HEIGHT as f32;
-        let top = body_top + y_offset;
+    unsafe fn draw_no_match_panel(&self, top: f32, offline: bool) -> windows::core::Result<()> {
         let panel = rect(0.0, top, CONTENT_WIDTH as f32, top + TOP_HEIGHT as f32);
         self.fill_gradient_rect(&panel, &self.palette.result_start, top)?;
         let (title, body) = if offline {
@@ -3309,13 +3272,38 @@ impl Renderer {
             &self.text.button,
             &self.palette.white_ink,
         );
-        self.text(
-            "×",
-            rect(342.0, top + 16.0, 372.0, top + 48.0),
-            &self.text.icon,
-            &self.palette.subtitle,
-        );
+        self.draw_result_close_icon(top);
         Ok(())
+    }
+
+    unsafe fn draw_result_close_icon(&self, body_top: f32) {
+        let [left, top, right, bottom] = native_icon_layout(body_top).result_close_visual;
+        self.target.DrawLine(
+            Vector2 {
+                X: left + 2.0,
+                Y: top + 2.0,
+            },
+            Vector2 {
+                X: right - 2.0,
+                Y: bottom - 2.0,
+            },
+            &self.palette.subtitle,
+            1.2,
+            None,
+        );
+        self.target.DrawLine(
+            Vector2 {
+                X: right - 2.0,
+                Y: top + 2.0,
+            },
+            Vector2 {
+                X: left + 2.0,
+                Y: bottom - 2.0,
+            },
+            &self.palette.subtitle,
+            1.2,
+            None,
+        );
     }
 
     unsafe fn draw_error_banner(&self, message: &str, body_top: f32) {
@@ -3805,12 +3793,6 @@ unsafe fn create_text_styles(factory: &IDWriteFactory) -> windows::core::Result<
             DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_TEXT_ALIGNMENT_TRAILING,
         )?,
-        icon: create_text_format(
-            factory,
-            20.0,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_TEXT_ALIGNMENT_CENTER,
-        )?,
         logo: create_text_format(
             factory,
             58.0,
@@ -4008,10 +3990,21 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
     if matches!(
         app.phase,
         MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
-    ) && x >= 340.0
-        && y <= body_top + 50.0
-    {
-        return MainHit::CloseResult;
+    ) {
+        let top = result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
+        let offset = top - body_top;
+        let close = native_icon_layout(body_top).result_close_hit;
+        if point_in_rect(x, y - offset, close) {
+            return MainHit::CloseResult;
+        }
+        if matches!(
+            app.phase,
+            MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
+        ) && (90.0..=290.0).contains(&x)
+            && (top + 115.0..=top + 155.0).contains(&y)
+        {
+            return MainHit::TryAgain;
+        }
     }
     if let MainPhase::Timeout { .. } = app.phase {
         if (70.0..=190.0).contains(&x) && (body_top + 126.0..=body_top + 160.0).contains(&y) {
@@ -4021,15 +4014,6 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
             return MainHit::TimeoutDismiss;
         }
         return MainHit::Other;
-    }
-    if matches!(
-        app.phase,
-        MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
-    ) && (90.0..=290.0).contains(&x)
-        && y >= body_top + 115.0
-        && y <= body_top + 155.0
-    {
-        return MainHit::TryAgain;
     }
     let file_hint_top = body_top + CONTENT_HEIGHT as f32 - 30.0;
     if (10.0..=220.0).contains(&x) && y >= file_hint_top {
@@ -4306,6 +4290,7 @@ fn complete_capture(app: &mut AppState, finished: CaptureFinished) {
                 app.phase = MainPhase::Matched {
                     track,
                     entered_at: Instant::now(),
+                    returned_to_ready_at: None,
                 };
             } else {
                 app.phase = MainPhase::NoMatch {
@@ -4594,7 +4579,15 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
         // They do not need an 8 ms UI-thread timer; future meter values enter
         // through a change event and update the audio transforms once per value.
         MainPhase::Listening { .. } => false,
-        MainPhase::Matched { entered_at, .. } => entered_at.elapsed() < Duration::from_millis(350),
+        MainPhase::Matched {
+            entered_at,
+            returned_to_ready_at,
+            ..
+        } => {
+            entered_at.elapsed() < Duration::from_millis(350)
+                || returned_to_ready_at
+                    .is_some_and(|start| start.elapsed() < Duration::from_millis(350))
+        }
         MainPhase::NoMatch {
             entered_at,
             returned_to_ready_at,
@@ -4612,6 +4605,36 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
         }
         MainPhase::Ready | MainPhase::Error { .. } | MainPhase::Timeout { .. } => false,
     }
+}
+
+fn result_panel_top_at(phase: &MainPhase, body_top: f32, now: Instant) -> Option<f32> {
+    let (entered_at, returned_to_ready_at) = match phase {
+        MainPhase::Matched {
+            entered_at,
+            returned_to_ready_at,
+            ..
+        }
+        | MainPhase::NoMatch {
+            entered_at,
+            returned_to_ready_at,
+        }
+        | MainPhase::Offline {
+            entered_at,
+            returned_to_ready_at,
+        } => (*entered_at, *returned_to_ready_at),
+        _ => return None,
+    };
+    let entrance = ui_model::native_bezier(
+        (now.saturating_duration_since(entered_at).as_secs_f64() / 0.3).clamp(0.0, 1.0),
+    ) as f32;
+    let exit = returned_to_ready_at
+        .map(|start| {
+            ui_model::native_bezier(
+                (now.saturating_duration_since(start).as_secs_f64() / 0.3).clamp(0.0, 1.0),
+            ) as f32
+        })
+        .unwrap_or(0.0);
+    Some(body_top - (1.0 - entrance) * TOP_HEIGHT as f32 + exit * TOP_HEIGHT as f32)
 }
 
 fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> bool {
@@ -4639,7 +4662,22 @@ unsafe fn process_main_hit(app: &mut AppState, hit: MainHit) {
         MainHit::TimeoutDismiss => app.phase = MainPhase::Ready,
         MainHit::TryAgain => start_capture(app, CaptureMode::Manual, None),
         MainHit::CloseResult => {
-            app.phase = MainPhase::Ready;
+            let now = Instant::now();
+            match &mut app.phase {
+                MainPhase::Matched {
+                    returned_to_ready_at,
+                    ..
+                }
+                | MainPhase::NoMatch {
+                    returned_to_ready_at,
+                    ..
+                }
+                | MainPhase::Offline {
+                    returned_to_ready_at,
+                    ..
+                } if returned_to_ready_at.is_none() => *returned_to_ready_at = Some(now),
+                _ => {}
+            }
             app.message = None;
         }
         MainHit::CenterButton => {
@@ -5214,11 +5252,22 @@ fn update_phase_timers(app: &mut AppState) -> bool {
     let now = Instant::now();
     let mut changed = false;
     match &mut app.phase {
-        MainPhase::Matched { entered_at, .. }
-            if now.duration_since(*entered_at) >= Duration::from_secs(10) =>
-        {
-            app.phase = MainPhase::Ready;
-            changed = true;
+        MainPhase::Matched {
+            entered_at,
+            returned_to_ready_at,
+            ..
+        } => {
+            if returned_to_ready_at.is_none()
+                && now.duration_since(*entered_at) >= Duration::from_secs(10)
+            {
+                *returned_to_ready_at = Some(now);
+                changed = true;
+            } else if returned_to_ready_at
+                .is_some_and(|start| now.duration_since(start) >= Duration::from_millis(300))
+            {
+                app.phase = MainPhase::Ready;
+                changed = true;
+            }
         }
         MainPhase::NoMatch {
             entered_at,
@@ -5258,8 +5307,8 @@ mod tests {
     use super::{
         animation_needs_frame, button_border_arc_points, gradient_origin_transform,
         is_offline_failure, is_timeout_failure, native_icon_layout, parse_debug_string,
-        parse_match, phase_needs_timeout, point_in_rect, CaptureMode, MainPhase,
-        OUTER_BASE_OPACITY,
+        parse_match, phase_needs_timeout, point_in_rect, result_panel_top_at, CaptureMode,
+        MainPhase, OUTER_BASE_OPACITY,
     };
 
     #[test]
@@ -5435,12 +5484,10 @@ mod tests {
 
         for dpi in [96, 120, 144, 168, 192, 240, 288] {
             let scale = composition_scale_for_dpi(dpi);
-            let d2d_center_x =
-                ui_model::physical_pixels(BUTTON_X as f64 + BUTTON_SIZE as f64 * 0.5, dpi);
+            let d2d_center_x = ui_model::physical_pixels(BUTTON_X + BUTTON_SIZE * 0.5, dpi);
             let composition_center_x =
                 ((BUTTON_X as f32 + BUTTON_SIZE as f32 * 0.5) * scale).round() as i32;
-            let button_center_y =
-                POPUP_ARROW_HEIGHT as f64 + BUTTON_TOP as f64 + BUTTON_SIZE as f64 * 0.5;
+            let button_center_y = POPUP_ARROW_HEIGHT + BUTTON_TOP + BUTTON_SIZE * 0.5;
             let d2d_center_y = ui_model::physical_pixels(button_center_y, dpi);
             let composition_center_y = (button_center_y as f32 * scale).round() as i32;
             assert_eq!(composition_center_x, d2d_center_x, "{dpi} DPI x");
@@ -5465,8 +5512,50 @@ mod tests {
         assert_eq!(layout.settings_hit, [342.0, 20.0, 372.0, 48.0]);
         assert_eq!(layout.cancel_visual, [351.0, 27.0, 363.0, 39.0]);
         assert_eq!(layout.cancel_hit, layout.settings_hit);
+        assert_eq!(layout.result_close_visual, [353.0, 25.0, 365.0, 37.0]);
+        assert_eq!(layout.result_close_hit, layout.result_close_visual);
         assert!(point_in_rect(342.0, 20.0, layout.settings_hit));
         assert!(!point_in_rect(341.9, 20.0, layout.settings_hit));
+        assert!(point_in_rect(353.0, 25.0, layout.result_close_hit));
+        assert!(!point_in_rect(352.9, 25.0, layout.result_close_hit));
+        assert!(!point_in_rect(349.0, 25.0, layout.result_close_hit));
+    }
+
+    #[test]
+    fn result_panel_position_is_reproducible_at_entry_and_exit_times() {
+        let entered_at = std::time::Instant::now();
+        let returned_at = entered_at + std::time::Duration::from_secs(1);
+        let phase = MainPhase::Matched {
+            track: super::Track {
+                title: String::new(),
+                artist: String::new(),
+                recognized_at: entered_at,
+            },
+            entered_at,
+            returned_to_ready_at: Some(returned_at),
+        };
+        let body_top = 42.0;
+
+        assert_eq!(
+            result_panel_top_at(&phase, body_top, entered_at),
+            Some(body_top - super::TOP_HEIGHT as f32)
+        );
+        assert_eq!(
+            result_panel_top_at(
+                &phase,
+                body_top,
+                entered_at + std::time::Duration::from_millis(300)
+            ),
+            Some(body_top)
+        );
+        assert_eq!(
+            result_panel_top_at(
+                &phase,
+                body_top,
+                returned_at + std::time::Duration::from_millis(300)
+            ),
+            Some(body_top + super::TOP_HEIGHT as f32)
+        );
     }
 
     #[test]
