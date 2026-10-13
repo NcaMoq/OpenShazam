@@ -104,8 +104,9 @@ use windows::{
         Composition::{
             AnimationIterationBehavior, CompositionColorBrush, CompositionEllipseGeometry,
             CompositionPath, CompositionPathGeometry, CompositionSpriteShape, Compositor,
-            ContainerVisual, Desktop::DesktopWindowTarget, DropShadow, ScalarKeyFrameAnimation,
-            ShapeVisual, Vector2KeyFrameAnimation, Vector3KeyFrameAnimation,
+            ContainerVisual, CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow,
+            ScalarKeyFrameAnimation, ShapeVisual, Vector2KeyFrameAnimation,
+            Vector3KeyFrameAnimation,
         },
     },
 };
@@ -1244,17 +1245,23 @@ struct CompositionScene {
     outer_audio_root: ContainerVisual,
     rings: [CompositionRing; 6],
     button: ContainerVisual,
+    button_content: ContainerVisual,
     button_shape: CompositionSpriteShape,
     button_fill: CompositionColorBrush,
     logo: CompositionLogo,
+    no_match_icon_transform: ContainerVisual,
     ring_brushes: [CompositionColorBrush; 6],
     idle_animation: Vector3KeyFrameAnimation,
     outer_scale_null_animation: Vector3KeyFrameAnimation,
     idle_active: bool,
+    idle_started_at: Option<Instant>,
+    last_button_scale: f32,
     ripples_active: bool,
     theme: Theme,
     body_top: f32,
     dpi: u32,
+    no_match_active: bool,
+    no_match_restore_active: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1267,6 +1274,7 @@ struct AnimationSnapshot {
     show_ripples: bool,
     levels: UiLevels,
     auto_spring: Option<ui_model::SpringProfile>,
+    no_match_elapsed: Option<f64>,
 }
 
 impl CompositionScene {
@@ -1605,8 +1613,38 @@ impl CompositionScene {
         button_shape.SetStrokeThickness(1.0)?;
         button_shape_visual.Shapes()?.Append(&button_shape)?;
         let mut logo = unsafe { CompositionLogo::new(d2d_factory, compositor, theme)? };
-        button.Children()?.InsertAtTop(&button_shape_visual)?;
-        button.Children()?.InsertAtTop(&logo.visual)?;
+        let button_content = compositor.CreateContainerVisual()?;
+        button_content.SetSize(Vector2 {
+            X: BUTTON_SIZE as f32,
+            Y: BUTTON_SIZE as f32,
+        })?;
+        button_content.SetCenterPoint(Vector3 {
+            X: BUTTON_SIZE as f32 * 0.5,
+            Y: BUTTON_SIZE as f32 * 0.5,
+            Z: 0.0,
+        })?;
+        // UI-131's mask icon path is not specified in the research master.
+        // Keep its center/position transform as its own node until the path
+        // is measured; do not approximate it by shifting the Shazam logo.
+        let no_match_icon_transform = compositor.CreateContainerVisual()?;
+        no_match_icon_transform.SetSize(Vector2 {
+            X: BUTTON_SIZE as f32,
+            Y: BUTTON_SIZE as f32,
+        })?;
+        no_match_icon_transform.SetCenterPoint(Vector3 {
+            X: BUTTON_SIZE as f32 * 0.5,
+            Y: BUTTON_SIZE as f32 * 0.5,
+            Z: 0.0,
+        })?;
+        no_match_icon_transform.SetOpacity(0.0)?;
+        button_content
+            .Children()?
+            .InsertAtTop(&button_shape_visual)?;
+        button_content.Children()?.InsertAtTop(&logo.visual)?;
+        button_content
+            .Children()?
+            .InsertAtTop(&no_match_icon_transform)?;
+        button.Children()?.InsertAtTop(&button_content)?;
 
         let children = root.Children()?;
         children.InsertAtTop(&inner_audio_root)?;
@@ -1686,17 +1724,23 @@ impl CompositionScene {
             outer_audio_root,
             rings,
             button,
+            button_content,
             button_shape,
             button_fill,
             logo,
+            no_match_icon_transform,
             ring_brushes,
             idle_animation,
             outer_scale_null_animation,
             idle_active: false,
+            idle_started_at: None,
+            last_button_scale: 1.0,
             ripples_active: false,
             theme,
             body_top,
             dpi,
+            no_match_active: false,
+            no_match_restore_active: false,
         })
     }
 
@@ -1749,11 +1793,62 @@ impl CompositionScene {
             })?;
         }
 
-        self.button.SetOffset(Vector3 {
-            X: BUTTON_X as f32,
-            Y: snapshot.body_top + BUTTON_TOP as f32,
-            Z: 0.0,
-        })?;
+        if snapshot.no_match_elapsed.is_some() && !self.no_match_restore_active {
+            let from_scale = if self.idle_active {
+                self.idle_started_at
+                    .map(|started_at| {
+                        ui_model::idle_pulse_at(started_at.elapsed().as_secs_f64()) as f32
+                    })
+                    .unwrap_or(self.last_button_scale)
+            } else {
+                self.last_button_scale
+            };
+            if self.idle_active {
+                self.button.StopAnimation(&HSTRING::from("Scale"))?;
+                self.idle_active = false;
+                self.idle_started_at = None;
+            }
+            self.start_no_match_idle_restore(from_scale)?;
+            self.no_match_restore_active = true;
+        }
+
+        if snapshot
+            .no_match_elapsed
+            .is_some_and(|elapsed| elapsed >= 0.18)
+            && !self.no_match_active
+        {
+            self.start_no_match_motion(snapshot.body_top)?;
+            self.no_match_active = true;
+        } else if snapshot.no_match_elapsed.is_none()
+            && (self.no_match_active || self.no_match_restore_active)
+        {
+            self.button.StopAnimation(&HSTRING::from("Offset"))?;
+            self.button.StopAnimation(&HSTRING::from("Scale"))?;
+            self.button_content.StopAnimation(&HSTRING::from("Scale"))?;
+            self.no_match_icon_transform
+                .StopAnimation(&HSTRING::from("Offset"))?;
+            self.button.SetScale(Vector3 {
+                X: 1.0,
+                Y: 1.0,
+                Z: 1.0,
+            })?;
+            self.button_content.SetScale(Vector3 {
+                X: 1.0,
+                Y: 1.0,
+                Z: 1.0,
+            })?;
+            self.no_match_icon_transform.SetOffset(Vector3::default())?;
+            self.no_match_active = false;
+            self.no_match_restore_active = false;
+            self.last_button_scale = 1.0;
+        }
+        if !self.no_match_active {
+            self.button.SetOffset(Vector3 {
+                X: BUTTON_X as f32,
+                Y: snapshot.body_top + BUTTON_TOP as f32,
+                Z: 0.0,
+            })?;
+        }
         self.button
             .SetOpacity(if snapshot.show_button { 1.0 } else { 0.0 })?;
 
@@ -1879,6 +1974,7 @@ impl CompositionScene {
             if self.idle_active {
                 self.button.StopAnimation(&HSTRING::from("Scale"))?;
                 self.idle_active = false;
+                self.idle_started_at = None;
             }
             let frame = ui_model::wave_frame_at_with_auto_spring(
                 snapshot.mode,
@@ -1913,14 +2009,17 @@ impl CompositionScene {
                 self.button
                     .StartAnimation(&HSTRING::from("Scale"), &self.idle_animation)?;
                 self.idle_active = true;
+                self.idle_started_at = Some(Instant::now());
             } else if (!snapshot.show_button || !logo_finished) && self.idle_active {
                 self.button.StopAnimation(&HSTRING::from("Scale"))?;
                 self.idle_active = false;
+                self.idle_started_at = None;
             }
         } else {
             if self.idle_active {
                 self.button.StopAnimation(&HSTRING::from("Scale"))?;
                 self.idle_active = false;
+                self.idle_started_at = None;
             }
             let frame = ui_model::wave_frame_at_with_auto_spring(
                 snapshot.mode,
@@ -1933,6 +2032,7 @@ impl CompositionScene {
                 Y: frame.button_child_scale as f32,
                 Z: 1.0,
             })?;
+            self.last_button_scale = frame.button_child_scale as f32;
         }
         Ok(())
     }
@@ -1940,6 +2040,135 @@ impl CompositionScene {
     fn startup_logo_complete(&self) -> bool {
         self.logo.stage == ui_model::StartupLogoStage::Complete
     }
+
+    fn start_no_match_idle_restore(&self, from_scale: f32) -> windows::core::Result<()> {
+        let ease_out = self.compositor.CreateCubicBezierEasingFunction(
+            Vector2 { X: 0.0, Y: 0.0 },
+            Vector2 { X: 0.58, Y: 1.0 },
+        )?;
+        let restore =
+            create_no_match_scale_animation(&self.compositor, from_scale, 1.0, 0.245, &ease_out)?;
+        self.button.SetScale(Vector3 {
+            X: from_scale,
+            Y: from_scale,
+            Z: 1.0,
+        })?;
+        self.button
+            .StartAnimation(&HSTRING::from("Scale"), &restore)
+    }
+
+    fn start_no_match_motion(&mut self, body_top: f32) -> windows::core::Result<()> {
+        let button_left = BUTTON_X as f32;
+        let button_top = body_top + BUTTON_TOP as f32;
+        let tagging_profile = ui_model::no_match_position_profile(
+            BUTTON_SIZE,
+            -0.150_000_005_960_464_48,
+            8.449_999_809_265_137,
+            0.5,
+        );
+        let icon_profile = ui_model::no_match_position_profile(
+            BUTTON_SIZE,
+            -0.070_000_000_298_023_22,
+            3.940_000_057_220_459,
+            1.100_000_023_841_858,
+        );
+        let tagging_position = create_no_match_position_animation(
+            &self.compositor,
+            button_left,
+            button_top,
+            tagging_profile,
+        )?;
+        let icon_position =
+            create_no_match_position_animation(&self.compositor, 0.0, 0.0, icon_profile)?;
+        self.button.SetOffset(Vector3 {
+            X: button_left + tagging_profile.from as f32,
+            Y: body_top + BUTTON_TOP as f32,
+            Z: 0.0,
+        })?;
+        self.no_match_icon_transform.SetOffset(Vector3 {
+            X: icon_profile.from as f32,
+            Y: 0.0,
+            Z: 0.0,
+        })?;
+        self.button
+            .StartAnimation(&HSTRING::from("Offset"), &tagging_position)?;
+        self.no_match_icon_transform
+            .StartAnimation(&HSTRING::from("Offset"), &icon_position)?;
+
+        let ease_out = self.compositor.CreateCubicBezierEasingFunction(
+            Vector2 { X: 0.0, Y: 0.0 },
+            Vector2 { X: 0.58, Y: 1.0 },
+        )?;
+        self.button_content.SetScale(Vector3 {
+            X: 1.0,
+            Y: 1.0,
+            Z: 1.0,
+        })?;
+        let scale = create_no_match_scale_animation(&self.compositor, 1.0, 0.8, 0.3, &ease_out)?;
+        self.button_content
+            .StartAnimation(&HSTRING::from("Scale"), &scale)
+    }
+}
+
+fn create_no_match_scale_animation(
+    compositor: &Compositor,
+    from: f32,
+    to: f32,
+    duration_seconds: f64,
+    easing: &CubicBezierEasingFunction,
+) -> windows::core::Result<Vector3KeyFrameAnimation> {
+    let animation = compositor.CreateVector3KeyFrameAnimation()?;
+    animation.SetDuration(TimeSpan {
+        Duration: (duration_seconds * 10_000_000.0).round() as i64,
+    })?;
+    animation.InsertKeyFrame(
+        0.0,
+        Vector3 {
+            X: from,
+            Y: from,
+            Z: 1.0,
+        },
+    )?;
+    animation.InsertKeyFrameWithEasingFunction(
+        1.0,
+        Vector3 {
+            X: to,
+            Y: to,
+            Z: 1.0,
+        },
+        easing,
+    )?;
+    Ok(animation)
+}
+
+fn create_no_match_position_animation(
+    compositor: &Compositor,
+    center_x: f32,
+    center_y: f32,
+    profile: ui_model::SpringProfile,
+) -> windows::core::Result<Vector3KeyFrameAnimation> {
+    let animation = compositor.CreateVector3KeyFrameAnimation()?;
+    animation.SetDuration(TimeSpan {
+        Duration: (profile.duration_seconds * 10_000_000.0).round() as i64,
+    })?;
+    animation.SetDelayTime(TimeSpan {
+        Duration: 3_000_000,
+    })?;
+    // Sample the analytic spring densely at creation time; Composition then
+    // interpolates on the GPU between knots without an 8 ms Rust frame loop.
+    for frame in 0..=256 {
+        let progress = frame as f64 / 256.0;
+        let offset = ui_model::spring_value(progress, profile) as f32;
+        animation.InsertKeyFrame(
+            progress as f32,
+            Vector3 {
+                X: center_x + offset,
+                Y: center_y,
+                Z: 0.0,
+            },
+        )?;
+    }
+    Ok(animation)
 }
 
 fn make_inner_ring_animations(
@@ -3937,6 +4166,10 @@ fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
         show_ripples,
         levels: app.ui_levels,
         auto_spring: app.auto_spring,
+        no_match_elapsed: match &app.phase {
+            MainPhase::NoMatch { entered_at, .. } => Some(entered_at.elapsed().as_secs_f64()),
+            _ => None,
+        },
     }
 }
 
@@ -3989,7 +4222,7 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
             entered_at,
             returned_to_ready_at,
         } => {
-            entered_at.elapsed() < Duration::from_millis(350)
+            entered_at.elapsed() < Duration::from_millis(1_600)
                 || returned_to_ready_at
                     .is_some_and(|start| start.elapsed() < Duration::from_millis(350))
         }
@@ -4842,6 +5075,21 @@ mod tests {
             started_at: std::time::Instant::now(),
         };
         assert!(!animation_needs_frame(&listening, false));
+    }
+
+    #[test]
+    fn no_match_keeps_high_resolution_ticks_through_both_position_springs() {
+        let now = std::time::Instant::now();
+        let motion = MainPhase::NoMatch {
+            entered_at: now - std::time::Duration::from_millis(900),
+            returned_to_ready_at: None,
+        };
+        assert!(animation_needs_frame(&motion, false));
+        let settled = MainPhase::NoMatch {
+            entered_at: now - std::time::Duration::from_millis(1_700),
+            returned_to_ready_at: None,
+        };
+        assert!(!animation_needs_frame(&settled, false));
     }
 
     #[test]

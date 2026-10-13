@@ -977,6 +977,23 @@ pub fn no_match_timing(settling: SettlingDuration) -> Option<NoMatchTiming> {
     })
 }
 
+pub fn no_match_position_profile(
+    button_width: f64,
+    left_fraction: f64,
+    initial_velocity: f64,
+    duration_seconds: f64,
+) -> SpringProfile {
+    SpringProfile {
+        from: button_width * left_fraction,
+        to: 0.0,
+        mass: 1.0,
+        damping: 10.0,
+        stiffness: 250.0,
+        initial_velocity,
+        duration_seconds,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NoMatchTiming {
     pub tag_button_center_begin: f64,
@@ -1297,5 +1314,19 @@ mod tests {
             settling_seconds: Some(f64::NAN)
         })
         .is_none());
+    }
+
+    #[test]
+    fn no_match_keeps_tagging_and_button_springs_distinct() {
+        let tagging = no_match_position_profile(96.0, -0.15, 8.449_999_809_265_137, 0.5);
+        let button =
+            no_match_position_profile(96.0, -0.07, 3.940_000_057_220_459, 1.100_000_023_841_858);
+        close(tagging.from, -14.4, 1e-6);
+        close(button.from, -6.72, 1e-6);
+        assert_ne!(tagging.duration_seconds, button.duration_seconds);
+        assert_ne!(tagging.initial_velocity, button.initial_velocity);
+        assert_eq!(spring_value(0.0, tagging), tagging.from);
+        assert_eq!(spring_value(0.0, button), button.from);
+        assert_ne!(spring_value(0.5, tagging), spring_value(0.5, button));
     }
 }
