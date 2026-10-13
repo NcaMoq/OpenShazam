@@ -78,13 +78,44 @@ impl UiLevels {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CircleFrame {
     pub diameter: f64,
-    /// Geometry diameter before the UI-level Bass transform.
+    /// Static base geometry diameter before container, animation and Bass transforms.
     pub shape_diameter: f64,
+    pub core_scale: f64,
+    pub sublayer_scale: f64,
+    pub scale_null: f64,
+    pub core_opacity: f64,
+    pub base_opacity: f64,
     pub audio_scale: f64,
     pub opacity: f64,
     pub stroke_width: f64,
     /// Local child animation time is retained for deterministic inspection.
     pub local_time: f64,
+}
+
+/// Cubic timing-function controls for a Composition keyframe segment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CubicBezier {
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+}
+
+/// One keyframe on a shifted Core Animation child track. `easing` applies
+/// between this keyframe and the preceding one; `None` means linear.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimedTrackKeyframe {
+    pub progress: f64,
+    pub value: f64,
+    pub easing: Option<CubicBezier>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InnerTrack {
+    CoreScale,
+    CoreOpacity,
+    SublayerScale,
+    ScaleNull,
 }
 
 /// Outer-circle values retain the three independently animated native scale
@@ -207,6 +238,223 @@ fn sample_track(values: &[f64], key_times: &[f64], progress: f64, bezier_segment
         }
     }
     *values.last().unwrap_or(&0.0)
+}
+
+/// Translate a child track into the current evaluator's parent-loop time
+/// coordinate. Native Core Animation's presentation at the child/parent
+/// duration boundary remains unverified. Clipped Bezier segments are split so
+/// the remaining curve keeps the same timing-function shape.
+fn shifted_track_keyframes(
+    values: &[f64],
+    key_times: &[f64],
+    bezier_segments: &[bool],
+    duration: f64,
+    phase_offset: f64,
+    loop_duration: f64,
+    value_scale: f64,
+) -> Vec<TimedTrackKeyframe> {
+    debug_assert_eq!(values.len(), key_times.len());
+    debug_assert_eq!(bezier_segments.len() + 1, values.len());
+    debug_assert!(duration > 0.0 && loop_duration > 0.0);
+
+    let loop_end = phase_offset + loop_duration;
+    let mut keyframes = vec![TimedTrackKeyframe {
+        progress: 0.0,
+        value: sample_track(values, key_times, phase_offset / duration, bezier_segments)
+            * value_scale,
+        easing: None,
+    }];
+
+    for segment in 0..bezier_segments.len() {
+        let source_start = key_times[segment] * duration;
+        let source_end = key_times[segment + 1] * duration;
+        if source_end <= source_start {
+            continue;
+        }
+        let clipped_start = phase_offset.max(source_start);
+        let clipped_end = loop_end.min(source_end);
+        if clipped_end <= clipped_start {
+            continue;
+        }
+
+        let local_start = (clipped_start - source_start) / (source_end - source_start);
+        let local_end = (clipped_end - source_start) / (source_end - source_start);
+        let progress = ((clipped_end - phase_offset) / loop_duration).clamp(0.0, 1.0);
+        if progress <= 1e-12 {
+            continue;
+        }
+        let easing = bezier_segments[segment].then(|| split_native_bezier(local_start, local_end));
+        let value =
+            sample_track(values, key_times, clipped_end / duration, bezier_segments) * value_scale;
+        if (progress - 1.0).abs() <= 1e-12 {
+            keyframes.push(TimedTrackKeyframe {
+                progress: 1.0,
+                value,
+                easing,
+            });
+            return keyframes;
+        }
+        keyframes.push(TimedTrackKeyframe {
+            progress,
+            value,
+            easing,
+        });
+    }
+
+    if keyframes
+        .last()
+        .is_some_and(|keyframe| keyframe.progress < 1.0 - 1e-12)
+    {
+        keyframes.push(TimedTrackKeyframe {
+            progress: 1.0,
+            value: sample_track(values, key_times, loop_end / duration, bezier_segments)
+                * value_scale,
+            easing: None,
+        });
+    }
+    keyframes
+}
+
+/// Return one inner-circle track shifted into the 1.9099-second parent loop
+/// represented by the deterministic evaluator. The native runtime's boundary
+/// presentation is still an unresolved [U] input.
+pub fn shifted_inner_track(track: InnerTrack, circle_index: usize) -> Vec<TimedTrackKeyframe> {
+    assert!(circle_index < INNER_DIAMETERS.len());
+    let (values, key_times, duration, bezier, offset, value_scale) = match track {
+        InnerTrack::CoreScale => (
+            &[0.0, 1.0, 1.0][..],
+            &[0.0, 0.740_740_716_457_366_9, 1.0][..],
+            INNER_CORE_DURATION,
+            &[true, false][..],
+            INNER_COMMON_OFFSET + INNER_PHASE_OFFSETS[circle_index],
+            1.0,
+        ),
+        InnerTrack::CoreOpacity => (
+            &[0.0, 1.0, 0.0][..],
+            &[0.0, 0.333_333_3, 1.0][..],
+            INNER_CORE_DURATION,
+            &[false, false][..],
+            INNER_COMMON_OFFSET + INNER_PHASE_OFFSETS[circle_index],
+            INNER_BASE_OPACITY[circle_index],
+        ),
+        InnerTrack::SublayerScale => (
+            &[0.0, 1.0, 0.7][..],
+            &[0.0, 0.333_333_3, 1.0][..],
+            INNER_CORE_DURATION,
+            &[false, false][..],
+            INNER_COMMON_OFFSET + INNER_PHASE_OFFSETS[circle_index],
+            1.0,
+        ),
+        InnerTrack::ScaleNull => (
+            &[1.0, 1.0, 0.9][..],
+            &[0.0, 0.244_186_043_739_318_85, 1.0][..],
+            INNER_NULL_DURATION,
+            &[false, true][..],
+            INNER_COMMON_OFFSET,
+            1.0,
+        ),
+    };
+    shifted_track_keyframes(
+        values,
+        key_times,
+        bezier,
+        duration,
+        offset,
+        INNER_OUTER_LOOP,
+        value_scale,
+    )
+}
+
+fn native_bezier_point(t: f64) -> (f64, f64) {
+    (
+        cubic_component(t, BEZIER_X1, BEZIER_X2),
+        cubic_component(t, BEZIER_Y1, BEZIER_Y2),
+    )
+}
+
+fn native_bezier_derivative(t: f64) -> (f64, f64) {
+    (
+        cubic_component_derivative(t, BEZIER_X1, BEZIER_X2),
+        cubic_component_derivative(t, BEZIER_Y1, BEZIER_Y2),
+    )
+}
+
+fn native_bezier_parameter(x: f64) -> f64 {
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..48 {
+        let middle = (low + high) * 0.5;
+        if cubic_component(middle, BEZIER_X1, BEZIER_X2) < x {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    (low + high) * 0.5
+}
+
+fn split_native_bezier(start_x: f64, end_x: f64) -> CubicBezier {
+    let start_t = native_bezier_parameter(start_x.clamp(0.0, 1.0));
+    let end_t = native_bezier_parameter(end_x.clamp(0.0, 1.0));
+    let span = (end_t - start_t).max(f64::EPSILON);
+    let start = native_bezier_point(start_t);
+    let end = native_bezier_point(end_t);
+    let start_derivative = native_bezier_derivative(start_t);
+    let end_derivative = native_bezier_derivative(end_t);
+    let width = (end.0 - start.0).max(f64::EPSILON);
+    let height = (end.1 - start.1).max(f64::EPSILON);
+    let first = (
+        (start.0 + start_derivative.0 * span / 3.0 - start.0) / width,
+        (start.1 + start_derivative.1 * span / 3.0 - start.1) / height,
+    );
+    let second = (
+        (end.0 - end_derivative.0 * span / 3.0 - start.0) / width,
+        (end.1 - end_derivative.1 * span / 3.0 - start.1) / height,
+    );
+    CubicBezier {
+        x1: first.0.clamp(0.0, 1.0),
+        y1: first.1.clamp(0.0, 1.0),
+        x2: second.0.clamp(0.0, 1.0),
+        y2: second.1.clamp(0.0, 1.0),
+    }
+}
+
+#[cfg(test)]
+fn sample_bezier_curve(progress: f64, curve: CubicBezier) -> f64 {
+    let x = finite_unit(progress);
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..48 {
+        let middle = (low + high) * 0.5;
+        if cubic_component(middle, curve.x1, curve.x2) < x {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    cubic_component((low + high) * 0.5, curve.y1, curve.y2)
+}
+
+#[cfg(test)]
+fn evaluate_track_keyframes(keyframes: &[TimedTrackKeyframe], progress: f64) -> f64 {
+    let progress = finite_unit(progress);
+    for pair in keyframes.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        if progress <= end.progress {
+            let local = if end.progress <= start.progress {
+                1.0
+            } else {
+                (progress - start.progress) / (end.progress - start.progress)
+            };
+            let eased = end.easing.map_or_else(
+                || finite_unit(local),
+                |curve| sample_bezier_curve(local, curve),
+            );
+            return linear(start.value, end.value, eased);
+        }
+    }
+    keyframes.last().map_or(0.0, |keyframe| keyframe.value)
 }
 
 fn inner_core_scale(local_time: f64) -> f64 {
@@ -366,16 +614,24 @@ pub fn wave_frame_at_with_auto_spring(
         let core_scale = inner_core_scale(core_local);
         let core_child_scale = inner_core_sublayer_scale(core_local);
         let null_scale = inner_scale_null(null_local);
-        let shape_diameter = INNER_DIAMETERS[index]
+        let core_opacity = inner_core_opacity(core_local);
+        let base_opacity = INNER_BASE_OPACITY[index];
+        let shape_diameter = INNER_DIAMETERS[index];
+        let diameter = shape_diameter
             * (inner_container_factor / 3.0)
             * core_scale
             * core_child_scale
-            * null_scale;
-        let diameter = shape_diameter * bass_scale;
-        let opacity = INNER_BASE_OPACITY[index] * bass_opacity * inner_core_opacity(core_local);
+            * null_scale
+            * bass_scale;
+        let opacity = base_opacity * bass_opacity * core_opacity;
         CircleFrame {
             diameter,
             shape_diameter,
+            core_scale,
+            sublayer_scale: core_child_scale,
+            scale_null: null_scale,
+            core_opacity,
+            base_opacity,
             audio_scale: bass_scale,
             opacity: opacity.clamp(0.0, 1.0),
             stroke_width: 0.0,
@@ -667,6 +923,33 @@ mod tests {
             second_peak.outer[1].diameter,
             second_peak.outer[1].shape_diameter
         );
+    }
+
+    #[test]
+    fn shifted_inner_composition_tracks_match_nested_time_evaluator() {
+        for index in 0..INNER_DIAMETERS.len() {
+            for track in [
+                InnerTrack::CoreScale,
+                InnerTrack::CoreOpacity,
+                InnerTrack::SublayerScale,
+                InnerTrack::ScaleNull,
+            ] {
+                let keyframes = shifted_inner_track(track, index);
+                for step in 0..1_000 {
+                    let elapsed = INNER_OUTER_LOOP * f64::from(step) / 1_000.0;
+                    let frame = wave_frame_at(TaggingMode::Manual, elapsed, UiLevels::default())
+                        .inner[index];
+                    let expected = match track {
+                        InnerTrack::CoreScale => frame.core_scale,
+                        InnerTrack::CoreOpacity => frame.base_opacity * frame.core_opacity,
+                        InnerTrack::SublayerScale => frame.sublayer_scale,
+                        InnerTrack::ScaleNull => frame.scale_null,
+                    };
+                    let actual = evaluate_track_keyframes(&keyframes, elapsed / INNER_OUTER_LOOP);
+                    close(actual, expected, 2e-8);
+                }
+            }
+        }
     }
 
     #[test]
