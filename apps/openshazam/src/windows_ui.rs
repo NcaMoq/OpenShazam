@@ -20,7 +20,7 @@ use std::{
 
 use windows::{
     core::{implement, Error, Interface, Ref, HSTRING, PCWSTR, PWSTR},
-    Foundation::TimeSpan,
+    Foundation::{TimeSpan, TypedEventHandler},
     Graphics::IGeometrySource2D,
     System::DispatcherQueueController,
     Win32::{
@@ -97,11 +97,12 @@ use windows::{
                 SW_SHOWNORMAL, ULW_ALPHA, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY,
                 WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
                 WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-                WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-                WS_POPUP, WS_VISIBLE,
+                WM_RBUTTONUP, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WNDPROC,
+                WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
             },
         },
     },
+    UI::ViewManagement::{UIColorType, UISettings},
     UI::{
         Color,
         Composition::{
@@ -126,6 +127,7 @@ const CLASS_NAME: &str = "OpenShazamNativeUiWindow";
 const WM_TRAYICON_MESSAGE: u32 = WM_APP + 0x41;
 const WM_CAPTURE_FINISHED: u32 = WM_APP + 0x42;
 const WM_SHOW_INITIAL_POPUP: u32 = WM_APP + 0x43;
+const WM_OS_THEME_CHANGED: u32 = WM_APP + 0x44;
 const TRAY_ICON_ID: u32 = 1;
 const TIMER_SINGLE_CLICK: usize = 0x4f53;
 const TIMER_LONG_PRESS: usize = 0x4f54;
@@ -183,6 +185,23 @@ enum WindowKind {
 enum Theme {
     Light,
     Dark,
+}
+
+fn theme_from_foreground_rgb(red: u8, green: u8, blue: u8) -> Theme {
+    if 5u32 * u32::from(green) + 2u32 * u32::from(red) + u32::from(blue) > 8 * 128 {
+        Theme::Dark
+    } else {
+        Theme::Light
+    }
+}
+
+fn theme_from_ui_settings(settings: &UISettings) -> windows::core::Result<Theme> {
+    let foreground = settings.GetColorValue(UIColorType::Foreground)?;
+    Ok(theme_from_foreground_rgb(
+        foreground.R,
+        foreground.G,
+        foreground.B,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -293,6 +312,8 @@ struct AppState {
     dwrite_factory: IDWriteFactory,
     compositor: Compositor,
     _dispatcher_queue: DispatcherQueueController,
+    theme_settings: UISettings,
+    theme_changed_token: Option<i64>,
     phase: MainPhase,
     history: Vec<Track>,
     history_transition: Option<HistoryMutationTransition>,
@@ -1277,7 +1298,6 @@ const NO_MATCH_ICON_PATH: [NoMatchIconCommand; 34] = [
 const NO_MATCH_ICON_BASE_WIDTH: f32 = 40.0;
 const NO_MATCH_ICON_BASE_HEIGHT: f32 = 117.0;
 const NO_MATCH_ICON_SCALE: f32 = 0.8;
-
 fn no_match_icon_rect(button_size: f32) -> [f32; 4] {
     let width = NO_MATCH_ICON_BASE_WIDTH * NO_MATCH_ICON_SCALE;
     let height = NO_MATCH_ICON_BASE_HEIGHT * NO_MATCH_ICON_SCALE;
@@ -1995,6 +2015,7 @@ impl CompositionScene {
         no_match_icon_transform
             .Children()?
             .InsertAtTop(&no_match_icon_visual)?;
+
         button_content
             .Children()?
             .InsertAtTop(&button_shape_visual)?;
@@ -5239,6 +5260,7 @@ fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> 
 }
 
 unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
+    refresh_os_theme(app);
     if let Some(renderer) = renderer.as_deref_mut() {
         match renderer.start_startup_logo() {
             Ok(complete) => app.startup_animation_pending = !complete,
@@ -5263,6 +5285,18 @@ unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
         }
     }
     update_visible_windows(app);
+}
+
+fn refresh_os_theme(app: &mut AppState) -> bool {
+    let Ok(theme) = theme_from_ui_settings(&app.theme_settings) else {
+        return false;
+    };
+    if app.theme == theme {
+        return false;
+    }
+    app.theme = theme;
+    app.theme_generation = app.theme_generation.wrapping_add(1);
+    true
 }
 
 unsafe fn process_main_hit(app: &mut AppState, hit: MainHit) {
@@ -5343,6 +5377,14 @@ unsafe extern "system" fn window_proc(
     match message {
         WM_SHOW_INITIAL_POPUP if data.kind == WindowKind::Main => {
             show_main(app, data.renderer.as_mut());
+            LRESULT(0)
+        }
+        WM_OS_THEME_CHANGED | WM_SETTINGCHANGE | WM_THEMECHANGED
+            if data.kind == WindowKind::Main =>
+        {
+            if refresh_os_theme(app) {
+                update_visible_windows(app);
+            }
             LRESULT(0)
         }
         WM_CREATE => {
@@ -5650,15 +5692,7 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONUP if data.kind == WindowKind::Settings => {
             let x = low_word(lparam.0) as f32 * 96.0 / GetDpiForWindow(hwnd).max(96) as f32;
             let y = high_word(lparam.0) as f32 * 96.0 / GetDpiForWindow(hwnd).max(96) as f32;
-            if (355.0..=510.0).contains(&x) && (110.0..=190.0).contains(&y) {
-                app.theme = if app.theme == Theme::Light {
-                    Theme::Dark
-                } else {
-                    Theme::Light
-                };
-                app.theme_generation += 1;
-                update_visible_windows(app);
-            } else if (55.0..=500.0).contains(&x) && (180.0..=244.0).contains(&y) {
+            if (55.0..=500.0).contains(&x) && (180.0..=244.0).contains(&y) {
                 if let Some(path) = choose_audio_file(hwnd) {
                     start_capture(app, CaptureMode::Manual, Some(path));
                 }
@@ -5791,6 +5825,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             apartmentType: DQTAT_COM_STA,
         })?;
         let compositor = Compositor::new()?;
+        let theme_settings = UISettings::new()?;
+        let theme = theme_from_ui_settings(&theme_settings)?;
         let app = Box::new(AppState {
             main_hwnd: HWND::default(),
             settings_hwnd: HWND::default(),
@@ -5800,6 +5836,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             dwrite_factory,
             compositor,
             _dispatcher_queue: dispatcher_queue,
+            theme_settings,
+            theme_changed_token: None,
             phase: MainPhase::Ready,
             history: Vec::new(),
             history_transition: None,
@@ -5807,7 +5845,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             hovered_row: None,
             ui_levels: UiLevels::default(),
             auto_spring: None,
-            theme: Theme::Light,
+            theme,
             theme_generation: 0,
             visible: false,
             main_activated: false,
@@ -5838,7 +5876,33 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             false,
         )?;
         (*app_ptr).main_hwnd = hwnd;
+        let callback_hwnd = hwnd.0 as isize;
+        let theme_changed_handler =
+            TypedEventHandler::<UISettings, windows::core::IInspectable>::new(move |_, _| {
+                let callback_hwnd = HWND(callback_hwnd as *mut c_void);
+                let _ = PostMessageW(
+                    Some(callback_hwnd),
+                    WM_OS_THEME_CHANGED,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+                Ok(())
+            });
+        match (*app_ptr)
+            .theme_settings
+            .ColorValuesChanged(&theme_changed_handler)
+        {
+            Ok(token) => (*app_ptr).theme_changed_token = Some(token),
+            Err(error) => {
+                let _ = DestroyWindow(hwnd);
+                drop(Box::from_raw(app_ptr));
+                return Err(Box::new(error));
+            }
+        }
         if let Err(error) = add_tray_icon(hwnd) {
+            if let Some(token) = (*app_ptr).theme_changed_token.take() {
+                let _ = (*app_ptr).theme_settings.RemoveColorValuesChanged(token);
+            }
             let _ = DestroyWindow(hwnd);
             drop(Box::from_raw(app_ptr));
             return Err(Box::new(error));
@@ -5862,6 +5926,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             let _ = WaitMessage();
+        }
+        if let Some(token) = (*app_ptr).theme_changed_token.take() {
+            let _ = (*app_ptr).theme_settings.RemoveColorValuesChanged(token);
         }
         if !(*app_ptr).settings_hwnd.0.is_null() {
             let _ = DestroyWindow((*app_ptr).settings_hwnd);
@@ -5970,12 +6037,13 @@ mod tests {
         is_offline_failure, is_timeout_failure, localized_ui_text, native_icon_layout,
         no_match_copy, no_match_icon_rect, parse_debug_string, parse_match, phase_needs_timeout,
         point_in_rect, result_artwork_frame, result_details_rects, result_panel_top_at,
-        select_ui_language_from_multisz, should_start_startup_logo, timeout_copy, ui_model,
-        ArrowEdge, CaptureMode, CompositionRootLayer, HeaderFillScope, HistoryMutationEvent,
-        HistoryMutationTransition, MainPhase, NoMatchIconCommand, ResultCardAdvance,
-        ResultCardStage, UiLanguage, UiTextKey, WindowKind, BUTTON_CLEAR_DIAMETER,
-        INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, RESULT_DETAILS_LEFT,
-        RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, WHITE_CLOSE_ICON_PIXELS,
+        select_ui_language_from_multisz, should_start_startup_logo, theme_from_foreground_rgb,
+        timeout_copy, ui_model, ArrowEdge, CaptureMode, CompositionRootLayer, HeaderFillScope,
+        HistoryMutationEvent, HistoryMutationTransition, MainPhase, NoMatchIconCommand,
+        ResultCardAdvance, ResultCardStage, Theme, UiLanguage, UiTextKey, WindowKind,
+        BUTTON_CLEAR_DIAMETER, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY,
+        POPUP_ARROW_HEIGHT, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS,
+        WHITE_CLOSE_ICON_PIXELS,
     };
 
     #[test]
@@ -6245,15 +6313,38 @@ mod tests {
         assert_eq!(layout.cancel_visual, [351.0, 27.0, 363.0, 39.0]);
         assert_eq!(layout.cancel_hit, layout.cancel_visual);
         assert_eq!(
-            (layout.settings_visual[1] + layout.settings_visual[3]) * 0.5,
-            (layout.settings_visual[1] + layout.settings_visual[3]) * 0.5
+            (
+                (layout.settings_visual[0] + layout.settings_visual[2]) * 0.5,
+                (layout.settings_visual[1] + layout.settings_visual[3]) * 0.5,
+            ),
+            (357.0, 33.0)
         );
         assert_eq!(
-            (layout.cancel_visual[1] + layout.cancel_visual[3]) * 0.5,
-            (layout.settings_visual[1] + layout.settings_visual[3]) * 0.5
+            (
+                (layout.cancel_visual[0] + layout.cancel_visual[2]) * 0.5,
+                (layout.cancel_visual[1] + layout.cancel_visual[3]) * 0.5,
+            ),
+            (357.0, 33.0)
         );
         assert_eq!(layout.result_close_visual, [353.0, 25.0, 365.0, 37.0]);
         assert_eq!(layout.result_close_hit, layout.result_close_visual);
+        assert_eq!(
+            (
+                (layout.result_close_visual[0] + layout.result_close_visual[2]) * 0.5,
+                (layout.result_close_visual[1] + layout.result_close_visual[3]) * 0.5,
+            ),
+            (359.0, 31.0)
+        );
+        let bottom_anchored = native_icon_layout(0.0);
+        let top_anchored = native_icon_layout(POPUP_ARROW_HEIGHT as f32);
+        assert_eq!(
+            top_anchored.settings_visual[1] - bottom_anchored.settings_visual[1],
+            POPUP_ARROW_HEIGHT as f32
+        );
+        assert_eq!(
+            top_anchored.cancel_hit[1] - bottom_anchored.cancel_hit[1],
+            POPUP_ARROW_HEIGHT as f32
+        );
         assert!(point_in_rect(349.0, 25.0, layout.settings_hit));
         assert!(!point_in_rect(348.9, 26.0, layout.settings_hit));
         assert!(point_in_rect(351.0, 27.0, layout.cancel_hit));
@@ -6261,6 +6352,14 @@ mod tests {
         assert!(point_in_rect(353.0, 25.0, layout.result_close_hit));
         assert!(!point_in_rect(352.9, 25.0, layout.result_close_hit));
         assert!(!point_in_rect(349.0, 25.0, layout.result_close_hit));
+    }
+
+    #[test]
+    fn os_foreground_color_uses_the_documented_windows_theme_threshold() {
+        assert_eq!(theme_from_foreground_rgb(0, 0, 0), Theme::Light);
+        assert_eq!(theme_from_foreground_rgb(255, 255, 255), Theme::Dark);
+        assert_eq!(theme_from_foreground_rgb(128, 128, 128), Theme::Light);
+        assert_eq!(theme_from_foreground_rgb(0, 255, 0), Theme::Dark);
     }
 
     #[test]
