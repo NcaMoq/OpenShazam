@@ -4222,7 +4222,10 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
             entered_at,
             returned_to_ready_at,
         } => {
-            entered_at.elapsed() < Duration::from_millis(1_600)
+            // Keep UI-thread redraws only for the 300 ms panel transition and
+            // the 180 ms deferred spring kickoff. The position/scale tracks
+            // continue on the Composition clock once they have started.
+            entered_at.elapsed() < Duration::from_millis(350)
                 || returned_to_ready_at
                     .is_some_and(|start| start.elapsed() < Duration::from_millis(350))
         }
@@ -5080,16 +5083,16 @@ mod tests {
     #[test]
     fn no_match_keeps_high_resolution_ticks_through_both_position_springs() {
         let now = std::time::Instant::now();
-        let motion = MainPhase::NoMatch {
+        let transition = MainPhase::NoMatch {
+            entered_at: now - std::time::Duration::from_millis(200),
+            returned_to_ready_at: None,
+        };
+        assert!(animation_needs_frame(&transition, false));
+        let composition_only = MainPhase::NoMatch {
             entered_at: now - std::time::Duration::from_millis(900),
             returned_to_ready_at: None,
         };
-        assert!(animation_needs_frame(&motion, false));
-        let settled = MainPhase::NoMatch {
-            entered_at: now - std::time::Duration::from_millis(1_700),
-            returned_to_ready_at: None,
-        };
-        assert!(!animation_needs_frame(&settled, false));
+        assert!(!animation_needs_frame(&composition_only, false));
     }
 
     #[test]
