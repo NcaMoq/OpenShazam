@@ -82,9 +82,9 @@ use windows::{
                 GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_ESCAPE,
             },
             Shell::{
-                Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP,
-                NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NOTIFYICONDATAW,
-                NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4,
+                Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE,
+                NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
+                NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4,
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
@@ -3855,6 +3855,34 @@ unsafe fn add_tray_icon(hwnd: HWND) -> windows::core::Result<()> {
     Ok(())
 }
 
+unsafe fn notify_hidden_match(hwnd: HWND, track: &Track) {
+    let body = format!("{} — {}", track.title, track.artist);
+    let mut data = NOTIFYICONDATAW {
+        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_INFO,
+        dwInfoFlags: NIIF_INFO,
+        ..Default::default()
+    };
+    copy_notification_text(&mut data.szInfoTitle, "Shazam");
+    copy_notification_text(&mut data.szInfo, &body);
+    let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+}
+
+fn copy_notification_text(destination: &mut [u16], value: &str) {
+    destination.fill(0);
+    let capacity = destination.len().saturating_sub(1);
+    let mut encoded: Vec<u16> = value.encode_utf16().take(capacity).collect();
+    if encoded
+        .last()
+        .is_some_and(|unit| (0xD800..=0xDBFF).contains(unit))
+    {
+        encoded.pop();
+    }
+    destination[..encoded.len()].copy_from_slice(&encoded);
+}
+
 unsafe fn delete_tray_icon(hwnd: HWND) {
     let data = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
@@ -4266,8 +4294,11 @@ fn complete_capture(app: &mut AppState, finished: CaptureFinished) {
                     };
                 } else {
                     // Native posts a notification when the popup is hidden;
-                    // do not surface the result card in a popup the user closed.
+                    // keep that result out of a popup the user closed.
                     app.phase = MainPhase::Ready;
+                    if finished.captured_mode == CaptureMode::Manual {
+                        unsafe { notify_hidden_match(app.main_hwnd, &track) };
+                    }
                 }
             } else {
                 app.phase = MainPhase::NoMatch {
@@ -5383,13 +5414,13 @@ fn _assert_only_ui_dependencies_are_used(_: &Path) {}
 mod tests {
     use super::{
         advance_result_card_stage, animation_needs_frame, button_border_arc_points,
-        composition_root_layer_order, gradient_origin_transform, history_artwork_frame,
-        history_row_top, inverse_circle_clip_radii, is_offline_failure, is_timeout_failure,
-        native_icon_layout, parse_debug_string, parse_match, phase_needs_timeout, point_in_rect,
-        result_artwork_frame, result_panel_top_at, should_start_startup_logo, ui_model,
-        CaptureMode, CompositionRootLayer, HistoryMutationEvent, HistoryMutationTransition,
-        MainPhase, ResultCardAdvance, ResultCardStage, WindowKind, INNER_RIPPLE_DIAMETER,
-        OUTER_BASE_OPACITY,
+        composition_root_layer_order, copy_notification_text, gradient_origin_transform,
+        history_artwork_frame, history_row_top, inverse_circle_clip_radii, is_offline_failure,
+        is_timeout_failure, native_icon_layout, parse_debug_string, parse_match,
+        phase_needs_timeout, point_in_rect, result_artwork_frame, result_panel_top_at,
+        should_start_startup_logo, ui_model, CaptureMode, CompositionRootLayer,
+        HistoryMutationEvent, HistoryMutationTransition, MainPhase, ResultCardAdvance,
+        ResultCardStage, WindowKind, INNER_RIPPLE_DIAMETER, OUTER_BASE_OPACITY,
     };
 
     #[test]
@@ -5402,6 +5433,17 @@ mod tests {
                 "カーリー・レイ・ジェプセン".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn notification_text_is_nul_terminated_without_splitting_surrogate_pairs() {
+        let mut buffer = [0xFFFF; 5];
+        copy_notification_text(&mut buffer, "A😀B");
+        assert_eq!(buffer, [b'A' as u16, 0xD83D, 0xDE00, b'B' as u16, 0]);
+
+        let mut truncated = [0; 3];
+        copy_notification_text(&mut truncated, "A😀B");
+        assert_eq!(truncated, [b'A' as u16, 0, 0]);
     }
 
     #[test]
