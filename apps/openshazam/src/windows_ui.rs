@@ -277,6 +277,7 @@ struct AppState {
     phase_timer_active: bool,
     animation_timer_active: bool,
     startup_animation_pending: bool,
+    startup_logo_consumed: bool,
     settings_visible: bool,
     about_visible: bool,
     microphone_visible: bool,
@@ -570,6 +571,7 @@ impl CompositionLogo {
         d2d_factory: &ID2D1Factory,
         compositor: &Compositor,
         theme: Theme,
+        animate_on_create: bool,
     ) -> windows::core::Result<Self> {
         let transparent_brush =
             compositor.CreateColorBrushWithColor(logo_transparent_color(theme))?;
@@ -596,9 +598,9 @@ impl CompositionLogo {
             &solid_brush,
             LogoTrim::None,
         )?;
-        transparent_visual.SetOpacity(1.0)?;
-        long_visual.SetOpacity(1.0)?;
-        final_visual.SetOpacity(0.0)?;
+        transparent_visual.SetOpacity(if animate_on_create { 1.0 } else { 0.0 })?;
+        long_visual.SetOpacity(if animate_on_create { 1.0 } else { 0.0 })?;
+        final_visual.SetOpacity(if animate_on_create { 0.0 } else { 1.0 })?;
 
         let transparent_root = compositor.CreateLayerVisual()?;
         transparent_root.SetSize(Vector2 {
@@ -686,7 +688,11 @@ impl CompositionLogo {
             long_fade_animation: long_fade,
             final_fade_animation: final_fade,
             started_at: None,
-            stage: ui_model::StartupLogoStage::TransparentStroke,
+            stage: if animate_on_create {
+                ui_model::StartupLogoStage::TransparentStroke
+            } else {
+                ui_model::StartupLogoStage::Complete
+            },
         })
     }
 
@@ -714,7 +720,7 @@ impl CompositionLogo {
 
     fn advance(&mut self) -> windows::core::Result<bool> {
         let Some(started_at) = self.started_at else {
-            return Ok(false);
+            return Ok(self.stage == ui_model::StartupLogoStage::Complete);
         };
         let frame = ui_model::startup_logo_frame_at(started_at.elapsed().as_secs_f64());
         if frame.stage != self.stage {
@@ -1354,6 +1360,10 @@ fn composition_root_layer_order() -> [CompositionRootLayer; 3] {
     ]
 }
 
+fn should_start_startup_logo(kind: WindowKind, already_started: bool) -> bool {
+    kind == WindowKind::Main && !already_started
+}
+
 impl CompositionScene {
     fn new(
         hwnd: HWND,
@@ -1362,6 +1372,7 @@ impl CompositionScene {
         theme: Theme,
         arrow_edge: ArrowEdge,
         dpi: u32,
+        animate_startup_logo: bool,
     ) -> windows::core::Result<Self> {
         let interop: ICompositorDesktopInterop = compositor.cast()?;
         let target = unsafe { interop.CreateDesktopWindowTarget(hwnd, true)? };
@@ -1739,7 +1750,8 @@ impl CompositionScene {
         button_border_shape.SetStrokeBrush(&button_edge)?;
         button_border_shape.SetStrokeThickness(1.0)?;
         button_shape_visual.Shapes()?.Append(&button_border_shape)?;
-        let mut logo = unsafe { CompositionLogo::new(d2d_factory, compositor, theme)? };
+        let mut logo =
+            unsafe { CompositionLogo::new(d2d_factory, compositor, theme, animate_startup_logo)? };
         let button_content = compositor.CreateContainerVisual()?;
         button_content.SetSize(Vector2 {
             X: BUTTON_SIZE as f32,
@@ -1845,7 +1857,9 @@ impl CompositionScene {
             &easing,
         )?;
         target.SetRoot(&root)?;
-        logo.start()?;
+        if animate_startup_logo {
+            logo.start()?;
+        }
 
         Ok(Self {
             compositor: compositor.clone(),
@@ -2505,6 +2519,14 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
     }
 }
 
+fn result_artwork_frame(panel_top: f32) -> D2D_RECT_F {
+    rect(10.0, panel_top + 20.0, 160.0, panel_top + 170.0)
+}
+
+fn history_artwork_frame(row_top: f32) -> D2D_RECT_F {
+    rect(20.0, row_top + 12.0, 85.0, row_top + 77.0)
+}
+
 fn gradient_origin_transform(top: f32) -> Matrix3x2 {
     Matrix3x2 {
         M11: 1.0,
@@ -2550,6 +2572,7 @@ impl Renderer {
         theme_generation: u64,
         theme: Theme,
         kind: WindowKind,
+        animate_startup_logo: bool,
     ) -> windows::core::Result<Self> {
         let mut client = RECT::default();
         GetClientRect(hwnd, &mut client)?;
@@ -2600,6 +2623,7 @@ impl Renderer {
                 theme,
                 ArrowEdge::Top,
                 dpi,
+                animate_startup_logo,
             )?)
         } else {
             None
@@ -3177,15 +3201,18 @@ impl Renderer {
                 self.fill_rect(row, &self.palette.skeleton);
             }
             let artwork = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
-                rect: rect(20.0, top + 12.0, 85.0, top + 77.0),
+                // UI-144 image padding belongs to primary-action icons, not album art.
+                rect: history_artwork_frame(top),
                 radiusX: 4.0,
                 radiusY: 4.0,
             };
             self.target
                 .FillRoundedRectangle(&artwork, &self.palette.result_start);
+            // The existing recognition UI contract has no artwork payload; this glyph is a
+            // placeholder, and the album-art view must not inherit UI-144 button padding.
             self.text(
                 "♫",
-                rect(20.0, top + 12.0, 85.0, top + 77.0),
+                history_artwork_frame(top),
                 &self.text.centered_title,
                 &self.palette.white_ink,
             );
@@ -3224,14 +3251,17 @@ impl Renderer {
         let panel = rect(0.0, top, CONTENT_WIDTH as f32, top + TOP_HEIGHT as f32);
         self.fill_gradient_rect(&panel, &self.palette.result_start, top)?;
         let art = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
-            rect: rect(10.0, top + 20.0, 160.0, top + 170.0),
+            // The image view itself is 150×150pt; do not add UI-144 button-image padding.
+            rect: result_artwork_frame(top),
             radiusX: 5.0,
             radiusY: 5.0,
         };
         self.target.FillRoundedRectangle(&art, &self.palette.accent);
+        // The current recognition result contains title/artist only; keep this as an explicit
+        // placeholder until an existing UI-facing artwork source is available.
         self.text(
             "♫",
-            rect(10.0, top + 20.0, 160.0, top + 170.0),
+            result_artwork_frame(top),
             &self.text.centered_heavy,
             &self.palette.white_ink,
         );
@@ -4750,6 +4780,8 @@ unsafe extern "system" fn window_proc(
         }
         WM_CREATE => {
             let dpi = GetDpiForWindow(hwnd).max(96);
+            let animate_startup_logo =
+                should_start_startup_logo(data.kind, app.startup_logo_consumed);
             match Renderer::new(
                 hwnd,
                 app.d2d_factory.clone(),
@@ -4759,8 +4791,12 @@ unsafe extern "system" fn window_proc(
                 app.theme_generation,
                 app.theme,
                 data.kind,
+                animate_startup_logo,
             ) {
                 Ok(renderer) => {
+                    if animate_startup_logo {
+                        app.startup_logo_consumed = true;
+                    }
                     if data.kind == WindowKind::Main {
                         app.startup_animation_pending = renderer
                             .composition
@@ -5210,6 +5246,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             phase_timer_active: false,
             animation_timer_active: false,
             startup_animation_pending: false,
+            startup_logo_consumed: false,
             settings_visible: false,
             about_visible: false,
             microphone_visible: false,
@@ -5334,9 +5371,10 @@ fn _assert_only_ui_dependencies_are_used(_: &Path) {}
 mod tests {
     use super::{
         animation_needs_frame, button_border_arc_points, composition_root_layer_order,
-        gradient_origin_transform, is_offline_failure, is_timeout_failure, native_icon_layout,
-        parse_debug_string, parse_match, phase_needs_timeout, point_in_rect, result_panel_top_at,
-        CaptureMode, CompositionRootLayer, MainPhase, OUTER_BASE_OPACITY,
+        gradient_origin_transform, history_artwork_frame, is_offline_failure, is_timeout_failure,
+        native_icon_layout, parse_debug_string, parse_match, phase_needs_timeout, point_in_rect,
+        result_artwork_frame, result_panel_top_at, should_start_startup_logo, CaptureMode,
+        CompositionRootLayer, MainPhase, WindowKind, OUTER_BASE_OPACITY,
     };
 
     #[test]
@@ -5635,6 +5673,32 @@ mod tests {
     }
 
     #[test]
+    fn logo_startup_animation_runs_once_for_the_main_scene_only() {
+        assert!(should_start_startup_logo(WindowKind::Main, false));
+        assert!(!should_start_startup_logo(WindowKind::Main, true));
+        assert!(!should_start_startup_logo(WindowKind::Settings, false));
+    }
+
+    #[test]
+    fn album_art_frames_keep_native_view_sizes_without_button_padding() {
+        let result = result_artwork_frame(10.0);
+        assert_eq!(
+            (result.left, result.top, result.right, result.bottom),
+            (10.0, 30.0, 160.0, 180.0)
+        );
+        assert_eq!(result.right - result.left, 150.0);
+        assert_eq!(result.bottom - result.top, 150.0);
+
+        let history = history_artwork_frame(200.0);
+        assert_eq!(
+            (history.left, history.top, history.right, history.bottom),
+            (20.0, 212.0, 85.0, 277.0)
+        );
+        assert_eq!(history.right - history.left, 65.0);
+        assert_eq!(history.bottom - history.top, 65.0);
+    }
+
+    #[test]
     fn gradient_origin_translation_preserves_dip_scale_and_tracks_panel_top() {
         for top in [0.0, 10.0, 27.5, 180.0] {
             let transform = gradient_origin_transform(top);
@@ -5752,7 +5816,7 @@ mod tests {
                     let host = compositor.CreateContainerVisual()?;
                     host.Children()?.InsertAtTop(&sprite)?;
                 }
-                let mut logo = CompositionLogo::new(&d2d_factory, &compositor, Theme::Light)?;
+                let mut logo = CompositionLogo::new(&d2d_factory, &compositor, Theme::Light, true)?;
                 logo.start()?;
                 for dpi in [96, 120, 144, 168, 192, 240, 288] {
                     let mask = factory.inverse_circle(288.0, 96.0, dpi)?;
