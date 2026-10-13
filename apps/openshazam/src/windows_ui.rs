@@ -1330,6 +1330,22 @@ struct AnimationSnapshot {
     no_match_elapsed: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompositionRootLayer {
+    OuterRipples,
+    InnerRipples,
+    Button,
+}
+
+fn composition_root_layer_order() -> [CompositionRootLayer; 3] {
+    // InsertAtTop is front-to-back: keep both ripple groups behind the button.
+    [
+        CompositionRootLayer::OuterRipples,
+        CompositionRootLayer::InnerRipples,
+        CompositionRootLayer::Button,
+    ]
+}
+
 impl CompositionScene {
     fn new(
         hwnd: HWND,
@@ -1750,9 +1766,13 @@ impl CompositionScene {
         button.Children()?.InsertAtTop(&button_content)?;
 
         let children = root.Children()?;
-        children.InsertAtTop(&inner_audio_root)?;
-        children.InsertAtTop(&button)?;
-        children.InsertAtTop(&outer_audio_root)?;
+        for layer in composition_root_layer_order() {
+            match layer {
+                CompositionRootLayer::OuterRipples => children.InsertAtTop(&outer_audio_root)?,
+                CompositionRootLayer::InnerRipples => children.InsertAtTop(&inner_audio_root)?,
+                CompositionRootLayer::Button => children.InsertAtTop(&button)?,
+            }
+        }
 
         let idle_animation = compositor.CreateVector3KeyFrameAnimation()?;
         idle_animation.SetDuration(TimeSpan {
@@ -5305,10 +5325,10 @@ fn _assert_only_ui_dependencies_are_used(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        animation_needs_frame, button_border_arc_points, gradient_origin_transform,
-        is_offline_failure, is_timeout_failure, native_icon_layout, parse_debug_string,
-        parse_match, phase_needs_timeout, point_in_rect, result_panel_top_at, CaptureMode,
-        MainPhase, OUTER_BASE_OPACITY,
+        animation_needs_frame, button_border_arc_points, composition_root_layer_order,
+        gradient_origin_transform, is_offline_failure, is_timeout_failure, native_icon_layout,
+        parse_debug_string, parse_match, phase_needs_timeout, point_in_rect, result_panel_top_at,
+        CaptureMode, CompositionRootLayer, MainPhase, OUTER_BASE_OPACITY,
     };
 
     #[test]
@@ -5585,6 +5605,18 @@ mod tests {
     #[test]
     fn outer_circle_children_keep_native_base_opacities() {
         assert_eq!(OUTER_BASE_OPACITY, [0.4, 0.6]);
+    }
+
+    #[test]
+    fn button_is_inserted_above_both_ripple_groups() {
+        assert_eq!(
+            composition_root_layer_order(),
+            [
+                CompositionRootLayer::OuterRipples,
+                CompositionRootLayer::InnerRipples,
+                CompositionRootLayer::Button,
+            ]
+        );
     }
 
     #[test]
