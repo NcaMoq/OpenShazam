@@ -12,20 +12,20 @@ use std::{
     process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
 };
 
 use windows::{
-    core::{implement, Error, Interface, Ref, HSTRING, PCWSTR},
+    core::{implement, Error, Interface, Ref, HSTRING, PCWSTR, PWSTR},
     Foundation::TimeSpan,
     Graphics::IGeometrySource2D,
     System::DispatcherQueueController,
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-        Globalization::GetUserDefaultUILanguage,
+        Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME},
         Graphics::{
             Direct2D::{
                 Common::{
@@ -3159,7 +3159,10 @@ impl Renderer {
 
     unsafe fn draw_ready(&self, _app: &AppState, body_top: f32) {
         self.text(
-            "Click To Shazam",
+            match ui_language() {
+                UiLanguage::Japanese => "クリックしてShazamする",
+                UiLanguage::English => "Click to Shazam",
+            },
             rect(
                 8.0,
                 body_top + 141.0,
@@ -3175,7 +3178,10 @@ impl Renderer {
     unsafe fn draw_listening_status(&self, body_top: f32, mode: CaptureMode) {
         self.text(
             match mode {
-                CaptureMode::Manual => "聴き取り中…",
+                CaptureMode::Manual => match ui_language() {
+                    UiLanguage::Japanese => "聞き取り中",
+                    UiLanguage::English => "Listening",
+                },
                 CaptureMode::Auto => "Auto Shazam",
             },
             rect(
@@ -3365,14 +3371,7 @@ impl Renderer {
     unsafe fn draw_no_match_panel(&self, top: f32, offline: bool) -> windows::core::Result<()> {
         let panel = rect(0.0, top, CONTENT_WIDTH as f32, top + TOP_HEIGHT as f32);
         self.fill_gradient_rect(&panel, &self.palette.result_start, top)?;
-        let (title, body) = if offline {
-            offline_copy()
-        } else {
-            (
-                "\u{8a8d}\u{8b58}\u{3067}\u{304d}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\u{305f}\u{3002}",
-                "\u{97f3}\u{697d}\u{304c}\u{306f}\u{3063}\u{304d}\u{308a}\u{8074}\u{3053}\u{3048}\u{308b}\u{5834}\u{6240}\u{3067}\u{3082}\u{3046}\u{4e00}\u{5ea6}\u{304a}\u{8a66}\u{3057}\u{304f}\u{3060}\u{3055}\u{3044}",
-            )
-        };
+        let (title, body) = no_match_copy(offline, ui_language());
         self.text(
             title,
             rect(15.0, top + 55.0, 365.0, top + 84.0),
@@ -3393,7 +3392,10 @@ impl Renderer {
         self.target
             .FillRoundedRectangle(&button, &self.palette.accent);
         self.text(
-            "もう一度試す",
+            match ui_language() {
+                UiLanguage::Japanese => "再度試す",
+                UiLanguage::English => "Try Again",
+            },
             rect(90.0, top + 120.0, 290.0, top + 150.0),
             &self.text.button,
             &self.palette.white_ink,
@@ -3449,7 +3451,7 @@ impl Renderer {
     }
 
     unsafe fn draw_timeout_dialog(&self, body_top: f32) {
-        let (description, dismiss, restart) = timeout_copy();
+        let (description, dismiss, restart) = timeout_copy(ui_language());
         let dialog = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
             rect: rect(24.0, body_top + 48.0, 356.0, body_top + 168.0),
             radiusX: 10.0,
@@ -4573,35 +4575,96 @@ fn is_offline_failure(message: &str) -> bool {
     .any(|marker| normalized.contains(marker))
 }
 
-fn timeout_copy() -> (&'static str, &'static str, &'static str) {
-    let language = unsafe { GetUserDefaultUILanguage() } & 0x03ff;
-    if language == 0x0011 {
-        (
-            "引き続き聴きたい？「再起動」をクリックして Shazam を続けましょう！",
-            "閉じる",
-            "再起動",
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiLanguage {
+    Japanese,
+    English,
+}
+
+static UI_LANGUAGE: OnceLock<UiLanguage> = OnceLock::new();
+
+fn ui_language() -> UiLanguage {
+    *UI_LANGUAGE.get_or_init(detect_ui_language)
+}
+
+fn select_ui_language_from_multisz(buffer: &[u16]) -> UiLanguage {
+    buffer
+        .split(|unit| *unit == 0)
+        .filter(|tag| !tag.is_empty())
+        .filter_map(|tag| String::from_utf16(tag).ok())
+        .find_map(|tag| {
+            let primary = tag.split(['-', '_']).next()?.to_ascii_lowercase();
+            match primary.as_str() {
+                "ja" => Some(UiLanguage::Japanese),
+                "en" => Some(UiLanguage::English),
+                _ => None,
+            }
+        })
+        .unwrap_or(UiLanguage::English)
+}
+
+fn detect_ui_language() -> UiLanguage {
+    let mut language_count = 0u32;
+    let mut character_count = 0u32;
+    // Windows reports the required MULTI_SZ size on the initial null-buffer
+    // call. The Result is expected to be an insufficient-buffer error here.
+    let _ = unsafe {
+        GetUserPreferredUILanguages(
+            MUI_LANGUAGE_NAME,
+            &mut language_count,
+            None,
+            &mut character_count,
         )
-    } else {
-        (
-            "Still listening? Click ‘Restart’ to keep Shazaming!",
-            "Dismiss",
-            "Restart",
+    };
+    if character_count == 0 || character_count > 65_536 {
+        return UiLanguage::English;
+    }
+
+    let mut languages = vec![0u16; character_count as usize];
+    if unsafe {
+        GetUserPreferredUILanguages(
+            MUI_LANGUAGE_NAME,
+            &mut language_count,
+            Some(PWSTR(languages.as_mut_ptr())),
+            &mut character_count,
         )
+    }
+    .is_err()
+    {
+        return UiLanguage::English;
+    }
+    select_ui_language_from_multisz(&languages[..character_count as usize])
+}
+
+fn no_match_copy(offline: bool, language: UiLanguage) -> (&'static str, &'static str) {
+    match (offline, language) {
+        (true, UiLanguage::Japanese) => (
+            "\u{7d50}\u{679c}\u{306a}\u{3057}",
+            "\u{63a5}\u{7d9a}\u{3092}\u{78ba}\u{8a8d}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}",
+        ),
+        (true, UiLanguage::English) => ("No Result", "Please check your connection"),
+        (false, UiLanguage::Japanese) => (
+            "\u{7d50}\u{679c}\u{306a}\u{3057}",
+            "\u{8a8d}\u{8b58}\u{3067}\u{304d}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\u{305f}\u{3002}\u{3082}\u{3046}\u{4e00}\u{5ea6}\u{304a}\u{8a66}\u{3057}\u{304f}\u{3060}\u{3055}\u{3044}\u{3002}",
+        ),
+        (false, UiLanguage::English) => {
+            ("No Result", "We didn’t quite catch that. Please try again.")
+        }
     }
 }
 
-fn offline_copy() -> (&'static str, &'static str) {
-    let language = unsafe { GetUserDefaultUILanguage() } & 0x03ff;
-    if language == 0x0011 {
-        (
-            "\u{63a5}\u{7d9a}\u{3092}\u{78ba}\u{8a8d}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}",
-            "\u{30a4}\u{30f3}\u{30bf}\u{30fc}\u{30cd}\u{30c3}\u{30c8}\u{63a5}\u{7d9a}\u{3092}\u{78ba}\u{8a8d}\u{3057}\u{3066}\u{518d}\u{8a66}\u{884c}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}",
-        )
-    } else {
-        (
-            "Check your connection",
-            "Check your internet connection and try again",
-        )
+fn timeout_copy(language: UiLanguage) -> (&'static str, &'static str, &'static str) {
+    match language {
+        UiLanguage::Japanese => (
+            "\u{5f15}\u{304d}\u{7d9a}\u{304d}\u{8074}\u{304d}\u{305f}\u{3044}\u{ff1f}\u{300c}\u{518d}\u{8d77}\u{52d5}\u{300d}\u{3092}\u{30af}\u{30ea}\u{30c3}\u{30af}\u{3057}\u{3066} Shazam \u{3092}\u{7d9a}\u{3051}\u{307e}\u{3057}\u{3087}\u{3046}\u{ff01}",
+            "\u{9589}\u{3058}\u{308b}",
+            "\u{518d}\u{8d77}\u{52d5}",
+        ),
+        UiLanguage::English => (
+            "Still listening? Click ‘Restart’ to keep Shazaming!",
+            "Dismiss",
+            "Restart",
+        ),
     }
 }
 
@@ -5608,11 +5671,12 @@ mod tests {
         advance_result_card_stage, animation_needs_frame, button_border_arc_points,
         composition_root_layer_order, copy_notification_text, gradient_origin_transform,
         header_fill_scope, history_artwork_frame, history_row_top, inverse_circle_clip_radii,
-        is_offline_failure, is_timeout_failure, native_icon_layout, parse_debug_string,
-        parse_match, phase_needs_timeout, point_in_rect, result_artwork_frame,
-        result_details_rects, result_panel_top_at, should_start_startup_logo, ui_model, ArrowEdge,
-        CaptureMode, CompositionRootLayer, HeaderFillScope, HistoryMutationEvent,
-        HistoryMutationTransition, MainPhase, ResultCardAdvance, ResultCardStage, WindowKind,
+        is_offline_failure, is_timeout_failure, native_icon_layout, no_match_copy,
+        parse_debug_string, parse_match, phase_needs_timeout, point_in_rect, result_artwork_frame,
+        result_details_rects, result_panel_top_at, select_ui_language_from_multisz,
+        should_start_startup_logo, timeout_copy, ui_model, ArrowEdge, CaptureMode,
+        CompositionRootLayer, HeaderFillScope, HistoryMutationEvent, HistoryMutationTransition,
+        MainPhase, ResultCardAdvance, ResultCardStage, UiLanguage, WindowKind,
         BUTTON_CLEAR_DIAMETER, INNER_MASK_BOUNDS, OUTER_BASE_OPACITY, RESULT_DETAILS_LEFT,
         RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, WHITE_CLOSE_ICON_PIXELS,
     };
@@ -6000,6 +6064,49 @@ mod tests {
         };
         assert!(!phase_needs_timeout(&timeout));
         assert!(!animation_needs_frame(&timeout, false));
+    }
+
+    #[test]
+    fn preferred_ui_languages_choose_first_supported_language_and_fallback_to_english() {
+        let to_multisz = |tags: &[&str]| {
+            let mut buffer = Vec::new();
+            for tag in tags {
+                buffer.extend(tag.encode_utf16());
+                buffer.push(0);
+            }
+            buffer.push(0);
+            buffer
+        };
+        assert_eq!(
+            select_ui_language_from_multisz(&to_multisz(&["fr-FR", "ja-JP", "en-US"])),
+            UiLanguage::Japanese
+        );
+        assert_eq!(
+            select_ui_language_from_multisz(&to_multisz(&["de-DE", "en-GB", "ja-JP"])),
+            UiLanguage::English
+        );
+        assert_eq!(
+            select_ui_language_from_multisz(&to_multisz(&["fr-FR", "de-DE"])),
+            UiLanguage::English
+        );
+    }
+
+    #[test]
+    fn localized_recognition_copy_uses_source_keys_for_both_languages() {
+        assert_eq!(
+            no_match_copy(false, UiLanguage::Japanese),
+            ("結果なし", "認識できませんでした。もう一度お試しください。")
+        );
+        assert_eq!(
+            no_match_copy(false, UiLanguage::English),
+            ("No Result", "We didn’t quite catch that. Please try again.")
+        );
+        assert_eq!(
+            no_match_copy(true, UiLanguage::Japanese),
+            ("結果なし", "接続を確認してください")
+        );
+        assert_eq!(timeout_copy(UiLanguage::English).1, "Dismiss");
+        assert_eq!(timeout_copy(UiLanguage::Japanese).2, "再起動");
     }
 
     #[test]
