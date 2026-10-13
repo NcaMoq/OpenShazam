@@ -523,6 +523,8 @@ struct CompositionLogo {
 }
 
 const SHZ_LOGO_SOURCE_SIZE: f32 = 210.0;
+const SHZ_LOGO_CANVAS_PADDING: f32 = 36.0;
+const SHZ_LOGO_CANVAS_SIZE: f32 = SHZ_LOGO_SOURCE_SIZE + SHZ_LOGO_CANVAS_PADDING * 2.0;
 const SHZ_LOGO_REFERENCE_SIZE: f32 = 367.5;
 const SHZ_LOGO_STROKE_WIDTH: f32 = 38.0;
 
@@ -546,8 +548,8 @@ fn shz_logo_layout(button_width: f32, button_height: f32) -> ShzLogoLayout {
     ShzLogoLayout {
         center_x,
         center_y,
-        offset_x: center_x - SHZ_LOGO_SOURCE_SIZE * 0.5,
-        offset_y: center_y - SHZ_LOGO_SOURCE_SIZE * 0.5,
+        offset_x: center_x - SHZ_LOGO_CANVAS_SIZE * 0.5,
+        offset_y: center_y - SHZ_LOGO_CANVAS_SIZE * 0.5,
         scale_x: button_width / SHZ_LOGO_REFERENCE_SIZE,
         scale_y: button_height / SHZ_LOGO_REFERENCE_SIZE,
     }
@@ -556,8 +558,10 @@ fn shz_logo_layout(button_width: f32, button_height: f32) -> ShzLogoLayout {
 #[cfg(test)]
 fn shz_logo_point_in_button(layout: ShzLogoLayout, point: (f32, f32)) -> (f32, f32) {
     (
-        layout.center_x + (point.0 - SHZ_LOGO_SOURCE_SIZE * 0.5) * layout.scale_x,
-        layout.center_y + (point.1 - SHZ_LOGO_SOURCE_SIZE * 0.5) * layout.scale_y,
+        layout.center_x
+            + (point.0 + SHZ_LOGO_CANVAS_PADDING - SHZ_LOGO_CANVAS_SIZE * 0.5) * layout.scale_x,
+        layout.center_y
+            + (point.1 + SHZ_LOGO_CANVAS_PADDING - SHZ_LOGO_CANVAS_SIZE * 0.5) * layout.scale_y,
     )
 }
 
@@ -598,8 +602,8 @@ impl CompositionLogo {
 
         let transparent_root = compositor.CreateLayerVisual()?;
         transparent_root.SetSize(Vector2 {
-            X: SHZ_LOGO_SOURCE_SIZE,
-            Y: SHZ_LOGO_SOURCE_SIZE,
+            X: SHZ_LOGO_CANVAS_SIZE,
+            Y: SHZ_LOGO_CANVAS_SIZE,
         })?;
         transparent_root
             .Children()?
@@ -607,8 +611,8 @@ impl CompositionLogo {
 
         let visual = compositor.CreateContainerVisual()?;
         visual.SetSize(Vector2 {
-            X: SHZ_LOGO_SOURCE_SIZE,
-            Y: SHZ_LOGO_SOURCE_SIZE,
+            X: SHZ_LOGO_CANVAS_SIZE,
+            Y: SHZ_LOGO_CANVAS_SIZE,
         })?;
         let layout = shz_logo_layout(BUTTON_SIZE as f32, BUTTON_SIZE as f32);
         visual.SetCenterPoint(Vector3 {
@@ -903,8 +907,8 @@ unsafe fn make_logo_visual<const N: usize>(
 ) -> windows::core::Result<(ShapeVisual, [CompositionPathGeometry; 2])> {
     let visual = compositor.CreateShapeVisual()?;
     visual.SetSize(Vector2 {
-        X: SHZ_LOGO_SOURCE_SIZE,
-        Y: SHZ_LOGO_SOURCE_SIZE,
+        X: SHZ_LOGO_CANVAS_SIZE,
+        Y: SHZ_LOGO_CANVAS_SIZE,
     })?;
     let geometries = [
         make_logo_path_geometry(compositor, d2d_factory, paths[0], trim)?,
@@ -916,6 +920,10 @@ unsafe fn make_logo_visual<const N: usize>(
         shape.SetStrokeThickness(SHZ_LOGO_STROKE_WIDTH)?;
         shape.SetStrokeStartCap(windows::UI::Composition::CompositionStrokeCap::Round)?;
         shape.SetStrokeEndCap(windows::UI::Composition::CompositionStrokeCap::Round)?;
+        shape.SetOffset(Vector2 {
+            X: SHZ_LOGO_CANVAS_PADDING,
+            Y: SHZ_LOGO_CANVAS_PADDING,
+        })?;
         visual.Shapes()?.Append(&shape)?;
     }
     Ok((visual, geometries))
@@ -5476,13 +5484,13 @@ mod tests {
         let layout = shz_logo_layout(96.0, 96.0);
         assert!((layout.scale_x - (96.0 / 367.5)).abs() < f32::EPSILON);
         assert_eq!(layout.scale_x, layout.scale_y);
-        assert_eq!((layout.offset_x, layout.offset_y), (-57.0, -57.0));
+        assert_eq!((layout.offset_x, layout.offset_y), (-93.0, -93.0));
         assert_eq!(
             (
                 layout.center_x - layout.offset_x,
                 layout.center_y - layout.offset_y
             ),
-            (105.0, 105.0)
+            (141.0, 141.0)
         );
         assert!((SHZ_LOGO_STROKE_WIDTH * layout.scale_x - 9.926_531).abs() < 0.000_01);
         let top_start = shz_logo_point_in_button(layout, SHZ_LOGO_TOP_PATH.start);
@@ -5492,6 +5500,13 @@ mod tests {
         assert!((bottom_start.0 - 55.528_49).abs() < 0.000_02);
         assert!((bottom_start.1 - 73.082_78).abs() < 0.000_02);
         assert_eq!(SHZ_LOGO_SOURCE_SIZE, 210.0);
+        assert_eq!(SHZ_LOGO_CANVAS_PADDING, 36.0);
+        assert_eq!(SHZ_LOGO_CANVAS_SIZE, 282.0);
+        let long_path_y_min = -13.49;
+        let long_path_y_max = 224.57;
+        let cap_radius = SHZ_LOGO_STROKE_WIDTH * 0.5;
+        assert!(long_path_y_min + SHZ_LOGO_CANVAS_PADDING - cap_radius > 0.0);
+        assert!(long_path_y_max + SHZ_LOGO_CANVAS_PADDING + cap_radius < SHZ_LOGO_CANVAS_SIZE);
         assert_eq!(SHZ_LOGO_TOP_PATH.curves.len(), 4);
         assert_eq!(SHZ_LOGO_BOTTOM_PATH.curves.len(), 4);
         assert_eq!(SHZ_LOGO_TOP_PATH.start, (76.19, 10.38));
