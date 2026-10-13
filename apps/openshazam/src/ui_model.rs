@@ -29,6 +29,7 @@ pub const INNER_BASE_OPACITY: [f64; 4] = [0.4, 0.5, 0.7, 0.75];
 
 pub const OUTER_CORE_DURATION: f64 = 1.500_000_037_645_038_9;
 pub const OUTER_LOOP_DURATION: f64 = 1.583_333_373;
+pub const OUTER_SCALE_NULL_DURATION: f64 = 1.583_333_373_069_763_2;
 pub const OUTER_SECOND_PHASE: f64 = 0.208_333_35;
 pub const OUTER_DIAMETERS: [f64; 2] = [604.8, 514.08];
 
@@ -83,6 +84,21 @@ pub struct CircleFrame {
     pub local_time: f64,
 }
 
+/// Outer-circle values retain the three independently animated native scale
+/// tracks. `diameter` is their composed logical result for the current frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OuterCircleFrame {
+    pub diameter: f64,
+    pub opacity: f64,
+    pub stroke_width: f64,
+    pub core_size_scale: f64,
+    pub container_scale: f64,
+    pub scale_null: f64,
+    pub audio_scale: f64,
+    pub local_time: f64,
+    pub scale_null_local_time: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WaveFrame {
     pub button_scale: f64,
@@ -92,7 +108,7 @@ pub struct WaveFrame {
     pub outer_audio_scale: f64,
     pub outer_audio_opacity: f64,
     pub inner: [CircleFrame; 4],
-    pub outer: [CircleFrame; 2],
+    pub outer: [OuterCircleFrame; 2],
     pub auto_shadow_scale: f64,
     pub inner_container_factor: f64,
     pub outer_container_factor: f64,
@@ -260,6 +276,15 @@ fn outer_border_width(local_time: f64) -> f64 {
     )
 }
 
+fn outer_scale_null(local_time: f64) -> f64 {
+    sample_track(
+        &[1.0, 1.0, 0.930_000_007_152_557_4],
+        &[0.0, 0.657_894_730_567_932_1, 1.0],
+        local_time / OUTER_SCALE_NULL_DURATION,
+        &[false, true],
+    )
+}
+
 /// Evaluate the manual or Auto Shazam wave scene at an arbitrary monotonic
 /// elapsed time. No allocation or frame-history accumulation is used.
 #[cfg(test)]
@@ -355,14 +380,28 @@ pub fn wave_frame_at_with_auto_spring(
     let outer = std::array::from_fn(|index| {
         let native_local = outer_phase - outer_phase_values[index];
         let local = native_local.clamp(0.0, OUTER_CORE_DURATION);
-        CircleFrame {
+        // UI-150 registers this keyframe directly on each outerCircleLayer,
+        // without the core helper's second-layer phase offset. Keep this
+        // clock and track independent from circleContainer.scale and
+        // circleLayer.size even though the current renderer composes scales.
+        let scale_null_local = elapsed.rem_euclid(OUTER_SCALE_NULL_DURATION);
+        let container_scale = outer_container_scale(local);
+        let core_size_scale = outer_size(local);
+        let scale_null = outer_scale_null(scale_null_local);
+        OuterCircleFrame {
             diameter: OUTER_DIAMETERS[index]
-                * outer_container_scale(local)
-                * treble_scale
-                * outer_size(local),
+                * container_scale
+                * core_size_scale
+                * scale_null
+                * treble_scale,
             opacity: treble_opacity,
             stroke_width: outer_border_width(local),
+            core_size_scale,
+            container_scale,
+            scale_null,
+            audio_scale: treble_scale,
             local_time: local,
+            scale_null_local_time: scale_null_local,
         }
     });
 
@@ -557,6 +596,30 @@ mod tests {
         assert_eq!(high.outer_audio_scale, 1.1);
         assert_eq!(low.inner_container_factor, 3.0);
         assert_eq!(low.outer_container_factor, 6.3);
+    }
+
+    #[test]
+    fn ui150_outer_scale_null_has_its_own_unshifted_loop() {
+        let eased_half = OUTER_SCALE_NULL_DURATION * (0.657_894_730_567_932_1 + 1.0) * 0.5;
+        let frame = wave_frame_at(TaggingMode::Manual, eased_half, UiLevels::default());
+        let expected_null = 1.0 - 0.07 * native_bezier(0.5);
+
+        close(frame.outer[0].scale_null, expected_null, 1e-8);
+        close(frame.outer[1].scale_null, expected_null, 1e-8);
+        close(
+            frame.outer[0].scale_null_local_time,
+            frame.outer[1].scale_null_local_time,
+            1e-12,
+        );
+        close(
+            frame.outer[0].local_time - frame.outer[1].local_time,
+            OUTER_SECOND_PHASE,
+            1e-8,
+        );
+
+        let neutral = wave_frame_at(TaggingMode::Ready, 0.0, UiLevels::default());
+        assert_eq!(neutral.outer[0].scale_null, 1.0);
+        assert_eq!(neutral.outer[1].scale_null, 1.0);
     }
 
     #[test]

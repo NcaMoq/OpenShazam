@@ -113,6 +113,7 @@ use crate::ui_model::{
 const CLASS_NAME: &str = "OpenShazamNativeUiWindow";
 const WM_TRAYICON_MESSAGE: u32 = WM_APP + 0x41;
 const WM_CAPTURE_FINISHED: u32 = WM_APP + 0x42;
+const WM_SHOW_INITIAL_POPUP: u32 = WM_APP + 0x43;
 const TRAY_ICON_ID: u32 = 1;
 const TIMER_SINGLE_CLICK: usize = 0x4f53;
 const TIMER_LONG_PRESS: usize = 0x4f54;
@@ -2471,6 +2472,10 @@ unsafe extern "system" fn window_proc(
     let app = &mut *data.app;
 
     match message {
+        WM_SHOW_INITIAL_POPUP if data.kind == WindowKind::Main => {
+            show_main(app);
+            LRESULT(0)
+        }
         WM_CREATE => {
             let dpi = GetDpiForWindow(hwnd).max(96);
             match Renderer::new(
@@ -2941,6 +2946,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             drop(Box::from_raw(app_ptr));
             return Err(Box::new(error));
         }
+        // Let Explorer finish publishing the notification icon before asking
+        // Shell_NotifyIconGetRect for its anchor. `ui` opens the popup on
+        // launch; the tray icon remains available to hide/show it afterward.
+        let _ = PostMessageW(Some(hwnd), WM_SHOW_INITIAL_POPUP, WPARAM(0), LPARAM(0));
         let mut message = MSG::default();
         let mut running = true;
         while running {
