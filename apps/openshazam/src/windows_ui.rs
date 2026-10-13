@@ -34,20 +34,15 @@ use windows::{
                     D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP,
                     D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
                 },
-                D2D1CreateDevice, D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Device,
-                ID2D1DeviceContext, ID2D1Factory, ID2D1Geometry, ID2D1HwndRenderTarget, ID2D1Layer,
-                ID2D1LinearGradientBrush, ID2D1RenderTarget, ID2D1SolidColorBrush,
-                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_COMBINE_MODE_UNION, D2D1_ELLIPSE,
-                D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
+                D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1Geometry,
+                ID2D1HwndRenderTarget, ID2D1Layer, ID2D1LinearGradientBrush, ID2D1RenderTarget,
+                ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_COMBINE_MODE_EXCLUDE,
+                D2D1_COMBINE_MODE_UNION, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
                 D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_OPTIONS_NONE,
                 D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 D2D1_RENDER_TARGET_USAGE_NONE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-            },
-            Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0},
-            Direct3D11::{
-                D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                D3D11_SDK_VERSION,
             },
             DirectWrite::{
                 DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
@@ -58,7 +53,6 @@ use windows::{
                 DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_WORD_WRAPPING_WRAP,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-            Dxgi::IDXGIDevice,
             Gdi::{
                 BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
                 GetMonitorInfoW, InvalidateRect, MonitorFromRect, SelectObject, AC_SRC_ALPHA,
@@ -111,20 +105,13 @@ use windows::{
         Color,
         Composition::{
             AnimationIterationBehavior, CompositionColorBrush, CompositionEllipseGeometry,
-            CompositionPath, CompositionPathGeometry, CompositionSpriteShape,
-            CompositionVisualSurface, Compositor, ContainerVisual, CubicBezierEasingFunction,
-            Desktop::DesktopWindowTarget, DropShadow, ScalarKeyFrameAnimation, ShapeVisual,
-            SpriteVisual, Vector2KeyFrameAnimation, Vector3KeyFrameAnimation,
+            CompositionGeometricClip, CompositionPath, CompositionPathGeometry,
+            CompositionSpriteShape, CompositionVisualSurface, Compositor, ContainerVisual,
+            CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow,
+            ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual, Vector2KeyFrameAnimation,
+            Vector3KeyFrameAnimation,
         },
     },
-};
-
-use windows::{
-    Foundation::Size,
-    Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat},
-    Win32::Graphics::Direct2D::{D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER},
-    Win32::System::WinRT::Composition::{ICompositionDrawingSurfaceInterop, ICompositorInterop},
-    UI::Composition::{CompositionDrawingSurface, CompositionMaskBrush, CompositionSurfaceBrush},
 };
 
 use windows_numerics::{Matrix3x2, Vector2, Vector3};
@@ -454,7 +441,7 @@ struct CompositionRing {
     visual: ContainerVisual,
     geometry: Option<CompositionEllipseGeometry>,
     shape: Option<CompositionSpriteShape>,
-    _masked_fill: Option<SpriteVisual>,
+    _inner_fill_visual: Option<SpriteVisual>,
     core_container: Option<ContainerVisual>,
     sublayer_container: Option<ContainerVisual>,
     inner_animations: Option<InnerRingAnimations>,
@@ -492,17 +479,6 @@ impl IGeometrySource2DInterop_Impl for D2DCompositionGeometrySource_Impl {
     ) -> windows::core::Result<ID2D1Geometry> {
         Ok(self.geometry.clone())
     }
-}
-
-/// Cached GPU alpha mask backed by a Composition drawing surface. Each surface
-/// contains a filled circle with a centered transparent cutout at the requested
-/// DPI, ready for a SpriteVisual and a CompositionMaskBrush.
-#[derive(Debug)]
-struct CompositionAlphaMask {
-    _surface: CompositionDrawingSurface,
-    _surface_brush: CompositionSurfaceBrush,
-    brush: CompositionMaskBrush,
-    source: CompositionColorBrush,
 }
 
 #[derive(Debug)]
@@ -1149,203 +1125,53 @@ fn logo_shadow_color(_theme: Theme) -> Color {
     composition_color(51, 255, 255, 255)
 }
 
-#[derive(Debug)]
-struct CompositionMaskFactory {
-    _compositor: Compositor,
-    _d3d_device: ID3D11Device,
-    _d2d_device: ID2D1Device,
-    graphics_device: windows::UI::Composition::CompositionGraphicsDevice,
+const INNER_RIPPLE_DIAMETER: f32 = 288.0;
+const BUTTON_CLEAR_DIAMETER: f32 = 96.0;
+
+fn inverse_circle_clip_radii(size: f32, hole: f32) -> Option<(f32, f32)> {
+    (size.is_finite() && hole.is_finite() && size > 0.0 && hole >= 0.0 && hole < size)
+        .then_some((size * 0.5, hole * 0.5))
 }
 
-impl CompositionMaskFactory {
-    unsafe fn new(compositor: &Compositor) -> windows::core::Result<Self> {
-        let d3d_device =
-            create_mask_d3d_device().map_err(|error| mask_error(error, "D3D11 mask device"))?;
-        let dxgi_device: IDXGIDevice = d3d_device
-            .cast()
-            .map_err(|error| mask_error(error, "DXGI mask device interface"))?;
-        let d2d_device: ID2D1Device = D2D1CreateDevice(&dxgi_device, None)
-            .map_err(|error| mask_error(error, "Direct2D mask device"))?;
-        let interop: ICompositorInterop = compositor
-            .cast()
-            .map_err(|error| mask_error(error, "Composition graphics interop"))?;
-        let graphics_device = interop
-            .CreateGraphicsDevice(&d2d_device)
-            .map_err(|error| mask_error(error, "Composition graphics device"))?;
-        Ok(Self {
-            _compositor: compositor.clone(),
-            _d3d_device: d3d_device,
-            _d2d_device: d2d_device,
-            graphics_device,
-        })
-    }
+unsafe fn make_inverse_circle_clip(
+    compositor: &Compositor,
+    d2d_factory: &ID2D1Factory,
+    size: f32,
+    hole: f32,
+) -> windows::core::Result<CompositionGeometricClip> {
+    let (outer_radius, inner_radius) = inverse_circle_clip_radii(size, hole).ok_or_else(|| {
+        Error::new(
+            windows::core::HRESULT(0x80070057u32 as i32),
+            "invalid ripple mask dimensions",
+        )
+    })?;
+    let center = size * 0.5;
+    let outer = d2d_factory.CreateEllipseGeometry(&D2D1_ELLIPSE {
+        point: Vector2 {
+            X: center,
+            Y: center,
+        },
+        radiusX: outer_radius,
+        radiusY: outer_radius,
+    })?;
+    let inner = d2d_factory.CreateEllipseGeometry(&D2D1_ELLIPSE {
+        point: Vector2 {
+            X: center,
+            Y: center,
+        },
+        radiusX: inner_radius,
+        radiusY: inner_radius,
+    })?;
+    let geometry = d2d_factory.CreatePathGeometry()?;
+    let sink = geometry.Open()?;
+    outer.CombineWithGeometry(&inner, D2D1_COMBINE_MODE_EXCLUDE, None, 0.25, &sink)?;
+    sink.Close()?;
 
-    unsafe fn inverse_circle(
-        &self,
-        size_dips: f32,
-        hole_diameter_dips: f32,
-        dpi: u32,
-    ) -> windows::core::Result<CompositionAlphaMask> {
-        CompositionAlphaMask::inverse_circle(self, size_dips, hole_diameter_dips, dpi)
-    }
-}
-
-impl CompositionAlphaMask {
-    unsafe fn inverse_circle(
-        factory: &CompositionMaskFactory,
-        size_dips: f32,
-        hole_diameter_dips: f32,
-        dpi: u32,
-    ) -> windows::core::Result<Self> {
-        let pixel_size = ui_model::physical_pixels(size_dips as f64, dpi.max(96));
-        let surface = factory
-            .graphics_device
-            .CreateDrawingSurface(
-                Size {
-                    Width: pixel_size as f32,
-                    Height: pixel_size as f32,
-                },
-                DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                DirectXAlphaMode::Premultiplied,
-            )
-            .map_err(|error| mask_error(error, "Composition drawing surface"))?;
-        let surface_interop: ICompositionDrawingSurfaceInterop = surface
-            .cast()
-            .map_err(|error| mask_error(error, "Drawing surface interop"))?;
-        let mut update_offset = POINT::default();
-        let draw_context: ID2D1DeviceContext = surface_interop
-            .BeginDraw(None, &mut update_offset)
-            .map_err(|error| mask_error(error, "Drawing surface BeginDraw"))?;
-        let draw_result = (|| -> windows::core::Result<()> {
-            draw_context.SetDpi(dpi.max(96) as f32, dpi.max(96) as f32);
-            draw_context.Clear(Some(&D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            }));
-            let opaque = draw_context.CreateSolidColorBrush(
-                &D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 1.0,
-                },
-                None,
-            )?;
-            let transparent = draw_context.CreateSolidColorBrush(
-                &D2D1_COLOR_F {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 0.0,
-                },
-                None,
-            )?;
-            let bounds = D2D_RECT_F {
-                left: update_offset.x as f32 * 96.0 / dpi.max(96) as f32,
-                top: update_offset.y as f32 * 96.0 / dpi.max(96) as f32,
-                right: update_offset.x as f32 * 96.0 / dpi.max(96) as f32 + size_dips,
-                bottom: update_offset.y as f32 * 96.0 / dpi.max(96) as f32 + size_dips,
-            };
-            let center = Vector2 {
-                X: (bounds.left + bounds.right) * 0.5,
-                Y: (bounds.top + bounds.bottom) * 0.5,
-            };
-            let outer_radius = size_dips.max(0.0) * 0.5;
-            draw_context.FillEllipse(
-                &D2D1_ELLIPSE {
-                    point: center,
-                    radiusX: outer_radius,
-                    radiusY: outer_radius,
-                },
-                &opaque,
-            );
-            draw_context.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
-            let radius = hole_diameter_dips.max(0.0) * 0.5;
-            draw_context.FillEllipse(
-                &D2D1_ELLIPSE {
-                    point: center,
-                    radiusX: radius,
-                    radiusY: radius,
-                },
-                &transparent,
-            );
-            draw_context.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
-            Ok(())
-        })();
-        let end_draw = surface_interop.EndDraw();
-        draw_result?;
-        end_draw?;
-
-        let surface_brush = factory
-            ._compositor
-            .CreateSurfaceBrushWithSurface(&surface)
-            .map_err(|error| mask_error(error, "Composition surface brush"))?;
-        let brush = factory
-            ._compositor
-            .CreateMaskBrush()
-            .map_err(|error| mask_error(error, "Composition mask brush"))?;
-        brush
-            .SetMask(&surface_brush)
-            .map_err(|error| mask_error(error, "Composition mask input"))?;
-        let source = factory
-            ._compositor
-            .CreateColorBrushWithColor(composition_color(255, 255, 255, 255))
-            .map_err(|error| mask_error(error, "Composition mask source brush"))?;
-        brush
-            .SetSource(&source)
-            .map_err(|error| mask_error(error, "Composition mask content source"))?;
-        Ok(Self {
-            _surface: surface,
-            _surface_brush: surface_brush,
-            brush,
-            source,
-        })
-    }
-
-    fn brush(&self) -> &CompositionMaskBrush {
-        &self.brush
-    }
-
-    fn set_color(&self, color: Color) -> windows::core::Result<()> {
-        self.source.SetColor(color)
-    }
-}
-
-fn mask_error(error: Error, context: &str) -> Error {
-    Error::new(error.code(), format!("{context}: {error}"))
-}
-
-unsafe fn create_mask_d3d_device() -> windows::core::Result<ID3D11Device> {
-    let feature_levels = [D3D_FEATURE_LEVEL_11_0];
-    let mut device = None;
-    if D3D11CreateDevice(
-        None,
-        D3D_DRIVER_TYPE_HARDWARE,
-        windows::Win32::Foundation::HMODULE::default(),
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        Some(&feature_levels),
-        D3D11_SDK_VERSION,
-        Some(&mut device),
-        None,
-        None,
-    )
-    .is_err()
-    {
-        D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_WARP,
-            windows::Win32::Foundation::HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            Some(&feature_levels),
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            None,
-        )?;
-    }
-    device.ok_or_else(Error::from_thread)
+    let geometry: ID2D1Geometry = geometry.cast()?;
+    let source: IGeometrySource2D = D2DCompositionGeometrySource { geometry }.into();
+    let path = CompositionPath::Create(&source)?;
+    let geometry = compositor.CreatePathGeometryWithPath(&path)?;
+    compositor.CreateGeometricClipWithGeometry(&geometry)
 }
 
 struct CompositionScene {
@@ -1353,6 +1179,7 @@ struct CompositionScene {
     _target: DesktopWindowTarget,
     root: ContainerVisual,
     inner_audio_root: ContainerVisual,
+    _inner_inverse_clip: CompositionGeometricClip,
     outer_audio_root: ContainerVisual,
     rings: [CompositionRing; 6],
     button: ContainerVisual,
@@ -1360,9 +1187,7 @@ struct CompositionScene {
     button_fill: CompositionColorBrush,
     logo: CompositionLogo,
     no_match_icon_transform: ContainerVisual,
-    ring_brushes: [CompositionColorBrush; 2],
-    inner_alpha_masks: [CompositionAlphaMask; 4],
-    _mask_factory: CompositionMaskFactory,
+    ring_brushes: [CompositionColorBrush; 3],
     idle_animation: Vector3KeyFrameAnimation,
     outer_scale_null_animation: Vector3KeyFrameAnimation,
     idle_active: bool,
@@ -1443,27 +1268,16 @@ impl CompositionScene {
         root.SetClip(&clip)?;
 
         let ring_color = composition_tagging_color(theme);
-        let mask_factory = unsafe { CompositionMaskFactory::new(compositor)? };
-        let inner_alpha_masks: [CompositionAlphaMask; 4] = ui_model::INNER_DIAMETERS
-            .iter()
-            .map(|diameter| unsafe {
-                mask_factory.inverse_circle(*diameter as f32, BUTTON_SIZE as f32, dpi)
-            })
-            .collect::<windows::core::Result<Vec<_>>>()?
-            .try_into()
-            .expect("four cached inner circle masks");
-        for mask in &inner_alpha_masks {
-            mask.set_color(ring_color)?;
-        }
         let easing = compositor.CreateCubicBezierEasingFunction(
             Vector2 { X: 0.44, Y: 0.05 },
             Vector2 { X: 0.55, Y: 0.95 },
         )?;
         let mut rings = Vec::with_capacity(6);
-        let mut ring_brushes = Vec::with_capacity(2);
+        let mut ring_brushes = Vec::with_capacity(3);
+        ring_brushes.push(compositor.CreateColorBrushWithColor(ring_color)?);
         let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
         let center_y = body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32;
-        let inner_bounds = ui_model::INNER_DIAMETERS[0] as f32;
+        let inner_bounds = INNER_RIPPLE_DIAMETER;
         let inner_audio_root = compositor.CreateContainerVisual()?;
         inner_audio_root.SetSize(Vector2 {
             X: inner_bounds,
@@ -1480,6 +1294,10 @@ impl CompositionScene {
             Z: 0.0,
         })?;
         inner_audio_root.SetOpacity(0.0)?;
+        let inner_inverse_clip = unsafe {
+            make_inverse_circle_clip(compositor, d2d_factory, inner_bounds, BUTTON_CLEAR_DIAMETER)?
+        };
+        inner_audio_root.SetClip(&inner_inverse_clip)?;
         let outer_bounds = ui_model::OUTER_DIAMETERS[0] as f32;
         let outer_audio_root = compositor.CreateContainerVisual()?;
         outer_audio_root.SetSize(Vector2 {
@@ -1541,13 +1359,13 @@ impl CompositionScene {
             })?;
             visual.SetOpacity(0.0)?;
 
-            let (geometry, shape, masked_fill) = if index < 4 {
+            let (geometry, shape, inner_fill_visual) = if index < 4 {
                 let sprite = compositor.CreateSpriteVisual()?;
                 sprite.SetSize(Vector2 {
                     X: diameter,
                     Y: diameter,
                 })?;
-                sprite.SetBrush(inner_alpha_masks[index].brush())?;
+                sprite.SetBrush(&ring_brushes[0])?;
                 (None, None, Some(sprite))
             } else {
                 let geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
@@ -1599,7 +1417,7 @@ impl CompositionScene {
                 })?;
                 sublayer
                     .Children()?
-                    .InsertAtTop(masked_fill.as_ref().expect("inner masked fill"))?;
+                    .InsertAtTop(inner_fill_visual.as_ref().expect("inner fill visual"))?;
                 core.Children()?.InsertAtTop(&sublayer)?;
                 visual.Children()?.InsertAtTop(&core)?;
                 inner_audio_root.Children()?.InsertAtTop(&visual)?;
@@ -1730,7 +1548,7 @@ impl CompositionScene {
                 visual,
                 geometry,
                 shape,
-                _masked_fill: masked_fill,
+                _inner_fill_visual: inner_fill_visual,
                 core_container,
                 sublayer_container,
                 inner_animations,
@@ -1743,9 +1561,9 @@ impl CompositionScene {
             });
         }
         let rings: [CompositionRing; 6] = rings.try_into().expect("six composition ring visuals");
-        let ring_brushes: [CompositionColorBrush; 2] = ring_brushes
+        let ring_brushes: [CompositionColorBrush; 3] = ring_brushes
             .try_into()
-            .expect("two outer composition ring brushes");
+            .expect("one inner and two outer composition ring brushes");
 
         let button = compositor.CreateContainerVisual()?;
         button.SetSize(Vector2 {
@@ -1911,6 +1729,7 @@ impl CompositionScene {
             _target: target,
             root,
             inner_audio_root,
+            _inner_inverse_clip: inner_inverse_clip,
             outer_audio_root,
             rings,
             button,
@@ -1919,8 +1738,6 @@ impl CompositionScene {
             logo,
             no_match_icon_transform,
             ring_brushes,
-            inner_alpha_masks,
-            _mask_factory: mask_factory,
             idle_animation,
             outer_scale_null_animation,
             idle_active: false,
@@ -1940,25 +1757,6 @@ impl CompositionScene {
         if self.dpi == dpi {
             return Ok(());
         }
-        let masks: [CompositionAlphaMask; 4] = ui_model::INNER_DIAMETERS
-            .iter()
-            .map(|diameter| unsafe {
-                self._mask_factory
-                    .inverse_circle(*diameter as f32, BUTTON_SIZE as f32, dpi)
-            })
-            .collect::<windows::core::Result<Vec<_>>>()?
-            .try_into()
-            .expect("four cached inner circle masks");
-        for mask in &masks {
-            mask.set_color(composition_tagging_color(self.theme))?;
-        }
-        for (ring, mask) in self.rings[..4].iter().zip(&masks) {
-            ring._masked_fill
-                .as_ref()
-                .expect("inner ring masked fill")
-                .SetBrush(mask.brush())?;
-        }
-        self.inner_alpha_masks = masks;
         self.dpi = dpi;
         let scale = composition_scale_for_dpi(dpi);
         self.root.SetScale(Vector3 {
@@ -1974,9 +1772,6 @@ impl CompositionScene {
             self.logo.set_theme(self.theme)?;
             for brush in &self.ring_brushes {
                 brush.SetColor(composition_tagging_color(self.theme))?;
-            }
-            for mask in &self.inner_alpha_masks {
-                mask.set_color(composition_tagging_color(self.theme))?;
             }
             self.button_fill
                 .SetColor(composition_color(77, 255, 255, 255))?;
@@ -5416,10 +5211,11 @@ fn _assert_only_ui_dependencies_are_used(_: &Path) {}
 mod tests {
     use super::{
         animation_needs_frame, button_border_arc_points, composition_root_layer_order,
-        gradient_origin_transform, history_artwork_frame, is_offline_failure, is_timeout_failure,
-        native_icon_layout, parse_debug_string, parse_match, phase_needs_timeout, point_in_rect,
-        result_artwork_frame, result_panel_top_at, should_start_startup_logo, CaptureMode,
-        CompositionRootLayer, MainPhase, WindowKind, OUTER_BASE_OPACITY,
+        gradient_origin_transform, history_artwork_frame, inverse_circle_clip_radii,
+        is_offline_failure, is_timeout_failure, native_icon_layout, parse_debug_string,
+        parse_match, phase_needs_timeout, point_in_rect, result_artwork_frame, result_panel_top_at,
+        should_start_startup_logo, ui_model, CaptureMode, CompositionRootLayer, MainPhase,
+        WindowKind, INNER_RIPPLE_DIAMETER, OUTER_BASE_OPACITY,
     };
 
     #[test]
@@ -5718,6 +5514,14 @@ mod tests {
     }
 
     #[test]
+    fn inner_ripple_clip_keeps_a_button_sized_hole_independent_of_child_rings() {
+        assert_eq!(INNER_RIPPLE_DIAMETER as f64, ui_model::INNER_DIAMETERS[0]);
+        assert_eq!(inverse_circle_clip_radii(288.0, 96.0), Some((144.0, 48.0)));
+        assert_eq!(inverse_circle_clip_radii(96.0, 96.0), None);
+        assert_eq!(inverse_circle_clip_radii(f32::NAN, 48.0), None);
+    }
+
+    #[test]
     fn logo_startup_animation_runs_once_for_the_main_scene_only() {
         assert!(should_start_startup_logo(WindowKind::Main, false));
         assert!(!should_start_startup_logo(WindowKind::Main, true));
@@ -5828,8 +5632,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a Windows Composition dispatcher and D3D device; run explicitly to verify alpha-mask surface interop"]
-    fn composition_drawing_surface_builds_a_cached_inverse_alpha_mask() {
+    #[ignore = "requires a Windows Composition dispatcher; run explicitly to verify group clip interop"]
+    fn composition_inner_ripple_group_accepts_the_inverse_circle_clip() {
         use super::*;
 
         unsafe {
@@ -5842,33 +5646,28 @@ mod tests {
             .unwrap();
             let result = (|| -> windows::core::Result<()> {
                 let compositor = Compositor::new()?;
-                let factory = CompositionMaskFactory::new(&compositor)?;
                 let d2d_factory: ID2D1Factory =
                     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-                let _masks = [
-                    factory.inverse_circle(288.0, 96.0, 144)?,
-                    factory.inverse_circle(222.545, 96.0, 144)?,
-                    factory.inverse_circle(170.182, 96.0, 144)?,
-                    factory.inverse_circle(130.909, 96.0, 144)?,
-                ];
-                for (mask, diameter) in _masks.iter().zip(ui_model::INNER_DIAMETERS) {
-                    let sprite = compositor.CreateSpriteVisual()?;
-                    sprite.SetSize(Vector2 {
-                        X: diameter as f32,
-                        Y: diameter as f32,
-                    })?;
-                    sprite.SetBrush(mask.brush())?;
-                    let host = compositor.CreateContainerVisual()?;
-                    host.Children()?.InsertAtTop(&sprite)?;
-                }
+                let clip = make_inverse_circle_clip(
+                    &compositor,
+                    &d2d_factory,
+                    INNER_RIPPLE_DIAMETER,
+                    BUTTON_CLEAR_DIAMETER,
+                )?;
+                let group = compositor.CreateContainerVisual()?;
+                group.SetSize(Vector2 {
+                    X: INNER_RIPPLE_DIAMETER,
+                    Y: INNER_RIPPLE_DIAMETER,
+                })?;
+                group.SetClip(&clip)?;
+                let ring = compositor.CreateSpriteVisual()?;
+                ring.SetSize(Vector2 {
+                    X: INNER_RIPPLE_DIAMETER,
+                    Y: INNER_RIPPLE_DIAMETER,
+                })?;
+                group.Children()?.InsertAtTop(&ring)?;
                 let mut logo = CompositionLogo::new(&d2d_factory, &compositor, Theme::Light, true)?;
                 logo.start()?;
-                for dpi in [96, 120, 144, 168, 192, 240, 288] {
-                    let mask = factory.inverse_circle(288.0, 96.0, dpi)?;
-                    let sprite = compositor.CreateSpriteVisual()?;
-                    sprite.SetSize(Vector2 { X: 288.0, Y: 288.0 })?;
-                    sprite.SetBrush(mask.brush())?;
-                }
                 Ok(())
             })();
             drop(dispatcher);
