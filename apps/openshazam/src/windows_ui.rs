@@ -6580,6 +6580,39 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a Windows Composition dispatcher; run explicitly to verify NoMatch path interop"]
+    fn composition_builds_the_native_no_match_icon_path() {
+        use super::*;
+
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).unwrap();
+            let dispatcher = CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })
+            .unwrap();
+            let result = (|| -> windows::core::Result<()> {
+                let compositor = Compositor::new()?;
+                let d2d_factory: ID2D1Factory =
+                    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+                let geometry = make_no_match_icon_geometry(
+                    &compositor,
+                    &d2d_factory,
+                    BUTTON_SIZE as f32 * 0.8,
+                )?;
+                let shape = compositor.CreateSpriteShapeWithGeometry(&geometry)?;
+                let visual = compositor.CreateShapeVisual()?;
+                visual.Shapes()?.Append(&shape)?;
+                Ok(())
+            })();
+            drop(dispatcher);
+            CoUninitialize();
+            result.unwrap();
+        }
+    }
+
+    #[test]
     #[ignore = "requires a Windows Composition dispatcher; run explicitly to verify group clip interop"]
     fn composition_inner_ripple_group_accepts_the_inverse_circle_clip() {
         use super::*;
