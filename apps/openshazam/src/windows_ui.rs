@@ -106,10 +106,10 @@ use windows::{
     UI::{
         Color,
         Composition::{
-            AnimationIterationBehavior, CompositionColorBrush, CompositionEllipseGeometry,
-            CompositionGeometricClip, CompositionPath, CompositionPathGeometry,
-            CompositionSpriteShape, CompositionVisualSurface, Compositor, ContainerVisual,
-            CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow,
+            AnimationIterationBehavior, CompositionBorderMode, CompositionColorBrush,
+            CompositionEllipseGeometry, CompositionGeometricClip, CompositionPath,
+            CompositionPathGeometry, CompositionSpriteShape, CompositionVisualSurface, Compositor,
+            ContainerVisual, CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow,
             ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual, Vector2KeyFrameAnimation,
             Vector3KeyFrameAnimation,
         },
@@ -1579,6 +1579,10 @@ impl CompositionScene {
             X: CONTENT_WIDTH as f32,
             Y: MAIN_WINDOW_HEIGHT as f32,
         })?;
+        // The root is scaled to the monitor DPI and clips the popup content.
+        // Inherit soft edges through the subtree so transformed visual and
+        // clip boundaries do not fall back to Composition's aliased default.
+        root.SetBorderMode(CompositionBorderMode::Soft)?;
         let dpi = dpi.max(96);
         let composition_scale = composition_scale_for_dpi(dpi);
         root.SetScale(Vector3 {
@@ -6754,6 +6758,10 @@ mod tests {
             .unwrap();
             let result = (|| -> windows::core::Result<()> {
                 let compositor = Compositor::new()?;
+                let root = compositor.CreateContainerVisual()?;
+                root.SetBorderMode(CompositionBorderMode::Soft)?;
+                assert_eq!(root.BorderMode()?, CompositionBorderMode::Soft);
+
                 let geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
                 let radius = compositor.CreateVector2KeyFrameAnimation()?;
                 radius.SetDuration(TimeSpan {
