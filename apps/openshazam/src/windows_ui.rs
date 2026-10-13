@@ -50,7 +50,6 @@ use windows::{
                 DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
                 DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_WORD_WRAPPING_WRAP,
             },
-            Dwm::DwmFlush,
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
                 BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
@@ -248,6 +247,7 @@ struct AppState {
     main_activated: bool,
     phase_timer_active: bool,
     animation_timer_active: bool,
+    startup_animation_pending: bool,
     settings_visible: bool,
     about_visible: bool,
     microphone_visible: bool,
@@ -1874,6 +1874,10 @@ impl CompositionScene {
             })?;
         }
         Ok(())
+    }
+
+    fn startup_logo_complete(&self) -> bool {
+        self.logo.stage == ui_model::StartupLogoStage::Complete
     }
 }
 
@@ -3882,7 +3886,7 @@ unsafe fn sync_main_timers(app: &mut AppState) {
             let _ = KillTimer(Some(hwnd), TIMER_PHASE);
             app.phase_timer_active = false;
         }
-        let animate = phase_needs_frame(&app.phase);
+        let animate = animation_needs_frame(&app.phase, app.startup_animation_pending);
         if animate && !app.animation_timer_active {
             let _ = SetTimer(Some(hwnd), TIMER_ANIMATION, ANIMATION_TICK_MS, None);
             app.animation_timer_active = true;
@@ -3923,6 +3927,10 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
         }
         MainPhase::Ready | MainPhase::Error { .. } => false,
     }
+}
+
+fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> bool {
+    startup_animation_pending || phase_needs_frame(phase)
 }
 
 unsafe fn show_main(app: &mut AppState) {
@@ -3995,7 +4003,15 @@ unsafe extern "system" fn window_proc(
                 app.theme,
                 data.kind,
             ) {
-                Ok(renderer) => data.renderer = Some(renderer),
+                Ok(renderer) => {
+                    if data.kind == WindowKind::Main {
+                        app.startup_animation_pending = renderer
+                            .composition
+                            .as_ref()
+                            .is_some_and(|scene| !scene.startup_logo_complete());
+                    }
+                    data.renderer = Some(renderer);
+                }
                 Err(error) => app.message = Some(format!("Direct2D初期化失敗: {error}")),
             }
             LRESULT(0)
@@ -4139,7 +4155,15 @@ unsafe extern "system" fn window_proc(
         WM_TIMER if data.kind == WindowKind::Main && wparam.0 == TIMER_ANIMATION => {
             if app.visible {
                 if let Some(renderer) = data.renderer.as_mut() {
-                    let _ = renderer.update_composition(animation_snapshot(app));
+                    if let Err(error) = renderer.update_composition(animation_snapshot(app)) {
+                        app.message = Some(format!("Windows Composition update failed: {error}"));
+                        app.startup_animation_pending = false;
+                    } else if app.startup_animation_pending {
+                        app.startup_animation_pending = renderer
+                            .composition
+                            .as_ref()
+                            .is_some_and(|scene| !scene.startup_logo_complete());
+                    }
                 }
                 if matches!(
                     app.phase,
@@ -4147,7 +4171,6 @@ unsafe extern "system" fn window_proc(
                 ) {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
-                let _ = DwmFlush();
                 sync_main_timers(app);
             }
             LRESULT(0)
@@ -4427,6 +4450,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             main_activated: false,
             phase_timer_active: false,
             animation_timer_active: false,
+            startup_animation_pending: false,
             settings_visible: false,
             about_visible: false,
             microphone_visible: false,
@@ -4534,7 +4558,10 @@ fn _assert_only_ui_dependencies_are_used(_: &Path) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{gradient_origin_transform, parse_debug_string, parse_match};
+    use super::{
+        animation_needs_frame, gradient_origin_transform, parse_debug_string, parse_match,
+        CaptureMode, MainPhase,
+    };
 
     #[test]
     fn parses_cli_result_without_changing_recognition_protocol() {
@@ -4714,6 +4741,19 @@ mod tests {
             assert_eq!(transform.M31, 0.0);
             assert_eq!(transform.M32, top);
         }
+    }
+
+    #[test]
+    fn startup_logo_keeps_the_ready_timer_until_idle_pulse_can_start() {
+        let ready = MainPhase::Ready;
+        assert!(!animation_needs_frame(&ready, false));
+        assert!(animation_needs_frame(&ready, true));
+
+        let listening = MainPhase::Listening {
+            mode: CaptureMode::Manual,
+            started_at: std::time::Instant::now(),
+        };
+        assert!(animation_needs_frame(&listening, false));
     }
 
     #[test]
