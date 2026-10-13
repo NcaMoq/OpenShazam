@@ -34,13 +34,13 @@ use windows::{
                     D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
                 },
                 D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1Geometry,
-                ID2D1HwndRenderTarget, ID2D1LinearGradientBrush, ID2D1RenderTarget,
-                ID2D1SolidColorBrush, D2D1_COMBINE_MODE_UNION, D2D1_ELLIPSE,
-                D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
-                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
-                D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-                D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
-                D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+                ID2D1HwndRenderTarget, ID2D1Layer, ID2D1LinearGradientBrush, ID2D1RenderTarget,
+                ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_COMBINE_MODE_UNION,
+                D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                D2D1_GAMMA_2_2, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_OPTIONS_NONE,
+                D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
+                D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                D2D1_RENDER_TARGET_USAGE_NONE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
             },
             DirectWrite::{
                 DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
@@ -310,6 +310,7 @@ struct Renderer {
     dpi: u32,
     theme_generation: u64,
     composition: Option<CompositionScene>,
+    popup_layer: Option<ID2D1Layer>,
     popup_outline: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     popup_header: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
 }
@@ -2135,6 +2136,11 @@ impl Renderer {
         } else {
             None
         };
+        let popup_layer = if kind == WindowKind::Main {
+            Some(target.CreateLayer(None)?)
+        } else {
+            None
+        };
         Ok(Self {
             factory,
             target,
@@ -2146,6 +2152,7 @@ impl Renderer {
             dpi,
             theme_generation,
             composition,
+            popup_layer,
             popup_outline: RefCell::new(None),
             popup_header: RefCell::new(None),
         })
@@ -2203,12 +2210,38 @@ impl Renderer {
         self.target.BeginDraw();
         let clear = d2d_color(0, 0, 0, 0.0);
         self.target.Clear(Some(&clear));
-        match kind {
-            WindowKind::Main => self.draw_main(app)?,
-            WindowKind::Settings => self.draw_settings(app)?,
-            WindowKind::About => self.draw_about(app)?,
-            WindowKind::MicrophoneInfo => self.draw_microphone_info(app)?,
+        let popup_layer_parameters = if kind == WindowKind::Main {
+            Some(windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS {
+                contentBounds: rect(0.0, 0.0, CONTENT_WIDTH as f32, MAIN_WINDOW_HEIGHT as f32),
+                geometricMask: std::mem::ManuallyDrop::new(Some(self.popup_outline(app)?)),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: windows_numerics::Matrix3x2 {
+                    M11: 1.0,
+                    M22: 1.0,
+                    ..Default::default()
+                },
+                opacity: 1.0,
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS_NONE,
+            })
+        } else {
+            None
+        };
+        if let (Some(parameters), Some(layer)) =
+            (popup_layer_parameters.as_ref(), self.popup_layer.as_ref())
+        {
+            self.target.PushLayer(parameters, layer);
         }
+        let draw_result = match kind {
+            WindowKind::Main => self.draw_main(app),
+            WindowKind::Settings => self.draw_settings(app),
+            WindowKind::About => self.draw_about(app),
+            WindowKind::MicrophoneInfo => self.draw_microphone_info(app),
+        };
+        if popup_layer_parameters.is_some() {
+            self.target.PopLayer();
+        }
+        draw_result?;
         self.target.EndDraw(None, None)?;
         if let Some(surface) = self.layered_surface.as_ref() {
             surface.present(app.main_hwnd)?;
@@ -2262,8 +2295,10 @@ impl Renderer {
             &self.palette.black
         };
 
-        let popup = self.popup_outline(app)?;
-        self.target.FillGeometry(&popup, bg, None);
+        self.target.FillRectangle(
+            &rect(0.0, 0.0, CONTENT_WIDTH as f32, MAIN_WINDOW_HEIGHT as f32),
+            bg,
+        );
         match app.phase {
             MainPhase::Listening { .. } => {
                 self.target
@@ -2409,18 +2444,12 @@ impl Renderer {
         header_sink.EndFigure(D2D1_FIGURE_END_CLOSED);
         header_sink.Close()?;
 
-        // Merge the colored header and arrow before clipping to the popup's
-        // outer contour so their shared edge is rasterized only once.
+        // Merge the colored header and arrow so their shared edge is
+        // rasterized only once. The popup layer applies the outer contour once.
         let arrow = self.popup_arrow_geometry(app.arrow_edge, center)?;
         let header_with_arrow = self.combine_geometry(&header, &arrow, D2D1_COMBINE_MODE_UNION)?;
-        let outline = self.popup_outline(app)?;
-        let clipped = self.combine_geometry(
-            &header_with_arrow,
-            &outline,
-            windows::Win32::Graphics::Direct2D::D2D1_COMBINE_MODE_INTERSECT,
-        )?;
-        *self.popup_header.borrow_mut() = Some((key.0, key.1, clipped.clone()));
-        Ok(clipped)
+        *self.popup_header.borrow_mut() = Some((key.0, key.1, header_with_arrow.clone()));
+        Ok(header_with_arrow)
     }
 
     unsafe fn popup_arrow_geometry(
@@ -4543,7 +4572,36 @@ mod tests {
                 .CombineWithGeometry(&arrow, D2D1_COMBINE_MODE_UNION, None, 0.25, &popup_sink)
                 .unwrap();
             popup_sink.Close().unwrap();
-            target.FillGeometry(&popup, &brush, None);
+            let layer = target.CreateLayer(None).unwrap();
+            let layer_parameters = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS {
+                contentBounds: D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 32.0,
+                    bottom: 32.0,
+                },
+                geometricMask: std::mem::ManuallyDrop::new(Some(popup.into())),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: windows_numerics::Matrix3x2 {
+                    M11: 1.0,
+                    M22: 1.0,
+                    ..Default::default()
+                },
+                opacity: 1.0,
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS_NONE,
+            };
+            target.PushLayer(&layer_parameters, &layer);
+            target.FillRectangle(
+                &D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 32.0,
+                    bottom: 32.0,
+                },
+                &brush,
+            );
+            target.PopLayer();
             target.EndDraw(None, None).unwrap();
 
             let pixels = surface._pixels.cast::<u8>();
