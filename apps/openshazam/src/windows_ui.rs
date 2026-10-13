@@ -5215,8 +5215,8 @@ fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> 
     startup_animation_pending || phase_needs_frame(phase)
 }
 
-unsafe fn show_main(app: &mut AppState, renderer: Option<&mut Renderer>) {
-    if let Some(renderer) = renderer {
+unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
+    if let Some(renderer) = renderer.as_deref_mut() {
         match renderer.start_startup_logo() {
             Ok(complete) => app.startup_animation_pending = !complete,
             Err(error) => {
@@ -5229,6 +5229,15 @@ unsafe fn show_main(app: &mut AppState, renderer: Option<&mut Renderer>) {
     anchor_popup(app);
     if changed {
         app.message = None;
+    }
+    // WM_CREATE builds the scene before the tray anchor determines whether
+    // the popup arrow belongs above or below the panel. Apply the resolved
+    // body origin before showing the HWND so Composition never presents the
+    // initial 10-DIP placeholder position for a bottom-anchored popup.
+    if let Some(renderer) = renderer {
+        if let Err(error) = renderer.update_composition(animation_snapshot(app)) {
+            app.message = Some(format!("Composition初期配置に失敗: {error}"));
+        }
     }
     update_visible_windows(app);
 }
