@@ -219,6 +219,7 @@ struct AppState {
     theme: Theme,
     theme_generation: u64,
     visible: bool,
+    main_activated: bool,
     phase_timer_active: bool,
     animation_timer_active: bool,
     settings_visible: bool,
@@ -3285,13 +3286,16 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_ACTIVATE if data.kind == WindowKind::Main => {
-            if (wparam.0 & 0xffff) == 0 && no_auxiliary_window_visible(app) {
+            let activation = wparam.0 & 0xffff;
+            if activation == 0 && app.main_activated && no_auxiliary_window_visible(app) {
                 hide_main(app);
+            } else if activation != 0 {
+                app.main_activated = true;
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_KILLFOCUS if data.kind == WindowKind::Main => {
-            if no_auxiliary_window_visible(app) {
+            if app.main_activated && no_auxiliary_window_visible(app) {
                 hide_main(app);
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
@@ -3392,6 +3396,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             theme: Theme::Light,
             theme_generation: 0,
             visible: false,
+            main_activated: false,
             phase_timer_active: false,
             animation_timer_active: false,
             settings_visible: false,
