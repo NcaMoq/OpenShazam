@@ -1754,7 +1754,7 @@ impl Renderer {
         }
         self.target.PopAxisAlignedClip();
 
-        match app.phase {
+        match &app.phase {
             MainPhase::Ready => self.draw_ready(app, body_top),
             MainPhase::Listening { mode, .. } => {
                 self.draw_listening_status(body_top, mode);
@@ -1823,12 +1823,24 @@ impl Renderer {
         });
         sink.EndFigure(D2D1_FIGURE_END_CLOSED);
         sink.Close()?;
-        let brush = if matches!(app.phase, MainPhase::Listening { .. }) {
-            &self.palette.listening
-        } else {
-            &self.palette.result_start
-        };
-        self.target.FillGeometry(&path, brush, None);
+        match app.phase {
+            MainPhase::Listening { .. } => {
+                self.target
+                    .FillGeometry(&path, &self.palette.listening, None);
+            }
+            MainPhase::Matched { .. } | MainPhase::NoMatch { .. } => {
+                self.target
+                    .FillGeometry(&path, &self.palette.result_start, None);
+            }
+            MainPhase::Ready | MainPhase::Error { .. } => {
+                let background = if app.theme == Theme::Light {
+                    &self.palette.white
+                } else {
+                    &self.palette.black
+                };
+                self.target.FillGeometry(&path, background, None);
+            }
+        }
         Ok(())
     }
 
