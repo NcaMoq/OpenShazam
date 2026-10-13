@@ -1274,37 +1274,60 @@ const NO_MATCH_ICON_PATH: [NoMatchIconCommand; 34] = [
     NoMatchIconCommand::Close,
 ];
 
-fn no_match_icon_point(point: (f64, f64), size: f32, origin: f32) -> Vector2 {
+const NO_MATCH_ICON_BASE_WIDTH: f32 = 40.0;
+const NO_MATCH_ICON_BASE_HEIGHT: f32 = 117.0;
+const NO_MATCH_ICON_SCALE: f32 = 0.8;
+
+fn no_match_icon_rect(button_size: f32) -> [f32; 4] {
+    let width = NO_MATCH_ICON_BASE_WIDTH * NO_MATCH_ICON_SCALE;
+    let height = NO_MATCH_ICON_BASE_HEIGHT * NO_MATCH_ICON_SCALE;
+    let left = (button_size - width) * 0.5;
+    let top = (button_size - height) * 0.5;
+    [left, top, left + width, top + height]
+}
+
+fn no_match_icon_point(
+    point: (f64, f64),
+    width: f32,
+    height: f32,
+    origin_x: f32,
+    origin_y: f32,
+) -> Vector2 {
     Vector2 {
-        X: (f64::from(origin) + point.0 * f64::from(size)) as f32,
-        Y: (f64::from(origin) + point.1 * f64::from(size)) as f32,
+        X: (f64::from(origin_x) + point.0 * f64::from(width)) as f32,
+        Y: (f64::from(origin_y) + point.1 * f64::from(height)) as f32,
     }
 }
 
 unsafe fn make_no_match_icon_geometry(
     compositor: &Compositor,
     d2d_factory: &ID2D1Factory,
-    size: f32,
+    icon_rect: [f32; 4],
 ) -> windows::core::Result<CompositionPathGeometry> {
-    let origin = (BUTTON_SIZE as f32 - size) * 0.5;
+    let origin_x = icon_rect[0];
+    let origin_y = icon_rect[1];
+    let width = icon_rect[2] - icon_rect[0];
+    let height = icon_rect[3] - icon_rect[1];
     let source = d2d_factory.CreatePathGeometry()?;
     let sink = source.Open()?;
     for command in NO_MATCH_ICON_PATH {
         match command {
             NoMatchIconCommand::Move(point) => {
                 sink.BeginFigure(
-                    no_match_icon_point(point, size, origin),
+                    no_match_icon_point(point, width, height, origin_x, origin_y),
                     D2D1_FIGURE_BEGIN_FILLED,
                 );
             }
             NoMatchIconCommand::Line(point) => {
-                sink.AddLine(no_match_icon_point(point, size, origin));
+                sink.AddLine(no_match_icon_point(
+                    point, width, height, origin_x, origin_y,
+                ));
             }
             NoMatchIconCommand::Cubic(cp1, cp2, end) => {
                 sink.AddBezier(&D2D1_BEZIER_SEGMENT {
-                    point1: no_match_icon_point(cp1, size, origin),
-                    point2: no_match_icon_point(cp2, size, origin),
-                    point3: no_match_icon_point(end, size, origin),
+                    point1: no_match_icon_point(cp1, width, height, origin_x, origin_y),
+                    point2: no_match_icon_point(cp2, width, height, origin_x, origin_y),
+                    point3: no_match_icon_point(end, width, height, origin_x, origin_y),
                 });
             }
             NoMatchIconCommand::Close => sink.EndFigure(D2D1_FIGURE_END_CLOSED),
@@ -1324,12 +1347,12 @@ unsafe fn make_no_match_icon_geometry(
     for command in NO_MATCH_ICON_PATH {
         let transform = |point: (f64, f64)| {
             let point = (
-                f64::from(origin) + point.0 * f64::from(size),
-                f64::from(origin) + point.1 * f64::from(size),
+                f64::from(origin_x) + point.0 * f64::from(width),
+                f64::from(origin_y) + point.1 * f64::from(height),
             );
             Vector2 {
-                X: (2.0 * f64::from(center_x) - point.0 - f64::from(origin)) as f32,
-                Y: (2.0 * f64::from(center_y) - point.1 - f64::from(origin)) as f32,
+                X: (2.0 * f64::from(center_x) - point.0 - f64::from(origin_x)) as f32,
+                Y: (2.0 * f64::from(center_y) - point.1 - f64::from(origin_y)) as f32,
             }
         };
         match command {
@@ -1948,22 +1971,22 @@ impl CompositionScene {
         no_match_icon_transform.SetOpacity(0.0)?;
         let no_match_icon_brush =
             compositor.CreateColorBrushWithColor(composition_color(255, 255, 255, 255))?;
-        let no_match_icon_geometry = unsafe {
-            make_no_match_icon_geometry(compositor, d2d_factory, BUTTON_SIZE as f32 * 0.8)?
-        };
+        let icon_rect = no_match_icon_rect(BUTTON_SIZE as f32);
+        let no_match_icon_geometry =
+            unsafe { make_no_match_icon_geometry(compositor, d2d_factory, icon_rect)? };
         let no_match_icon_shape =
             compositor.CreateSpriteShapeWithGeometry(&no_match_icon_geometry)?;
         no_match_icon_shape.SetFillBrush(&no_match_icon_brush)?;
         let no_match_icon_visual = compositor.CreateShapeVisual()?;
-        let no_match_icon_size = BUTTON_SIZE as f32 * 0.8;
-        let no_match_icon_inset = (BUTTON_SIZE as f32 - no_match_icon_size) * 0.5;
+        let no_match_icon_width = icon_rect[2] - icon_rect[0];
+        let no_match_icon_height = icon_rect[3] - icon_rect[1];
         no_match_icon_visual.SetSize(Vector2 {
-            X: no_match_icon_size,
-            Y: no_match_icon_size,
+            X: no_match_icon_width,
+            Y: no_match_icon_height,
         })?;
         no_match_icon_visual.SetOffset(Vector3 {
-            X: no_match_icon_inset,
-            Y: no_match_icon_inset,
+            X: icon_rect[0],
+            Y: icon_rect[1],
             Z: 0.0,
         })?;
         no_match_icon_visual
@@ -5945,8 +5968,8 @@ mod tests {
         composition_root_layer_order, copy_notification_text, gradient_origin_transform,
         header_fill_scope, history_artwork_frame, history_row_top, inverse_circle_clip_radii,
         is_offline_failure, is_timeout_failure, localized_ui_text, native_icon_layout,
-        no_match_copy, parse_debug_string, parse_match, phase_needs_timeout, point_in_rect,
-        result_artwork_frame, result_details_rects, result_panel_top_at,
+        no_match_copy, no_match_icon_rect, parse_debug_string, parse_match, phase_needs_timeout,
+        point_in_rect, result_artwork_frame, result_details_rects, result_panel_top_at,
         select_ui_language_from_multisz, should_start_startup_logo, timeout_copy, ui_model,
         ArrowEdge, CaptureMode, CompositionRootLayer, HeaderFillScope, HistoryMutationEvent,
         HistoryMutationTransition, MainPhase, NoMatchIconCommand, ResultCardAdvance,
@@ -5989,6 +6012,17 @@ mod tests {
             NoMatchIconCommand::Cubic((_, _), (cp2_x, _), _)
                 if *cp2_x > 1.0
         )));
+    }
+
+    #[test]
+    fn no_match_icon_uses_the_native_portrait_mask_rect() {
+        let [left, top, right, bottom] = no_match_icon_rect(96.0);
+        assert!((left - 32.0).abs() < 1e-5);
+        assert!((top - 1.2).abs() < 1e-5);
+        assert!((right - 64.0).abs() < 1e-5);
+        assert!((bottom - 94.8).abs() < 1e-4);
+        assert!((right - left - 32.0).abs() < 1e-5);
+        assert!((bottom - top - 93.6).abs() < 1e-4);
     }
 
     #[test]
@@ -6659,7 +6693,7 @@ mod tests {
                 let geometry = make_no_match_icon_geometry(
                     &compositor,
                     &d2d_factory,
-                    BUTTON_SIZE as f32 * 0.8,
+                    no_match_icon_rect(BUTTON_SIZE as f32),
                 )?;
                 let shape = compositor.CreateSpriteShapeWithGeometry(&geometry)?;
                 let visual = compositor.CreateShapeVisual()?;
