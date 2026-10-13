@@ -362,7 +362,8 @@ struct Palette {
     button: ID2D1SolidColorBrush,
     separator: ID2D1SolidColorBrush,
     skeleton: ID2D1SolidColorBrush,
-    result_start: ID2D1LinearGradientBrush,
+    result_top: ID2D1LinearGradientBrush,
+    result_bottom: ID2D1LinearGradientBrush,
     listening: ID2D1LinearGradientBrush,
     listening_bottom: ID2D1LinearGradientBrush,
     empty_overlay: ID2D1LinearGradientBrush,
@@ -1466,6 +1467,7 @@ fn logo_shadow_color(_theme: Theme) -> Color {
 
 const INNER_MASK_BOUNDS: f32 = 336.0;
 const BUTTON_CLEAR_DIAMETER: f32 = 96.0;
+const BUTTON_OFFSET_IN_MASK: f32 = (INNER_MASK_BOUNDS - BUTTON_CLEAR_DIAMETER) * 0.5;
 const INNER_MASK_GEOMETRY_TOLERANCE: f32 = 0.01;
 
 fn inverse_circle_clip_radii(size: f32, hole: f32) -> Option<(f32, f32)> {
@@ -1972,8 +1974,8 @@ impl CompositionScene {
             Z: 0.0,
         })?;
         button.SetOffset(Vector3 {
-            X: (BUTTON_X + BUTTON_SIZE * 0.5) as f32 - inner_bounds * 0.5,
-            Y: (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32 - inner_bounds * 0.5,
+            X: BUTTON_OFFSET_IN_MASK,
+            Y: BUTTON_OFFSET_IN_MASK,
             Z: 0.0,
         })?;
         let button_shape_visual = compositor.CreateShapeVisual()?;
@@ -2281,8 +2283,8 @@ impl CompositionScene {
         }
         if !self.no_match_active {
             self.button.SetOffset(Vector3 {
-                X: (BUTTON_X + BUTTON_SIZE * 0.5) as f32 - INNER_MASK_BOUNDS * 0.5,
-                Y: (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32 - INNER_MASK_BOUNDS * 0.5,
+                X: BUTTON_OFFSET_IN_MASK,
+                Y: BUTTON_OFFSET_IN_MASK,
                 Z: 0.0,
             })?;
         }
@@ -2523,8 +2525,8 @@ impl CompositionScene {
     }
 
     fn start_no_match_motion(&mut self) -> windows::core::Result<()> {
-        let button_left = (BUTTON_X + BUTTON_SIZE * 0.5) as f32 - INNER_MASK_BOUNDS * 0.5;
-        let button_top = (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32 - INNER_MASK_BOUNDS * 0.5;
+        let button_left = BUTTON_OFFSET_IN_MASK;
+        let button_top = BUTTON_OFFSET_IN_MASK;
         let tagging_profile = ui_model::no_match_position_profile(
             BUTTON_SIZE,
             -0.150_000_005_960_464_48,
@@ -2807,7 +2809,7 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
     }
 }
 
-fn result_artwork_frame(panel_top: f32) -> D2D_RECT_F {
+fn result_artwork_rect(panel_top: f32) -> D2D_RECT_F {
     rect(10.0, panel_top + 20.0, 160.0, panel_top + 170.0)
 }
 
@@ -2820,6 +2822,7 @@ const RESULT_TITLE_MIN_HEIGHT: f32 = 24.0;
 const RESULT_TITLE_MAX_LINES: f32 = 3.0;
 const RESULT_ARTIST_MIN_HEIGHT: f32 = 18.0;
 const RESULT_ARTIST_MAX_LINES: f32 = 4.0;
+const RESULT_ARTWORK_CORNER_RADIUS: f32 = 5.0;
 const RESULT_DETAILS_TITLE_ARTIST_GAP: f32 = 5.0;
 const RESULT_DETAILS_ARTIST_ACTION_GAP: f32 = 10.0;
 const RESULT_ACTION_HEIGHT: f32 = 20.0;
@@ -2871,6 +2874,24 @@ fn header_fill_scope(edge: ArrowEdge) -> HeaderFillScope {
     match edge {
         ArrowEdge::Top => HeaderFillScope::HeaderAndArrow,
         ArrowEdge::Bottom => HeaderFillScope::HeaderRectangle,
+    }
+}
+
+fn popup_base_color(theme: Theme) -> (u8, u8, u8) {
+    match theme {
+        Theme::Light => (255, 255, 255),
+        Theme::Dark => (30, 30, 30),
+    }
+}
+
+fn result_gradient_colors(theme: Theme, edge: ArrowEdge) -> [(u8, u8, u8); 2] {
+    let (top, bottom) = match theme {
+        Theme::Light => ((244, 247, 249), (188, 205, 216)),
+        Theme::Dark => ((0, 0, 0), (55, 66, 73)),
+    };
+    match edge {
+        ArrowEdge::Top => [top, bottom],
+        ArrowEdge::Bottom => [bottom, top],
     }
 }
 
@@ -3284,10 +3305,15 @@ impl Renderer {
                 }
             }
             MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. } => {
+                let result_gradient = if app.arrow_edge == ArrowEdge::Top {
+                    &self.palette.result_top
+                } else {
+                    &self.palette.result_bottom
+                };
                 if header_fill_scope(app.arrow_edge) == HeaderFillScope::HeaderAndArrow {
                     self.fill_gradient_geometry(
                         &self.popup_header(app)?,
-                        &self.palette.result_start,
+                        result_gradient,
                         body_top,
                     )?;
                 } else {
@@ -3298,7 +3324,7 @@ impl Renderer {
                             CONTENT_WIDTH as f32,
                             body_top + TOP_HEIGHT as f32,
                         ),
-                        &self.palette.result_start,
+                        result_gradient,
                         body_top,
                     )?;
                 }
@@ -3343,17 +3369,17 @@ impl Renderer {
             MainPhase::Matched { ref track, .. } => {
                 let top =
                     result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
-                self.draw_result_panel(track, top)?;
+                self.draw_result_panel(track, top, app.arrow_edge)?;
             }
             MainPhase::NoMatch { .. } => {
                 let top =
                     result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
-                self.draw_no_match_panel(top, false)?;
+                self.draw_no_match_panel(top, false, app.arrow_edge)?;
             }
             MainPhase::Offline { .. } => {
                 let top =
                     result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
-                self.draw_no_match_panel(top, true)?;
+                self.draw_no_match_panel(top, true, app.arrow_edge)?;
             }
             MainPhase::Error { ref message, .. } => {
                 self.draw_ready(app, body_top);
@@ -3447,8 +3473,13 @@ impl Renderer {
 
         // Merge the colored header and arrow so their shared edge is
         // rasterized only once. The popup layer applies the outer contour once.
-        let arrow = self.popup_arrow_geometry(app.arrow_edge, center)?;
-        let header_with_arrow = self.combine_geometry(&header, &arrow, D2D1_COMBINE_MODE_UNION)?;
+        let header_with_arrow =
+            if header_fill_scope(app.arrow_edge) == HeaderFillScope::HeaderAndArrow {
+                let arrow = self.popup_arrow_geometry(app.arrow_edge, center)?;
+                self.combine_geometry(&header, &arrow, D2D1_COMBINE_MODE_UNION)?
+            } else {
+                header.cast()?
+            };
         *self.popup_header.borrow_mut() = Some((key.0, key.1, header_with_arrow.clone()));
         Ok(header_with_arrow)
     }
@@ -3618,7 +3649,7 @@ impl Renderer {
                 radiusY: 4.0,
             };
             self.target
-                .FillRoundedRectangle(&artwork, &self.palette.result_start);
+                .FillRoundedRectangle(&artwork, &self.palette.result_top);
             // The existing recognition UI contract has no artwork payload; this glyph is a
             // placeholder, and the album-art view must not inherit UI-144 button padding.
             self.text(
@@ -3658,23 +3689,33 @@ impl Renderer {
         }
     }
 
-    unsafe fn draw_result_panel(&self, track: &Track, top: f32) -> windows::core::Result<()> {
+    unsafe fn draw_result_panel(
+        &self,
+        track: &Track,
+        top: f32,
+        edge: ArrowEdge,
+    ) -> windows::core::Result<()> {
         let panel = rect(0.0, top, CONTENT_WIDTH as f32, top + TOP_HEIGHT as f32);
-        self.fill_gradient_rect(&panel, &self.palette.result_start, top)?;
+        let gradient = if edge == ArrowEdge::Top {
+            &self.palette.result_top
+        } else {
+            &self.palette.result_bottom
+        };
+        self.fill_gradient_rect(&panel, gradient, top)?;
         let details = self.result_details_metrics(track)?;
         let detail_rects = result_details_rects(top, details.title_height, details.artist_height);
         let art = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
             // The image view itself is 150×150pt; do not add UI-144 button-image padding.
-            rect: result_artwork_frame(top),
-            radiusX: 5.0,
-            radiusY: 5.0,
+            rect: result_artwork_rect(top),
+            radiusX: RESULT_ARTWORK_CORNER_RADIUS,
+            radiusY: RESULT_ARTWORK_CORNER_RADIUS,
         };
         self.target.FillRoundedRectangle(&art, &self.palette.accent);
         // The current recognition result contains title/artist only; keep this as an explicit
         // placeholder until an existing UI-facing artwork source is available.
         self.text(
             "♫",
-            result_artwork_frame(top),
+            result_artwork_rect(top),
             &self.text.centered_heavy,
             &self.palette.white_ink,
         );
@@ -3707,9 +3748,19 @@ impl Renderer {
         Ok(())
     }
 
-    unsafe fn draw_no_match_panel(&self, top: f32, offline: bool) -> windows::core::Result<()> {
+    unsafe fn draw_no_match_panel(
+        &self,
+        top: f32,
+        offline: bool,
+        edge: ArrowEdge,
+    ) -> windows::core::Result<()> {
         let panel = rect(0.0, top, CONTENT_WIDTH as f32, top + TOP_HEIGHT as f32);
-        self.fill_gradient_rect(&panel, &self.palette.result_start, top)?;
+        let gradient = if edge == ArrowEdge::Top {
+            &self.palette.result_top
+        } else {
+            &self.palette.result_bottom
+        };
+        self.fill_gradient_rect(&panel, gradient, top)?;
         let (title, body) = no_match_copy(offline, ui_language());
         self.text(
             title,
@@ -4018,7 +4069,7 @@ impl Renderer {
 
     unsafe fn draw_microphone_info(&self, app: &AppState) -> windows::core::Result<()> {
         let background = if app.theme == Theme::Light {
-            &self.palette.result_start
+            &self.palette.result_top
         } else {
             &self.palette.listening
         };
@@ -4052,22 +4103,22 @@ unsafe fn create_palette(
     target: &ID2D1RenderTarget,
     theme: Theme,
 ) -> windows::core::Result<Palette> {
-    let (background, foreground, subtitle, skeleton, separator) = match theme {
+    let (foreground, subtitle, skeleton, separator) = match theme {
         Theme::Light => (
-            d2d_color(255, 255, 255, 1.0),
             d2d_color(0, 0, 0, 0.847),
             d2d_color(148, 148, 148, 1.0),
             d2d_color(230, 234, 237, 0.75),
             d2d_color(0, 0, 0, 0.098),
         ),
         Theme::Dark => (
-            d2d_color(30, 30, 30, 1.0),
             d2d_color(255, 255, 255, 0.847),
             d2d_color(212, 212, 212, 1.0),
             d2d_color(55, 66, 73, 0.8),
             d2d_color(255, 255, 255, 0.098),
         ),
     };
+    let (background_red, background_green, background_blue) = popup_base_color(theme);
+    let background = d2d_color(background_red, background_green, background_blue, 1.0);
     let white = solid(target, background)?;
     let white_ink = solid(target, d2d_color(255, 255, 255, 1.0))?;
     let black = solid(target, d2d_color(30, 30, 30, 1.0))?;
@@ -4082,14 +4133,22 @@ unsafe fn create_palette(
     let button = solid(target, d2d_color(0, 136, 255, 1.0))?;
     let separator = solid(target, separator)?;
     let skeleton = solid(target, skeleton)?;
-    let result_colors = if theme == Theme::Light {
-        [d2d_color(244, 247, 249, 1.0), d2d_color(188, 205, 216, 1.0)]
-    } else {
-        [d2d_color(0, 0, 0, 1.0), d2d_color(55, 66, 73, 1.0)]
-    };
-    let result_start = gradient(
+    let result_top_colors =
+        result_gradient_colors(theme, ArrowEdge::Top).map(|(r, g, b)| d2d_color(r, g, b, 1.0));
+    let result_bottom_colors =
+        result_gradient_colors(theme, ArrowEdge::Bottom).map(|(r, g, b)| d2d_color(r, g, b, 1.0));
+    let result_top = gradient(
         target,
-        result_colors,
+        result_top_colors,
+        Vector2 { X: 190.0, Y: 0.0 },
+        Vector2 {
+            X: 190.0,
+            Y: TOP_HEIGHT as f32,
+        },
+    )?;
+    let result_bottom = gradient(
+        target,
+        result_bottom_colors,
         Vector2 { X: 190.0, Y: 0.0 },
         Vector2 {
             X: 190.0,
@@ -4167,7 +4226,8 @@ unsafe fn create_palette(
         button,
         separator,
         skeleton,
-        result_start,
+        result_top,
+        result_bottom,
         listening,
         listening_bottom,
         empty_overlay,
@@ -6098,14 +6158,15 @@ mod tests {
         header_fill_scope, history_artwork_frame, history_row_top, inverse_circle_clip_radii,
         is_offline_failure, is_timeout_failure, localized_ui_text, native_icon_layout,
         no_match_copy, no_match_icon_rect, parse_debug_string, parse_match, phase_needs_timeout,
-        point_in_rect, result_artwork_frame, result_details_rects, result_panel_top_at,
-        select_ui_language_from_multisz, should_start_startup_logo, theme_from_foreground_rgb,
-        timeout_copy, ui_model, ArrowEdge, CaptureMode, CompositionRootLayer, HeaderFillScope,
-        HistoryMutationEvent, HistoryMutationTransition, MainPhase, NoMatchIconCommand,
-        ResultCardAdvance, ResultCardStage, Theme, UiLanguage, UiTextKey, WindowKind,
-        BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, INNER_MASK_BOUNDS,
-        NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, POPUP_ARROW_HEIGHT, RESULT_DETAILS_LEFT,
-        RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, WHITE_CLOSE_ICON_PIXELS,
+        point_in_rect, popup_base_color, result_artwork_rect, result_details_rects,
+        result_gradient_colors, result_panel_top_at, select_ui_language_from_multisz,
+        should_start_startup_logo, theme_from_foreground_rgb, timeout_copy, ui_model, ArrowEdge,
+        CaptureMode, CompositionRootLayer, HeaderFillScope, HistoryMutationEvent,
+        HistoryMutationTransition, MainPhase, NoMatchIconCommand, ResultCardAdvance,
+        ResultCardStage, Theme, UiLanguage, UiTextKey, WindowKind, BUTTON_CLEAR_DIAMETER,
+        BUTTON_OFFSET_IN_MASK, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, INNER_MASK_BOUNDS,
+        NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, POPUP_ARROW_HEIGHT, RESULT_ARTWORK_CORNER_RADIUS,
+        RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, WHITE_CLOSE_ICON_PIXELS,
     };
 
     #[test]
@@ -6674,6 +6735,20 @@ mod tests {
     }
 
     #[test]
+    fn shared_button_parent_keeps_button_in_the_336_point_mask_center() {
+        let parent_left = (BUTTON_X + BUTTON_SIZE * 0.5) as f32 - INNER_MASK_BOUNDS * 0.5;
+        assert_eq!(BUTTON_OFFSET_IN_MASK, 120.0);
+        assert!((parent_left + BUTTON_OFFSET_IN_MASK - BUTTON_X as f32).abs() < 1e-5);
+        for body_top in [0.0, POPUP_ARROW_HEIGHT as f32] {
+            let parent_top =
+                body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32 - INNER_MASK_BOUNDS * 0.5;
+            assert!(
+                (parent_top + BUTTON_OFFSET_IN_MASK - (body_top + BUTTON_TOP as f32)).abs() < 1e-5
+            );
+        }
+    }
+
+    #[test]
     fn inner_ripple_clip_keeps_a_button_sized_hole_independent_of_child_rings() {
         assert_eq!(
             INNER_MASK_BOUNDS,
@@ -6722,13 +6797,14 @@ mod tests {
 
     #[test]
     fn album_art_frames_keep_native_view_sizes_without_button_padding() {
-        let result = result_artwork_frame(10.0);
+        let result = result_artwork_rect(10.0);
         assert_eq!(
             (result.left, result.top, result.right, result.bottom),
             (10.0, 30.0, 160.0, 180.0)
         );
         assert_eq!(result.right - result.left, 150.0);
         assert_eq!(result.bottom - result.top, 150.0);
+        assert_eq!(RESULT_ARTWORK_CORNER_RADIUS, 5.0);
 
         let history = history_artwork_frame(200.0);
         assert_eq!(
@@ -6749,6 +6825,54 @@ mod tests {
             header_fill_scope(ArrowEdge::Bottom),
             HeaderFillScope::HeaderRectangle
         );
+        assert_eq!(popup_base_color(Theme::Light), (255, 255, 255));
+        assert_eq!(popup_base_color(Theme::Dark), (30, 30, 30));
+    }
+
+    #[test]
+    fn ui183_result_gradient_reverses_for_each_theme_and_result_surface() {
+        let surfaces = ["header", "matched", "no-match/offline"];
+        let cases = [
+            (
+                Theme::Light,
+                [(244, 247, 249), (188, 205, 216)],
+                [(188, 205, 216), (244, 247, 249)],
+            ),
+            (
+                Theme::Dark,
+                [(0, 0, 0), (55, 66, 73)],
+                [(55, 66, 73), (0, 0, 0)],
+            ),
+        ];
+        for (theme, top, bottom) in cases {
+            for (edge, expected) in [(ArrowEdge::Top, top), (ArrowEdge::Bottom, bottom)] {
+                for surface in surfaces {
+                    assert_eq!(
+                        result_gradient_colors(theme, edge),
+                        expected,
+                        "{surface} gradient for {theme:?}/{edge:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ui184_result_artwork_keeps_native_insets_while_panel_moves_at_hidpi() {
+        let dpi_sizes = [(96, 150), (120, 188), (144, 225), (192, 300)];
+        for (dpi, expected_pixel_size) in dpi_sizes {
+            let scale = composition_scale_for_dpi(dpi);
+            for panel_top in [-180.0, -170.0, -90.0, 0.0, 10.0, 180.0, 190.0] {
+                let art = result_artwork_rect(panel_top);
+                assert_eq!(art.left, 10.0);
+                assert_eq!(art.top - panel_top, 20.0);
+                assert_eq!(art.right, 160.0);
+                assert_eq!(art.bottom - panel_top, 170.0);
+                assert_eq!(art.right - art.left, 150.0);
+                assert_eq!(art.bottom - art.top, 150.0);
+                assert_eq!((150.0 * scale).round() as i32, expected_pixel_size);
+            }
+        }
     }
 
     #[test]
