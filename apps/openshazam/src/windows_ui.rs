@@ -158,11 +158,10 @@ struct NativeIconLayout {
 fn native_icon_layout(body_top: f32) -> NativeIconLayout {
     NativeIconLayout {
         settings_visual: [349.0, body_top + 25.0, 365.0, body_top + 41.0],
-        // Nib's stored popup frame is y=20..48, but its center constraints
-        // align it to the gear and close glyph at y=33 (final y=19..47).
-        settings_hit: [342.0, body_top + 19.0, 372.0, body_top + 47.0],
+        // The popup's stored 30x28 frame is constrained to the 16x16 gear.
+        settings_hit: [349.0, body_top + 25.0, 365.0, body_top + 41.0],
         cancel_visual: [351.0, body_top + 27.0, 363.0, body_top + 39.0],
-        cancel_hit: [342.0, body_top + 19.0, 372.0, body_top + 47.0],
+        cancel_hit: [351.0, body_top + 27.0, 363.0, body_top + 39.0],
         result_close_visual: [353.0, body_top + 25.0, 365.0, body_top + 37.0],
         result_close_hit: [353.0, body_top + 25.0, 365.0, body_top + 37.0],
     }
@@ -1453,7 +1452,8 @@ struct CompositionScene {
     _target: DesktopWindowTarget,
     root: ContainerVisual,
     inner_audio_root: ContainerVisual,
-    _inner_inverse_clip: CompositionGeometricClip,
+    inner_wave_root: ContainerVisual,
+    inner_inverse_clip: CompositionGeometricClip,
     outer_audio_root: ContainerVisual,
     rings: [CompositionRing; 6],
     button: ContainerVisual,
@@ -1574,7 +1574,25 @@ impl CompositionScene {
         let inner_inverse_clip = unsafe {
             make_inverse_circle_clip(compositor, d2d_factory, inner_bounds, BUTTON_CLEAR_DIAMETER)?
         };
+        // The fill waves follow the audio-driven inner scale, while the clear
+        // hole follows the button scale. Keep the mask in the unscaled parent
+        // coordinate space and transform the clip independently.
+        inner_inverse_clip.SetCenterPoint(Vector2 {
+            X: inner_bounds * 0.5,
+            Y: inner_bounds * 0.5,
+        })?;
         inner_audio_root.SetClip(&inner_inverse_clip)?;
+        let inner_wave_root = compositor.CreateContainerVisual()?;
+        inner_wave_root.SetSize(Vector2 {
+            X: inner_bounds,
+            Y: inner_bounds,
+        })?;
+        inner_wave_root.SetCenterPoint(Vector3 {
+            X: inner_bounds * 0.5,
+            Y: inner_bounds * 0.5,
+            Z: 0.0,
+        })?;
+        inner_audio_root.Children()?.InsertAtTop(&inner_wave_root)?;
         let outer_bounds = ui_model::OUTER_DIAMETERS[0] as f32;
         let outer_audio_root = compositor.CreateContainerVisual()?;
         outer_audio_root.SetSize(Vector2 {
@@ -1709,7 +1727,7 @@ impl CompositionScene {
                     .InsertAtTop(inner_fill_visual.as_ref().expect("inner fill visual"))?;
                 core.Children()?.InsertAtTop(&sublayer)?;
                 visual.Children()?.InsertAtTop(&core)?;
-                inner_audio_root.Children()?.InsertAtTop(&visual)?;
+                inner_wave_root.Children()?.InsertAtTop(&visual)?;
                 (Some(core), Some(sublayer))
             } else {
                 let container = compositor.CreateContainerVisual()?;
@@ -2041,7 +2059,8 @@ impl CompositionScene {
             _target: target,
             root,
             inner_audio_root,
-            _inner_inverse_clip: inner_inverse_clip,
+            inner_wave_root,
+            inner_inverse_clip,
             outer_audio_root,
             rings,
             button,
@@ -2259,11 +2278,13 @@ impl CompositionScene {
 
         if !snapshot.show_ripples {
             self.inner_audio_root.SetOpacity(0.0)?;
-            self.inner_audio_root.SetScale(Vector3 {
+            self.inner_wave_root.SetScale(Vector3 {
                 X: 1.0,
                 Y: 1.0,
                 Z: 1.0,
             })?;
+            self.inner_inverse_clip
+                .SetScale(Vector2 { X: 1.0, Y: 1.0 })?;
             self.outer_audio_root.SetOpacity(0.0)?;
             self.outer_audio_root.SetScale(Vector3 {
                 X: 1.0,
@@ -2313,10 +2334,14 @@ impl CompositionScene {
                 snapshot.levels,
                 snapshot.auto_spring,
             );
-            self.inner_audio_root.SetScale(Vector3 {
+            self.inner_wave_root.SetScale(Vector3 {
                 X: (frame.inner_container_factor / 3.0 * frame.inner_audio_scale) as f32,
                 Y: (frame.inner_container_factor / 3.0 * frame.inner_audio_scale) as f32,
                 Z: 1.0,
+            })?;
+            self.inner_inverse_clip.SetScale(Vector2 {
+                X: frame.button_child_scale as f32,
+                Y: frame.button_child_scale as f32,
             })?;
             self.inner_audio_root
                 .SetOpacity(frame.inner_audio_opacity as f32)?;
@@ -6173,21 +6198,23 @@ mod tests {
     fn native_icon_visual_frames_and_hit_targets_are_independent() {
         let layout = native_icon_layout(0.0);
         assert_eq!(layout.settings_visual, [349.0, 25.0, 365.0, 41.0]);
-        assert_eq!(layout.settings_hit, [342.0, 19.0, 372.0, 47.0]);
+        assert_eq!(layout.settings_hit, layout.settings_visual);
         assert_eq!(layout.cancel_visual, [351.0, 27.0, 363.0, 39.0]);
-        assert_eq!(layout.cancel_hit, layout.settings_hit);
+        assert_eq!(layout.cancel_hit, layout.cancel_visual);
         assert_eq!(
             (layout.settings_visual[1] + layout.settings_visual[3]) * 0.5,
-            (layout.settings_hit[1] + layout.settings_hit[3]) * 0.5
+            (layout.settings_visual[1] + layout.settings_visual[3]) * 0.5
         );
         assert_eq!(
             (layout.cancel_visual[1] + layout.cancel_visual[3]) * 0.5,
-            (layout.settings_hit[1] + layout.settings_hit[3]) * 0.5
+            (layout.settings_visual[1] + layout.settings_visual[3]) * 0.5
         );
         assert_eq!(layout.result_close_visual, [353.0, 25.0, 365.0, 37.0]);
         assert_eq!(layout.result_close_hit, layout.result_close_visual);
-        assert!(point_in_rect(342.0, 19.0, layout.settings_hit));
-        assert!(!point_in_rect(341.9, 20.0, layout.settings_hit));
+        assert!(point_in_rect(349.0, 25.0, layout.settings_hit));
+        assert!(!point_in_rect(348.9, 26.0, layout.settings_hit));
+        assert!(point_in_rect(351.0, 27.0, layout.cancel_hit));
+        assert!(!point_in_rect(350.9, 28.0, layout.cancel_hit));
         assert!(point_in_rect(353.0, 25.0, layout.result_close_hit));
         assert!(!point_in_rect(352.9, 25.0, layout.result_close_hit));
         assert!(!point_in_rect(349.0, 25.0, layout.result_close_hit));
@@ -6434,6 +6461,30 @@ mod tests {
     }
 
     #[test]
+    fn inner_ripple_mask_tracks_button_scale_separately_from_audio_fill() {
+        for bass in [0.0, 0.2, 5.0 / 7.0, 1.0] {
+            let frame = ui_model::wave_frame_at(
+                ui_model::TaggingMode::Manual,
+                0.0,
+                ui_model::UiLevels { bass, treble: 0.5 },
+            );
+            let hole_diameter = BUTTON_CLEAR_DIAMETER as f64 * frame.button_child_scale;
+            let fill_scale = frame.inner_container_factor / 3.0 * frame.inner_audio_scale;
+            let expected_button_scale = 0.75 + 0.35 * bass;
+            let expected_fill_scale = 0.7 + 0.6 * bass;
+            assert!((frame.button_child_scale - expected_button_scale).abs() < 1e-9);
+            assert!((fill_scale - expected_fill_scale).abs() < 1e-9);
+            assert!((hole_diameter - 96.0 * expected_button_scale).abs() < 1e-9);
+            assert!(
+                (48.0 * (expected_fill_scale - expected_button_scale) - (-2.4 + 12.0 * bass)).abs()
+                    < 1e-9
+            );
+            assert!(frame.button_child_scale > 0.0);
+            assert!(fill_scale > 0.0);
+        }
+    }
+
+    #[test]
     fn logo_startup_animation_runs_once_for_the_main_scene_only() {
         assert!(should_start_startup_logo(WindowKind::Main, false));
         assert!(!should_start_startup_logo(WindowKind::Main, true));
@@ -6645,6 +6696,8 @@ mod tests {
                     Y: INNER_MASK_BOUNDS,
                 })?;
                 group.SetClip(&clip)?;
+                clip.SetScale(Vector2 { X: 0.75, Y: 0.75 })?;
+                assert_eq!(clip.Scale()?, Vector2 { X: 0.75, Y: 0.75 });
                 let ring = compositor.CreateSpriteVisual()?;
                 ring.SetSize(Vector2 {
                     X: ui_model::INNER_DIAMETERS[0] as f32,
