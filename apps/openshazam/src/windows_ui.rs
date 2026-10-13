@@ -2300,6 +2300,20 @@ impl Renderer {
             bg,
         );
         match app.phase {
+            // UI-156: the tagging view owns this gradient from its initial
+            // Ready state onward. Listening and Auto use the same colors;
+            // result and NoMatch panels are separate overlays below.
+            MainPhase::Ready | MainPhase::Error { .. } => {
+                self.target.FillRectangle(
+                    &rect(
+                        0.0,
+                        body_top,
+                        CONTENT_WIDTH as f32,
+                        body_top + TOP_HEIGHT as f32,
+                    ),
+                    &self.palette.listening,
+                );
+            }
             MainPhase::Listening { .. } => {
                 self.target
                     .FillGeometry(&self.popup_header(app)?, &self.palette.listening, None);
@@ -2311,7 +2325,6 @@ impl Renderer {
                     None,
                 );
             }
-            MainPhase::Ready | MainPhase::Error { .. } => {}
         }
 
         let history_top = body_top + TOP_HEIGHT as f32;
