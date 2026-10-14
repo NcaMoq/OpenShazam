@@ -1,0 +1,10 @@
+[package]
+name = "openshazam-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+shazam-http-lab = { path = "../shazam-http-lab" }
+shazam-progressive = { path = "../shazam-progressive" }

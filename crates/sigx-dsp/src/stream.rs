@@ -11,9 +11,11 @@ use super::{
 };
 use crate::resampler::{Resampler, ResamplerError, INTERNAL_SAMPLE_RATE};
 
-/// `sig_extractor_pipe::flush_fft` runs 61 zero blocks before rewinding the
-/// FFT and SigX state. This gives the temporal peak search its native tail
-/// lookahead; the captured peaks are retained by the caller.
+/// The recovered low-level `sig_extractor_pipe::flush_fft` helper checkpoints
+/// both streams, flows 61 zero blocks, then rewinds. It remains available to
+/// the existing one-shot/reference finalizer. The public Shazam TaggingType 2
+/// freeze branch instead calls `get_sig(..., false)` on the live peak deque and
+/// clears that deque; its Progressive path must not use this flush helper.
 pub const SIGNATURE_FLUSH_FRAMES: usize = 61;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

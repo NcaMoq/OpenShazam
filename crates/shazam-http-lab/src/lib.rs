@@ -2,8 +2,8 @@
 //!
 //! The request body is a partial static reconstruction. Mock requests use a
 //! loopback-only transport; the separate live path fetches public Config over
-//! verified HTTPS and restricts recognition to the resulting Mac manual-tag
-//! route. This is an experimental
+//! verified HTTPS and restricts recognition to Config-provided first-party
+//! Manual or explicitly contextualized Auto routes. This is an experimental
 //! client for a non-public route, not an official API implementation. The
 //! request carries the observed Shazam 2.11.0 platform/version headers and
 //! omits the conditional AMP authentication header.
@@ -12,25 +12,483 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
     time::Duration,
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
-use shazam_progressive::{RecognitionTiming, RetryDirective};
+use shazam_progressive::{
+    EngineError, NativeSampleFrameTargets, NativeTaggingType, ProgressiveSession,
+    RecognitionOutcome, RecognitionTiming, RetryDirective, SessionStatus,
+    NATIVE_TAGGING_TYPE_1_DEFAULT_SESSION_TIMEOUT_MS,
+    NATIVE_TAGGING_TYPE_2_DEFAULT_SESSION_TIMEOUT_MS,
+};
 
 const SIGNATURE_DATA_URI: &str = "data:audio/vnd.shazam.sig;base64,";
 const SHAZAM_MAC_PLATFORM: &str = "MAC";
 const SHAZAM_MAC_APP_VERSION: &str = "2.11.0";
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_HEADER_BYTES: usize = 16_384;
+/// Maximum retained UI web-track template size (4 KiB).
+pub const MAX_WEB_TRACK_URL_TEMPLATE_BYTES: usize = 4_096;
 const CURL_STATUS_MARKER: &[u8] = b"\n__OPENSHZAM_HTTP_STATUS__";
+
+fn progressive_request_timestamp_ms(source_timestamp_ms: Option<u64>) -> Result<u64, Error> {
+    if let Some(timestamp_ms) = source_timestamp_ms {
+        return Ok(timestamp_ms);
+    }
+    use std::time::{SystemTime, UNIX_EPOCH};
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::Transport("system clock is before Unix epoch".into()))?
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackCandidate {
     pub track_id: Option<String>,
     pub title: String,
+    /// Normalized artist display value. The inspected Native main view reads
+    /// this role through `SHALTrack.subtitle` backed by `TagResult.artist`.
     pub artist: String,
+    /// TagResult-backed values used by Native `SHALTrack` display getters,
+    /// copied only when the recognition response supplies them.
+    pub ui_metadata: Option<NativeTrackUiMetadata>,
+    /// Native's separate alternative-track object, when the root `track`
+    /// dictionary carries a non-empty `alternativetrack` dictionary.
+    /// This is not derived from the second entry in `matches`.
+    pub alternative_track: Option<Box<TrackCandidate>>,
+    /// Provenance used to avoid treating an unverified `matches` array order
+    /// as the Native matcher `tags` order for UI callback construction.
+    #[doc(hidden)]
+    pub origin: TrackCandidateOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackCandidateOrigin {
+    /// The single top-level `track` dictionary, statically mapped to the
+    /// Native tag selected by `tags.firstObject`.
+    RootTrack,
+    /// The separate `alternativetrack` dictionary from that root response.
+    AlternativeTrack,
+    /// An entry from a fallback `matches` array with unverified Native order.
+    MatchesEntry,
+    /// A synthetic candidate created by tests or a caller.
+    Synthetic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeTrackUiMetadata {
+    /// Response string selected for Native UI handoff. This is deliberately
+    /// distinct from `TrackCandidate::track_id`; no numeric ID fallback is
+    /// inferred for web-page links.
+    pub track_key: Option<String>,
+    pub album_adam_id: Option<String>,
+    pub isrc: Option<String>,
+    pub date: Option<String>,
+    pub artwork_url: Option<String>,
+    pub hq_artwork_url: Option<String>,
+    pub background_image_url: Option<String>,
+}
+
+/// Manual Type 1 result callback stage exposed to a UI host.
+///
+/// A tag-bearing response with a positive Retry is delivered through
+/// `willFetchCompleteResultForContext:track:alternativeTrack:`. A response
+/// without a positive Retry follows `matchFoundForContext:inTagSession:`;
+/// `SHALAppTagManager.tagResultMatched:alternativeTagResult:context:inTaggingSession:`
+/// then converts the results and calls the UI delegate's
+/// `taggingDidFinishWithTrack:alternativeTrack:context:inTaggingSession:`.
+/// This Rust event reports the corresponding phase and the two normalized
+/// track values passed to the Native UI delegate; it does not synthesize
+/// Native `SHALTrack` objects or location enrichment. Callers must still apply the Progressive session's
+/// context-delivery and Retry-authorization gates before publishing it to a
+/// UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeManualResultStage {
+    /// Positive Manual Retry: Native performs its early-result callback and
+    /// keeps the Manual generator eligible for another Signature.
+    WillFetchCompleteResult,
+    /// No positive Manual Retry: Native routes the match through
+    /// `matchFoundForContext:inTagSession:` and then calls the UI delegate's
+    /// final `taggingDidFinishWithTrack:alternativeTrack:context:inTaggingSession:`.
+    TaggingDidFinish,
+}
+
+/// UI-facing, data-only result for the verified Manual Type 1 callback paths.
+/// `SHALAppTagManager` selects the first tag and passes its primary track plus
+/// that tag's optional alternative as separate callback arguments; additional
+/// tags in the matcher array are not UI callback tracks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeManualResultEvent {
+    pub stage: NativeManualResultStage,
+    pub primary_track: TrackCandidate,
+    pub alternative_track: Option<Box<TrackCandidate>>,
+}
+
+/// One normalized projection of Manual Type 1 callback values for an application UI.
+///
+/// The enum preserves the Native callback phase (early complete-result,
+/// final match, no-match, or terminal error) without pretending that Rust has
+/// Native `SHALTrack`, context/session objects, or an `NSError` instance. The
+/// JSON result includes `native_main_view_action` to distinguish the early
+/// no-op from the final primary-track display observed in Shazam 2.11.0's main
+/// controller. This is not a runtime observation of the Native delegate callback: the Rust
+/// event is created when the HTTP response is applied, while Native's
+/// TagResult conversion can conditionally perform asynchronous Smoid
+/// enrichment before invoking its delegate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeManualUiEvent {
+    Result(NativeManualResultEvent),
+    NoMatch,
+    Error { kind: NativeManualErrorKind },
+}
+
+/// Normalized candidate inputs for Auto Type 2's continuous-result delegate.
+/// Shazam's app performs duplicate checks before invoking that delegate; this
+/// projection exposes the supported root-track values but does not claim that
+/// Native's stateful duplicate reporter accepted the candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAutoResultEvent {
+    pub primary_track: TrackCandidate,
+    pub alternative_track: Option<Box<TrackCandidate>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeAutoUiEvent {
+    ContinuousMatchCandidate(NativeAutoResultEvent),
+}
+
+/// Serialize the result values that Shazam 2.11.0 passes through
+/// `continuousTaggingDidFinishWithTrack:alternativeTrack:context:` after its
+/// app-level duplicate checks. This event is deliberately named a candidate:
+/// the Rust HTTP adapter does not implement the Native duplicate reporter or
+/// manufacture its tag-context object.
+pub fn native_auto_ui_event_to_json(event: &NativeAutoUiEvent) -> String {
+    match event {
+        NativeAutoUiEvent::ContinuousMatchCandidate(result) => json!({
+            "schema": "openshazam.auto-ui-event.v1",
+            "event": "continuous_match_candidate",
+            "tagging_type": 2,
+            "native_callback_candidate": "continuousTaggingDidFinishWithTrack:alternativeTrack:context:",
+            "native_duplicate_filter_applied": false,
+            "primary_track": track_candidate_json(&result.primary_track),
+            "alternative_track": result.alternative_track.as_deref().map(track_candidate_json),
+        })
+        .to_string(),
+    }
+}
+
+/// Build the supported Auto Type 2 UI candidate from the same root `track`
+/// shape used by the inspected continuous-tag conversion path. Fallback
+/// `matches` entries are not promoted because their correspondence to Native
+/// `TagResult` ordering is unverified.
+pub fn native_auto_result_event(candidates: Vec<TrackCandidate>) -> Option<NativeAutoResultEvent> {
+    let mut primary_track = candidates.into_iter().next()?;
+    if primary_track.origin != TrackCandidateOrigin::RootTrack {
+        return None;
+    }
+    let alternative_track = primary_track.alternative_track.take();
+    Some(NativeAutoResultEvent {
+        primary_track,
+        alternative_track,
+    })
+}
+
+/// Serialize one normalized Manual callback input as a versioned JSONL record
+/// for an external UI host. `native_main_view_inputs` names only the three
+/// values read by Shazam 2.11.0's final main-view update; early complete-result
+/// callbacks carry their callback tracks but request no main-view update.
+/// Native objects are not synthesized. The parser's documented image
+/// fallback is an explicit normalization, not a raw response copy.
+pub fn native_manual_ui_event_to_json(event: &NativeManualUiEvent) -> String {
+    use serde_json::json;
+
+    let value = match event {
+        NativeManualUiEvent::Result(result) => {
+            let (stage, native_main_view_action) = match result.stage {
+                NativeManualResultStage::WillFetchCompleteResult => {
+                    ("will_fetch_complete_result", "no_update")
+                }
+                NativeManualResultStage::TaggingDidFinish => {
+                    ("tagging_did_finish", "display_primary")
+                }
+            };
+            let native_main_view_inputs =
+                (result.stage == NativeManualResultStage::TaggingDidFinish).then(|| {
+                    let artwork_url = result
+                        .primary_track
+                        .ui_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.artwork_url.as_deref());
+                    json!({
+                        "title": result.primary_track.title.as_str(),
+                        "subtitle": result.primary_track.artist.as_str(),
+                        "artwork_url": artwork_url,
+                    })
+                });
+            json!({
+                "schema": "openshazam.manual-ui-event.v2",
+                "event": "result",
+                "stage": stage,
+                "native_main_view_action": native_main_view_action,
+                "native_main_view_inputs": native_main_view_inputs,
+                "primary_track": track_candidate_json(&result.primary_track),
+                "alternative_track": result.alternative_track.as_deref().map(track_candidate_json),
+            })
+        }
+        NativeManualUiEvent::NoMatch => json!({
+            "schema": "openshazam.manual-ui-event.v2",
+            "event": "no_match",
+        }),
+        NativeManualUiEvent::Error { kind } => {
+            let error_kind = match kind {
+                NativeManualErrorKind::MatcherFailure => "matcher_failure",
+                NativeManualErrorKind::InvalidResponse => "invalid_response",
+                NativeManualErrorKind::TransportFailure => "transport_failure",
+            };
+            json!({
+                "schema": "openshazam.manual-ui-event.v2",
+                "event": "error",
+                "error_kind": error_kind,
+            })
+        }
+    };
+
+    value.to_string()
+}
+
+/// Serialize the normalized terminal event for the Native tagging-session
+/// timeout. Shazam 2.11.0 statically routes `taggingTimedOutForSession:` into
+/// `SHKAudioMatcherBridge` and the context delegate's error callback; this
+/// record preserves only the observed reason and tagging type, not an NSError
+/// code, native object, context identifier, or session identifier.
+pub fn native_session_timeout_event_to_json(tagging_type: NativeTaggingType) -> String {
+    let native_tagging_type = match tagging_type {
+        NativeTaggingType::Manual => 1,
+        NativeTaggingType::Auto => 2,
+    };
+    json!({
+        "schema": "openshazam.progressive-session-event.v1",
+        "event": "session_timeout",
+        "tagging_type": native_tagging_type,
+    })
+    .to_string()
+}
+
+/// Native Manual Type 1 terminal callback kind for a no-match or a failure
+/// that did not continue through an accepted Retry. Native's No Match UI
+/// selector receives the tag context and tagging session, not the Retry;
+/// Retry remains an internal control value. Shazam's UI-facing callbacks are
+/// dispatched asynchronously on the main queue. This event is data-only and
+/// does not itself carry Native context/session objects or NSError values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeManualTerminalEvent {
+    /// Native reports No Match and stops the Manual tagging context when no
+    /// accepted Retry continues the matched callback.
+    NoMatch,
+    /// Normalized local failure category for Native's error callback. This is
+    /// not a byte-for-byte NSError replacement; response bodies and raw OS
+    /// errors are deliberately not copied into this event.
+    Error { kind: NativeManualErrorKind },
+}
+
+/// Bounded failure category for the Native Manual error callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeManualErrorKind {
+    MatcherFailure,
+    InvalidResponse,
+    TransportFailure,
+}
+
+/// Build a UI-phase event for a delivered, tag-bearing Manual Type 1 response
+/// whose primary is the statically mapped root `track` dictionary.
+///
+/// Native Shazam 2.11 routes a positive Retry with non-empty tags to its
+/// complete-result callback; zero/missing retry duration follows
+/// `matchFoundForContext` and the asynchronously produced
+/// `taggingDidFinishWithTrack` UI callback. The Native app selects only the
+/// first tag and its separate alternative track. Candidate fields are
+/// normalized values from the supported root-track response shape, not a
+/// byte-for-byte `SHALTrack` model. Native's `SHDTagAccessor` may also perform
+/// asynchronous Smoid enrichment based on TagOrigin before calling its
+/// delegate; this Rust projection is emitted at response-application time and
+/// does not reproduce that completion timing or location enrichment. The
+/// caller is responsible for filtering late/cancelled responses and using
+/// this only for Manual Type 1, since other Native tagging types have
+/// different delegate semantics.
+pub fn native_manual_result_event(
+    candidates: Vec<TrackCandidate>,
+    retry: Option<RetryDirective>,
+) -> Option<NativeManualResultEvent> {
+    let mut primary_track = candidates.into_iter().next()?;
+    if primary_track.origin != TrackCandidateOrigin::RootTrack {
+        return None;
+    }
+    let alternative_track = primary_track.alternative_track.take();
+
+    let stage = if retry.is_some_and(RetryDirective::has_positive_retry_duration) {
+        NativeManualResultStage::WillFetchCompleteResult
+    } else {
+        NativeManualResultStage::TaggingDidFinish
+    };
+
+    Some(NativeManualResultEvent {
+        stage,
+        primary_track,
+        alternative_track,
+    })
+}
+
+/// Result of applying one progressive matcher response to its session.
+/// `manual_result_event` is populated only after the response passes Native's
+/// shared-context delivery gate and the session is Manual Type 1. UI callers
+/// should consume that event rather than infer a callback phase from HTTP 200.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressiveResponseDelivery {
+    pub status: SessionStatus,
+    pub delivered_to_matcher: bool,
+    /// Candidates are included only for a response delivered to the session.
+    pub candidates: Vec<TrackCandidate>,
+    pub manual_result_event: Option<NativeManualResultEvent>,
+    /// Manual No Match/Error callback data, present only after the shared
+    /// context gate has accepted the response. Accepted MatcherFailure Retry
+    /// directives do not produce an error event because Native continues
+    /// tagging instead of notifying the UI of a terminal failure.
+    pub manual_terminal_event: Option<NativeManualTerminalEvent>,
+    /// Auto Type 2 continuous-match candidate, created only after the response
+    /// passes Native's shared-context delivery gate. Native app duplicate
+    /// filtering remains outside this platform-independent response mapper.
+    pub auto_result_event: Option<NativeAutoResultEvent>,
+}
+
+impl ProgressiveResponseDelivery {
+    /// Return the single Manual UI callback input for this delivered response.
+    /// Stale/cancelled responses, Auto sessions, and accepted Retry-only
+    /// failures have no UI event.
+    pub fn native_manual_ui_event(&self) -> Option<NativeManualUiEvent> {
+        match (&self.manual_result_event, self.manual_terminal_event) {
+            (Some(result), None) => Some(NativeManualUiEvent::Result(result.clone())),
+            (None, Some(NativeManualTerminalEvent::NoMatch)) => Some(NativeManualUiEvent::NoMatch),
+            (None, Some(NativeManualTerminalEvent::Error { kind })) => {
+                Some(NativeManualUiEvent::Error { kind })
+            }
+            // The response mapper emits at most one callback. Treat an
+            // impossible mixed/empty payload as absent instead of inventing
+            // a callback ordering.
+            _ => None,
+        }
+    }
+
+    pub fn native_auto_ui_event(&self) -> Option<NativeAutoUiEvent> {
+        self.auto_result_event
+            .as_ref()
+            .map(|event| NativeAutoUiEvent::ContinuousMatchCandidate(event.clone()))
+    }
+}
+
+/// Apply a parsed response and expose the Native Manual UI callback payload.
+/// This is a reusable library boundary for a UI host: it applies the same
+/// context gate/state transition first, then returns the event and observed
+/// candidate data. Callers still own polling/dispatch of any Retry Signature.
+pub fn apply_progressive_response(
+    session: &mut ProgressiveSession,
+    attempt: u64,
+    outcome: RecognitionOutcome,
+    candidates: Vec<TrackCandidate>,
+    now_ms: u64,
+) -> Result<ProgressiveResponseDelivery, EngineError> {
+    let now_ns = now_ms
+        .checked_mul(1_000_000)
+        .ok_or(EngineError::InvalidTiming(
+            "monotonic timestamp exceeds nanosecond clock range",
+        ))?;
+    apply_progressive_response_at_ns(session, attempt, outcome, candidates, now_ns)
+}
+
+/// Nanosecond-resolution response adapter for live capture/controller clocks.
+pub fn apply_progressive_response_at_ns(
+    session: &mut ProgressiveSession,
+    attempt: u64,
+    outcome: RecognitionOutcome,
+    candidates: Vec<TrackCandidate>,
+    now_ns: u64,
+) -> Result<ProgressiveResponseDelivery, EngineError> {
+    let retry = match outcome {
+        RecognitionOutcome::Match { retry } => retry,
+        _ => None,
+    };
+    let (status, delivered_to_matcher) =
+        match session.complete_with_delivery_at_ns(attempt, outcome, now_ns) {
+            Ok(delivery) => delivery,
+            Err(EngineError::NoRequestInFlight) => {
+                return Ok(ProgressiveResponseDelivery {
+                    status: session.status(),
+                    delivered_to_matcher: false,
+                    candidates: Vec::new(),
+                    manual_result_event: None,
+                    manual_terminal_event: None,
+                    auto_result_event: None,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+    let event_candidates = candidates.clone();
+    let manual_result_event = if delivered_to_matcher
+        && session.tagging_type() == NativeTaggingType::Manual
+        && matches!(outcome, RecognitionOutcome::Match { .. })
+    {
+        native_manual_result_event(event_candidates.clone(), retry)
+    } else {
+        None
+    };
+    let manual_terminal_event = if delivered_to_matcher
+        && session.tagging_type() == NativeTaggingType::Manual
+    {
+        match outcome {
+            RecognitionOutcome::NoMatch { retry: None } => Some(NativeManualTerminalEvent::NoMatch),
+            RecognitionOutcome::MatcherFailure { retry: None } => {
+                Some(NativeManualTerminalEvent::Error {
+                    kind: NativeManualErrorKind::MatcherFailure,
+                })
+            }
+            RecognitionOutcome::InvalidResponse => Some(NativeManualTerminalEvent::Error {
+                kind: NativeManualErrorKind::InvalidResponse,
+            }),
+            RecognitionOutcome::TransportFailure => Some(NativeManualTerminalEvent::Error {
+                kind: NativeManualErrorKind::TransportFailure,
+            }),
+            RecognitionOutcome::NoMatch { retry: Some(_) }
+            | RecognitionOutcome::Match { .. }
+            | RecognitionOutcome::MatcherFailure { retry: Some(_) } => None,
+        }
+    } else {
+        None
+    };
+    let auto_result_event = if delivered_to_matcher
+        && session.tagging_type() == NativeTaggingType::Auto
+        && matches!(outcome, RecognitionOutcome::Match { .. })
+    {
+        native_auto_result_event(event_candidates)
+    } else {
+        None
+    };
+
+    Ok(ProgressiveResponseDelivery {
+        status,
+        delivered_to_matcher,
+        candidates: if delivered_to_matcher {
+            candidates
+        } else {
+            Vec::new()
+        },
+        manual_result_event,
+        manual_terminal_event,
+        auto_result_event,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,15 +497,57 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// Transport boundary for one Config-resolved recognition HTTPS POST.
+/// Implementations must preserve TLS verification, the caller's timeout and
+/// cancellation semantics, and must not follow redirects or use ambient
+/// cookies/proxy credentials.
+pub trait RecognitionHttpTransport: Send + Sync {
+    fn post_json_cancellable(
+        &self,
+        endpoint: &str,
+        body: &[u8],
+        timeout: Duration,
+        cancelled: &AtomicBool,
+        on_transport_started: &mut dyn FnMut(),
+    ) -> Result<HttpResponse, Error>;
+}
+
+/// Existing verified HTTPS transport. It uses the host's curl executable and
+/// remains the default until a native Windows transport is independently
+/// verified against the same request and cancellation tests.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CurlRecognitionTransport;
+
 /// Classification of one progressive recognition HTTP response. The response
 /// body is consumed immediately; callers only receive parsed track data or
 /// bounded control fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressiveHttpResponse {
-    Matched(Vec<TrackCandidate>),
+    Matched {
+        candidates: Vec<TrackCandidate>,
+        retry: Option<RetryDirective>,
+    },
     NoMatch(Option<RetryDirective>),
-    HttpError(u16),
+    HttpError {
+        status: u16,
+        retry: Option<RetryDirective>,
+    },
+    /// The response could not be decoded as a usable tag dictionary. Native
+    /// sends this through its matcher-failure callback, which can synthesize
+    /// a zero-interval Retry to the request maximum when the Signature is
+    /// still shorter.
+    ParseFailure {
+        retry: Option<RetryDirective>,
+    },
     InvalidResponse,
+}
+
+/// Parsed result from one live progressive recognition request. The response
+/// body and Signature are deliberately not retained in this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressiveRecognitionResult {
+    pub status: u16,
+    pub response: ProgressiveHttpResponse,
 }
 
 /// Non-secret host profile sent to the Config endpoint. The installation ID
@@ -64,13 +564,89 @@ pub struct ConfigRequestProfile {
     pub app_version: String,
 }
 
-/// The two values required to construct a Mac manual-tag route. No `Debug`
-/// implementation is provided so accidental logging cannot expose INID.
+/// Foreground/background state consumed by the Native continuous-tag request
+/// builder. Callers provide the observed UI/app state; this crate does not
+/// infer it from the CLI process or OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeTaggingRequestContext {
+    Foreground,
+    Background,
+}
+
+/// Config values required to construct supported Mac tagging routes. No
+/// `Debug` implementation is provided so accidental logging cannot expose
+/// INID or the retained route templates.
 #[derive(Clone)]
 pub struct ShazamConfiguration {
     tag_url_template: String,
+    web_track_url_template: Option<String>,
+    continuous_foreground_url_template: Option<String>,
+    continuous_background_url_template: Option<String>,
     installation_id: String,
     manual_timing: ManualTaggingTiming,
+    native_frame_seconds: NativeFrameSeconds,
+}
+
+/// Minimal Config data intended for a UI PageLinkResolver. The generation is
+/// assigned by the caller that owns Config/session lifecycle, not by parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiConfigSnapshot {
+    pub generation: u64,
+    pub web_track_url_template: Option<String>,
+}
+
+impl UiConfigSnapshot {
+    /// Versioned standalone record for an explicitly opted-in UI JSONL host.
+    pub fn to_json(&self) -> String {
+        json!({
+            "schema": "openshazam.ui-config-snapshot.v1",
+            "event": "ui_config_snapshot",
+            "generation": self.generation,
+            "web_track_url_template": self.web_track_url_template.as_deref(),
+        })
+        .to_string()
+    }
+}
+
+/// Typed UI result input paired with the Config generation active for its
+/// recognition session. Track Key remains inside the existing result event;
+/// this wrapper does not generate or validate a page URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiRecognitionInput {
+    pub config_generation: u64,
+    pub event: UiRecognitionEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiRecognitionEvent {
+    Manual(NativeManualUiEvent),
+    Auto(NativeAutoUiEvent),
+}
+
+impl UiRecognitionInput {
+    /// Independent versioned record for hosts that explicitly opt into the
+    /// new JSONL bridge. Existing Manual/Auto event schemas are nested intact.
+    pub fn to_json(&self) -> String {
+        let event_json = match &self.event {
+            UiRecognitionEvent::Manual(event) => native_manual_ui_event_to_json(event),
+            UiRecognitionEvent::Auto(event) => native_auto_ui_event_to_json(event),
+        };
+        let recognition_event: Value = serde_json::from_str(&event_json)
+            .expect("existing UI event serializers always produce JSON");
+        json!({
+            "schema": "openshazam.ui-recognition-input.v1",
+            "event": "recognition_ui_input",
+            "config_generation": self.config_generation,
+            "recognition_event": recognition_event,
+        })
+        .to_string()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NativeFrameSeconds {
+    sample_seconds_bits: Option<u64>,
+    progressive_seconds_bits: Option<u64>,
 }
 
 /// Recognized numeric fields from the Shazam Config response. These remain
@@ -78,51 +654,194 @@ pub struct ShazamConfiguration {
 /// server value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManualTaggingTiming {
+    /// Config `tagging.sampleSeconds`: Native per-cycle maximum.
     pub sample_ms: Option<u64>,
+    /// Config `tagging.progressiveRecordingSeconds`: Native initial target.
     pub progressive_ms: Option<u64>,
-    pub minimum_sample_ms: Option<u64>,
-    pub maximum_sample_ms: Option<u64>,
+    /// Config `settings.recording.silentRecordingSeconds` converted using the
+    /// Native `NSNumber.integerValue` behavior, in milliseconds.
+    /// Use `effective_pre_record_buffer_ms` for Native fallback behavior.
+    pub pre_record_buffer_ms: Option<u64>,
+    /// Config `tagging.minsamplems`: minimum Signature duration in ms.
+    pub minimum_signature_ms: Option<u64>,
+    /// Config maximum signature length; Native uses it in a conditional
+    /// assertion when a Retry duration exceeds the value.
+    pub maximum_signature_ms: Option<u64>,
+    /// Native Manual Type 1 deadline, sourced from
+    /// `autoTag.continuousForegroundIdleTimeout` (seconds).
+    pub session_timeout_ms: Option<u64>,
+    /// Native Auto Type 2 deadline from the same Config field. Retained as a
+    /// separate value in the public timing model for mode-specific reporting.
+    pub auto_session_timeout_ms: Option<u64>,
 }
 
+/// `SHNTaggingConfiguration.maxSampleSeconds` falls back to 12 seconds when
+/// the selected Native tag block has no valid `maxsamplems` value. This is a
+/// maximum Signature length, not the Auto Shazam cycle interval.
+pub const NATIVE_DEFAULT_MAX_SIGNATURE_LENGTH_MS: u64 = 12_000;
+/// `SHNTaggingConfiguration.minSampleSeconds` falls back to 2 seconds when
+/// `tagging.minsamplems` is missing or invalid. Confirmed in the Shazam 2.11.0
+/// ARM64 getter; this is the Signature-generation gate, not the initial target.
+pub const NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS: u64 = 2_000;
+/// `SHNTaggingConfiguration.silentRecordingSeconds` falls back to 3 seconds
+/// when the setting is absent or its `NSNumber.integerValue` is at most 2.
+pub const NATIVE_DEFAULT_PRE_RECORD_BUFFER_MS: u64 = 3_000;
+/// Shazam 2.11's ARM64 recorder baseline uses the Apple Silicon page size
+/// observed on the machine running its `vm_page_size`-based ring allocator.
+pub const NATIVE_MACOS_VM_PAGE_SIZE_BYTES: u64 = 16_384;
+/// `SHKTaggingComponents.recorderConfiguration` creates a standard mono
+/// `AVAudioFormat`; its Float32 stream has four bytes per audio frame.
+pub const NATIVE_RECORDER_BYTES_PER_FRAME: u64 = 4;
+
 impl ManualTaggingTiming {
-    /// Build the control-engine profile from Config values plus explicit local
-    /// safety bounds. Attempt count and request timeout are local safeguards,
-    /// not claims about the Mac app's undocumented defaults.
+    /// Effective first recording target for Native manual TaggingType 1.
+    /// The native getter uses progressiveRecordingSeconds when present and
+    /// otherwise falls back to sampleSeconds. `None` means neither value was
+    /// supplied by Config; callers must not invent a replacement.
+    pub const fn effective_initial_sample_ms(self) -> Option<u64> {
+        match self.progressive_ms {
+            Some(milliseconds) => Some(milliseconds),
+            None => self.sample_ms,
+        }
+    }
+
+    /// Effective Native recorder ring-buffer length. The framework returns
+    /// the configured NSNumber only when its integer value is greater than 2.
+    pub const fn effective_pre_record_buffer_ms(self) -> u64 {
+        match self.pre_record_buffer_ms {
+            Some(milliseconds) if milliseconds / 1_000 > 2 => (milliseconds / 1_000) * 1_000,
+            _ => NATIVE_DEFAULT_PRE_RECORD_BUFFER_MS,
+        }
+    }
+
+    /// Reproduce the Native recorder's page-rounded circular-buffer capacity
+    /// for the Shazam 2.11 ARM64 baseline. The binary computes
+    /// `ceil(sampleRate * integerSeconds * mBytesPerFrame / vm_page_size)` pages
+    /// before allocating the ring; the mono Float32 stream uses four bytes per
+    /// audio frame. The returned value is an audio-frame count for the Rust
+    /// mono PCM ring.
+    pub fn effective_pre_record_capacity_frames(self, sample_rate: u32) -> Result<usize, Error> {
+        if sample_rate == 0 {
+            return Err(Error::InvalidRequest(
+                "pre-record buffer sample rate must be nonzero".into(),
+            ));
+        }
+        let frames = u64::from(sample_rate)
+            .checked_mul(self.effective_pre_record_buffer_ms() / 1_000)
+            .ok_or_else(|| Error::InvalidRequest("pre-record frame count overflow".into()))?;
+        let bytes = frames
+            .checked_mul(NATIVE_RECORDER_BYTES_PER_FRAME)
+            .ok_or_else(|| Error::InvalidRequest("pre-record byte count overflow".into()))?;
+        let page_rounded_bytes = bytes
+            .checked_add(NATIVE_MACOS_VM_PAGE_SIZE_BYTES - 1)
+            .map(|value| value / NATIVE_MACOS_VM_PAGE_SIZE_BYTES * NATIVE_MACOS_VM_PAGE_SIZE_BYTES)
+            .ok_or_else(|| Error::InvalidRequest("pre-record page alignment overflow".into()))?;
+        usize::try_from(page_rounded_bytes / NATIVE_RECORDER_BYTES_PER_FRAME)
+            .map_err(|_| Error::InvalidRequest("pre-record frame capacity is too large".into()))
+    }
+
+    /// Effective Native maximum Signature length used by MatcherRequest.
+    pub const fn effective_maximum_signature_length_ms(self) -> u64 {
+        match self.maximum_signature_ms {
+            Some(value) => value,
+            None => NATIVE_DEFAULT_MAX_SIGNATURE_LENGTH_MS,
+        }
+    }
+
+    /// Build the control-engine profile from Config values plus caller policy.
+    /// Attempt count is local; callers use the Native 60-second request
+    /// timeout by default but may override it for diagnostics.
     pub fn recognition_timing(
         self,
         sample_rate: u32,
         minimum_sample_fallback_ms: u64,
         default_retry_interval_ms: u64,
         request_timeout_ms: u64,
-        maximum_retry_delay_ms: u64,
-        maximum_attempts: u8,
+        maximum_retry_delay_ms: Option<u64>,
+        maximum_attempts: Option<u64>,
     ) -> Result<RecognitionTiming, Error> {
-        let initial_sample_ms = self.progressive_ms.or(self.sample_ms).ok_or_else(|| {
+        let initial_sample_ms = self.effective_initial_sample_ms().ok_or_else(|| {
             Error::BadResponse("Config has no usable manual sample duration".into())
+        })?;
+        let maximum_sample_ms = self.sample_ms.ok_or_else(|| {
+            Error::BadResponse("Config has no usable per-cycle sample duration".into())
         })?;
         let timing = RecognitionTiming {
             sample_rate,
-            minimum_signature_ms: self.minimum_sample_ms.unwrap_or(minimum_sample_fallback_ms),
+            minimum_signature_ms: self
+                .minimum_signature_ms
+                .unwrap_or(minimum_sample_fallback_ms),
             initial_sample_ms,
-            progressive_step_ms: self.progressive_ms.unwrap_or(initial_sample_ms),
-            maximum_sample_ms: self.maximum_sample_ms.or(self.sample_ms).ok_or_else(|| {
-                Error::BadResponse("Config has no usable maximum sample duration".into())
-            })?,
+            maximum_sample_ms,
             default_retry_interval_ms,
+            maximum_retry_duration_ms: Some(self.effective_maximum_signature_length_ms()),
+            session_timeout_ms: Some(
+                self.session_timeout_ms
+                    .unwrap_or(NATIVE_TAGGING_TYPE_1_DEFAULT_SESSION_TIMEOUT_MS),
+            ),
             request_timeout_ms,
             maximum_retry_delay_ms,
             maximum_attempts,
         };
-        if timing.default_retry_interval_ms > maximum_retry_delay_ms {
+        if timing
+            .maximum_retry_delay_ms
+            .is_some_and(|maximum| timing.default_retry_interval_ms > maximum)
+        {
             return Err(Error::BadResponse(
                 "local default retry interval exceeds the local safety bound".into(),
             ));
         }
         Ok(timing)
     }
+
+    /// Build the same sample profile with Auto TaggingType 2's session
+    /// timeout source and Native fallback.
+    pub fn auto_recognition_timing(
+        self,
+        sample_rate: u32,
+        minimum_sample_fallback_ms: u64,
+        default_retry_interval_ms: u64,
+        request_timeout_ms: u64,
+        maximum_retry_delay_ms: Option<u64>,
+        maximum_attempts: Option<u64>,
+    ) -> Result<RecognitionTiming, Error> {
+        let mut timing = self.recognition_timing(
+            sample_rate,
+            minimum_sample_fallback_ms,
+            default_retry_interval_ms,
+            request_timeout_ms,
+            maximum_retry_delay_ms,
+            maximum_attempts,
+        )?;
+        // Native TaggingType 2's secondsToRecord branch returns sampleSeconds
+        // directly; it does not use progressiveRecordingSeconds.
+        timing.initial_sample_ms = timing.maximum_sample_ms;
+        timing.session_timeout_ms = Some(
+            self.auto_session_timeout_ms
+                .unwrap_or(NATIVE_TAGGING_TYPE_2_DEFAULT_SESSION_TIMEOUT_MS),
+        );
+        Ok(timing)
+    }
 }
 
 impl ShazamConfiguration {
+    /// Optional UI page-link template from `settings.webtrackurl`. This is
+    /// separate from `tag_url_template()`, which is an internal recognition
+    /// POST route. The value is not validated as a safe URL and is not
+    /// expanded with a track identifier; those are UI responsibilities.
+    pub fn web_track_url_template(&self) -> Option<&str> {
+        self.web_track_url_template.as_deref()
+    }
+
+    /// Project only the UI-safe page-link input. `generation` belongs to the
+    /// caller's Config/session lifecycle and is not allocated by the parser.
+    pub fn ui_config_snapshot(&self, generation: u64) -> UiConfigSnapshot {
+        UiConfigSnapshot {
+            generation,
+            web_track_url_template: self.web_track_url_template.clone(),
+        }
+    }
+
     pub fn resolve_tag_url(&self, tag_id: &str, streaming_provider: &str) -> Result<String, Error> {
         resolve_shazam_tag_url(
             &self.tag_url_template,
@@ -132,6 +851,78 @@ impl ShazamConfiguration {
         )
     }
 
+    /// Resolve the foreground Auto Shazam endpoint selected by Native for
+    /// continuous matching. The route remains optional because Manual Config
+    /// validity does not require an Auto endpoint.
+    pub fn resolve_continuous_tag_url(
+        &self,
+        tag_id: &str,
+        streaming_provider: &str,
+    ) -> Result<String, Error> {
+        self.resolve_continuous_tag_url_for_context(
+            NativeTaggingRequestContext::Foreground,
+            tag_id,
+            streaming_provider,
+        )
+    }
+
+    /// Resolve the Config route selected by Native's `inForegroundForTagging`
+    /// argument. A missing route is an error; the caller's state is never
+    /// replaced with a guessed foreground/background default.
+    pub fn resolve_continuous_tag_url_for_context(
+        &self,
+        context: NativeTaggingRequestContext,
+        tag_id: &str,
+        streaming_provider: &str,
+    ) -> Result<String, Error> {
+        let template = match context {
+            NativeTaggingRequestContext::Foreground => {
+                self.continuous_foreground_url_template.as_deref()
+            }
+            NativeTaggingRequestContext::Background => {
+                self.continuous_background_url_template.as_deref()
+            }
+        }
+        .ok_or_else(|| match context {
+            NativeTaggingRequestContext::Foreground => {
+                Error::BadResponse("Config has no Auto foreground route".into())
+            }
+            NativeTaggingRequestContext::Background => {
+                Error::BadResponse("Config has no Auto background route".into())
+            }
+        })?;
+        resolve_shazam_continuous_tag_url(
+            template,
+            &self.installation_id,
+            tag_id,
+            streaming_provider,
+        )
+    }
+
+    /// Resolve the Native endpoint selected for the requested tagging type.
+    /// Manual keeps the strict `apis.tag.href` route. Auto requires explicit
+    /// Native foreground/background context and selects the matching route.
+    pub fn resolve_tag_url_for_type(
+        &self,
+        tagging_type: NativeTaggingType,
+        context: Option<NativeTaggingRequestContext>,
+        tag_id: &str,
+        streaming_provider: &str,
+    ) -> Result<String, Error> {
+        match tagging_type {
+            NativeTaggingType::Manual => self.resolve_tag_url(tag_id, streaming_provider),
+            NativeTaggingType::Auto => self.resolve_continuous_tag_url_for_context(
+                context.ok_or_else(|| {
+                    Error::InvalidRequest(
+                        "Auto recognition requires explicit foreground/background context".into(),
+                    )
+                })?,
+                tag_id,
+                streaming_provider,
+            ),
+        }
+    }
+
     pub fn tag_url_template(&self) -> &str {
         &self.tag_url_template
     }
@@ -139,6 +930,217 @@ impl ShazamConfiguration {
     pub fn manual_timing(&self) -> ManualTaggingTiming {
         self.manual_timing
     }
+
+    /// Frame thresholds for Native manual TaggingType 1, computed directly
+    /// from the original Config Double values as `sampleRate * seconds`,
+    /// truncated toward zero like `SHKSignatureGenerator`.
+    pub fn manual_native_frame_targets(
+        &self,
+        sample_rate: u32,
+    ) -> Result<NativeSampleFrameTargets, Error> {
+        self.native_frame_targets_for_type(NativeTaggingType::Manual, sample_rate)
+    }
+
+    /// Frame thresholds selected by Native `secondsToRecord` for the active
+    /// tagging type. Manual Type 1 uses `progressiveRecordingSeconds` with a
+    /// `sampleSeconds` fallback; Auto Type 2 uses `sampleSeconds` for both its
+    /// initial target and per-cycle maximum. Conversion uses the original
+    /// Config Double and truncates toward zero at the active sample rate.
+    pub fn native_frame_targets_for_type(
+        &self,
+        tagging_type: NativeTaggingType,
+        sample_rate: u32,
+    ) -> Result<NativeSampleFrameTargets, Error> {
+        let sample_seconds = self
+            .native_frame_seconds
+            .sample_seconds_bits
+            .map(f64::from_bits)
+            .ok_or_else(|| Error::BadResponse("Config has no usable sampleSeconds".into()))?;
+        let initial_seconds = match tagging_type {
+            NativeTaggingType::Manual => self
+                .native_frame_seconds
+                .progressive_seconds_bits
+                .map(f64::from_bits)
+                .unwrap_or(sample_seconds),
+            NativeTaggingType::Auto => sample_seconds,
+        };
+        let maximum_frames = native_frames_from_seconds(sample_rate, sample_seconds)?;
+        let initial_frames = native_frames_from_seconds(sample_rate, initial_seconds)?;
+        if maximum_frames == 0 || initial_frames == 0 || initial_frames > maximum_frames {
+            return Err(Error::BadResponse(
+                "Config Native frame targets are zero or inconsistent".into(),
+            ));
+        }
+        Ok(NativeSampleFrameTargets {
+            initial_frames,
+            maximum_frames,
+        })
+    }
+
+    /// Serialize the verified Native inputs and resolved Manual Type 1
+    /// controls for an external UI host. This deliberately omits the Config
+    /// route and installation identifier. `pre_record_capacity_frames` is
+    /// the capacity actually selected by the capture adapter, which may be a
+    /// diagnostic override rather than the Native page-rounded value.
+    pub fn native_manual_ui_config_json(
+        &self,
+        sample_rate_hz: u32,
+        pre_record_capacity_frames: usize,
+        diagnostic_pre_record_override: bool,
+        request_timeout_ms: u64,
+    ) -> Result<String, Error> {
+        let timing = self.manual_timing.recognition_timing(
+            sample_rate_hz,
+            NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS,
+            shazam_progressive::NATIVE_TAGGING_TYPE_1_DEFAULT_INTERVAL_MS,
+            request_timeout_ms,
+            None,
+            None,
+        )?;
+        let targets = self.manual_native_frame_targets(sample_rate_hz)?;
+        let sample_seconds = self
+            .native_frame_seconds
+            .sample_seconds_bits
+            .map(f64::from_bits)
+            .ok_or_else(|| Error::BadResponse("Config has no usable sampleSeconds".into()))?;
+        let progressive_seconds = self
+            .native_frame_seconds
+            .progressive_seconds_bits
+            .map(f64::from_bits);
+        let effective_initial_seconds = progressive_seconds.unwrap_or(sample_seconds);
+        let effective_pre_record_seconds =
+            self.manual_timing.effective_pre_record_buffer_ms() / 1_000;
+        let pre_record_capacity_ms =
+            frames_to_ceil_milliseconds(pre_record_capacity_frames, sample_rate_hz)?;
+
+        Ok(json!({
+            "schema": "openshazam.manual-ui-config.v1",
+            "event": "session_config",
+            "native_ui_start_inputs": {
+                "tagging_type": 1,
+                "debugging_enabled": false
+            },
+            "native_origin_observations": [{
+                "code": 14,
+                "label": "webbridge",
+                "scope": "one_observed_main_view_callsite"
+            }],
+            "native_controls": {
+                "use_buffered_audio": true,
+                "default_retry_interval_ms": timing.default_retry_interval_ms,
+                "pre_record": {
+                    "configured_integer_seconds": self.manual_timing.pre_record_buffer_ms.map(|ms| ms / 1_000),
+                    "effective_seconds": effective_pre_record_seconds,
+                    "capacity_frames": pre_record_capacity_frames,
+                    "capacity_ms_ceil": pre_record_capacity_ms,
+                    "capacity_source": if diagnostic_pre_record_override { "diagnostic_override" } else { "native_page_rounded" }
+                }
+            },
+            "sigx": {
+                "signature_type": 2,
+                "signature_options": 0,
+                "input": {
+                    "sample_rate_hz": sample_rate_hz,
+                    "channels": 1,
+                    "sample_format": "mono_float32"
+                }
+            },
+            "timing": {
+                "config_sample_seconds": sample_seconds,
+                "config_progressive_seconds": progressive_seconds,
+                "effective_initial_signature_seconds": effective_initial_seconds,
+                "initial_signature_target_frames": targets.initial_frames,
+                "maximum_recording_frames": targets.maximum_frames,
+                "initial_signature_target_ms": timing.initial_sample_ms,
+                "maximum_recording_ms": timing.maximum_sample_ms,
+                "minimum_signature_config_ms": self.manual_timing.minimum_signature_ms,
+                "minimum_signature_effective_ms": timing.minimum_signature_ms,
+                "maximum_signature_config_ms": self.manual_timing.maximum_signature_ms,
+                "maximum_signature_effective_ms": self.manual_timing.effective_maximum_signature_length_ms(),
+                "session_timeout_config_ms": self.manual_timing.session_timeout_ms,
+                "session_timeout_effective_ms": timing.session_timeout_ms,
+                "request_timeout_ms": request_timeout_ms
+            }
+        }).to_string())
+    }
+
+    /// Serialize the observed Auto Type 2 controls and the caller-supplied
+    /// foreground/background snapshot for an external UI host. The context is
+    /// deliberately passed by the caller rather than inferred by this crate.
+    /// Config URLs and the installation identifier are omitted.
+    pub fn native_auto_ui_config_json(
+        &self,
+        sample_rate_hz: u32,
+        request_context: NativeTaggingRequestContext,
+        request_timeout_ms: u64,
+    ) -> Result<String, Error> {
+        let timing = self.manual_timing.auto_recognition_timing(
+            sample_rate_hz,
+            NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS,
+            shazam_progressive::NATIVE_TAGGING_TYPE_2_DEFAULT_INTERVAL_MS,
+            request_timeout_ms,
+            None,
+            None,
+        )?;
+        let targets =
+            self.native_frame_targets_for_type(NativeTaggingType::Auto, sample_rate_hz)?;
+        let sample_seconds = self
+            .native_frame_seconds
+            .sample_seconds_bits
+            .map(f64::from_bits)
+            .ok_or_else(|| Error::BadResponse("Config has no usable sampleSeconds".into()))?;
+        let progressive_seconds = self
+            .native_frame_seconds
+            .progressive_seconds_bits
+            .map(f64::from_bits);
+
+        Ok(json!({
+            "schema": "openshazam.auto-ui-config.v1",
+            "event": "session_config",
+            "caller_inputs": {
+                "tagging_type": 2,
+                "request_context": match request_context {
+                    NativeTaggingRequestContext::Foreground => "foreground",
+                    NativeTaggingRequestContext::Background => "background",
+                }
+            },
+            "native_controls": {
+                "use_buffered_audio": false,
+                "default_retry_interval_ms": timing.default_retry_interval_ms,
+                "pre_record_enabled": false
+            },
+            "timing": {
+                "config_sample_seconds": sample_seconds,
+                "config_progressive_seconds": progressive_seconds,
+                "progressive_seconds_applied": false,
+                "initial_signature_target_frames": targets.initial_frames,
+                "maximum_recording_frames": targets.maximum_frames,
+                "initial_signature_target_ms": timing.initial_sample_ms,
+                "maximum_recording_ms": timing.maximum_sample_ms,
+                "minimum_signature_config_ms": self.manual_timing.minimum_signature_ms,
+                "minimum_signature_effective_ms": timing.minimum_signature_ms,
+                "maximum_signature_config_ms": self.manual_timing.maximum_signature_ms,
+                "maximum_signature_effective_ms": self.manual_timing.effective_maximum_signature_length_ms(),
+                "session_timeout_config_ms": self.manual_timing.auto_session_timeout_ms,
+                "session_timeout_effective_ms": timing.session_timeout_ms,
+                "request_timeout_ms": request_timeout_ms
+            }
+        }).to_string())
+    }
+}
+
+fn frames_to_ceil_milliseconds(frames: usize, sample_rate_hz: u32) -> Result<u64, Error> {
+    if sample_rate_hz == 0 {
+        return Err(Error::InvalidRequest(
+            "capture sample rate must be nonzero".into(),
+        ));
+    }
+    let numerator = (frames as u128)
+        .checked_mul(1_000)
+        .and_then(|value| value.checked_add(u128::from(sample_rate_hz) - 1))
+        .ok_or_else(|| Error::InvalidRequest("capture duration overflow".into()))?;
+    u64::try_from(numerator / u128::from(sample_rate_hz))
+        .map_err(|_| Error::InvalidRequest("capture duration is too large".into()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +1149,11 @@ pub enum Error {
     InvalidEndpoint(String),
     InvalidRequest(String),
     Transport(String),
+    /// The HTTPS client started, but the recognition request completed with a
+    /// network-level failure (for example DNS/TLS/timeout). Native routes
+    /// these through a matcher result with no tag dictionary, which can carry
+    /// its implicit Retry-to-maximum directive.
+    NetworkFailure(String),
     BadResponse(String),
     NoMatches,
 }
@@ -176,6 +1183,7 @@ impl std::fmt::Display for Error {
             | Self::InvalidEndpoint(message)
             | Self::InvalidRequest(message)
             | Self::Transport(message)
+            | Self::NetworkFailure(message)
             | Self::BadResponse(message) => f.write_str(message),
             Self::NoMatches => f.write_str("response contained no usable track candidates"),
         }
@@ -252,7 +1260,8 @@ fn percent_encode_query_component(value: &str) -> String {
 }
 
 /// Parse the Config response without retaining any unrelated user/config data.
-/// The root INID and `apis.tag.href` are the only extracted values.
+/// The root INID, manual route, optional Auto foreground/background routes,
+/// and Native timing blocks are extracted.
 pub fn parse_shazam_config(body: &[u8]) -> Result<ShazamConfiguration, Error> {
     let root: Value = serde_json::from_slice(body)
         .map_err(|_| Error::BadResponse("Config response is not valid JSON".into()))?;
@@ -273,51 +1282,98 @@ pub fn parse_shazam_config(body: &[u8]) -> Result<ShazamConfiguration, Error> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| Error::BadResponse("Config response has no `apis.tag.href` value".into()))?;
     validate_shazam_tag_template(tag_url_template)?;
+    let continuous_foreground_url_template = root
+        .get("apis")
+        .and_then(|apis| apis.get("autotag"))
+        .and_then(|autotag| autotag.get("foregroundhref"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let continuous_background_url_template = root
+        .get("apis")
+        .and_then(|apis| apis.get("autotag"))
+        .and_then(|autotag| autotag.get("backgroundhref"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    // This optional UI value has no bearing on the recognition route and must
+    // never make an otherwise valid recognition Config unusable.
+    let web_track_url_template = root
+        .get("settings")
+        .and_then(|settings| settings.get("webtrackurl"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_WEB_TRACK_URL_TEMPLATE_BYTES)
+        .map(str::to_owned);
     Ok(ShazamConfiguration {
         tag_url_template: tag_url_template.to_owned(),
+        web_track_url_template,
+        continuous_foreground_url_template,
+        continuous_background_url_template,
         installation_id: installation_id.to_owned(),
         manual_timing: parse_manual_tagging_timing(&root),
+        native_frame_seconds: parse_native_frame_seconds(&root),
     })
 }
 
-fn parse_manual_tagging_timing(root: &Value) -> ManualTaggingTiming {
-    ManualTaggingTiming {
-        sample_ms: unique_config_number(root, "sampleseconds").and_then(seconds_to_ms),
-        progressive_ms: unique_config_number(root, "progressiveseconds").and_then(seconds_to_ms),
-        minimum_sample_ms: unique_config_number(root, "minsamplems").and_then(number_to_ms),
-        maximum_sample_ms: unique_config_number(root, "maxsamplems").and_then(number_to_ms),
+fn parse_native_frame_seconds(root: &Value) -> NativeFrameSeconds {
+    let tag_block = root.get("apis").and_then(|apis| apis.get("tag"));
+    NativeFrameSeconds {
+        sample_seconds_bits: config_number(tag_block, "sampleseconds").map(f64::to_bits),
+        progressive_seconds_bits: config_number(tag_block, "progressiveseconds").map(f64::to_bits),
     }
 }
 
-fn unique_config_number(root: &Value, key: &str) -> Option<f64> {
-    fn collect(value: &Value, key: &str, found: &mut Vec<f64>) {
-        match value {
-            Value::Object(object) => {
-                for (name, child) in object {
-                    if name.eq_ignore_ascii_case(key) {
-                        if let Some(number) = child.as_f64().filter(|number| number.is_finite()) {
-                            found.push(number);
-                        }
-                    }
-                    collect(child, key, found);
-                }
-            }
-            Value::Array(items) => {
-                for child in items {
-                    collect(child, key, found);
-                }
-            }
-            _ => {}
-        }
+fn native_frames_from_seconds(sample_rate: u32, seconds: f64) -> Result<usize, Error> {
+    if sample_rate == 0 || !seconds.is_finite() || seconds < 0.0 {
+        return Err(Error::BadResponse(
+            "Config Native sample duration or sample rate is invalid".into(),
+        ));
     }
+    let frames = f64::from(sample_rate) * seconds;
+    if !frames.is_finite() || frames >= usize::MAX as f64 {
+        return Err(Error::BadResponse(
+            "Config Native sample duration exceeds addressable PCM".into(),
+        ));
+    }
+    Ok(frames as usize)
+}
 
-    let mut values = Vec::new();
-    collect(root, key, &mut values);
-    let first = *values.first()?;
-    values
+fn parse_manual_tagging_timing(root: &Value) -> ManualTaggingTiming {
+    // SHNTaggingConfiguration's sample/min/max getters read its `tagBlock`,
+    // which resolves config.apis.tag. Both Manual Type 1 and Auto Type 2
+    // timeoutSeconds getters resolve config.apis.autotag's
+    // continuousForegroundIdleTimeout. `settings.recording.maxTagSeconds` is
+    // selected by the separate Type 7 getter branch, not these Progressive
+    // modes; Type 7's caller/purpose is not established here.
+    // Avoid recursive key search: the same field names can occur in unrelated
+    // route/config blocks.
+    let tag_block = root.get("apis").and_then(|apis| apis.get("tag"));
+    let recording_block = root
+        .get("settings")
+        .and_then(|settings| settings.get("recording"));
+    let auto_tag_block = root.get("apis").and_then(|apis| apis.get("autotag"));
+    ManualTaggingTiming {
+        sample_ms: config_number(tag_block, "sampleseconds").and_then(seconds_to_ms),
+        progressive_ms: config_number(tag_block, "progressiveseconds").and_then(seconds_to_ms),
+        pre_record_buffer_ms: config_number(recording_block, "silentrecordingseconds")
+            .and_then(native_integer_seconds_to_ms),
+        minimum_signature_ms: config_number(tag_block, "minsamplems").and_then(number_to_ms),
+        maximum_signature_ms: config_number(tag_block, "maxsamplems").and_then(number_to_ms),
+        session_timeout_ms: config_number(auto_tag_block, "continuousforegroundidletimeout")
+            .and_then(timeout_seconds_to_ms),
+        auto_session_timeout_ms: config_number(auto_tag_block, "continuousforegroundidletimeout")
+            .and_then(timeout_seconds_to_ms),
+    }
+}
+
+fn config_number(block: Option<&Value>, key: &str) -> Option<f64> {
+    block?
+        .as_object()?
         .iter()
-        .all(|value| (*value - first).abs() <= f64::EPSILON)
-        .then_some(first)
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))?
+        .1
+        .as_f64()
+        .filter(|number| number.is_finite())
 }
 
 fn seconds_to_ms(seconds: f64) -> Option<u64> {
@@ -328,6 +1384,43 @@ fn seconds_to_ms(seconds: f64) -> Option<u64> {
     (millis.is_finite() && millis <= u64::MAX as f64).then_some(millis.round() as u64)
 }
 
+/// `SHNTaggingConfiguration.silentRecordingSeconds` uses NSNumber.integerValue
+/// before constructing `SHREAudioRecorderConfiguration`; unlike the tagging
+/// thresholds, fractional seconds are truncated rather than rounded.
+fn native_integer_seconds_to_ms(seconds: f64) -> Option<u64> {
+    if !(0.0..=600.0).contains(&seconds) {
+        return None;
+    }
+    Some((seconds.trunc() as u64) * 1_000)
+}
+
+/// Project Native `intervalDuration` onto the controller's millisecond clock.
+/// Shazam multiplies seconds by 1e9, truncates to signed nanoseconds, then
+/// passes that duration to `dispatch_after`. Ceiling here prevents a restart
+/// earlier than the Native delay when the controller can observe only ms.
+fn native_interval_seconds_to_controller_ms(seconds: f64) -> Option<u64> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let nanoseconds = (seconds * 1_000_000_000.0) as i64;
+    u64::try_from(nanoseconds)
+        .ok()
+        .map(|ns| ns.div_ceil(1_000_000))
+}
+
+/// Session deadlines are not audio-recording durations. The Native getters
+/// return the configured `NSNumber` for `maxTagSeconds` and
+/// `continuousForegroundIdleTimeout` without the 600-second bound used for
+/// sample-length fields; keep any finite, nonnegative value representable in
+/// the controller's millisecond clock instead of silently falling back.
+fn timeout_seconds_to_ms(seconds: f64) -> Option<u64> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let millis = (seconds * 1_000.0).round();
+    (millis.is_finite() && millis >= 0.0 && millis < u64::MAX as f64).then_some(millis as u64)
+}
+
 fn number_to_ms(millis: f64) -> Option<u64> {
     if !(0.0..=600_000.0).contains(&millis) {
         return None;
@@ -335,63 +1428,213 @@ fn number_to_ms(millis: f64) -> Option<u64> {
     (millis.is_finite() && millis <= u64::MAX as f64).then_some(millis.round() as u64)
 }
 
-/// Decode the Mac 2.11 response fields confirmed in the ARM64 request parser.
-/// `retryms` is a cumulative sample target in milliseconds; otherwise
-/// `sampleseconds` is the target and `intervalseconds` is the wait. The
-/// similarly named `retryInMilliseconds` is not present in this binary and is
-/// deliberately ignored. Unknown/invalid layouts leave retry choice to the
-/// caller's bounded local fallback.
+/// Decode explicit retry fields handled by the Mac 2.11 ARM64 response parser.
+/// Without request context, this function cannot model Native's implicit
+/// retry-to-maximum branch; production Progressive paths should call
+/// `retry_directive_for_signature_from_response`.
 pub fn retry_directive_from_response(body: &[u8]) -> Result<Option<RetryDirective>, Error> {
     let root: Value = serde_json::from_slice(body)
         .map_err(|_| Error::BadResponse("recognition response is not valid JSON".into()))?;
+    Ok(explicit_retry_directive(&root))
+}
+
+/// Decode a response Retry using the same precedence as Mac 2.11. For a
+/// present tag-response dictionary, explicit `retryms` or
+/// `sampleseconds`/`intervalseconds` fields win regardless of current length.
+/// The implicit zero-interval Retry to `maximum_signature_length_ms` applies
+/// only when no tag-response dictionary is available and the current
+/// Signature is shorter.
+pub fn retry_directive_for_signature_from_response(
+    body: &[u8],
+    current_signature_length_ms: u64,
+    maximum_signature_length_ms: u64,
+) -> Result<Option<RetryDirective>, Error> {
+    let root: Value = serde_json::from_slice(body)
+        .map_err(|_| Error::BadResponse("recognition response is not valid JSON".into()))?;
+    if let Some(retry) = explicit_retry_ms(&root) {
+        return Ok(Some(retry));
+    }
+    if root.is_object() {
+        return Ok(explicit_interval_retry(&root));
+    }
+    Ok(native_retry_to_maximum_if_signature_is_shorter(
+        current_signature_length_ms,
+        maximum_signature_length_ms,
+    ))
+}
+
+/// Native `SHKNetworkMatcher.retryRequestFromTagResponse:matcherRequest:`
+/// (ShazamTagging 2.11.0, 0x6200) constructs this Retry when a matcher
+/// completion has no usable tag-response dictionary, including a failed
+/// request, provided the submitted Signature is shorter than the request
+/// maximum. The failure callback then applies it through the bridge when the
+/// app delegate allows retry.
+pub fn native_retry_to_maximum_if_signature_is_shorter(
+    current_signature_length_ms: u64,
+    maximum_signature_length_ms: u64,
+) -> Option<RetryDirective> {
+    (current_signature_length_ms < maximum_signature_length_ms).then_some(RetryDirective {
+        retry_duration_ms: Some(maximum_signature_length_ms),
+        interval_ms: Some(0),
+        retry_duration_seconds_bits: None,
+        interval_seconds_bits: None,
+    })
+}
+
+/// Reproduce the Native no-tag-response failure path for a request that was
+/// actually started. Cancellation and local setup failures do not reach this
+/// matcher callback and therefore must not synthesize a Retry.
+pub fn native_retry_for_network_failure(
+    error: &Error,
+    current_signature_length_ms: u64,
+    maximum_signature_length_ms: u64,
+    cancelled: bool,
+) -> Option<RetryDirective> {
+    if cancelled || !matches!(error, Error::NetworkFailure(_)) {
+        return None;
+    }
+    native_retry_to_maximum_if_signature_is_shorter(
+        current_signature_length_ms,
+        maximum_signature_length_ms,
+    )
+}
+
+/// Apply the observed network-failure Retry policy for the active Native
+/// tagging type. Ordinary Manual Type 1 synthesizes a Retry to the configured
+/// maximum for a dispatched short Signature; Auto Type 2 keeps its enclosing
+/// context alive without forwarding a synthetic Retry to the SignaturePipe.
+pub fn native_retry_for_network_failure_for_tagging_type(
+    tagging_type: NativeTaggingType,
+    error: &Error,
+    current_signature_length_ms: u64,
+    maximum_signature_length_ms: u64,
+    cancelled: bool,
+) -> Option<RetryDirective> {
+    if tagging_type != NativeTaggingType::Manual {
+        return None;
+    }
+    native_retry_for_network_failure(
+        error,
+        current_signature_length_ms,
+        maximum_signature_length_ms,
+        cancelled,
+    )
+}
+
+fn explicit_retry_directive(root: &Value) -> Option<RetryDirective> {
+    explicit_retry_ms(root).or_else(|| explicit_interval_retry(root))
+}
+
+fn explicit_retry_ms(root: &Value) -> Option<RetryDirective> {
     if let Some(retry_ms) = root
         .get("retryms")
         .and_then(Value::as_f64)
-        .filter(|value| value.is_finite())
-        .and_then(number_to_ms)
+        .filter(|value| value.is_finite() && *value >= 0.0)
     {
-        return Ok(Some(RetryDirective {
-            delay_ms: Some(0),
-            target_sample_ms: Some(retry_ms),
-        }));
+        return Some(RetryDirective {
+            retry_duration_ms: retry_milliseconds_for_display(retry_ms),
+            interval_ms: Some(0),
+            // ShazamFoundation converts `retryms` by dividing the original
+            // NSNumber Double by 1000.0; the SignatureGenerator later
+            // multiplies those seconds by sampleRate and truncates frames.
+            retry_duration_seconds_bits: Some((retry_ms / 1_000.0).to_bits()),
+            interval_seconds_bits: Some(0.0_f64.to_bits()),
+        });
     }
+    None
+}
 
-    let sample_ms = root
+fn retry_milliseconds_for_display(milliseconds: f64) -> Option<u64> {
+    let rounded = milliseconds.round();
+    (rounded.is_finite() && rounded >= 0.0 && rounded < u64::MAX as f64).then_some(rounded as u64)
+}
+
+fn explicit_interval_retry(root: &Value) -> Option<RetryDirective> {
+    root.get("intervalseconds")?;
+
+    let sample_seconds = root
         .get("sampleseconds")
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite())
-        .and_then(seconds_to_ms);
-    let interval_ms = root
+        .filter(|value| (0.0..=600.0).contains(value));
+    let sample_ms = sample_seconds.and_then(seconds_to_ms).unwrap_or(0);
+    let interval_seconds = root
         .get("intervalseconds")
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite())
-        .and_then(seconds_to_ms);
+        .unwrap_or(0.0);
+    let interval_ms = native_interval_seconds_to_controller_ms(interval_seconds).unwrap_or(0);
 
-    Ok(
-        (sample_ms.is_some() || interval_ms.is_some()).then_some(RetryDirective {
-            delay_ms: interval_ms,
-            target_sample_ms: sample_ms,
-        }),
-    )
+    Some(RetryDirective {
+        retry_duration_ms: Some(sample_ms),
+        interval_ms: Some(interval_ms),
+        retry_duration_seconds_bits: sample_seconds.map(f64::to_bits),
+        interval_seconds_bits: Some(interval_seconds.to_bits()),
+    })
 }
 
 /// Convert the response status/body into the minimal state transition used by
 /// the progressive controller. Unknown retry fields do not force sampling or
 /// waiting; callers fall back to their bounded local policy.
 pub fn interpret_progressive_http_response(status: u16, body: &[u8]) -> ProgressiveHttpResponse {
+    interpret_progressive_http_response_for_signature(status, body, None, None)
+}
+
+/// Context-aware Progressive response classifier used by live attempts. The
+/// Signature/max pair is omitted only by tests exercising body-only parsing.
+/// Static ShazamTagging ARM64 evidence: `SHKTaggingNetworkRequest`
+/// `parseNetworkResponse:error:completion:` at `0x17a04` routes only HTTP
+/// 200–299 through `SHKTag` dictionary parsing; other statuses use
+/// `networkRequestFailedWithResponse:error:completion:`. The failure path
+/// supplies no tag-response dictionary, so `SHKNetworkMatcher` at `0x6200`
+/// may synthesize a zero-interval Retry to the request maximum when the
+/// submitted Signature is shorter. A non-2xx body’s `retryms` is therefore
+/// not interpreted as a tag Retry.
+pub fn interpret_progressive_http_response_for_signature(
+    status: u16,
+    body: &[u8],
+    current_signature_length_ms: Option<u64>,
+    maximum_signature_length_ms: Option<u64>,
+) -> ProgressiveHttpResponse {
+    let retry_for_response = || {
+        match (current_signature_length_ms, maximum_signature_length_ms) {
+            (Some(current), Some(maximum)) => {
+                retry_directive_for_signature_from_response(body, current, maximum)
+            }
+            _ => retry_directive_from_response(body),
+        }
+        .ok()
+        .flatten()
+    };
     if !(200..300).contains(&status) {
-        return ProgressiveHttpResponse::HttpError(status);
+        let retry = current_signature_length_ms
+            .zip(maximum_signature_length_ms)
+            .and_then(|(current, maximum)| {
+                native_retry_to_maximum_if_signature_is_shorter(current, maximum)
+            });
+        return ProgressiveHttpResponse::HttpError { status, retry };
     }
 
     match parse_track_candidates(body) {
-        Ok(candidates) if !candidates.is_empty() => ProgressiveHttpResponse::Matched(candidates),
-        Ok(_) | Err(Error::NoMatches) => {
-            ProgressiveHttpResponse::NoMatch(retry_directive_from_response(body).ok().flatten())
-        }
-        Err(_) => match retry_directive_from_response(body).ok().flatten() {
-            Some(retry) => ProgressiveHttpResponse::NoMatch(Some(retry)),
-            None => ProgressiveHttpResponse::InvalidResponse,
+        Ok(candidates) if !candidates.is_empty() => ProgressiveHttpResponse::Matched {
+            candidates,
+            retry: retry_for_response(),
         },
+        Ok(_) | Err(Error::NoMatches) => ProgressiveHttpResponse::NoMatch(retry_for_response()),
+        Err(_) if serde_json::from_slice::<Value>(body).is_ok_and(|value| value.is_object()) => {
+            // A valid JSON dictionary with an unfamiliar/no-track shape is a
+            // parsed tag response, not the Native nil-tag-response error
+            // path. Keep only its explicit retry fields.
+            ProgressiveHttpResponse::NoMatch(retry_for_response())
+        }
+        Err(_) => {
+            let retry = current_signature_length_ms
+                .zip(maximum_signature_length_ms)
+                .and_then(|(current, maximum)| {
+                    native_retry_to_maximum_if_signature_is_shorter(current, maximum)
+                });
+            ProgressiveHttpResponse::ParseFailure { retry }
+        }
     }
 }
 
@@ -422,6 +1665,34 @@ pub fn resolve_shazam_tag_url(
     Ok(endpoint)
 }
 
+/// Resolve a Config-provided endpoint used by Native continuous matching.
+/// Only the first-party AMP host is accepted. The Native URL getter replaces
+/// the INID, while the request builder may also replace tag ID and streaming-provider tokens when present.
+pub fn resolve_shazam_continuous_tag_url(
+    template: &str,
+    installation_id: &str,
+    tag_id: &str,
+    streaming_provider: &str,
+) -> Result<String, Error> {
+    validate_continuous_tag_template(template)?;
+    for (name, value) in [("INID", installation_id), ("tag ID", tag_id)] {
+        if value.is_empty() || !value.bytes().all(is_url_unreserved) {
+            return Err(Error::InvalidEndpoint(format!(
+                "Config {name} is not a safe URL path token"
+            )));
+        }
+    }
+    if !streaming_provider.bytes().all(is_url_unreserved) {
+        return Err(Error::InvalidEndpoint(
+            "streaming provider is not a safe URL query token".into(),
+        ));
+    }
+    let endpoint =
+        substitute_endpoint_tokens(template, tag_id, streaming_provider, installation_id);
+    validate_continuous_shazam_endpoint(&endpoint)?;
+    Ok(endpoint)
+}
+
 fn validate_shazam_tag_template(template: &str) -> Result<(), Error> {
     if template.matches("{inid}").count() != 1
         || template.matches("{tagid}").count() != 1
@@ -441,6 +1712,27 @@ fn validate_shazam_tag_template(template: &str) -> Result<(), Error> {
         ));
     }
     validate_shazam_endpoint(&sanitized)
+}
+
+fn validate_continuous_tag_template(template: &str) -> Result<(), Error> {
+    if template.matches("{inid}").count() != 1
+        || template.matches("{tagid}").count() > 1
+        || template.matches("{streamingprovider}").count() > 1
+    {
+        return Err(Error::InvalidEndpoint(
+            "Config Auto continuous template has missing or duplicate placeholders".into(),
+        ));
+    }
+    let sanitized = template
+        .replace("{inid}", "installation-id")
+        .replace("{tagid}", "tag-id")
+        .replace("{streamingprovider}", "");
+    if sanitized.contains(['{', '}']) {
+        return Err(Error::InvalidEndpoint(
+            "Config Auto continuous template contains an unknown placeholder".into(),
+        ));
+    }
+    validate_continuous_shazam_endpoint(&sanitized)
 }
 
 /// Construct the statically observed Mac tagging body shape.
@@ -511,11 +1803,14 @@ pub fn post_loopback_json(endpoint: &str, body: &[u8]) -> Result<HttpResponse, E
     parse_http_response(&response)
 }
 
-/// POST to the observed Mac manual-tagging route over verified HTTPS.
+/// POST to an observed Config-provided Mac recognition route over verified
+/// HTTPS. Manual routes use strict template validation; Auto continuous
+/// routes are restricted to `amp.shazam.com` and safe URL characters.
 ///
-/// This intentionally allows only the Shazam `amp.shazam.com` manual-tag
-/// route and its observed query keys. It sends no cookies or AMP token, does
-/// not use a proxy or follow redirects, and requires a locally installed curl.
+/// This allows only the Shazam `amp.shazam.com` host. Manual routes use the
+/// observed path/query allowlist; Auto routes use a separate URL-safety check.
+/// It sends no cookies or AMP token, does not use a proxy or follow redirects,
+/// and requires a locally installed curl.
 /// Call only when you are authorized to use this first-party endpoint.
 pub fn post_shazam_json(endpoint: &str, body: &[u8]) -> Result<HttpResponse, Error> {
     post_shazam_json_with_timeout(endpoint, body, Duration::from_secs(20))
@@ -529,14 +1824,118 @@ pub fn post_shazam_json_with_timeout(
     body: &[u8],
     timeout: Duration,
 ) -> Result<HttpResponse, Error> {
+    post_shazam_json_with_timeout_cancellable(endpoint, body, timeout, &AtomicBool::new(false))
+}
+
+/// Cancellable variant used by streaming capture adapters. The curl process
+/// is terminated when `cancelled` becomes true; stdout is drained separately
+/// and capped so the child cannot block on a full pipe or grow memory without
+/// bound.
+pub fn post_shazam_json_with_timeout_cancellable(
+    endpoint: &str,
+    body: &[u8],
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<HttpResponse, Error> {
+    post_shazam_json_with_timeout_cancellable_and_dispatch(
+        endpoint,
+        body,
+        timeout,
+        cancelled,
+        || {},
+    )
+}
+
+/// Cancellable HTTPS POST with a callback after the local HTTPS client
+/// process is spawned. This marks transport handoff, not remote receipt.
+pub fn post_shazam_json_with_timeout_cancellable_and_dispatch<F>(
+    endpoint: &str,
+    body: &[u8],
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<HttpResponse, Error>
+where
+    F: FnOnce(),
+{
+    post_shazam_json_with_transport(
+        &CurlRecognitionTransport,
+        endpoint,
+        body,
+        timeout,
+        cancelled,
+        on_transport_started,
+    )
+}
+
+/// Send a validated recognition POST through an explicitly selected
+/// transport. The callback indicates local transport startup, not remote
+/// receipt. Current production paths use [`CurlRecognitionTransport`].
+pub fn post_shazam_json_with_transport<T, F>(
+    transport: &T,
+    endpoint: &str,
+    body: &[u8],
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<HttpResponse, Error>
+where
+    T: RecognitionHttpTransport + ?Sized,
+    F: FnOnce(),
+{
     if timeout.is_zero() || timeout > Duration::from_secs(600) {
         return Err(Error::BadResponse(
             "HTTPS timeout must be greater than zero and at most 600 seconds".into(),
         ));
     }
-    validate_shazam_endpoint(endpoint)?;
+    validate_shazam_request_endpoint(endpoint)?;
 
-    let mut child = Command::new(system_curl_program())
+    let mut callback = Some(on_transport_started);
+    transport.post_json_cancellable(endpoint, body, timeout, cancelled, &mut || {
+        if let Some(callback) = callback.take() {
+            callback();
+        }
+    })
+}
+
+impl RecognitionHttpTransport for CurlRecognitionTransport {
+    fn post_json_cancellable(
+        &self,
+        endpoint: &str,
+        body: &[u8],
+        timeout: Duration,
+        cancelled: &AtomicBool,
+        on_transport_started: &mut dyn FnMut(),
+    ) -> Result<HttpResponse, Error> {
+        curl_post_shazam_json_with_timeout_cancellable_and_dispatch(
+            endpoint,
+            body,
+            timeout,
+            cancelled,
+            on_transport_started,
+        )
+    }
+}
+
+fn curl_post_shazam_json_with_timeout_cancellable_and_dispatch<F>(
+    endpoint: &str,
+    body: &[u8],
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<HttpResponse, Error>
+where
+    F: FnOnce(),
+{
+    if timeout.is_zero() || timeout > Duration::from_secs(600) {
+        return Err(Error::BadResponse(
+            "HTTPS timeout must be greater than zero and at most 600 seconds".into(),
+        ));
+    }
+    validate_shazam_request_endpoint(endpoint)?;
+
+    let mut command = Command::new(system_curl_program());
+    command
         .args([
             "--disable",
             "--noproxy",
@@ -567,9 +1966,18 @@ pub fn post_shazam_json_with_timeout(
         .arg(endpoint)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| Error::Transport("could not start the system HTTPS client".into()))?;
+        .stderr(Stdio::null());
+    let mut child = spawn_http_client_with_dispatch(&mut command, on_transport_started)?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Transport("HTTPS client stdout was unavailable".into()))?;
+    let output_limit = MAX_RESPONSE_BYTES + CURL_STATUS_MARKER.len() + 8;
+    let reader = thread::Builder::new()
+        .name("openshazam-http-response-reader".into())
+        .spawn(move || read_bounded_response(stdout, output_limit))
+        .map_err(|_| Error::Transport("could not start the HTTPS response reader".into()))?;
 
     let mut stdin = child
         .stdin
@@ -579,37 +1987,46 @@ pub fn post_shazam_json_with_timeout(
         drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
+        let _ = reader.join();
         return Err(Error::Transport(
             "could not write the JSON request body".into(),
         ));
     }
     drop(stdin);
 
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::Transport("HTTPS client stdout was unavailable".into()))?;
-    let output_limit = MAX_RESPONSE_BYTES + CURL_STATUS_MARKER.len() + 8;
-    let mut combined = Vec::new();
-    stdout
-        .by_ref()
-        .take(output_limit as u64 + 1)
-        .read_to_end(&mut combined)
+    let status = loop {
+        if cancelled.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err(Error::Transport("HTTPS request was cancelled".into()));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(Error::Transport(
+                    "could not wait for the HTTPS client".into(),
+                ));
+            }
+        }
+    };
+    let (combined, exceeded_limit) = reader
+        .join()
+        .map_err(|_| Error::Transport("HTTPS response reader stopped unexpectedly".into()))?
         .map_err(|_| Error::Transport("could not read the HTTPS response".into()))?;
-    if combined.len() > output_limit {
-        let _ = child.kill();
-        let _ = child.wait();
+    if exceeded_limit {
         return Err(Error::BadResponse(
             "HTTPS response exceeded the local size limit".into(),
         ));
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|_| Error::Transport("could not wait for the HTTPS client".into()))?;
-    if !output.status.success() {
-        return Err(Error::Transport(format!(
+    if !status.success() {
+        return Err(Error::NetworkFailure(format!(
             "HTTPS request failed (curl exit {})",
-            output.status.code().unwrap_or(-1)
+            status.code().unwrap_or(-1)
         )));
     }
 
@@ -635,6 +2052,37 @@ pub fn post_shazam_json_with_timeout(
     })
 }
 
+fn spawn_http_client_with_dispatch<F>(
+    command: &mut Command,
+    on_transport_started: F,
+) -> Result<std::process::Child, Error>
+where
+    F: FnOnce(),
+{
+    let child = command
+        .spawn()
+        .map_err(|_| Error::Transport("could not start the system HTTPS client".into()))?;
+    on_transport_started();
+    Ok(child)
+}
+
+fn read_bounded_response<R: Read>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut stored = Vec::with_capacity(limit.min(64 * 1024));
+    let mut exceeded_limit = false;
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(stored.len());
+        let kept = remaining.min(count);
+        stored.extend_from_slice(&buffer[..kept]);
+        exceeded_limit |= kept != count;
+    }
+    Ok((stored, exceeded_limit))
+}
+
 #[cfg(windows)]
 fn system_curl_program() -> &'static str {
     "curl.exe"
@@ -647,8 +2095,10 @@ fn system_curl_program() -> &'static str {
 
 /// Fetch the current Shazam Config using an ordinary verified HTTPS GET.
 /// Redirects, cookies, proxies, AMP credentials, and Shazam app storage are
-/// not used. The response is parsed in memory and only `inid` plus
-/// `apis.tag.href` are retained for the current process.
+/// not used. The response is parsed in memory and only `inid`, the Manual
+/// `apis.tag.href`, optional Auto `apis.autotag.foregroundhref` and
+/// `backgroundhref`, and relevant timing fields are retained for the current
+/// process.
 pub fn fetch_shazam_config(profile: &ConfigRequestProfile) -> Result<ShazamConfiguration, Error> {
     let url = build_config_url(profile)?;
     let app_version_header = format!("X-Shazam-AppVersion: {}", profile.app_version);
@@ -774,6 +2224,372 @@ pub fn recognize_signature_for_windows(
     Ok((response.status, candidates))
 }
 
+/// Submit one ProgressiveSession Signature through a previously resolved
+/// manual-tag Config route. The caller supplies the host's IANA timezone and
+/// owns capture/session timing; this helper only builds and performs one
+/// authorized request, returning parsed control fields and candidates.
+pub fn submit_progressive_signature(
+    configuration: &ShazamConfiguration,
+    signature: &[u8],
+    sample_ms: u64,
+    timezone: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<ProgressiveRecognitionResult, Error> {
+    submit_progressive_signature_with_timestamp_ms(
+        configuration,
+        signature,
+        sample_ms,
+        None,
+        timezone,
+        timeout,
+        cancelled,
+    )
+}
+
+/// Progressive submission with the Native Signature/session date supplied by
+/// the controller. `None` preserves the previous current-time fallback for
+/// callers without an audio-origin timestamp.
+pub fn submit_progressive_signature_with_timestamp_ms(
+    configuration: &ShazamConfiguration,
+    signature: &[u8],
+    sample_ms: u64,
+    native_timestamp_ms: Option<u64>,
+    timezone: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<ProgressiveRecognitionResult, Error> {
+    submit_progressive_signature_with_transport_started_and_timestamp_ms(
+        configuration,
+        signature,
+        sample_ms,
+        native_timestamp_ms,
+        timezone,
+        timeout,
+        cancelled,
+        || {},
+    )
+}
+
+/// Progressive submission variant that notifies after the local HTTPS client
+/// process has been spawned. This lets the stopped-generator Manual Retry path
+/// preserve Native's synchronous request-dispatch-before-stop ordering.
+pub fn submit_progressive_signature_with_transport_started<F>(
+    configuration: &ShazamConfiguration,
+    signature: &[u8],
+    sample_ms: u64,
+    timezone: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<ProgressiveRecognitionResult, Error>
+where
+    F: FnOnce(),
+{
+    submit_progressive_signature_with_transport_started_and_timestamp_ms(
+        configuration,
+        signature,
+        sample_ms,
+        None,
+        timezone,
+        timeout,
+        cancelled,
+        on_transport_started,
+    )
+}
+
+/// Progressive submission variant that preserves both Native's request
+/// dispatch ordering and the Signature/session timestamp selected by the
+/// caller.
+#[allow(clippy::too_many_arguments)]
+pub fn submit_progressive_signature_with_transport_started_and_timestamp_ms<F>(
+    configuration: &ShazamConfiguration,
+    signature: &[u8],
+    sample_ms: u64,
+    native_timestamp_ms: Option<u64>,
+    timezone: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<ProgressiveRecognitionResult, Error>
+where
+    F: FnOnce(),
+{
+    submit_progressive_signature_for_tagging_type_with_transport_started_and_timestamp_ms(
+        configuration,
+        NativeTaggingType::Manual,
+        None,
+        signature,
+        sample_ms,
+        native_timestamp_ms,
+        timezone,
+        timeout,
+        cancelled,
+        on_transport_started,
+    )
+}
+
+/// Submit a Progressive Signature using the Native endpoint selected by its
+/// TaggingType. Manual may use the paired Manual route overrides; Auto
+/// requires an explicit foreground/background request context. The callback
+/// indicates only that the local HTTPS client process started.
+#[allow(clippy::too_many_arguments)]
+pub fn submit_progressive_signature_for_tagging_type_with_transport_started_and_timestamp_ms<F>(
+    configuration: &ShazamConfiguration,
+    tagging_type: NativeTaggingType,
+    request_context: Option<NativeTaggingRequestContext>,
+    signature: &[u8],
+    sample_ms: u64,
+    native_timestamp_ms: Option<u64>,
+    timezone: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<ProgressiveRecognitionResult, Error>
+where
+    F: FnOnce(),
+{
+    submit_progressive_signature_for_tagging_type_with_transport(
+        &CurlRecognitionTransport,
+        configuration,
+        tagging_type,
+        request_context,
+        signature,
+        sample_ms,
+        native_timestamp_ms,
+        timezone,
+        timeout,
+        cancelled,
+        on_transport_started,
+    )
+}
+
+/// Same Progressive recognition request path with an injectable verified
+/// HTTPS transport. Request construction, endpoint allowlisting, and response
+/// interpretation stay shared with the default curl path.
+#[allow(clippy::too_many_arguments)]
+pub fn submit_progressive_signature_for_tagging_type_with_transport<T, F>(
+    transport: &T,
+    configuration: &ShazamConfiguration,
+    tagging_type: NativeTaggingType,
+    request_context: Option<NativeTaggingRequestContext>,
+    signature: &[u8],
+    sample_ms: u64,
+    native_timestamp_ms: Option<u64>,
+    timezone: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<ProgressiveRecognitionResult, Error>
+where
+    T: RecognitionHttpTransport + ?Sized,
+    F: FnOnce(),
+{
+    let tag_id = random_uuid_v4()?;
+    let streaming_provider = std::env::var("SHAZAM_STREAMING_PROVIDER").unwrap_or_default();
+    let endpoint = match tagging_type {
+        NativeTaggingType::Manual => match (
+            std::env::var("SHAZAM_TAG_URL_TEMPLATE"),
+            std::env::var("SHAZAM_INID"),
+        ) {
+            (Ok(template), Ok(installation_id)) => {
+                resolve_shazam_tag_url(&template, &installation_id, &tag_id, &streaming_provider)?
+            }
+            (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
+                configuration.resolve_tag_url_for_type(
+                    tagging_type,
+                    request_context,
+                    &tag_id,
+                    &streaming_provider,
+                )?
+            }
+            _ => {
+                return Err(Error::InvalidRequest(
+                    "manual recognition route overrides must be paired".into(),
+                ));
+            }
+        },
+        NativeTaggingType::Auto => {
+            if std::env::var_os("SHAZAM_TAG_URL_TEMPLATE").is_some()
+                || std::env::var_os("SHAZAM_INID").is_some()
+            {
+                return Err(Error::InvalidRequest(
+                    "manual route overrides cannot select an Auto endpoint".into(),
+                ));
+            }
+            configuration.resolve_tag_url_for_type(
+                tagging_type,
+                request_context,
+                &tag_id,
+                &streaming_provider,
+            )?
+        }
+    };
+    let timestamp_ms = progressive_request_timestamp_ms(native_timestamp_ms)?;
+    let body = build_request_body(
+        signature,
+        sample_ms,
+        timestamp_ms,
+        timezone,
+        json!({}),
+        json!({}),
+        None,
+    )?;
+    let response = post_shazam_json_with_transport(
+        transport,
+        &endpoint,
+        &body,
+        timeout,
+        cancelled,
+        on_transport_started,
+    )?;
+    Ok(ProgressiveRecognitionResult {
+        status: response.status,
+        response: interpret_progressive_http_response_for_signature(
+            response.status,
+            &response.body,
+            Some(sample_ms),
+            Some(
+                configuration
+                    .manual_timing()
+                    .effective_maximum_signature_length_ms(),
+            ),
+        ),
+    })
+}
+
+/// Submit one cumulative ProgressiveSession Signature using a Config fetched
+/// once for the Windows run. This follows the Mac-observed retry response
+/// fields while keeping the request timeout and cancellation local to the
+/// adapter. Only parsed candidates/retry metadata leave this function.
+#[cfg(windows)]
+pub fn submit_progressive_signature_for_windows(
+    configuration: &ShazamConfiguration,
+    signature: &[u8],
+    sample_ms: u64,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<ProgressiveRecognitionResult, Error> {
+    submit_progressive_signature_for_windows_with_timestamp_ms(
+        configuration,
+        signature,
+        sample_ms,
+        None,
+        timeout,
+        cancelled,
+    )
+}
+
+#[cfg(windows)]
+pub fn submit_progressive_signature_for_windows_with_timestamp_ms(
+    configuration: &ShazamConfiguration,
+    signature: &[u8],
+    sample_ms: u64,
+    native_timestamp_ms: Option<u64>,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<ProgressiveRecognitionResult, Error> {
+    submit_progressive_signature_for_windows_with_transport_started_and_timestamp_ms(
+        configuration,
+        signature,
+        sample_ms,
+        native_timestamp_ms,
+        timeout,
+        cancelled,
+        || {},
+    )
+}
+
+#[cfg(windows)]
+pub fn submit_progressive_signature_for_windows_with_transport_started<F>(
+    configuration: &ShazamConfiguration,
+    signature: &[u8],
+    sample_ms: u64,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<ProgressiveRecognitionResult, Error>
+where
+    F: FnOnce(),
+{
+    submit_progressive_signature_for_windows_with_transport_started_and_timestamp_ms(
+        configuration,
+        signature,
+        sample_ms,
+        None,
+        timeout,
+        cancelled,
+        on_transport_started,
+    )
+}
+
+#[cfg(windows)]
+pub fn submit_progressive_signature_for_windows_with_transport_started_and_timestamp_ms<F>(
+    configuration: &ShazamConfiguration,
+    signature: &[u8],
+    sample_ms: u64,
+    native_timestamp_ms: Option<u64>,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<ProgressiveRecognitionResult, Error>
+where
+    F: FnOnce(),
+{
+    submit_progressive_signature_for_windows_tagging_type_with_transport_started_and_timestamp_ms(
+        configuration,
+        NativeTaggingType::Manual,
+        None,
+        signature,
+        sample_ms,
+        native_timestamp_ms,
+        timeout,
+        cancelled,
+        on_transport_started,
+    )
+}
+
+/// Windows adapter for the type-aware progressive submit path. It derives
+/// the host timezone using the same precedence as the legacy Manual helper,
+/// then delegates route selection and request construction to the shared
+/// cross-platform implementation.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub fn submit_progressive_signature_for_windows_tagging_type_with_transport_started_and_timestamp_ms<
+    F,
+>(
+    configuration: &ShazamConfiguration,
+    tagging_type: NativeTaggingType,
+    request_context: Option<NativeTaggingRequestContext>,
+    signature: &[u8],
+    sample_ms: u64,
+    native_timestamp_ms: Option<u64>,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<ProgressiveRecognitionResult, Error>
+where
+    F: FnOnce(),
+{
+    let timezone = std::env::var("TZ")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| iana_time_zone::get_timezone().ok())
+        .unwrap_or_else(|| "UTC".into());
+    submit_progressive_signature_for_tagging_type_with_transport_started_and_timestamp_ms(
+        configuration,
+        tagging_type,
+        request_context,
+        signature,
+        sample_ms,
+        native_timestamp_ms,
+        &timezone,
+        timeout,
+        cancelled,
+        on_transport_started,
+    )
+}
+
 /// Read locale, OS, and device fields used by the existing Windows Config
 /// route. The API currently returns the supported MAC/MACOS route, so these
 /// fields describe the host while the established route identifier is kept.
@@ -850,7 +2666,6 @@ fn parse_windows_host_profile(bytes: &[u8]) -> Result<WindowsHostProfile, Error>
     })
 }
 
-#[cfg(windows)]
 fn random_uuid_v4() -> Result<String, Error> {
     let mut bytes = [0u8; 16];
     getrandom::getrandom(&mut bytes)
@@ -948,6 +2763,65 @@ fn validate_shazam_endpoint(endpoint: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_shazam_request_endpoint(endpoint: &str) -> Result<(), Error> {
+    validate_shazam_endpoint(endpoint).or_else(|_| validate_continuous_shazam_endpoint(endpoint))
+}
+
+fn validate_continuous_shazam_endpoint(endpoint: &str) -> Result<(), Error> {
+    let rest = endpoint
+        .strip_prefix("https://amp.shazam.com/")
+        .ok_or_else(|| {
+            Error::InvalidEndpoint(
+                "Auto continuous requests require the configured amp.shazam.com HTTPS host".into(),
+            )
+        })?;
+    if rest.is_empty()
+        || rest.contains(['#', '@', '\\', '{', '}'])
+        || rest
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ' || !byte.is_ascii())
+    {
+        return Err(Error::InvalidEndpoint(
+            "Auto continuous endpoint contains unsafe or unresolved characters".into(),
+        ));
+    }
+    let (path, query) = match rest.split_once('?') {
+        Some((path, query)) if !query.is_empty() && !query.contains('?') => (path, Some(query)),
+        Some(_) => {
+            return Err(Error::InvalidEndpoint(
+                "Auto continuous endpoint has a malformed query".into(),
+            ));
+        }
+        None => (rest, None),
+    };
+    if path.is_empty() || path.starts_with('/') || path.ends_with('/') {
+        return Err(Error::InvalidEndpoint(
+            "Auto continuous endpoint has an invalid path".into(),
+        ));
+    }
+    if let Some(query) = query {
+        for pair in query.split('&') {
+            let Some((key, value)) = pair.split_once('=') else {
+                return Err(Error::InvalidEndpoint(
+                    "Auto continuous endpoint has a malformed query parameter".into(),
+                ));
+            };
+            if key.is_empty()
+                || !key.bytes().all(is_url_unreserved)
+                || !value.bytes().all(|byte| {
+                    is_url_unreserved(byte)
+                        || matches!(byte, b'%' | b'+' | b':' | b'/' | b',' | b';')
+                })
+            {
+                return Err(Error::InvalidEndpoint(
+                    "Auto continuous endpoint has unsafe query characters".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn is_url_unreserved(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
@@ -955,14 +2829,26 @@ fn is_url_unreserved(byte: u8) -> bool {
 /// Decode the currently observed response keys into displayable candidates.
 ///
 /// The `matches`, `trackid`, `title`, and `artist` keys exist in the installed
-/// binary. The complete live response envelope has not been captured; this
-/// parser supports the common array/object forms only as a diagnostic.
+/// binary. The complete live response envelope has not been captured. The
+/// fallback `matches` forms are parsed for diagnostics but are not promoted to
+/// Native UI callback inputs because their order relative to
+/// `tags.firstObject` is unverified.
 pub fn parse_track_candidates(response_body: &[u8]) -> Result<Vec<TrackCandidate>, Error> {
     let root: Value = serde_json::from_slice(response_body)
         .map_err(|error| Error::BadResponse(format!("response is not valid JSON: {error}")))?;
 
     if let Some(track) = root.get("track").filter(|value| value.is_object()) {
-        if let Some(candidate) = track_candidate(track) {
+        if let Some(mut candidate) = track_candidate(track, TrackCandidateOrigin::RootTrack) {
+            // SHKTag's root-track path retains the response dictionary. The
+            // Native data bridge then looks up this exact lower-case key on
+            // that dictionary and only creates a child tag for a non-empty
+            // dictionary. Matches-array entries are not promoted to this
+            // role, and matches[1] is never treated as an alternative.
+            candidate.alternative_track = root
+                .get("alternativetrack")
+                .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+                .and_then(|track| track_candidate(track, TrackCandidateOrigin::AlternativeTrack))
+                .map(Box::new);
             return Ok(vec![candidate]);
         }
     }
@@ -986,7 +2872,7 @@ pub fn parse_track_candidates(response_body: &[u8]) -> Result<Vec<TrackCandidate
             .get("track")
             .filter(|value| value.is_object())
             .unwrap_or(entry);
-        if let Some(candidate) = track_candidate(track) {
+        if let Some(candidate) = track_candidate(track, TrackCandidateOrigin::MatchesEntry) {
             candidates.push(candidate);
         }
     }
@@ -996,20 +2882,102 @@ pub fn parse_track_candidates(response_body: &[u8]) -> Result<Vec<TrackCandidate
     Ok(candidates)
 }
 
-fn track_candidate(track: &Value) -> Option<TrackCandidate> {
+fn track_candidate(track: &Value, origin: TrackCandidateOrigin) -> Option<TrackCandidate> {
+    let images = track.get("images").and_then(Value::as_object);
+    let artwork_url = images
+        .and_then(|images| images.get("coverart"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let hq_artwork_url = images
+        .and_then(|images| images.get("coverarthq"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let background_image_url = images
+        .and_then(|images| images.get("background"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| artwork_url.clone());
+    let ui_metadata = NativeTrackUiMetadata {
+        track_key: track
+            .get("key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                track
+                    .get("trackKey")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+            })
+            .map(str::to_owned),
+        album_adam_id: track
+            .get("albumadamid")
+            .or_else(|| track.get("albumAdamId"))
+            .and_then(|value| match value {
+                Value::String(value) => Some(value.clone()),
+                Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            }),
+        isrc: track.get("isrc").and_then(Value::as_str).map(str::to_owned),
+        date: track.get("date").and_then(Value::as_str).map(str::to_owned),
+        artwork_url,
+        hq_artwork_url,
+        background_image_url,
+    };
+    let has_ui_metadata = ui_metadata.track_key.is_some()
+        || ui_metadata.album_adam_id.is_some()
+        || ui_metadata.isrc.is_some()
+        || ui_metadata.date.is_some()
+        || ui_metadata.artwork_url.is_some()
+        || ui_metadata.hq_artwork_url.is_some()
+        || ui_metadata.background_image_url.is_some();
+    let ui_metadata = has_ui_metadata.then_some(ui_metadata);
+
+    // Native's manual root-track bridge derives the visible value from
+    // SHALTrack.subtitle -> TagResult.artist -> TagResult.artists. The V5 track
+    // converter carries wire `subtitle` into that artist representation. A
+    // scalar wire `artist` fallback is not present in the inspected path, so a
+    // root result without subtitle is withheld instead of fabricating a value.
+    let artist = match origin {
+        TrackCandidateOrigin::RootTrack => track.get("subtitle").and_then(Value::as_str),
+        _ => track
+            .get("artist")
+            .and_then(Value::as_str)
+            .or_else(|| track.get("subtitle").and_then(Value::as_str)),
+    }?;
+
     Some(TrackCandidate {
         track_id: track
             .get("trackid")
             .or_else(|| track.get("key"))
+            .or_else(|| track.get("trackKey"))
             .and_then(Value::as_str)
             .map(str::to_owned),
         title: track.get("title")?.as_str()?.to_owned(),
-        artist: track
-            .get("artist")
-            .or_else(|| track.get("subtitle"))?
-            .as_str()?
-            .to_owned(),
+        artist: artist.to_owned(),
+        ui_metadata,
+        alternative_track: None,
+        origin,
     })
+}
+
+fn track_candidate_json(candidate: &TrackCandidate) -> Value {
+    let mut value = json!({
+        "track_id": candidate.track_id.as_deref(),
+        "title": candidate.title.as_str(),
+        "artist": candidate.artist.as_str(),
+    });
+    if let Some(metadata) = &candidate.ui_metadata {
+        value["native_track_values"] = json!({
+            "track_key": metadata.track_key.as_deref(),
+            "album_adam_id": metadata.album_adam_id.as_deref(),
+            "isrc": metadata.isrc.as_deref(),
+            "date": metadata.date.as_deref(),
+            "artwork_url": metadata.artwork_url.as_deref(),
+            "hq_artwork_url": metadata.hq_artwork_url.as_deref(),
+            "background_image_url": metadata.background_image_url.as_deref(),
+        });
+    }
+    value
 }
 
 /// Summarize JSON response structure without exposing any response values.
@@ -1169,6 +3137,11 @@ mod tests {
         thread,
     };
 
+    use shazam_progressive::{
+        NativeTaggingType, ProgressiveSession, NATIVE_NETWORK_REQUEST_TIMEOUT_MS,
+        NATIVE_TAGGING_TYPE_1_DEFAULT_INTERVAL_MS, NATIVE_TAGGING_TYPE_2_DEFAULT_INTERVAL_MS,
+    };
+
     use super::*;
 
     fn valid_signature() -> Vec<u8> {
@@ -1180,6 +3153,21 @@ mod tests {
             sections: Vec::new(),
         })
         .expect("empty legacy signature is valid")
+    }
+
+    #[test]
+    fn transport_dispatch_callback_runs_only_after_child_process_spawn() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--list")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut dispatched = false;
+        let mut child =
+            spawn_http_client_with_dispatch(&mut command, || dispatched = true).unwrap();
+
+        assert!(dispatched);
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]
@@ -1206,6 +3194,26 @@ mod tests {
     }
 
     #[test]
+    fn progressive_request_uses_signature_timestamp_before_legacy_now_fallback() {
+        let source_timestamp_ms = 1_800_000_000_123;
+        assert_eq!(
+            progressive_request_timestamp_ms(Some(source_timestamp_ms)).unwrap(),
+            source_timestamp_ms
+        );
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let fallback = progressive_request_timestamp_ms(None).unwrap();
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!((before..=after).contains(&fallback));
+    }
+
+    #[test]
     fn response_parser_reads_mock_matches_without_claiming_live_schema() {
         let candidates = parse_track_candidates(
             br#"{"matches":[{"trackid":"mock-1","title":"Mock Song","artist":"Test Artist"}]}"#,
@@ -1217,8 +3225,571 @@ mod tests {
                 track_id: Some("mock-1".into()),
                 title: "Mock Song".into(),
                 artist: "Test Artist".into(),
+                ui_metadata: None,
+                alternative_track: None,
+                origin: TrackCandidateOrigin::MatchesEntry,
             }]
         );
+        assert!(native_manual_result_event(candidates, None).is_none());
+    }
+
+    #[test]
+    fn native_manual_result_event_distinguishes_complete_result_from_final_callback() {
+        let alternative = TrackCandidate {
+            track_id: Some("alternative-1".into()),
+            title: "Alternative Song".into(),
+            artist: "Alternative Artist".into(),
+            ui_metadata: None,
+            alternative_track: None,
+            origin: TrackCandidateOrigin::AlternativeTrack,
+        };
+        let candidate = TrackCandidate {
+            track_id: Some("mock-1".into()),
+            title: "Mock Song".into(),
+            artist: "Test Artist".into(),
+            ui_metadata: None,
+            alternative_track: Some(Box::new(alternative.clone())),
+            origin: TrackCandidateOrigin::RootTrack,
+        };
+
+        let later_match = TrackCandidate {
+            track_id: Some("second-match".into()),
+            title: "Not a Native callback track".into(),
+            artist: "Not a Native callback artist".into(),
+            ui_metadata: None,
+            alternative_track: None,
+            origin: TrackCandidateOrigin::MatchesEntry,
+        };
+        let early = native_manual_result_event(
+            vec![candidate.clone(), later_match],
+            Some(RetryDirective {
+                retry_duration_ms: Some(6_000),
+                interval_ms: Some(2_000),
+                retry_duration_seconds_bits: None,
+                interval_seconds_bits: None,
+            }),
+        )
+        .unwrap();
+        let mut expected_primary = candidate.clone();
+        expected_primary.alternative_track = None;
+        assert_eq!(
+            early.stage,
+            NativeManualResultStage::WillFetchCompleteResult
+        );
+        assert_eq!(early.primary_track, expected_primary);
+        assert_eq!(early.alternative_track.as_deref(), Some(&alternative));
+
+        for retry in [
+            None,
+            Some(RetryDirective {
+                retry_duration_ms: Some(0),
+                interval_ms: Some(2_000),
+                retry_duration_seconds_bits: None,
+                interval_seconds_bits: None,
+            }),
+        ] {
+            let final_event = native_manual_result_event(vec![candidate.clone()], retry).unwrap();
+            assert_eq!(final_event.stage, NativeManualResultStage::TaggingDidFinish);
+            assert_eq!(final_event.primary_track, expected_primary);
+            assert_eq!(final_event.alternative_track.as_deref(), Some(&alternative));
+        }
+
+        let submillisecond_retry = native_manual_result_event(
+            vec![candidate.clone()],
+            Some(RetryDirective {
+                retry_duration_ms: Some(0),
+                interval_ms: Some(0),
+                retry_duration_seconds_bits: Some(0.0001_f64.to_bits()),
+                interval_seconds_bits: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            submillisecond_retry.stage,
+            NativeManualResultStage::WillFetchCompleteResult,
+            "Native callback phase depends on the original positive Double, not rounded milliseconds"
+        );
+
+        assert!(native_manual_result_event(Vec::new(), None).is_none());
+    }
+
+    #[test]
+    fn auto_match_exposes_native_continuous_candidate_not_manual_callback() {
+        let timing = RecognitionTiming {
+            sample_rate: 16_000,
+            minimum_signature_ms: 2_000,
+            initial_sample_ms: 3_000,
+            maximum_sample_ms: 6_000,
+            default_retry_interval_ms: 12_000,
+            maximum_retry_duration_ms: Some(6_000),
+            session_timeout_ms: None,
+            request_timeout_ms: 5_000,
+            maximum_retry_delay_ms: None,
+            maximum_attempts: None,
+        };
+        let mut session =
+            ProgressiveSession::new_for_type(timing, NativeTaggingType::Auto).unwrap();
+        session.push_i16_at(&vec![0; 48_000], 3_000).unwrap();
+        let job = session.poll(3_000).unwrap().unwrap();
+        let delivery = apply_progressive_response(
+            &mut session,
+            job.attempt,
+            RecognitionOutcome::Match {
+                retry: Some(RetryDirective {
+                    retry_duration_ms: Some(6_000),
+                    interval_ms: Some(2_000),
+                    retry_duration_seconds_bits: None,
+                    interval_seconds_bits: None,
+                }),
+            },
+            vec![TrackCandidate {
+                track_id: Some("auto-track".into()),
+                title: "Auto Song".into(),
+                artist: "Auto Artist".into(),
+                ui_metadata: None,
+                alternative_track: None,
+                origin: TrackCandidateOrigin::RootTrack,
+            }],
+            3_100,
+        )
+        .unwrap();
+
+        assert!(delivery.delivered_to_matcher);
+        assert!(delivery.native_manual_ui_event().is_none());
+        let auto_event = delivery
+            .native_auto_ui_event()
+            .expect("Auto Type 2 match exposes the continuous callback candidate");
+        let auto_json: Value =
+            serde_json::from_str(&native_auto_ui_event_to_json(&auto_event)).unwrap();
+        assert_eq!(auto_json["schema"], "openshazam.auto-ui-event.v1");
+        assert_eq!(auto_json["event"], "continuous_match_candidate");
+        assert_eq!(auto_json["tagging_type"], 2);
+        assert_eq!(
+            auto_json["native_callback_candidate"],
+            "continuousTaggingDidFinishWithTrack:alternativeTrack:context:"
+        );
+        assert_eq!(auto_json["native_duplicate_filter_applied"], false);
+        assert_eq!(auto_json["primary_track"]["title"], "Auto Song");
+        assert_eq!(auto_json["primary_track"]["artist"], "Auto Artist");
+        assert!(auto_json.get("context").is_none());
+        assert!(auto_json.get("session_id").is_none());
+    }
+
+    #[test]
+    fn auto_continuous_candidate_requires_native_root_track_shape() {
+        let fallback = TrackCandidate {
+            track_id: Some("fallback-track".into()),
+            title: "Unverified fallback".into(),
+            artist: "Unverified artist".into(),
+            ui_metadata: None,
+            alternative_track: None,
+            origin: TrackCandidateOrigin::MatchesEntry,
+        };
+        assert!(native_auto_result_event(vec![fallback]).is_none());
+    }
+
+    #[test]
+    fn native_manual_ui_events_have_stable_jsonl_records_without_native_only_values() {
+        let result = NativeManualResultEvent {
+            stage: NativeManualResultStage::WillFetchCompleteResult,
+            primary_track: TrackCandidate {
+                track_id: Some("fixture-track".into()),
+                title: "Fixture Song".into(),
+                artist: "Fixture Artist".into(),
+                ui_metadata: None,
+                alternative_track: None,
+                origin: TrackCandidateOrigin::RootTrack,
+            },
+            alternative_track: Some(Box::new(TrackCandidate {
+                track_id: Some("alternative-track".into()),
+                title: "Alternative Song".into(),
+                artist: "Alternative Artist".into(),
+                ui_metadata: None,
+                alternative_track: None,
+                origin: TrackCandidateOrigin::AlternativeTrack,
+            })),
+        };
+        let early_event = NativeManualUiEvent::Result(result.clone());
+        let early_json: Value =
+            serde_json::from_str(&native_manual_ui_event_to_json(&early_event)).unwrap();
+        assert_eq!(early_json["schema"], "openshazam.manual-ui-event.v2");
+        assert_eq!(early_json["event"], "result");
+        assert_eq!(early_json["stage"], "will_fetch_complete_result");
+        assert_eq!(early_json["native_main_view_action"], "no_update");
+        assert!(early_json["native_main_view_inputs"].is_null());
+        assert_eq!(early_json["primary_track"]["track_id"], "fixture-track");
+        assert_eq!(
+            early_json["alternative_track"]["track_id"],
+            "alternative-track"
+        );
+        assert!(early_json.get("candidates").is_none());
+        assert_eq!(early_json.as_object().unwrap().len(), 7);
+
+        let mut final_result = result;
+        final_result.stage = NativeManualResultStage::TaggingDidFinish;
+        let final_event = NativeManualUiEvent::Result(final_result);
+        let final_json: Value =
+            serde_json::from_str(&native_manual_ui_event_to_json(&final_event)).unwrap();
+        assert_eq!(final_json["stage"], "tagging_did_finish");
+        assert_eq!(final_json["native_main_view_action"], "display_primary");
+        assert_eq!(
+            final_json["native_main_view_inputs"]["title"],
+            "Fixture Song"
+        );
+        assert_eq!(
+            final_json["native_main_view_inputs"]["subtitle"],
+            "Fixture Artist"
+        );
+        assert!(final_json["native_main_view_inputs"]["artwork_url"].is_null());
+
+        let no_match: Value = serde_json::from_str(&native_manual_ui_event_to_json(
+            &NativeManualUiEvent::NoMatch,
+        ))
+        .unwrap();
+        assert_eq!(no_match["schema"], "openshazam.manual-ui-event.v2");
+        assert_eq!(no_match["event"], "no_match");
+        assert_eq!(no_match.as_object().unwrap().len(), 2);
+
+        let error: Value = serde_json::from_str(&native_manual_ui_event_to_json(
+            &NativeManualUiEvent::Error {
+                kind: NativeManualErrorKind::TransportFailure,
+            },
+        ))
+        .unwrap();
+        assert_eq!(error["schema"], "openshazam.manual-ui-event.v2");
+        assert_eq!(error["event"], "error");
+        assert_eq!(error["error_kind"], "transport_failure");
+        assert_eq!(error.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn native_session_timeout_event_is_typed_and_contains_no_native_identifiers() {
+        let manual: Value = serde_json::from_str(&native_session_timeout_event_to_json(
+            NativeTaggingType::Manual,
+        ))
+        .unwrap();
+        assert_eq!(manual["schema"], "openshazam.progressive-session-event.v1");
+        assert_eq!(manual["event"], "session_timeout");
+        assert_eq!(manual["tagging_type"], 1);
+        assert!(manual.get("inid").is_none());
+        assert!(manual.get("context_id").is_none());
+        assert!(manual.get("session_id").is_none());
+
+        let auto: Value = serde_json::from_str(&native_session_timeout_event_to_json(
+            NativeTaggingType::Auto,
+        ))
+        .unwrap();
+        assert_eq!(auto["tagging_type"], 2);
+    }
+
+    #[test]
+    fn applied_manual_response_exposes_only_context_delivered_ui_events() {
+        let make_session = || {
+            ProgressiveSession::new_for_type(
+                RecognitionTiming {
+                    sample_rate: 16_000,
+                    minimum_signature_ms: 2_000,
+                    initial_sample_ms: 3_000,
+                    maximum_sample_ms: 6_000,
+                    default_retry_interval_ms: NATIVE_TAGGING_TYPE_1_DEFAULT_INTERVAL_MS,
+                    maximum_retry_duration_ms: Some(6_000),
+                    session_timeout_ms: None,
+                    request_timeout_ms: 5_000,
+                    maximum_retry_delay_ms: None,
+                    maximum_attempts: None,
+                },
+                NativeTaggingType::Manual,
+            )
+            .unwrap()
+        };
+        let samples: Vec<i16> = (0..48_000)
+            .map(|index| ((index * 73 % 30_001) - 15_000) as i16)
+            .collect();
+        let parse_match = |body: &[u8]| match interpret_progressive_http_response(200, body) {
+            ProgressiveHttpResponse::Matched { candidates, retry } => {
+                (RecognitionOutcome::Match { retry }, candidates)
+            }
+            other => panic!("expected a parsed mock match, got {other:?}"),
+        };
+        let early_response = parse_match(
+            br#"{"track":{"key":"mock-track","title":"Mock Song","subtitle":"Test Artist","artist":"Unverified Alias","images":{"coverart":"https://example.test/cover.jpg","coverarthq":"https://example.test/cover-hq.jpg","background":"https://example.test/background.jpg"}},"alternativetrack":{"key":"alternative-track","title":"Alternative Song","subtitle":"Alternative Artist"},"matches":[{"key":"ignored-match","title":"Not the root callback","subtitle":"Ignored Artist"}],"sampleseconds":6,"intervalseconds":0}"#,
+        );
+        let alternative = TrackCandidate {
+            track_id: Some("alternative-track".into()),
+            title: "Alternative Song".into(),
+            artist: "Alternative Artist".into(),
+            ui_metadata: Some(NativeTrackUiMetadata {
+                track_key: Some("alternative-track".into()),
+                album_adam_id: None,
+                isrc: None,
+                date: None,
+                artwork_url: None,
+                hq_artwork_url: None,
+                background_image_url: None,
+            }),
+            alternative_track: None,
+            origin: TrackCandidateOrigin::AlternativeTrack,
+        };
+        let candidate = TrackCandidate {
+            track_id: Some("mock-track".into()),
+            title: "Mock Song".into(),
+            artist: "Test Artist".into(),
+            ui_metadata: Some(NativeTrackUiMetadata {
+                track_key: Some("mock-track".into()),
+                album_adam_id: None,
+                isrc: None,
+                date: None,
+                artwork_url: Some("https://example.test/cover.jpg".into()),
+                hq_artwork_url: Some("https://example.test/cover-hq.jpg".into()),
+                background_image_url: Some("https://example.test/background.jpg".into()),
+            }),
+            alternative_track: Some(Box::new(alternative.clone())),
+            origin: TrackCandidateOrigin::RootTrack,
+        };
+        assert_eq!(early_response.1, [candidate.clone()]);
+
+        let mut early_session = make_session();
+        early_session.push_i16_at(&samples, 3_000).unwrap();
+        let first = early_session.poll(3_000).unwrap().unwrap();
+        let early = apply_progressive_response(
+            &mut early_session,
+            first.attempt,
+            early_response.0,
+            early_response.1,
+            3_200,
+        )
+        .unwrap();
+        assert!(early.delivered_to_matcher);
+        assert_eq!(early.candidates, [candidate.clone()]);
+        assert_eq!(
+            early.native_manual_ui_event(),
+            Some(NativeManualUiEvent::Result(
+                early.manual_result_event.clone().unwrap()
+            ))
+        );
+        assert_eq!(
+            early.manual_result_event.as_ref().unwrap().stage,
+            NativeManualResultStage::WillFetchCompleteResult
+        );
+        let early_json: Value = serde_json::from_str(&native_manual_ui_event_to_json(
+            &early.native_manual_ui_event().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(early_json["stage"], "will_fetch_complete_result");
+        assert_eq!(early_json["native_main_view_action"], "no_update");
+        assert!(early_json["native_main_view_inputs"].is_null());
+        assert_eq!(early_json["primary_track"]["title"], "Mock Song");
+        assert_eq!(early_json["primary_track"]["artist"], "Test Artist");
+        assert_eq!(
+            early_json["primary_track"]["native_track_values"]["artwork_url"],
+            "https://example.test/cover.jpg"
+        );
+        assert_eq!(
+            early_json["alternative_track"]["track_id"],
+            "alternative-track"
+        );
+        assert!(early_json.get("candidates").is_none());
+
+        let mut final_session = make_session();
+        final_session.push_i16_at(&samples, 3_000).unwrap();
+        let first = final_session.poll(3_000).unwrap().unwrap();
+        let final_response = parse_match(
+            br#"{"track":{"key":"mock-track","title":"Mock Song","subtitle":"Test Artist","artist":"Unverified Alias","images":{"coverart":"https://example.test/cover.jpg","coverarthq":"https://example.test/cover-hq.jpg","background":"https://example.test/background.jpg"}},"alternativetrack":{"key":"alternative-track","title":"Alternative Song","subtitle":"Alternative Artist"}}"#,
+        );
+        assert_eq!(final_response.1, [candidate.clone()]);
+        let final_result = apply_progressive_response(
+            &mut final_session,
+            first.attempt,
+            final_response.0,
+            final_response.1,
+            3_200,
+        )
+        .unwrap();
+        assert!(final_result.delivered_to_matcher);
+        assert_eq!(
+            final_result.native_manual_ui_event(),
+            Some(NativeManualUiEvent::Result(
+                final_result.manual_result_event.clone().unwrap()
+            ))
+        );
+        assert_eq!(
+            final_result.manual_result_event.as_ref().unwrap().stage,
+            NativeManualResultStage::TaggingDidFinish
+        );
+        let final_json: Value = serde_json::from_str(&native_manual_ui_event_to_json(
+            &final_result.native_manual_ui_event().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(final_json["stage"], "tagging_did_finish");
+        assert_eq!(final_json["native_main_view_action"], "display_primary");
+        assert_eq!(final_json["native_main_view_inputs"]["title"], "Mock Song");
+        assert_eq!(
+            final_json["native_main_view_inputs"]["subtitle"],
+            "Test Artist"
+        );
+        assert_eq!(
+            final_json["native_main_view_inputs"]["artwork_url"],
+            "https://example.test/cover.jpg"
+        );
+        assert_eq!(final_json["primary_track"]["title"], "Mock Song");
+        assert_eq!(final_json["primary_track"]["artist"], "Test Artist");
+        assert_eq!(
+            final_json["alternative_track"]["track_id"],
+            "alternative-track"
+        );
+
+        let mut cancelled_session = make_session();
+        cancelled_session.push_i16_at(&samples, 3_000).unwrap();
+        let first = cancelled_session.poll(3_000).unwrap().unwrap();
+        cancelled_session.cancel();
+        let cancelled_response = parse_match(
+            br#"{"track":{"key":"mock-track","title":"Mock Song","subtitle":"Test Artist"}}"#,
+        );
+        let suppressed = apply_progressive_response(
+            &mut cancelled_session,
+            first.attempt,
+            cancelled_response.0,
+            cancelled_response.1,
+            3_200,
+        )
+        .unwrap();
+        assert!(!suppressed.delivered_to_matcher);
+        assert!(suppressed.candidates.is_empty());
+        assert!(suppressed.manual_result_event.is_none());
+        assert!(suppressed.manual_terminal_event.is_none());
+        assert!(suppressed.native_manual_ui_event().is_none());
+    }
+
+    #[test]
+    fn applied_manual_no_match_and_terminal_failures_emit_native_callback_events() {
+        let make_session = |tagging_type| {
+            ProgressiveSession::new_for_type(
+                RecognitionTiming {
+                    sample_rate: 16_000,
+                    minimum_signature_ms: 2_000,
+                    initial_sample_ms: 3_000,
+                    maximum_sample_ms: 6_000,
+                    default_retry_interval_ms: NATIVE_TAGGING_TYPE_1_DEFAULT_INTERVAL_MS,
+                    maximum_retry_duration_ms: Some(6_000),
+                    session_timeout_ms: None,
+                    request_timeout_ms: 5_000,
+                    maximum_retry_delay_ms: None,
+                    maximum_attempts: None,
+                },
+                tagging_type,
+            )
+            .unwrap()
+        };
+        let samples: Vec<i16> = (0..48_000)
+            .map(|index| ((index * 73 % 30_001) - 15_000) as i16)
+            .collect();
+        let cases = [
+            (
+                RecognitionOutcome::NoMatch { retry: None },
+                NativeManualTerminalEvent::NoMatch,
+            ),
+            (
+                RecognitionOutcome::MatcherFailure { retry: None },
+                NativeManualTerminalEvent::Error {
+                    kind: NativeManualErrorKind::MatcherFailure,
+                },
+            ),
+            (
+                RecognitionOutcome::InvalidResponse,
+                NativeManualTerminalEvent::Error {
+                    kind: NativeManualErrorKind::InvalidResponse,
+                },
+            ),
+            (
+                RecognitionOutcome::TransportFailure,
+                NativeManualTerminalEvent::Error {
+                    kind: NativeManualErrorKind::TransportFailure,
+                },
+            ),
+        ];
+
+        for (outcome, expected_event) in cases {
+            let mut session = make_session(NativeTaggingType::Manual);
+            session.push_i16_at(&samples, 3_000).unwrap();
+            let job = session.poll(3_000).unwrap().unwrap();
+            let delivery =
+                apply_progressive_response(&mut session, job.attempt, outcome, Vec::new(), 3_200)
+                    .unwrap();
+
+            assert!(delivery.delivered_to_matcher);
+            assert_eq!(delivery.manual_terminal_event, Some(expected_event));
+            let expected_ui_event = match expected_event {
+                NativeManualTerminalEvent::NoMatch => NativeManualUiEvent::NoMatch,
+                NativeManualTerminalEvent::Error { kind } => NativeManualUiEvent::Error { kind },
+            };
+            assert_eq!(delivery.native_manual_ui_event(), Some(expected_ui_event));
+        }
+
+        let mut retrying_no_match_session = make_session(NativeTaggingType::Manual);
+        retrying_no_match_session
+            .push_i16_at(&samples, 3_000)
+            .unwrap();
+        let job = retrying_no_match_session.poll(3_000).unwrap().unwrap();
+        let retrying_no_match = apply_progressive_response(
+            &mut retrying_no_match_session,
+            job.attempt,
+            RecognitionOutcome::NoMatch {
+                retry: Some(RetryDirective {
+                    retry_duration_ms: Some(6_000),
+                    interval_ms: Some(0),
+                    retry_duration_seconds_bits: None,
+                    interval_seconds_bits: None,
+                }),
+            },
+            Vec::new(),
+            3_200,
+        )
+        .unwrap();
+        assert!(retrying_no_match.delivered_to_matcher);
+        assert!(retrying_no_match.manual_terminal_event.is_none());
+        assert!(retrying_no_match.native_manual_ui_event().is_none());
+        assert_eq!(
+            retrying_no_match.status,
+            SessionStatus::WaitingForRetry {
+                not_before_ms: 3_200,
+                target_sample_ms: 6_000,
+            }
+        );
+
+        let mut retrying_session = make_session(NativeTaggingType::Manual);
+        retrying_session.push_i16_at(&samples, 3_000).unwrap();
+        let job = retrying_session.poll(3_000).unwrap().unwrap();
+        let retrying_failure = apply_progressive_response(
+            &mut retrying_session,
+            job.attempt,
+            RecognitionOutcome::MatcherFailure {
+                retry: Some(RetryDirective {
+                    retry_duration_ms: Some(6_000),
+                    interval_ms: Some(0),
+                    retry_duration_seconds_bits: None,
+                    interval_seconds_bits: None,
+                }),
+            },
+            Vec::new(),
+            3_200,
+        )
+        .unwrap();
+        assert!(retrying_failure.manual_terminal_event.is_none());
+        assert!(retrying_failure.native_manual_ui_event().is_none());
+
+        let mut auto_session = make_session(NativeTaggingType::Auto);
+        auto_session.push_i16_at(&samples, 3_000).unwrap();
+        let job = auto_session.poll(3_000).unwrap().unwrap();
+        let auto_no_match = apply_progressive_response(
+            &mut auto_session,
+            job.attempt,
+            RecognitionOutcome::NoMatch { retry: None },
+            Vec::new(),
+            3_200,
+        )
+        .unwrap();
+        assert!(auto_no_match.manual_terminal_event.is_none());
+        assert!(auto_no_match.native_manual_ui_event().is_none());
     }
 
     #[test]
@@ -1230,6 +3801,244 @@ mod tests {
         assert_eq!(candidates[0].track_id.as_deref(), Some("mock-key"));
         assert_eq!(candidates[0].title, "Mock Song");
         assert_eq!(candidates[0].artist, "Test Artist");
+    }
+
+    #[test]
+    fn native_track_key_prefers_valid_string_fields_without_id_fallbacks() {
+        let cases = [
+            (r#"{"key":"key-only"}"#, Some("key-only")),
+            (r#"{"trackKey":"camel-only"}"#, Some("camel-only")),
+            (
+                r#"{"key":"preferred","trackKey":"secondary"}"#,
+                Some("preferred"),
+            ),
+            (r#"{"key":null,"trackKey":"camel"}"#, Some("camel")),
+            (r#"{"key":42,"trackKey":"camel"}"#, Some("camel")),
+            (r#"{"key":"","trackKey":"camel"}"#, Some("camel")),
+            (r#"{"trackid":"wire-id"}"#, None),
+            (r#"{"trackId":123}"#, None),
+        ];
+        for (fields, expected) in cases {
+            let body = format!(
+                r#"{{"track":{{"title":"Song","subtitle":"Artist",{}}}}}"#,
+                &fields[1..fields.len() - 1]
+            );
+            let candidates = parse_track_candidates(body.as_bytes()).unwrap();
+            let metadata = candidates[0].ui_metadata.as_ref();
+            assert_eq!(
+                metadata.and_then(|metadata| metadata.track_key.as_deref()),
+                expected
+            );
+        }
+
+        let matches_only = parse_track_candidates(
+            br#"{"matches":[{"track":{"trackid":"match-id","title":"Song","subtitle":"Artist"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(matches_only[0].ui_metadata, None);
+        assert_eq!(matches_only[0].track_id.as_deref(), Some("match-id"));
+    }
+
+    #[test]
+    fn web_track_config_is_optional_bounded_and_independent_of_tag_route() {
+        let base = json!({
+            "inid":"private-installation-id",
+            "apis":{"tag":{"href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected=&sharehub=false&hidelb=true"}},
+        });
+        let parse = |web: Option<Value>| {
+            let mut root = base.clone();
+            if let Some(web) = web {
+                root["settings"] = json!({"webtrackurl": web});
+            }
+            parse_shazam_config(root.to_string().as_bytes()).unwrap()
+        };
+        assert_eq!(parse(None).web_track_url_template(), None);
+        let mut settings_without_web_template = base.clone();
+        settings_without_web_template["settings"] = json!({});
+        assert_eq!(
+            parse_shazam_config(settings_without_web_template.to_string().as_bytes())
+                .unwrap()
+                .web_track_url_template(),
+            None
+        );
+        for invalid in [json!(null), json!(""), json!(7), json!([]), json!({})] {
+            assert_eq!(parse(Some(invalid)).web_track_url_template(), None);
+        }
+        assert_eq!(
+            parse(Some(json!("https://web.invalid/track/{trackid}"))).web_track_url_template(),
+            Some("https://web.invalid/track/{trackid}")
+        );
+        assert_eq!(
+            parse(Some(
+                json!("x".repeat(MAX_WEB_TRACK_URL_TEMPLATE_BYTES + 1))
+            ))
+            .web_track_url_template(),
+            None
+        );
+        let config = parse(Some(json!("https://web.invalid/track/{trackid}")));
+        assert!(config
+            .tag_url_template()
+            .starts_with("https://amp.shazam.com/"));
+        let snapshot = config.ui_config_snapshot(17);
+        assert_eq!(snapshot.generation, 17);
+        assert_eq!(
+            snapshot.web_track_url_template.as_deref(),
+            config.web_track_url_template()
+        );
+        let serialized: Value = serde_json::from_str(&snapshot.to_json()).unwrap();
+        assert_eq!(serialized["schema"], "openshazam.ui-config-snapshot.v1");
+        assert_eq!(serialized["generation"], 17);
+        assert_eq!(
+            serialized["web_track_url_template"],
+            "https://web.invalid/track/{trackid}"
+        );
+        assert!(snapshot.to_json().contains("web.invalid"));
+        assert!(!snapshot.to_json().contains("private-installation-id"));
+        assert!(!snapshot.to_json().contains("amp.shazam.com"));
+
+        let updated =
+            parse(Some(json!("https://new-web.invalid/song/{trackid}"))).ui_config_snapshot(18);
+        assert_ne!(snapshot.generation, updated.generation);
+        assert_ne!(
+            snapshot.web_track_url_template,
+            updated.web_track_url_template
+        );
+    }
+
+    #[test]
+    fn ui_recognition_input_preserves_result_schema_and_config_generation() {
+        let input = UiRecognitionInput {
+            config_generation: 23,
+            event: UiRecognitionEvent::Manual(NativeManualUiEvent::NoMatch),
+        };
+        let record: Value = serde_json::from_str(&input.to_json()).unwrap();
+        assert_eq!(record["schema"], "openshazam.ui-recognition-input.v1");
+        assert_eq!(record["config_generation"], 23);
+        assert_eq!(
+            record["recognition_event"]["schema"],
+            "openshazam.manual-ui-event.v2"
+        );
+        assert_eq!(record["recognition_event"]["event"], "no_match");
+
+        let candidates =
+            parse_track_candidates(br#"{"track":{"title":"Song","subtitle":"Artist"}}"#).unwrap();
+        let no_key_event =
+            NativeManualUiEvent::Result(native_manual_result_event(candidates, None).unwrap());
+        let missing_web_config = UiConfigSnapshot {
+            generation: 24,
+            web_track_url_template: None,
+        };
+        let result_without_key = UiRecognitionInput {
+            config_generation: missing_web_config.generation,
+            event: UiRecognitionEvent::Manual(no_key_event),
+        };
+        assert!(missing_web_config.web_track_url_template.is_none());
+        assert_eq!(
+            serde_json::from_str::<Value>(&result_without_key.to_json()).unwrap()
+                ["config_generation"],
+            24
+        );
+
+        let alternative = parse_track_candidates(
+            br#"{"track":{"key":"primary-key","title":"Song","subtitle":"Artist"},"alternativetrack":{"trackKey":"alternative-key","title":"Other Song","subtitle":"Other Artist"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            alternative[0]
+                .alternative_track
+                .as_deref()
+                .and_then(|track| track.ui_metadata.as_ref())
+                .and_then(|metadata| metadata.track_key.as_deref()),
+            Some("alternative-key")
+        );
+    }
+
+    #[test]
+    fn native_root_track_uses_subtitle_before_artist_alias() {
+        let candidates = parse_track_candidates(
+            br#"{"track":{"title":"Mock Song","subtitle":"Native Subtitle","artist":"Other Alias"}}"#,
+        )
+        .unwrap();
+        assert_eq!(candidates[0].artist, "Native Subtitle");
+
+        let scalar_artist_only = parse_track_candidates(
+            br#"{"track":{"title":"Mock Song","artist":"Unverified Alias"}}"#,
+        );
+        assert!(scalar_artist_only.is_err());
+
+        let diagnostic_matches = parse_track_candidates(
+            br#"{"matches":[{"title":"Mock Song","subtitle":"Native Subtitle","artist":"Diagnostic Artist"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(diagnostic_matches[0].artist, "Diagnostic Artist");
+    }
+
+    #[test]
+    fn response_parser_preserves_native_track_display_values_when_present() {
+        let candidates = parse_track_candidates(
+            br#"{"track":{"key":"mock-key","title":"Mock Song","subtitle":"Test Artist","albumadamid":12345,"isrc":"USABC2600001","date":"2026-01-02","images":{"coverart":"https://img.test/cover.jpg","coverarthq":"https://img.test/cover-hq.jpg"}}}"#,
+        )
+        .unwrap();
+        let metadata = candidates[0].ui_metadata.as_ref().unwrap();
+        assert_eq!(metadata.track_key.as_deref(), Some("mock-key"));
+        assert_eq!(metadata.album_adam_id.as_deref(), Some("12345"));
+        assert_eq!(metadata.isrc.as_deref(), Some("USABC2600001"));
+        assert_eq!(metadata.date.as_deref(), Some("2026-01-02"));
+        assert_eq!(
+            metadata.artwork_url.as_deref(),
+            Some("https://img.test/cover.jpg")
+        );
+        assert_eq!(
+            metadata.hq_artwork_url.as_deref(),
+            Some("https://img.test/cover-hq.jpg")
+        );
+        assert_eq!(
+            metadata.background_image_url.as_deref(),
+            Some("https://img.test/cover.jpg"),
+            "Native background image falls back to the standard artwork URL"
+        );
+
+        let event =
+            NativeManualUiEvent::Result(native_manual_result_event(candidates, None).unwrap());
+        let event: Value = serde_json::from_str(&native_manual_ui_event_to_json(&event)).unwrap();
+        assert_eq!(
+            event["primary_track"]["native_track_values"]["artwork_url"],
+            "https://img.test/cover.jpg"
+        );
+        assert_eq!(
+            event["primary_track"]["native_track_values"]["track_key"],
+            "mock-key"
+        );
+    }
+
+    #[test]
+    fn response_parser_maps_native_alternative_dictionary_separately_from_matches() {
+        let candidates = parse_track_candidates(
+            br#"{"track":{"key":"primary-key","title":"Primary Song","subtitle":"Primary Artist"},"alternativetrack":{"trackKey":"alternative-key","title":"Alternative Song","artist":"Alternative Artist"}}"#,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].track_id.as_deref(), Some("primary-key"));
+        let alternative = candidates[0].alternative_track.as_deref().unwrap();
+        assert_eq!(alternative.track_id.as_deref(), Some("alternative-key"));
+        assert_eq!(alternative.title, "Alternative Song");
+        assert_eq!(alternative.artist, "Alternative Artist");
+
+        let empty_alternative = parse_track_candidates(
+            br#"{"track":{"key":"primary-key","title":"Primary Song","subtitle":"Primary Artist"},"alternativetrack":{}}"#,
+        )
+        .unwrap();
+        assert!(empty_alternative[0].alternative_track.is_none());
+
+        let matches = parse_track_candidates(
+            br#"{"matches":[{"trackid":"first","title":"First","artist":"A"},{"trackid":"second","title":"Second","artist":"B"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].track_id.as_deref(), Some("first"));
+        assert_eq!(matches[1].track_id.as_deref(), Some("second"));
+        assert!(matches[0].alternative_track.is_none());
+        assert!(matches[1].alternative_track.is_none());
     }
 
     #[test]
@@ -1313,46 +4122,669 @@ mod tests {
     }
 
     #[test]
-    fn config_parser_extracts_only_unique_manual_timing_values() {
+    fn native_manual_ui_config_exposes_observed_inputs_without_secrets() {
         let fixture = br#"{
             "inid":"fixture-installation-id",
-            "apis":{"tag":{"href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true"}},
-            "tagging":{"sampleseconds":12,"progressiveseconds":3,"minsamplems":3000,"maxsamplems":12000}
+            "apis":{"tag":{
+                "href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true",
+                "sampleseconds":4.75,
+                "progressiveseconds":1.375,
+                "minsamplems":null,
+                "maxsamplems":5000
+            }},
+            "settings":{"recording":{"silentrecordingseconds":2.999,"maxtagseconds":null}}
         }"#;
         let configuration = parse_shazam_config(fixture).unwrap();
+        let json = configuration
+            .native_manual_ui_config_json(44_100, 135_168, false, 60_000)
+            .unwrap();
+        let event: Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(event["schema"], "openshazam.manual-ui-config.v1");
+        assert_eq!(event["event"], "session_config");
+        assert_eq!(event["native_ui_start_inputs"]["tagging_type"], 1);
+        assert_eq!(event["native_ui_start_inputs"]["debugging_enabled"], false);
+        assert_eq!(
+            event["native_ui_start_inputs"].get("tagging_origin_code"),
+            None
+        );
+        assert_eq!(event["native_origin_observations"][0]["code"], 14);
+        assert_eq!(event["native_origin_observations"][0]["label"], "webbridge");
+        assert_eq!(
+            event["native_origin_observations"][0]["scope"],
+            "one_observed_main_view_callsite"
+        );
+        assert_eq!(event["native_controls"]["use_buffered_audio"], true);
+        assert_eq!(event["sigx"]["signature_type"], 2);
+        assert_eq!(event["sigx"]["signature_options"], 0);
+        assert_eq!(event["sigx"]["input"]["sample_rate_hz"], 44_100);
+        assert_eq!(event["sigx"]["input"]["channels"], 1);
+        assert_eq!(event["sigx"]["input"]["sample_format"], "mono_float32");
+        assert_eq!(
+            event["native_controls"]["pre_record"]["configured_integer_seconds"],
+            2
+        );
+        assert_eq!(
+            event["native_controls"]["pre_record"]["effective_seconds"],
+            3
+        );
+        assert_eq!(
+            event["native_controls"]["pre_record"]["capacity_frames"],
+            135_168
+        );
+        assert_eq!(
+            event["native_controls"]["pre_record"]["capacity_ms_ceil"],
+            3_066
+        );
+        assert_eq!(
+            event["native_controls"]["pre_record"]["capacity_source"],
+            "native_page_rounded"
+        );
+        assert_eq!(event["timing"]["config_sample_seconds"], 4.75);
+        assert_eq!(event["timing"]["config_progressive_seconds"], 1.375);
+        assert_eq!(
+            event["timing"]["effective_initial_signature_seconds"],
+            1.375
+        );
+        assert_eq!(event["timing"]["initial_signature_target_frames"], 60_637);
+        assert_eq!(event["timing"]["maximum_recording_frames"], 209_475);
+        assert_eq!(event["timing"]["initial_signature_target_ms"], 1_375);
+        assert_eq!(event["timing"]["maximum_recording_ms"], 4_750);
+        assert_eq!(event["timing"]["minimum_signature_config_ms"], Value::Null);
+        assert_eq!(event["timing"]["minimum_signature_effective_ms"], 2_000);
+        assert_eq!(event["timing"]["maximum_signature_config_ms"], 5_000);
+        assert_eq!(event["timing"]["maximum_signature_effective_ms"], 5_000);
+        assert_eq!(event["timing"]["session_timeout_config_ms"], Value::Null);
+        assert_eq!(
+            event["timing"]["session_timeout_effective_ms"],
+            NATIVE_TAGGING_TYPE_1_DEFAULT_SESSION_TIMEOUT_MS
+        );
+        assert_eq!(event["timing"]["request_timeout_ms"], 60_000);
+        assert_eq!(event["native_controls"]["default_retry_interval_ms"], 0);
+        assert!(!json.contains("fixture-installation-id"));
+        assert!(!json.contains("amp.shazam.com"));
+    }
+
+    #[test]
+    fn native_manual_ui_config_reports_sample_seconds_fallback() {
+        let configuration = parse_shazam_config(
+            br#"{"inid":"fixture-id","apis":{"tag":{"href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true","sampleseconds":12}}}"#,
+        )
+        .unwrap();
+        let event: Value = serde_json::from_str(
+            &configuration
+                .native_manual_ui_config_json(48_000, 147_456, false, 60_000)
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(event["timing"]["config_progressive_seconds"], Value::Null);
+        assert_eq!(event["timing"]["config_sample_seconds"], 12.0);
+        assert_eq!(event["timing"]["effective_initial_signature_seconds"], 12.0);
+        assert_eq!(event["timing"]["initial_signature_target_frames"], 576_000);
+        assert_eq!(event["timing"]["maximum_recording_frames"], 576_000);
+    }
+
+    #[test]
+    fn native_auto_ui_config_exposes_type2_controls_without_config_secrets() {
+        let configuration = parse_shazam_config(
+            br#"{
+                "inid":"fixture-installation-id",
+                "apis":{
+                    "tag":{"href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true","sampleseconds":4.75,"progressiveseconds":1.375,"minsamplems":2000,"maxsamplems":6000},
+                    "autotag":{"foregroundhref":"https://amp.shazam.com/foreground/{inid}/{tagid}","backgroundhref":"https://amp.shazam.com/background/{inid}/{tagid}","continuousforegroundidletimeout":48}
+                }
+            }"#,
+        )
+        .unwrap();
+        let json = configuration
+            .native_auto_ui_config_json(44_100, NativeTaggingRequestContext::Background, 60_000)
+            .unwrap();
+        let event: Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(event["schema"], "openshazam.auto-ui-config.v1");
+        assert_eq!(event["event"], "session_config");
+        assert_eq!(event["caller_inputs"]["tagging_type"], 2);
+        assert_eq!(event["caller_inputs"]["request_context"], "background");
+        assert_eq!(event["native_controls"]["use_buffered_audio"], false);
+        assert_eq!(event["native_controls"]["pre_record_enabled"], false);
+        assert_eq!(
+            event["native_controls"]["default_retry_interval_ms"],
+            12_000
+        );
+        assert_eq!(event["timing"]["config_sample_seconds"], 4.75);
+        assert_eq!(event["timing"]["config_progressive_seconds"], 1.375);
+        assert_eq!(event["timing"]["progressive_seconds_applied"], false);
+        assert_eq!(event["timing"]["initial_signature_target_frames"], 209_475);
+        assert_eq!(event["timing"]["maximum_recording_frames"], 209_475);
+        assert_eq!(event["timing"]["session_timeout_effective_ms"], 48_000);
+        assert!(!json.contains("fixture-installation-id"));
+        assert!(!json.contains("amp.shazam.com"));
+    }
+
+    #[test]
+    fn config_parser_uses_native_selected_timing_blocks() {
+        let fixture = br#"{
+            "inid":"fixture-installation-id",
+            "apis":{
+                "tag":{
+                    "href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true",
+                    "sampleseconds":12,"progressiveseconds":3,"minsamplems":3000,"maxsamplems":12000
+                },
+                "autotag":{
+                    "sampleseconds":90,"progressiveseconds":60,"minsamplems":1000,"maxsamplems":90000,
+                    "continuousforegroundidletimeout":48
+                },
+                "rollingtag":{
+                    "sampleseconds":99,"progressiveseconds":80,"minsamplems":500,"maxsamplems":99000
+                }
+            },
+            "settings":{"recording":{"silentrecordingseconds":6,"maxtagseconds":22}},
+            "other":{"sampleseconds":99,"progressiveseconds":99,"minsamplems":999,"maxsamplems":999000}
+        }"#;
+        let configuration = parse_shazam_config(fixture).unwrap();
+        assert_eq!(
+            configuration.manual_native_frame_targets(44_100).unwrap(),
+            NativeSampleFrameTargets {
+                initial_frames: 132_300,
+                maximum_frames: 529_200,
+            }
+        );
         assert_eq!(
             configuration.manual_timing(),
             ManualTaggingTiming {
                 sample_ms: Some(12_000),
                 progressive_ms: Some(3_000),
-                minimum_sample_ms: Some(3_000),
-                maximum_sample_ms: Some(12_000),
+                pre_record_buffer_ms: Some(6_000),
+                minimum_signature_ms: Some(3_000),
+                maximum_signature_ms: Some(12_000),
+                session_timeout_ms: Some(48_000),
+                auto_session_timeout_ms: Some(48_000),
             }
+        );
+        assert_eq!(
+            configuration.manual_timing().effective_initial_sample_ms(),
+            Some(3_000)
         );
         let timing = configuration
             .manual_timing()
-            .recognition_timing(44_100, 1_000, 0, 20_000, 30_000, 4)
+            .recognition_timing(
+                44_100,
+                NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS,
+                0,
+                20_000,
+                Some(30_000),
+                Some(4),
+            )
             .unwrap();
         assert_eq!(timing.initial_sample_ms, 3_000);
-        assert_eq!(timing.progressive_step_ms, 3_000);
         assert_eq!(timing.maximum_sample_ms, 12_000);
         assert_eq!(timing.default_retry_interval_ms, 0);
+        assert_eq!(timing.maximum_retry_duration_ms, Some(12_000));
+        assert_eq!(timing.session_timeout_ms, Some(48_000));
+        let auto_timing = configuration
+            .manual_timing()
+            .auto_recognition_timing(
+                44_100,
+                NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS,
+                12_000,
+                20_000,
+                Some(30_000),
+                Some(4),
+            )
+            .unwrap();
+        assert_eq!(auto_timing.initial_sample_ms, 12_000);
+        assert_eq!(auto_timing.maximum_sample_ms, 12_000);
+        assert_eq!(auto_timing.session_timeout_ms, Some(48_000));
+
+        let no_timeout_config = parse_shazam_config(
+            br#"{"inid":"fixture-installation-id","apis":{"tag":{"href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true","sampleseconds":12},"autotag":{"maxsamplems":90000}}}"#,
+        )
+        .unwrap();
+        assert_eq!(no_timeout_config.manual_timing().session_timeout_ms, None);
+        assert_eq!(
+            no_timeout_config
+                .manual_timing()
+                .effective_initial_sample_ms(),
+            Some(12_000)
+        );
+        assert_eq!(no_timeout_config.manual_timing().pre_record_buffer_ms, None);
+        assert_eq!(
+            no_timeout_config
+                .manual_timing()
+                .effective_pre_record_buffer_ms(),
+            NATIVE_DEFAULT_PRE_RECORD_BUFFER_MS
+        );
+        assert_eq!(
+            no_timeout_config
+                .manual_timing()
+                .effective_maximum_signature_length_ms(),
+            NATIVE_DEFAULT_MAX_SIGNATURE_LENGTH_MS
+        );
+        let native_timing = no_timeout_config
+            .manual_timing()
+            .recognition_timing(
+                44_100,
+                NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS,
+                12_000,
+                20_000,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            native_timing.minimum_signature_ms,
+            NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS
+        );
+        assert_eq!(native_timing.initial_sample_ms, 12_000);
+        assert_eq!(
+            native_timing.maximum_retry_duration_ms,
+            Some(NATIVE_DEFAULT_MAX_SIGNATURE_LENGTH_MS)
+        );
+        assert_eq!(
+            native_timing.session_timeout_ms,
+            Some(NATIVE_TAGGING_TYPE_1_DEFAULT_SESSION_TIMEOUT_MS)
+        );
+        let auto_native_timing = no_timeout_config
+            .manual_timing()
+            .auto_recognition_timing(
+                44_100,
+                NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS,
+                12_000,
+                20_000,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            auto_native_timing.session_timeout_ms,
+            Some(NATIVE_TAGGING_TYPE_2_DEFAULT_SESSION_TIMEOUT_MS)
+        );
     }
 
     #[test]
-    fn ambiguous_or_missing_config_timing_is_not_filled_with_assumptions() {
+    fn tagging_type_and_context_select_manual_foreground_or_background_route() {
+        let configuration = parse_shazam_config(
+            br#"{
+                "inid":"fixture-installation-id",
+                "apis":{
+                    "tag":{"href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true","sampleseconds":12,"progressiveseconds":3},
+                    "autotag":{"foregroundhref":"https://amp.shazam.com/fixture/continuous/{inid}/{tagid}?mode=foreground&connected={streamingprovider}","backgroundhref":"https://amp.shazam.com/fixture/continuous/{inid}/{tagid}?mode=background"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            configuration
+                .resolve_tag_url_for_type(NativeTaggingType::Manual, None, "manual-id", "")
+                .unwrap(),
+            "https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/fixture-installation-id/manual-id?sync=true&webv3=true&sampling=true&connected=&sharehub=false&hidelb=true"
+        );
+        let continuous = configuration
+            .resolve_tag_url_for_type(
+                NativeTaggingType::Auto,
+                Some(NativeTaggingRequestContext::Foreground),
+                "auto-id",
+                "",
+            )
+            .unwrap();
+        assert_eq!(
+            continuous,
+            "https://amp.shazam.com/fixture/continuous/fixture-installation-id/auto-id?mode=foreground&connected="
+        );
+        assert!(validate_shazam_request_endpoint(&continuous).is_ok());
+        assert!(validate_shazam_endpoint(&continuous).is_err());
+
+        let background = configuration
+            .resolve_tag_url_for_type(
+                NativeTaggingType::Auto,
+                Some(NativeTaggingRequestContext::Background),
+                "auto-id",
+                "",
+            )
+            .unwrap();
+        assert_eq!(
+            background,
+            "https://amp.shazam.com/fixture/continuous/fixture-installation-id/auto-id?mode=background"
+        );
+        assert!(validate_shazam_request_endpoint(&background).is_ok());
+        assert!(configuration
+            .resolve_tag_url_for_type(NativeTaggingType::Auto, None, "auto-id", "")
+            .is_err());
+    }
+
+    #[test]
+    fn continuous_foreground_route_is_optional_and_host_restricted() {
+        let configuration = parse_shazam_config(
+            br#"{"inid":"fixture-id","apis":{"tag":{"href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected=&sharehub=false&hidelb=true"}}}"#,
+        )
+        .unwrap();
+        assert!(configuration
+            .resolve_continuous_tag_url("auto-id", "")
+            .is_err());
+        assert!(configuration
+            .resolve_continuous_tag_url_for_context(
+                NativeTaggingRequestContext::Background,
+                "auto-id",
+                "",
+            )
+            .is_err());
+        assert!(resolve_shazam_continuous_tag_url(
+            "https://example.com/continuous/{inid}/{tagid}",
+            "fixture-id",
+            "auto-id",
+            ""
+        )
+        .is_err());
+        assert!(resolve_shazam_continuous_tag_url(
+            "https://amp.shazam.com/continuous/{inid}/{unknown}",
+            "fixture-id",
+            "auto-id",
+            ""
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn native_config_frame_targets_preserve_submillisecond_seconds() {
+        let fixture = br#"{
+            "inid":"fixture-installation-id",
+            "apis":{"tag":{
+                "href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true",
+                "sampleseconds":1.2345,"progressiveseconds":1.0001,
+                "minsamplems":1000,"maxsamplems":2000
+            }}
+        }"#;
+        let configuration = parse_shazam_config(fixture).unwrap();
+        let timing = configuration
+            .manual_timing()
+            .recognition_timing(44_100, 1_000, 0, 60_000, None, None)
+            .unwrap();
+
+        // Native uses the raw JSON Double: floor(44,100 * seconds). The
+        // legacy integer-ms route would instead produce 44,100 and 54,463.
+        let native_targets = configuration.manual_native_frame_targets(44_100).unwrap();
+        let auto_native_targets = configuration
+            .native_frame_targets_for_type(NativeTaggingType::Auto, 44_100)
+            .unwrap();
+        assert_eq!(timing.initial_sample_ms, 1_000);
+        assert_eq!(timing.maximum_sample_ms, 1_235);
+        assert_eq!(native_targets.initial_frames, 44_104);
+        assert_eq!(native_targets.maximum_frames, 54_441);
+        // Type 2 ignores progressiveRecordingSeconds and uses the raw
+        // sampleSeconds Double for both the first and maximum cycle target.
+        assert_eq!(auto_native_targets.initial_frames, 54_441);
+        assert_eq!(auto_native_targets.maximum_frames, 54_441);
+        assert_eq!(44_100u64 * timing.initial_sample_ms / 1_000, 44_100);
+        assert_eq!(44_100u64 * timing.maximum_sample_ms / 1_000, 54_463);
+
+        let auto_timing = configuration
+            .manual_timing()
+            .auto_recognition_timing(44_100, 1_000, 12_000, 60_000, None, None)
+            .unwrap();
+        let mut auto_session = ProgressiveSession::new_for_type_with_native_frame_targets(
+            auto_timing,
+            NativeTaggingType::Auto,
+            0,
+            Some(auto_native_targets),
+        )
+        .unwrap();
+        let samples = vec![0_i16; auto_native_targets.maximum_frames];
+        auto_session.push_i16_at(&samples[..54_440], 1_234).unwrap();
+        assert!(auto_session.poll(1_234).unwrap().is_none());
+        auto_session.push_i16_at(&samples[54_440..], 1_235).unwrap();
+        let job = auto_session.poll(1_235).unwrap().unwrap();
+        assert_eq!(job.sample_ms, 1_234);
+        assert_eq!(auto_session.tagging_type(), NativeTaggingType::Auto);
+    }
+
+    #[test]
+    fn config_parser_preserves_native_session_timeouts_beyond_audio_duration_limit() {
+        let configuration = parse_shazam_config(
+            br#"{
+                "inid":"fixture-installation-id",
+                "apis":{"tag":{"href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true","sampleseconds":12,"progressiveseconds":3},
+                        "autotag":{"continuousforegroundidletimeout":21600}},
+                "settings":{"recording":{"maxtagseconds":3600}}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configuration.manual_timing().session_timeout_ms,
+            Some(21_600_000)
+        );
+        assert_eq!(
+            configuration.manual_timing().auto_session_timeout_ms,
+            Some(21_600_000)
+        );
+
+        let manual = configuration
+            .manual_timing()
+            .recognition_timing(
+                44_100,
+                NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS,
+                NATIVE_TAGGING_TYPE_1_DEFAULT_INTERVAL_MS,
+                NATIVE_NETWORK_REQUEST_TIMEOUT_MS,
+                None,
+                None,
+            )
+            .unwrap();
+        let auto = configuration
+            .manual_timing()
+            .auto_recognition_timing(
+                44_100,
+                NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS,
+                NATIVE_TAGGING_TYPE_2_DEFAULT_INTERVAL_MS,
+                NATIVE_NETWORK_REQUEST_TIMEOUT_MS,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(manual.session_timeout_ms, Some(21_600_000));
+        assert_eq!(auto.session_timeout_ms, Some(21_600_000));
+    }
+
+    #[test]
+    fn native_prerecord_default_applies_when_integer_seconds_are_at_most_two() {
+        let base = ManualTaggingTiming {
+            sample_ms: None,
+            progressive_ms: None,
+            pre_record_buffer_ms: None,
+            minimum_signature_ms: None,
+            maximum_signature_ms: None,
+            session_timeout_ms: None,
+            auto_session_timeout_ms: None,
+        };
+        assert_eq!(
+            base.effective_pre_record_buffer_ms(),
+            NATIVE_DEFAULT_PRE_RECORD_BUFFER_MS
+        );
+        for milliseconds in [0, 1_000, 2_000, 2_500, 2_999] {
+            assert_eq!(
+                ManualTaggingTiming {
+                    pre_record_buffer_ms: Some(milliseconds),
+                    ..base
+                }
+                .effective_pre_record_buffer_ms(),
+                NATIVE_DEFAULT_PRE_RECORD_BUFFER_MS
+            );
+        }
+        for milliseconds in [3_000, 3_001, 3_500] {
+            assert_eq!(
+                ManualTaggingTiming {
+                    pre_record_buffer_ms: Some(milliseconds),
+                    ..base
+                }
+                .effective_pre_record_buffer_ms(),
+                3_000
+            );
+        }
+    }
+
+    #[test]
+    fn silent_recording_config_matches_native_integer_seconds_conversion() {
+        let below_threshold: Value = serde_json::from_slice(
+            br#"{"settings":{"recording":{"silentRecordingSeconds":2.9999}}}"#,
+        )
+        .unwrap();
+        let fractional_seconds: Value =
+            serde_json::from_slice(br#"{"settings":{"recording":{"silentRecordingSeconds":3.9}}}"#)
+                .unwrap();
+
+        assert_eq!(
+            parse_manual_tagging_timing(&below_threshold).effective_pre_record_buffer_ms(),
+            NATIVE_DEFAULT_PRE_RECORD_BUFFER_MS
+        );
+        assert_eq!(
+            parse_manual_tagging_timing(&fractional_seconds).effective_pre_record_buffer_ms(),
+            3_000
+        );
+    }
+
+    #[test]
+    fn native_prerecord_capacity_rounds_mono_float_bytes_to_arm64_vm_pages() {
+        let timing = ManualTaggingTiming {
+            sample_ms: None,
+            progressive_ms: None,
+            pre_record_buffer_ms: None,
+            minimum_signature_ms: None,
+            maximum_signature_ms: None,
+            session_timeout_ms: None,
+            auto_session_timeout_ms: None,
+        };
+
+        assert_eq!(
+            timing.effective_pre_record_capacity_frames(44_100).unwrap(),
+            135_168
+        );
+        assert_eq!(
+            timing.effective_pre_record_capacity_frames(48_000).unwrap(),
+            147_456
+        );
+        assert!(timing.effective_pre_record_capacity_frames(0).is_err());
+    }
+
+    #[test]
+    fn missing_native_minimum_uses_two_second_gate_before_signature_dispatch() {
+        let fixture = br#"{
+            "inid":"fixture-installation-id",
+            "apis":{"tag":{
+                "href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true",
+                "sampleseconds":12,
+                "progressiveseconds":1.5
+            }}
+        }"#;
+        let configuration = parse_shazam_config(fixture).unwrap();
+        let timing = configuration
+            .manual_timing()
+            .recognition_timing(
+                16_000,
+                NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS,
+                NATIVE_TAGGING_TYPE_1_DEFAULT_INTERVAL_MS,
+                60_000,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            timing.minimum_signature_ms,
+            NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS
+        );
+
+        let mut session =
+            ProgressiveSession::new_for_type(timing, NativeTaggingType::Manual).unwrap();
+        session.push_i16(&vec![0; 24_000]).unwrap();
+        assert_eq!(
+            session.status(),
+            shazam_progressive::SessionStatus::Failed(
+                shazam_progressive::StopReason::SignatureGenerationFailure
+            )
+        );
+        assert!(session.poll(1_500).unwrap().is_none());
+        assert!(session.is_terminal());
+    }
+
+    #[test]
+    fn parsed_config_controls_manual_progressive_signature_and_capture_ceiling() {
+        let fixture = br#"{
+            "inid":"fixture-installation-id",
+            "apis":{"tag":{
+                "href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected={streamingprovider}&sharehub=false&hidelb=true",
+                "sampleseconds":4.75,
+                "progressiveseconds":1.375,
+                "minsamplems":500,
+                "maxsamplems":4750
+            }},
+            "settings":{"recording":{"maxtagseconds":45}}
+        }"#;
+        let configuration = parse_shazam_config(fixture).unwrap();
+        let timing = configuration
+            .manual_timing()
+            .recognition_timing(
+                16_000,
+                0,
+                NATIVE_TAGGING_TYPE_1_DEFAULT_INTERVAL_MS,
+                60_000,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(timing.initial_sample_ms, 1_375);
+        assert_eq!(timing.maximum_sample_ms, 4_750);
+
+        let mut session =
+            ProgressiveSession::new_for_type(timing, NativeTaggingType::Manual).unwrap();
+        let audio: Vec<i16> = (0..76_000)
+            .map(|index| ((index * 37) % 30_001 - 15_000) as i16)
+            .collect();
+        for chunk in audio[..21_999].chunks(997) {
+            session.push_i16_at(chunk, 1_374).unwrap();
+        }
+        assert!(session.poll(1_374).unwrap().is_none());
+
+        session.push_i16_at(&audio[21_999..22_000], 1_375).unwrap();
+        let first = session
+            .poll(1_375)
+            .unwrap()
+            .expect("the Config progressive threshold is the first Signature target");
+        assert_eq!(first.sample_ms, 1_375);
+        assert_eq!(first.generated_at_ms, 1_375);
+
+        // The audio adapter keeps feeding PCM while the recognition request
+        // represented by `first` is in flight. The Config maximum is a
+        // per-cycle ceiling, not a fixed 12-second send interval.
+        let report = session.push_i16_at(&audio[22_000..], 1_400).unwrap();
+        assert_eq!(report.accepted_frames, 54_000);
+        assert_eq!(session.frames_seen(), 76_000);
+        assert!(session.poll(1_400).unwrap().is_none());
+        assert_eq!(
+            session
+                .complete(
+                    first.attempt,
+                    shazam_progressive::RecognitionOutcome::Match { retry: None },
+                    1_500,
+                )
+                .unwrap(),
+            shazam_progressive::SessionStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn config_timing_does_not_fall_through_to_other_blocks() {
         let value: Value = serde_json::from_slice(
-            br#"{"tagging":{"sampleseconds":12,"progressiveseconds":3},"other":{"sampleseconds":9}}"#,
+            br#"{"apis":{"tag":{"sampleseconds":"invalid"},"autotag":{"sampleseconds":9,"progressiveseconds":8,"maxsamplems":90000,"continuousforegroundidletimeout":48}},"settings":{"recording":{"silentrecordingseconds":"invalid"}},"other":{"sampleseconds":12,"progressiveseconds":3,"silentrecordingseconds":6,"maxsamplems":12000}}"#,
         )
         .unwrap();
         assert_eq!(parse_manual_tagging_timing(&value).sample_ms, None);
         assert_eq!(
-            parse_manual_tagging_timing(&value).progressive_ms,
-            Some(3_000)
+            parse_manual_tagging_timing(&value).pre_record_buffer_ms,
+            None
         );
-        assert!(parse_manual_tagging_timing(&value)
-            .recognition_timing(16_000, 1_000, 0, 20_000, 30_000, 4)
-            .is_err());
+        let timing = parse_manual_tagging_timing(&value);
+        assert_eq!(timing.progressive_ms, None);
+        assert_eq!(timing.maximum_signature_ms, None);
+        assert_eq!(timing.auto_session_timeout_ms, Some(48_000));
     }
 
     #[test]
@@ -1363,15 +4795,97 @@ mod tests {
             )
             .unwrap(),
             Some(RetryDirective {
-                delay_ms: Some(0),
-                target_sample_ms: Some(6_000),
+                retry_duration_ms: Some(6_000),
+                interval_ms: Some(0),
+                retry_duration_seconds_bits: Some(6.0_f64.to_bits()),
+                interval_seconds_bits: Some(0.0_f64.to_bits()),
             })
         );
         assert_eq!(
             retry_directive_from_response(br#"{"sampleseconds":6,"intervalseconds":2}"#).unwrap(),
             Some(RetryDirective {
-                delay_ms: Some(2_000),
-                target_sample_ms: Some(6_000),
+                retry_duration_ms: Some(6_000),
+                interval_ms: Some(2_000),
+                retry_duration_seconds_bits: Some(6.0_f64.to_bits()),
+                interval_seconds_bits: Some(2.0_f64.to_bits()),
+            })
+        );
+        let fractional_retry =
+            retry_directive_from_response(br#"{"sampleseconds":1.2345,"intervalseconds":0}"#)
+                .unwrap()
+                .unwrap();
+        assert_eq!(fractional_retry.retry_duration_ms, Some(1_235));
+        assert_eq!(
+            fractional_retry.retry_duration_seconds_bits,
+            Some(1.2345_f64.to_bits())
+        );
+        assert_eq!(fractional_retry.interval_ms, Some(0));
+        assert_eq!(
+            fractional_retry.interval_seconds_bits,
+            Some(0.0_f64.to_bits())
+        );
+        let fractional_interval =
+            retry_directive_from_response(br#"{"sampleseconds":1,"intervalseconds":1.2341}"#)
+                .unwrap()
+                .unwrap();
+        assert_eq!(fractional_interval.interval_ms, Some(1_235));
+        assert_eq!(
+            fractional_interval.interval_seconds_bits,
+            Some(1.2341_f64.to_bits())
+        );
+        let submillisecond_interval =
+            retry_directive_from_response(br#"{"sampleseconds":1,"intervalseconds":0.0000009}"#)
+                .unwrap()
+                .unwrap();
+        assert_eq!(submillisecond_interval.interval_ms, Some(1));
+        assert_eq!(
+            submillisecond_interval.interval_seconds_bits,
+            Some(0.0000009_f64.to_bits())
+        );
+        let fractional_retry_ms = retry_directive_from_response(
+            br#"{"retryms":1234.567,"sampleseconds":6,"intervalseconds":2}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fractional_retry_ms.retry_duration_ms, Some(1_235));
+        assert_eq!(
+            fractional_retry_ms.retry_duration_seconds_bits,
+            Some((1_234.567_f64 / 1_000.0).to_bits())
+        );
+        assert_eq!(fractional_retry_ms.interval_ms, Some(0));
+        assert_eq!(
+            fractional_retry_ms.interval_seconds_bits,
+            Some(0.0_f64.to_bits())
+        );
+        let long_retry_ms = retry_directive_from_response(br#"{"retryms":600001}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(long_retry_ms.retry_duration_ms, Some(600_001));
+        assert_eq!(
+            long_retry_ms.retry_duration_seconds_bits,
+            Some((600_001.0_f64 / 1_000.0).to_bits())
+        );
+        assert_eq!(
+            retry_directive_from_response(br#"{"sampleseconds":6}"#).unwrap(),
+            None
+        );
+        assert_eq!(
+            retry_directive_from_response(br#"{"intervalseconds":2}"#).unwrap(),
+            Some(RetryDirective {
+                retry_duration_ms: Some(0),
+                interval_ms: Some(2_000),
+                retry_duration_seconds_bits: None,
+                interval_seconds_bits: Some(2.0_f64.to_bits()),
+            })
+        );
+        assert_eq!(
+            retry_directive_from_response(br#"{"sampleseconds":"invalid","intervalseconds":null}"#)
+                .unwrap(),
+            Some(RetryDirective {
+                retry_duration_ms: Some(0),
+                interval_ms: Some(0),
+                retry_duration_seconds_bits: None,
+                interval_seconds_bits: Some(0.0_f64.to_bits()),
             })
         );
         assert_eq!(
@@ -1386,20 +4900,218 @@ mod tests {
     }
 
     #[test]
+    fn retry_parser_obeys_native_tag_response_presence_precedence() {
+        assert_eq!(
+            retry_directive_for_signature_from_response(br#"{"matches":[]}"#, 3_000, 12_000)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            retry_directive_for_signature_from_response(
+                br#"{"retryms":2500,"intervalseconds":7}"#,
+                3_000,
+                12_000,
+            )
+            .unwrap(),
+            Some(RetryDirective {
+                retry_duration_ms: Some(2_500),
+                interval_ms: Some(0),
+                retry_duration_seconds_bits: Some(2.5_f64.to_bits()),
+                interval_seconds_bits: Some(0.0_f64.to_bits()),
+            })
+        );
+        assert_eq!(
+            retry_directive_for_signature_from_response(
+                br#"{"sampleseconds":6,"intervalseconds":2}"#,
+                3_000,
+                12_000,
+            )
+            .unwrap(),
+            Some(RetryDirective {
+                retry_duration_ms: Some(6_000),
+                interval_ms: Some(2_000),
+                retry_duration_seconds_bits: Some(6.0_f64.to_bits()),
+                interval_seconds_bits: Some(2.0_f64.to_bits()),
+            })
+        );
+        assert_eq!(
+            retry_directive_for_signature_from_response(
+                br#"{"sampleseconds":6,"intervalseconds":2}"#,
+                12_000,
+                12_000,
+            )
+            .unwrap(),
+            Some(RetryDirective {
+                retry_duration_ms: Some(6_000),
+                interval_ms: Some(2_000),
+                retry_duration_seconds_bits: Some(6.0_f64.to_bits()),
+                interval_seconds_bits: Some(2.0_f64.to_bits()),
+            })
+        );
+        assert_eq!(
+            retry_directive_for_signature_from_response(br#"{"matches":[]}"#, 12_000, 12_000)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            retry_directive_for_signature_from_response(b"null", 3_000, 12_000).unwrap(),
+            Some(RetryDirective {
+                retry_duration_ms: Some(12_000),
+                interval_ms: Some(0),
+                retry_duration_seconds_bits: None,
+                interval_seconds_bits: None,
+            })
+        );
+    }
+
+    #[test]
+    fn network_failure_uses_native_retry_to_maximum_only_for_live_short_signature() {
+        let network_error = Error::NetworkFailure("network failed".into());
+        let local_error = Error::Transport("HTTPS client unavailable".into());
+        let expected = Some(RetryDirective {
+            retry_duration_ms: Some(12_000),
+            interval_ms: Some(0),
+            retry_duration_seconds_bits: None,
+            interval_seconds_bits: None,
+        });
+        assert_eq!(
+            native_retry_for_network_failure(&network_error, 3_000, 12_000, false),
+            expected
+        );
+        assert_eq!(
+            native_retry_for_network_failure(&network_error, 12_000, 12_000, false),
+            None
+        );
+        assert_eq!(
+            native_retry_for_network_failure(&network_error, 3_000, 12_000, true),
+            None
+        );
+        assert_eq!(
+            native_retry_for_network_failure(&local_error, 3_000, 12_000, false),
+            None
+        );
+        assert_eq!(
+            native_retry_for_network_failure_for_tagging_type(
+                NativeTaggingType::Manual,
+                &network_error,
+                3_000,
+                12_000,
+                false,
+            ),
+            expected
+        );
+        assert_eq!(
+            native_retry_for_network_failure_for_tagging_type(
+                NativeTaggingType::Auto,
+                &network_error,
+                3_000,
+                12_000,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn native_network_failure_retry_extends_manual_session_to_maximum() {
+        let maximum_sample_ms = 6_000;
+        let timing = RecognitionTiming {
+            sample_rate: 16_000,
+            minimum_signature_ms: 2_000,
+            initial_sample_ms: 3_000,
+            maximum_sample_ms,
+            default_retry_interval_ms: NATIVE_TAGGING_TYPE_1_DEFAULT_INTERVAL_MS,
+            maximum_retry_duration_ms: Some(maximum_sample_ms),
+            session_timeout_ms: None,
+            request_timeout_ms: 5_000,
+            maximum_retry_delay_ms: None,
+            maximum_attempts: None,
+        };
+        let mut session =
+            ProgressiveSession::new_for_type(timing, NativeTaggingType::Manual).unwrap();
+        let samples: Vec<i16> = (0..96_000)
+            .map(|index| ((index * 73 % 30_001) - 15_000) as i16)
+            .collect();
+        session.push_i16_at(&samples[..48_000], 3_000).unwrap();
+        let first = session.poll(3_000).unwrap().unwrap();
+        assert_eq!(first.sample_ms, 3_000);
+
+        let network_error = Error::NetworkFailure("request failed".into());
+        let retry = native_retry_for_network_failure(
+            &network_error,
+            first.sample_ms,
+            maximum_sample_ms,
+            false,
+        )
+        .expect("a dispatched short Signature gets the Native maximum-length Retry");
+        assert_eq!(retry.retry_duration_ms, Some(maximum_sample_ms));
+        assert_eq!(retry.interval_ms, Some(0));
+        assert_eq!(
+            session
+                .complete(
+                    first.attempt,
+                    shazam_progressive::RecognitionOutcome::MatcherFailure { retry: Some(retry) },
+                    3_200,
+                )
+                .unwrap(),
+            shazam_progressive::SessionStatus::WaitingForRetry {
+                not_before_ms: 3_200,
+                target_sample_ms: maximum_sample_ms,
+            }
+        );
+
+        session
+            .push_i16_at(&samples[48_000..], 6_000)
+            .expect("Native-allowed Retry keeps accepting PCM");
+        let followup = session.poll(6_000).unwrap().unwrap();
+        assert_eq!(followup.attempt, 2);
+        assert_eq!(followup.sample_ms, maximum_sample_ms);
+    }
+
+    #[test]
     fn progressive_response_classifier_covers_match_retry_http_and_invalid() {
+        let track_response = br#"{"track":{"title":"Mock Song","subtitle":"Mock Artist"}}"#;
+        for status in [200, 201, 299] {
+            assert!(matches!(
+                interpret_progressive_http_response(status, track_response),
+                ProgressiveHttpResponse::Matched { .. }
+            ));
+        }
+        for status in [199, 300] {
+            assert_eq!(
+                interpret_progressive_http_response(status, track_response),
+                ProgressiveHttpResponse::HttpError {
+                    status,
+                    retry: None,
+                }
+            );
+        }
         assert_eq!(
             interpret_progressive_http_response(
                 200,
                 br#"{"track":{"title":"Mock Song","subtitle":"Mock Artist"}}"#
             ),
-            ProgressiveHttpResponse::Matched(vec![TrackCandidate {
-                track_id: None,
-                title: "Mock Song".into(),
-                artist: "Mock Artist".into(),
-            }])
+            ProgressiveHttpResponse::Matched {
+                candidates: vec![TrackCandidate {
+                    track_id: None,
+                    title: "Mock Song".into(),
+                    artist: "Mock Artist".into(),
+                    ui_metadata: None,
+                    alternative_track: None,
+                    origin: TrackCandidateOrigin::RootTrack,
+                }],
+                retry: None,
+            }
         );
         assert_eq!(
             interpret_progressive_http_response(200, br#"{"matches":[]}"#),
+            ProgressiveHttpResponse::NoMatch(None)
+        );
+        // Native parses a successful tag dictionary before extracting tracks;
+        // an unknown but valid dictionary shape therefore represents an empty
+        // tag set, not the nil-dictionary failure path that retries to max.
+        assert_eq!(
+            interpret_progressive_http_response(200, br#"{"unrecognized":true}"#),
             ProgressiveHttpResponse::NoMatch(None)
         );
         assert_eq!(
@@ -1408,9 +5120,33 @@ mod tests {
                 br#"{"matches":[],"sampleseconds":6,"intervalseconds":0.25}"#
             ),
             ProgressiveHttpResponse::NoMatch(Some(RetryDirective {
-                delay_ms: Some(250),
-                target_sample_ms: Some(6_000),
+                retry_duration_ms: Some(6_000),
+                interval_ms: Some(250),
+                retry_duration_seconds_bits: Some(6.0_f64.to_bits()),
+                interval_seconds_bits: Some(0.25_f64.to_bits()),
             }))
+        );
+        assert_eq!(
+            interpret_progressive_http_response(
+                200,
+                br#"{"track":{"title":"Mock Song","subtitle":"Mock Artist"},"sampleseconds":2.5,"intervalseconds":5}"#
+            ),
+            ProgressiveHttpResponse::Matched {
+                candidates: vec![TrackCandidate {
+                    track_id: None,
+                    title: "Mock Song".into(),
+                    artist: "Mock Artist".into(),
+                    ui_metadata: None,
+                    alternative_track: None,
+                    origin: TrackCandidateOrigin::RootTrack,
+                }],
+                retry: Some(RetryDirective {
+                    retry_duration_ms: Some(2_500),
+                    interval_ms: Some(5_000),
+                    retry_duration_seconds_bits: Some(2.5_f64.to_bits()),
+                    interval_seconds_bits: Some(5.0_f64.to_bits()),
+                }),
+            }
         );
         assert_eq!(
             interpret_progressive_http_response(
@@ -1421,11 +5157,86 @@ mod tests {
         );
         assert_eq!(
             interpret_progressive_http_response(503, br#"{"matches":[]}"#),
-            ProgressiveHttpResponse::HttpError(503)
+            ProgressiveHttpResponse::HttpError {
+                status: 503,
+                retry: None,
+            }
+        );
+        assert_eq!(
+            interpret_progressive_http_response(
+                503,
+                br#"{"error":"temporarily unavailable","retryms":2500}"#
+            ),
+            ProgressiveHttpResponse::HttpError {
+                status: 503,
+                retry: None,
+            }
+        );
+        assert_eq!(
+            interpret_progressive_http_response_for_signature(
+                503,
+                br#"{"error":"temporarily unavailable","retryms":2500}"#,
+                Some(3_000),
+                Some(12_000),
+            ),
+            ProgressiveHttpResponse::HttpError {
+                status: 503,
+                retry: Some(RetryDirective {
+                    retry_duration_ms: Some(12_000),
+                    interval_ms: Some(0),
+                    retry_duration_seconds_bits: None,
+                    interval_seconds_bits: None,
+                }),
+            }
+        );
+        assert_eq!(
+            interpret_progressive_http_response_for_signature(
+                503,
+                br#"{"error":"temporarily unavailable","retryms":2500}"#,
+                Some(12_000),
+                Some(12_000),
+            ),
+            ProgressiveHttpResponse::HttpError {
+                status: 503,
+                retry: None,
+            }
         );
         assert_eq!(
             interpret_progressive_http_response(200, b"not json"),
-            ProgressiveHttpResponse::InvalidResponse
+            ProgressiveHttpResponse::ParseFailure { retry: None }
+        );
+    }
+
+    #[test]
+    fn malformed_tag_response_uses_native_failure_retry_with_request_context() {
+        assert_eq!(
+            interpret_progressive_http_response_for_signature(
+                200,
+                b"not json",
+                Some(3_000),
+                Some(12_000),
+            ),
+            ProgressiveHttpResponse::ParseFailure {
+                retry: Some(RetryDirective {
+                    retry_duration_ms: Some(12_000),
+                    interval_ms: Some(0),
+                    retry_duration_seconds_bits: None,
+                    interval_seconds_bits: None,
+                }),
+            }
+        );
+        assert_eq!(
+            interpret_progressive_http_response_for_signature(
+                200,
+                b"not json",
+                Some(12_000),
+                Some(12_000),
+            ),
+            ProgressiveHttpResponse::ParseFailure { retry: None }
+        );
+        assert_eq!(
+            interpret_progressive_http_response(200, b"not json"),
+            ProgressiveHttpResponse::ParseFailure { retry: None }
         );
     }
 
@@ -1545,6 +5356,58 @@ mod tests {
             post_loopback_json("https://127.0.0.1:443/match", body),
             Err(Error::InvalidEndpoint(_))
         ));
+    }
+
+    #[test]
+    fn recognition_transport_is_injectable_behind_shared_request_validation() {
+        struct TestTransport(std::sync::atomic::AtomicUsize);
+
+        impl RecognitionHttpTransport for TestTransport {
+            fn post_json_cancellable(
+                &self,
+                endpoint: &str,
+                body: &[u8],
+                timeout: Duration,
+                _cancelled: &AtomicBool,
+                on_transport_started: &mut dyn FnMut(),
+            ) -> Result<HttpResponse, Error> {
+                assert_eq!(endpoint, "https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/inid/tag?sync=true&webv3=true&sampling=true&connected=&sharehub=false&hidelb=true");
+                assert_eq!(body, b"{\"signature\":{}}");
+                assert_eq!(timeout, Duration::from_secs(7));
+                self.0.fetch_add(1, Ordering::Relaxed);
+                on_transport_started();
+                Ok(HttpResponse {
+                    status: 200,
+                    body: b"{}".to_vec(),
+                })
+            }
+        }
+
+        let transport = TestTransport(std::sync::atomic::AtomicUsize::new(0));
+        let started = std::cell::Cell::new(false);
+        let response = post_shazam_json_with_transport(
+            &transport,
+            "https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/inid/tag?sync=true&webv3=true&sampling=true&connected=&sharehub=false&hidelb=true",
+            b"{\"signature\":{}}",
+            Duration::from_secs(7),
+            &AtomicBool::new(false),
+            || started.set(true),
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert!(started.get());
+        assert_eq!(transport.0.load(Ordering::Relaxed), 1);
+
+        assert!(post_shazam_json_with_transport(
+            &transport,
+            "https://example.com/not-allowlisted",
+            b"{}",
+            Duration::from_secs(7),
+            &AtomicBool::new(false),
+            || {},
+        )
+        .is_err());
+        assert_eq!(transport.0.load(Ordering::Relaxed), 1);
     }
 
     #[test]

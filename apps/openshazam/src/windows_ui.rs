@@ -1,8 +1,7 @@
 //! Windows-native UI host: Win32 tray/popup and Direct2D/DirectWrite renderer.
 //!
-//! Audio, signature generation and recognition remain in the existing CLI
-//! commands. This module only starts those existing commands and adapts their
-//! output to UI state.
+//! Win32 owns the tray, popup and input. Loopback recognition enters through
+//! the typed controller API; file recognition keeps using its existing CLI.
 
 use std::{
     cell::RefCell,
@@ -117,6 +116,13 @@ use windows::{
 };
 
 use windows_numerics::{Matrix3x2, Vector2, Vector3};
+
+use openshazam::WindowsRecognitionBackend;
+use openshazam_controller::{
+    ApplicationController, CommandId, CommandResultLookup, CommandStatus, NativeManualResultStage,
+    NativeManualUiEvent, RecognitionCommand, RecognitionContext, RecognitionEvent,
+    RecognitionEventKind, SessionId,
+};
 
 use crate::ui_model::{
     self, CubicBezier, TaggingMode, UiLevels, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, CONTENT_HEIGHT,
@@ -342,6 +348,8 @@ struct AppState {
     single_click_pending: bool,
     capture_canceled: Arc<AtomicBool>,
     capture_child: Option<Arc<Mutex<Option<Child>>>>,
+    recognition_controller: Option<ApplicationController>,
+    recognition_session: Option<(SessionId, CaptureMode, CommandId)>,
     message: Option<String>,
 }
 
@@ -4707,6 +4715,46 @@ fn start_capture(app: &mut AppState, mode: CaptureMode, file: Option<PathBuf>) {
     if matches!(app.phase, MainPhase::Listening { .. }) {
         return;
     }
+    if file.is_none() {
+        if app.recognition_controller.is_none() {
+            match ApplicationController::spawn(WindowsRecognitionBackend::new(), 16, 64) {
+                Ok(controller) => app.recognition_controller = Some(controller),
+                Err(error) => {
+                    app.phase = MainPhase::Error {
+                        message: format!("認識コントローラーを開始できません: {error}"),
+                        entered_at: Instant::now(),
+                    };
+                    return;
+                }
+            }
+        }
+        let controller = app
+            .recognition_controller
+            .as_ref()
+            .expect("controller created");
+        let ticket = match mode {
+            CaptureMode::Manual => controller.commands.start_manual(),
+            CaptureMode::Auto => controller
+                .commands
+                .start_auto(RecognitionContext::Foreground),
+        };
+        match ticket {
+            Ok(ticket) => {
+                app.recognition_session = Some((ticket.session_id, mode, ticket.command_id));
+                app.phase = MainPhase::Listening {
+                    mode,
+                    started_at: Instant::now(),
+                };
+            }
+            Err(error) => {
+                app.phase = MainPhase::Error {
+                    message: format!("認識を開始できません: {error:?}"),
+                    entered_at: Instant::now(),
+                };
+            }
+        }
+        return;
+    }
     let (program, args) = match file {
         Some(path) => match shazam_http_lab_exe() {
             Some(exe) => (
@@ -4725,25 +4773,18 @@ fn start_capture(app: &mut AppState, mode: CaptureMode, file: Option<PathBuf>) {
                 return;
             }
         },
-        None => match std::env::current_exe() {
-            Ok(exe) => (exe, vec!["recognize-loopback".to_owned()]),
-            Err(error) => {
-                app.phase = MainPhase::Error {
-                    message: error.to_string(),
-                    entered_at: Instant::now(),
-                };
-                return;
-            }
-        },
+        None => unreachable!("loopback recognition uses the typed controller"),
     };
 
     let mut command = Command::new(program);
     command
         .args(args)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     match command.spawn() {
-        Ok(child) => {
+        Ok(mut child) => {
+            drop(child.stdin.take());
             let slot = Arc::new(Mutex::new(Some(child)));
             let slot_for_worker = Arc::clone(&slot);
             let cancel = Arc::new(AtomicBool::new(false));
@@ -4828,12 +4869,135 @@ fn wait_for_capture(
 }
 
 fn cancel_capture(app: &mut AppState) {
+    if let (Some(controller), Some((session_id, _, _))) =
+        (app.recognition_controller.as_ref(), app.recognition_session)
+    {
+        let _ = controller
+            .commands
+            .submit(RecognitionCommand::CancelRecognition { session_id });
+        app.recognition_session = None;
+        app.phase = MainPhase::Ready;
+        return;
+    }
     app.capture_canceled.store(true, Ordering::Release);
     if let Some(slot) = &app.capture_child {
         if let Ok(mut guard) = slot.lock() {
             if let Some(child) = guard.as_mut() {
                 let _ = child.kill();
             }
+        }
+    }
+}
+
+fn poll_recognition_events(app: &mut AppState) -> bool {
+    let mut changed = false;
+    let mut events = Vec::new();
+    if let Some(controller) = &app.recognition_controller {
+        if let Some((_, _, command_id)) = app.recognition_session {
+            if let CommandResultLookup::Retained(result) =
+                controller.commands.command_result(command_id)
+            {
+                if let CommandStatus::StartFailed { reason } | CommandStatus::Rejected { reason } =
+                    result.status
+                {
+                    app.recognition_session = None;
+                    app.phase = MainPhase::Error {
+                        message: format!("認識を開始できません: {reason}"),
+                        entered_at: Instant::now(),
+                    };
+                    changed = true;
+                }
+            }
+        }
+        while let Ok(event) = controller.events.try_recv() {
+            events.push(event);
+        }
+    }
+    for event in events {
+        if let Some((session_id, mode, _)) = app.recognition_session {
+            if event.session_id.is_some_and(|id| id != session_id) {
+                continue;
+            }
+            changed |= apply_recognition_event(app, event, mode);
+        }
+    }
+    changed
+}
+
+fn apply_recognition_event(app: &mut AppState, event: RecognitionEvent, mode: CaptureMode) -> bool {
+    match event.kind {
+        RecognitionEventKind::ManualUiEvent(NativeManualUiEvent::Result(result))
+            if mode == CaptureMode::Manual
+                && result.stage == NativeManualResultStage::TaggingDidFinish =>
+        {
+            show_controller_match(
+                app,
+                result.primary_track.title,
+                result.primary_track.artist,
+                mode,
+            );
+            true
+        }
+        RecognitionEventKind::ManualUiEvent(NativeManualUiEvent::NoMatch)
+        | RecognitionEventKind::NoMatch { .. } => {
+            app.phase = MainPhase::NoMatch {
+                entered_at: Instant::now(),
+                returned_to_ready_at: None,
+            };
+            true
+        }
+        RecognitionEventKind::RecognitionError { message, .. } => {
+            app.phase = MainPhase::Error {
+                message,
+                entered_at: Instant::now(),
+            };
+            true
+        }
+        RecognitionEventKind::SessionTimedOut => {
+            app.phase = MainPhase::Timeout {
+                mode,
+                entered_at: Instant::now(),
+            };
+            true
+        }
+        RecognitionEventKind::SessionCancelled | RecognitionEventKind::SessionEnded { .. } => {
+            app.recognition_session = None;
+            if matches!(app.phase, MainPhase::Listening { .. }) {
+                app.phase = MainPhase::Ready;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn show_controller_match(app: &mut AppState, title: String, artist: String, mode: CaptureMode) {
+    let track = Track {
+        title,
+        artist,
+        recognized_at: Instant::now(),
+    };
+    let previous_count = app.history.len();
+    app.history.insert(0, track.clone());
+    app.history_transition = Some(HistoryMutationTransition {
+        started_at: Instant::now(),
+        event: HistoryMutationEvent::Insert {
+            index: 0,
+            previous_count,
+        },
+    });
+    app.history.truncate(40);
+    if app.visible {
+        app.phase = MainPhase::Matched {
+            track,
+            stage: ResultCardStage::Entering {
+                started_at: Instant::now(),
+            },
+        };
+    } else {
+        app.phase = MainPhase::Ready;
+        if mode == CaptureMode::Manual {
+            unsafe { notify_hidden_match(app.main_hwnd, &track) };
         }
     }
 }
@@ -5216,8 +5380,10 @@ fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
 
 unsafe fn sync_main_timers(app: &mut AppState) {
     let hwnd = app.main_hwnd;
-    if app.visible && !hwnd.0.is_null() {
-        let track_phase = phase_needs_timeout(&app.phase) || app.history_transition.is_some();
+    if (app.visible || app.recognition_session.is_some()) && !hwnd.0.is_null() {
+        let track_phase = phase_needs_timeout(&app.phase)
+            || app.history_transition.is_some()
+            || app.recognition_session.is_some();
         if track_phase && !app.phase_timer_active {
             let _ = SetTimer(Some(hwnd), TIMER_PHASE, PHASE_TICK_MS, None);
             app.phase_timer_active = true;
@@ -5660,7 +5826,8 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_TIMER if data.kind == WindowKind::Main && wparam.0 == TIMER_PHASE => {
-            if update_phase_timers(app) {
+            let recognition_changed = poll_recognition_events(app);
+            if update_phase_timers(app) || recognition_changed {
                 update_visible_windows(app);
             }
             LRESULT(0)
@@ -5875,6 +6042,11 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY if data.kind == WindowKind::Main => {
             delete_tray_icon(hwnd);
+            if let Some(controller) = app.recognition_controller.take() {
+                thread::spawn(move || {
+                    let _ = controller.join();
+                });
+            }
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -5974,6 +6146,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             single_click_pending: false,
             capture_canceled: Arc::new(AtomicBool::new(false)),
             capture_child: None,
+            recognition_controller: None,
+            recognition_session: None,
             message: None,
         });
         let app_ptr = Box::into_raw(app);
