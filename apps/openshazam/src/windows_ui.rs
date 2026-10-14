@@ -257,7 +257,7 @@ fn result_card_link_hit(
     y: f32,
     card_top: f32,
     close: [f32; 4],
-    action: D2D_RECT_F,
+    store_action: Option<[f32; 4]>,
 ) -> bool {
     point_in_rect(
         x,
@@ -269,7 +269,7 @@ fn result_card_link_hit(
             card_top + TOP_HEIGHT as f32,
         ],
     ) && !point_in_rect(x, y, close)
-        && !point_in_rect(x, y, [action.left, action.top, action.right, action.bottom])
+        && !store_action.is_some_and(|action| point_in_rect(x, y, action))
 }
 
 fn visible_history_row_hit(y: f32, row_top: f32, history_top: f32, history_bottom: f32) -> bool {
@@ -621,6 +621,9 @@ struct TextStyles {
 struct ResultDetailsRects {
     title: D2D_RECT_F,
     artist: D2D_RECT_F,
+    // Retained for a future verified provider badge; no store is currently
+    // present in the UI presentation contract, so the control stays hidden.
+    #[allow(dead_code)]
     action: D2D_RECT_F,
 }
 
@@ -5005,19 +5008,9 @@ impl Renderer {
             &self.text.result_artist,
             &self.palette.result_label,
         );
-        let pill = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
-            rect: detail_rects.action,
-            radiusX: 10.0,
-            radiusY: 10.0,
-        };
-        self.target
-            .FillRoundedRectangle(&pill, &self.palette.accent);
-        self.text(
-            "再生",
-            detail_rects.action,
-            &self.text.date,
-            &self.palette.white_ink,
-        );
+        // The current Track presentation has no verified store provider or
+        // store-badge image. UI-233 requires hiding this control in that case;
+        // do not draw an inert generic play pill.
         self.draw_result_close_icon(top, edge);
         Ok(())
     }
@@ -5938,13 +5931,7 @@ unsafe fn window_data(hwnd: HWND) -> Option<&'static mut WindowData> {
     ptr.as_mut()
 }
 
-unsafe fn main_hit_test(
-    app: &AppState,
-    renderer: Option<&Renderer>,
-    x: f32,
-    y: f32,
-    body_top: f32,
-) -> MainHit {
+unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHit {
     if matches!(
         app.phase,
         MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
@@ -5958,18 +5945,8 @@ unsafe fn main_hit_test(
         }
         if let MainPhase::Matched { track, .. } = &app.phase {
             if track.page_url.is_some() {
-                if let Some(renderer) = renderer {
-                    if let Ok(metrics) = renderer.result_details_metrics(track) {
-                        let action = result_details_rects(
-                            body_top,
-                            metrics.title_height,
-                            metrics.artist_height,
-                        )
-                        .action;
-                        if result_card_link_hit(x, local_y, body_top, close, action) {
-                            return MainHit::OpenTrack(track.display_id);
-                        }
-                    }
+                if result_card_link_hit(x, local_y, body_top, close, None) {
+                    return MainHit::OpenTrack(track.display_id);
                 }
             }
         }
@@ -7617,8 +7594,7 @@ unsafe extern "system" fn window_proc(
             } else {
                 0.0
             };
-            app.mouse_down_center =
-                main_hit_test(app, data.renderer.as_ref(), x, y, body_top) == MainHit::CenterButton;
+            app.mouse_down_center = main_hit_test(app, x, y, body_top) == MainHit::CenterButton;
             app.long_press_consumed = false;
             if app.mouse_down_center {
                 let _ = SetCapture(hwnd);
@@ -7636,7 +7612,7 @@ unsafe extern "system" fn window_proc(
             } else {
                 0.0
             };
-            if main_hit_test(app, data.renderer.as_ref(), x, y, body_top) == MainHit::CenterButton {
+            if main_hit_test(app, x, y, body_top) == MainHit::CenterButton {
                 app.mouse_down_center = true;
                 app.long_press_consumed = true;
                 if matches!(
@@ -7653,10 +7629,7 @@ unsafe extern "system" fn window_proc(
             } else {
                 app.mouse_down_center = false;
                 app.long_press_consumed = false;
-                process_main_hit(
-                    app,
-                    main_hit_test(app, data.renderer.as_ref(), x, y, body_top),
-                );
+                process_main_hit(app, main_hit_test(app, x, y, body_top));
             }
             update_visible_windows(app);
             LRESULT(0)
@@ -7679,7 +7652,7 @@ unsafe extern "system" fn window_proc(
                 } else {
                     0.0
                 };
-                let hit = main_hit_test(app, data.renderer.as_ref(), x, y, body_top);
+                let hit = main_hit_test(app, x, y, body_top);
                 process_main_hit(app, hit);
                 update_visible_windows(app);
             }
@@ -7824,7 +7797,7 @@ unsafe extern "system" fn window_proc(
             } else {
                 0.0
             };
-            if main_hit_test(app, data.renderer.as_ref(), x, y, body_top) == MainHit::CenterButton {
+            if main_hit_test(app, x, y, body_top) == MainHit::CenterButton {
                 if matches!(
                     app.phase,
                     MainPhase::Listening {
@@ -8756,28 +8729,67 @@ mod tests {
     }
 
     #[test]
-    fn ui222_result_card_link_excludes_close_and_action_controls() {
+    fn ui222_result_card_link_excludes_close_and_visible_store_action() {
         let top = 42.0;
         let close = [353.0, top + 25.0, 365.0, top + 37.0];
         let action = result_details_rects(top, 24.0, 18.0).action;
+        let action_bounds = [action.left, action.top, action.right, action.bottom];
 
-        assert!(result_card_link_hit(30.0, top + 80.0, top, close, action));
-        assert!(!result_card_link_hit(359.0, top + 31.0, top, close, action));
+        assert!(result_card_link_hit(
+            30.0,
+            top + 80.0,
+            top,
+            close,
+            Some(action_bounds)
+        ));
+        assert!(!result_card_link_hit(
+            359.0,
+            top + 31.0,
+            top,
+            close,
+            Some(action_bounds)
+        ));
         assert!(!result_card_link_hit(
             (action.left + action.right) * 0.5,
             (action.top + action.bottom) * 0.5,
             top,
             close,
-            action,
+            Some(action_bounds),
         ));
-        assert!(!result_card_link_hit(30.0, top - 0.1, top, close, action));
+        assert!(!result_card_link_hit(
+            30.0,
+            top - 0.1,
+            top,
+            close,
+            Some(action_bounds)
+        ));
         assert!(!result_card_link_hit(
             30.0,
             top + TOP_HEIGHT as f32 + 0.1,
             top,
             close,
-            action,
+            Some(action_bounds),
         ));
+    }
+
+    #[test]
+    fn ui233_absent_store_badge_does_not_leave_an_inert_hit_area() {
+        let top = 42.0;
+        let close = [353.0, top + 25.0, 365.0, top + 37.0];
+        let action = result_details_rects(top, 24.0, 18.0).action;
+        let action_center = (
+            (action.left + action.right) * 0.5,
+            (action.top + action.bottom) * 0.5,
+        );
+
+        assert!(result_card_link_hit(
+            action_center.0,
+            action_center.1,
+            top,
+            close,
+            None,
+        ));
+        assert!(!result_card_link_hit(359.0, top + 31.0, top, close, None));
     }
 
     #[test]
