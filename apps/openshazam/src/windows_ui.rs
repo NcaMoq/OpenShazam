@@ -9043,6 +9043,56 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the Windows Composition graphics device; run explicitly on Windows"]
+    fn composition_result_overlay_uploads_pixels_and_resizes_at_fractional_dpi() {
+        use super::{CompositionResultOverlay, LayeredSurface};
+
+        unsafe {
+            super::CoInitializeEx(None, super::COINIT_APARTMENTTHREADED).unwrap();
+            let dispatcher =
+                super::CreateDispatcherQueueController(super::DispatcherQueueOptions {
+                    dwSize: std::mem::size_of::<super::DispatcherQueueOptions>() as u32,
+                    threadType: super::DQTYPE_THREAD_CURRENT,
+                    apartmentType: super::DQTAT_COM_STA,
+                })
+                .unwrap();
+            let result = (|| -> windows::core::Result<()> {
+                let compositor = super::Compositor::new()?;
+                let mut overlay = CompositionResultOverlay::new(&compositor, 96)?;
+                let source_96 = LayeredSurface::new(380, 220)?;
+                let bytes_96 = std::slice::from_raw_parts_mut(
+                    source_96._pixels.cast::<u8>(),
+                    source_96.size.width as usize * source_96.size.height as usize * 4,
+                );
+                bytes_96.fill(0);
+                let first_content_pixel_96 = 10 * 380 * 4;
+                bytes_96[first_content_pixel_96..first_content_pixel_96 + 4]
+                    .copy_from_slice(&[0, 0, 0, 255]);
+                overlay.update_from_layered(&source_96, 10.0, 10.0, 96)?;
+
+                bytes_96[first_content_pixel_96..first_content_pixel_96 + 4]
+                    .copy_from_slice(&[32, 64, 128, 255]);
+                overlay.update_from_layered(&source_96, 10.0, 10.0, 96)?;
+
+                let source_120 = LayeredSurface::new(475, 280)?;
+                let bytes_120 = std::slice::from_raw_parts_mut(
+                    source_120._pixels.cast::<u8>(),
+                    source_120.size.width as usize * source_120.size.height as usize * 4,
+                );
+                bytes_120.fill(0);
+                let first_content_pixel_120 = 16 * 475 * 4;
+                bytes_120[first_content_pixel_120..first_content_pixel_120 + 4]
+                    .copy_from_slice(&[16, 32, 64, 255]);
+                overlay.update_from_layered(&source_120, 12.5, 12.5, 120)?;
+                Ok(())
+            })();
+            drop(dispatcher);
+            super::CoUninitialize();
+            result.unwrap();
+        }
+    }
+
+    #[test]
     fn button_keeps_its_specified_absolute_position() {
         for body_top in [0.0, POPUP_ARROW_HEIGHT as f32] {
             let button_left = BUTTON_X as f32;
