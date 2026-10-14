@@ -1,7 +1,7 @@
 use super::CaptureAccumulator;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Data, FromSample, Sample, SampleFormat, SizedSample,
+    Data, FromSample, Sample, SampleFormat, SizedSample, SupportedBufferSize,
 };
 use shazam_progressive::{
     NativeTaggingType, ProgressiveSession, RecognitionOutcome, RollingPcmBuffer, SessionStatus,
@@ -14,17 +14,29 @@ use std::{
     io::{self, Write},
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         mpsc::{self, sync_channel, TryRecvError, TrySendError},
-        Arc, Mutex,
+        Arc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const PACKET_QUEUE_CAPACITY: usize = 8;
+const PROGRESSIVE_EVENT_QUEUE_CAPACITY: usize = 32;
+const AUDIO_POOL_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const PACKET_TIMEOUT: Duration = Duration::from_secs(30);
 const RECOGNITION_QUEUE_TIMEOUT: Duration = Duration::from_millis(25);
+type AudioBufferPool = (mpsc::SyncSender<Vec<f32>>, mpsc::Receiver<Vec<f32>>);
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum CallbackFault {
+    None = 0,
+    SampleBuffer = 1,
+    Device = 2,
+    EventQueueClosed = 3,
+}
 
 pub(super) fn capture_signature(
     output: &Path,
@@ -59,7 +71,12 @@ pub(super) fn capture_signature(
         .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?;
 
     let (sender, receiver) = sync_channel(PACKET_QUEUE_CAPACITY);
-    let callback_fault = Arc::new(Mutex::new(None::<String>));
+    let audio_buffer_pool = make_audio_buffer_pool(supported.buffer_size(), channels);
+    let (recycled_buffers, mut available_buffers) = match audio_buffer_pool {
+        Some(pool) => (Some(pool.0), Some(pool.1)),
+        None => (None, None),
+    };
+    let callback_fault = Arc::new(AtomicU8::new(CallbackFault::None as u8));
     let stream_fault = Arc::clone(&callback_fault);
     let queue_overflow = Arc::new(AtomicBool::new(false));
     let callback_overflow = Arc::clone(&queue_overflow);
@@ -67,19 +84,39 @@ pub(super) fn capture_signature(
         supported.into(),
         sample_format,
         move |data, _| {
-            let Some(samples) = convert_to_f32(data) else {
-                set_fault(&stream_fault, "could not decode microphone sample buffer");
-                return;
-            };
-            if let Err(error) = sender.try_send(samples) {
-                if matches!(error, TrySendError::Full(_)) {
+            let samples = if let (Some(pool_sender), Some(pool_receiver)) =
+                (&recycled_buffers, &mut available_buffers)
+            {
+                let Ok(mut buffer) = pool_receiver.try_recv() else {
                     callback_overflow.store(true, Ordering::Relaxed);
+                    return;
+                };
+                if !convert_to_f32_into(data, &mut buffer) {
+                    let _ = pool_sender.try_send(buffer);
+                    set_fault(&stream_fault, CallbackFault::SampleBuffer);
+                    return;
+                }
+                AudioBuffer::pooled(buffer, pool_sender.clone())
+            } else {
+                let Some(samples) = convert_to_f32(data) else {
+                    set_fault(&stream_fault, CallbackFault::SampleBuffer);
+                    return;
+                };
+                AudioBuffer::owned(samples)
+            };
+            match sender.try_send(samples) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    callback_overflow.store(true, Ordering::Relaxed);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    set_fault(&stream_fault, CallbackFault::EventQueueClosed);
                 }
             }
         },
         {
             let stream_error = Arc::clone(&callback_fault);
-            move |error| set_fault(&stream_error, &format!("CoreAudio stream error: {error}"))
+            move |_| set_fault(&stream_error, CallbackFault::Device)
         },
         Some(Duration::from_secs(2)),
     )?;
@@ -97,13 +134,13 @@ pub(super) fn capture_signature(
             )
             .into());
         }
-        if let Some(error) = take_fault(&callback_fault)? {
+        if let Some(error) = take_fault(&callback_fault) {
             return Err(io::Error::other(error).into());
         }
         match receiver.recv_timeout(PACKET_TIMEOUT) {
-            Ok(samples) => accumulator.push_interleaved_f32(&samples, channels)?,
+            Ok(samples) => accumulator.push_interleaved_f32(&samples.samples, channels)?,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(error) = take_fault(&callback_fault)? {
+                if let Some(error) = take_fault(&callback_fault) {
                     return Err(io::Error::other(error).into());
                 }
                 return Err(io::Error::new(
@@ -180,10 +217,16 @@ pub(super) fn recognize_progressive(
     let trace_enabled =
         std::env::var_os("OPENSHZAM_PROGRESSIVE_TRACE").is_some_and(|value| value == "1");
 
-    let (progressive_sender, progressive_receiver) = mpsc::channel();
+    let (progressive_sender, progressive_receiver) =
+        mpsc::sync_channel(PROGRESSIVE_EVENT_QUEUE_CAPACITY);
+    let audio_buffer_pool = make_audio_buffer_pool(supported.buffer_size(), channels);
+    let (recycled_buffers, mut available_buffers) = match audio_buffer_pool {
+        Some(pool) => (Some(pool.0), Some(pool.1)),
+        None => (None, None),
+    };
     let pending_audio_packets = Arc::new(AtomicUsize::new(0));
     let callback_pending_audio = Arc::clone(&pending_audio_packets);
-    let callback_fault = Arc::new(Mutex::new(None::<String>));
+    let callback_fault = Arc::new(AtomicU8::new(CallbackFault::None as u8));
     let stream_fault = Arc::clone(&callback_fault);
     let queue_overflow = Arc::new(AtomicBool::new(false));
     let callback_overflow = Arc::clone(&queue_overflow);
@@ -194,9 +237,25 @@ pub(super) fn recognize_progressive(
         supported.into(),
         sample_format,
         move |data, info| {
-            let Some(samples) = convert_to_f32(data) else {
-                set_fault(&stream_fault, "could not decode microphone sample buffer");
-                return;
+            let samples = if let (Some(pool_sender), Some(pool_receiver)) =
+                (&recycled_buffers, &mut available_buffers)
+            {
+                let Ok(mut buffer) = pool_receiver.try_recv() else {
+                    callback_overflow.store(true, Ordering::Relaxed);
+                    return;
+                };
+                if !convert_to_f32_into(data, &mut buffer) {
+                    let _ = pool_sender.try_send(buffer);
+                    set_fault(&stream_fault, CallbackFault::SampleBuffer);
+                    return;
+                }
+                AudioBuffer::pooled(buffer, pool_sender.clone())
+            } else {
+                let Some(samples) = convert_to_f32(data) else {
+                    set_fault(&stream_fault, CallbackFault::SampleBuffer);
+                    return;
+                };
+                AudioBuffer::owned(samples)
             };
             enqueue_audio_event(
                 &stream_sender,
@@ -210,7 +269,7 @@ pub(super) fn recognize_progressive(
         },
         {
             let stream_error = Arc::clone(&callback_fault);
-            move |error| set_fault(&stream_error, &format!("CoreAudio stream error: {error}"))
+            move |_| set_fault(&stream_error, CallbackFault::Device)
         },
         Some(Duration::from_secs(2)),
     )?;
@@ -256,7 +315,7 @@ pub(super) fn recognize_progressive(
             )
             .into());
         }
-        if let Some(error) = take_fault(&callback_fault)? {
+        if let Some(error) = take_fault(&callback_fault) {
             return Err(io::Error::other(error).into());
         }
         match configuration_receiver.try_recv() {
@@ -274,10 +333,9 @@ pub(super) fn recognize_progressive(
             Ok(ProgressiveEvent::Audio {
                 samples,
                 source_timestamp_ms,
-                processed,
             }) => {
                 release_audio_packet(&pending_audio_packets);
-                let result = super::downmix_interleaved_f32(&samples, channels);
+                let result = super::downmix_interleaved_f32(&samples.samples, channels);
                 if let Ok(mono) = &result {
                     push_timed_preroll(
                         preroll
@@ -289,7 +347,6 @@ pub(super) fn recognize_progressive(
                         sample_rate,
                     );
                 }
-                let _ = processed.send(());
                 result?;
             }
             Ok(ProgressiveEvent::Completion(_)) => {
@@ -410,9 +467,8 @@ pub(super) fn recognize_progressive(
         preroll = None;
         while let Ok(event) = progressive_receiver.try_recv() {
             match event {
-                ProgressiveEvent::Audio { processed, .. } => {
+                ProgressiveEvent::Audio { .. } => {
                     release_audio_packet(&pending_audio_packets);
-                    let _ = processed.send(());
                 }
                 ProgressiveEvent::Completion(_) => {}
             }
@@ -470,12 +526,12 @@ pub(super) fn recognize_progressive(
                 )
                 .into());
             }
-            if let Some(error) = take_fault(&callback_fault)? {
+            if let Some(error) = take_fault(&callback_fault) {
                 return Err(io::Error::other(error).into());
             }
 
             match trigger_receiver.try_recv() {
-                Ok(Ok(())) => {
+                Ok(super::ManualTriggerSignal::Enter) => {
                     trace_progressive(
                         trace_enabled,
                         capture_started,
@@ -487,10 +543,10 @@ pub(super) fn recognize_progressive(
                             Ok(ProgressiveEvent::Audio {
                                 samples,
                                 source_timestamp_ms,
-                                processed,
                             }) => {
                                 release_audio_packet(&pending_audio_packets);
-                                let result = super::downmix_interleaved_f32(&samples, channels);
+                                let result =
+                                    super::downmix_interleaved_f32(&samples.samples, channels);
                                 if let Ok(mono) = &result {
                                     push_timed_preroll(
                                         &mut ring,
@@ -500,7 +556,6 @@ pub(super) fn recognize_progressive(
                                         sample_rate,
                                     );
                                 }
-                                let _ = processed.send(());
                                 result?;
                             }
                             Ok(ProgressiveEvent::Completion(_)) => {
@@ -522,7 +577,16 @@ pub(super) fn recognize_progressive(
                     }
                     break;
                 }
-                Ok(Err(error)) => return Err(io::Error::other(error).into()),
+                Ok(super::ManualTriggerSignal::EndOfInput) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "manual recognition trigger input closed",
+                    )
+                    .into());
+                }
+                Ok(super::ManualTriggerSignal::InputError(error)) => {
+                    return Err(io::Error::other(error).into());
+                }
                 Err(TryRecvError::Disconnected) => {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -537,10 +601,9 @@ pub(super) fn recognize_progressive(
                 Ok(ProgressiveEvent::Audio {
                     samples,
                     source_timestamp_ms,
-                    processed,
                 }) => {
                     release_audio_packet(&pending_audio_packets);
-                    let result = super::downmix_interleaved_f32(&samples, channels);
+                    let result = super::downmix_interleaved_f32(&samples.samples, channels);
                     if let Ok(mono) = &result {
                         push_timed_preroll(
                             &mut ring,
@@ -550,7 +613,6 @@ pub(super) fn recognize_progressive(
                             sample_rate,
                         );
                     }
-                    let _ = processed.send(());
                     result?;
                 }
                 Ok(ProgressiveEvent::Completion(_)) => {
@@ -621,7 +683,7 @@ pub(super) fn recognize_progressive(
                 )
                 .into());
             }
-            if let Some(error) = take_fault(&callback_fault)? {
+            if let Some(error) = take_fault(&callback_fault) {
                 return Err(io::Error::other(error).into());
             }
 
@@ -689,9 +751,8 @@ pub(super) fn recognize_progressive(
     let mut outstanding_at_stop = active_workers.len();
     while outstanding_at_stop > 0 {
         match progressive_receiver.recv_timeout(Duration::from_secs(2)) {
-            Ok(ProgressiveEvent::Audio { processed, .. }) => {
+            Ok(ProgressiveEvent::Audio { .. }) => {
                 release_audio_packet(&pending_audio_packets);
-                let _ = processed.send(());
             }
             Ok(ProgressiveEvent::Completion(completion)) => {
                 if active_workers.remove(&completion.attempt) {
@@ -772,9 +833,8 @@ struct ProgressiveCompletion {
 // any threshold-triggered request have been dispatched.
 enum ProgressiveEvent {
     Audio {
-        samples: Vec<f32>,
+        samples: AudioBuffer,
         source_timestamp_ms: Option<u64>,
-        processed: mpsc::SyncSender<()>,
     },
     Completion(ProgressiveCompletion),
 }
@@ -792,49 +852,88 @@ fn release_audio_packet(pending: &AtomicUsize) {
     debug_assert!(previous > 0, "audio packet counter underflow");
 }
 
+struct AudioBuffer {
+    samples: Vec<f32>,
+    recycle: Option<mpsc::SyncSender<Vec<f32>>>,
+}
+
+impl AudioBuffer {
+    fn owned(samples: Vec<f32>) -> Self {
+        Self {
+            samples,
+            recycle: None,
+        }
+    }
+
+    fn pooled(samples: Vec<f32>, recycle: mpsc::SyncSender<Vec<f32>>) -> Self {
+        Self {
+            samples,
+            recycle: Some(recycle),
+        }
+    }
+}
+
+impl Drop for AudioBuffer {
+    fn drop(&mut self) {
+        if let Some(recycle) = &self.recycle {
+            self.samples.clear();
+            let _ = recycle.try_send(std::mem::take(&mut self.samples));
+        }
+    }
+}
+
+fn make_audio_buffer_pool(
+    supported_size: &SupportedBufferSize,
+    channels: usize,
+) -> Option<AudioBufferPool> {
+    let SupportedBufferSize::Range { max, .. } = supported_size else {
+        return None;
+    };
+    let samples_per_buffer = usize::try_from(*max).ok()?.checked_mul(channels)?;
+    let total_bytes = samples_per_buffer
+        .checked_mul(std::mem::size_of::<f32>())?
+        .checked_mul(PACKET_QUEUE_CAPACITY)?;
+    if samples_per_buffer == 0 || total_bytes > AUDIO_POOL_MEMORY_LIMIT_BYTES {
+        return None;
+    }
+
+    let (sender, receiver) = sync_channel(PACKET_QUEUE_CAPACITY);
+    for _ in 0..PACKET_QUEUE_CAPACITY {
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(samples_per_buffer).ok()?;
+        sender.try_send(buffer).ok()?;
+    }
+    Some((sender, receiver))
+}
+
 fn enqueue_audio_event(
-    sender: &mpsc::Sender<ProgressiveEvent>,
+    sender: &mpsc::SyncSender<ProgressiveEvent>,
     pending_audio_packets: &AtomicUsize,
     queue_overflow: &AtomicBool,
-    callback_fault: &Mutex<Option<String>>,
+    callback_fault: &AtomicU8,
     stream_stopping: &AtomicBool,
-    samples: Vec<f32>,
+    samples: AudioBuffer,
     source_timestamp_ms: Option<u64>,
 ) {
     if stream_stopping.load(Ordering::Acquire) {
         return;
     }
-    let (processed_sender, processed_receiver) = mpsc::sync_channel(0);
     if !reserve_audio_packet(pending_audio_packets) {
         queue_overflow.store(true, Ordering::Relaxed);
         return;
     }
-    if sender
-        .send(ProgressiveEvent::Audio {
-            samples,
-            source_timestamp_ms,
-            processed: processed_sender,
-        })
-        .is_err()
-    {
-        release_audio_packet(pending_audio_packets);
-        set_fault(
-            callback_fault,
-            "Progressive event queue closed during capture",
-        );
-        return;
-    }
-    loop {
-        match processed_receiver.recv_timeout(RECOGNITION_QUEUE_TIMEOUT) {
-            Ok(()) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) if stream_stopping.load(Ordering::Acquire) => {
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                set_fault(callback_fault, "Progressive PCM event was not acknowledged");
-                break;
-            }
+    match sender.try_send(ProgressiveEvent::Audio {
+        samples,
+        source_timestamp_ms,
+    }) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            release_audio_packet(pending_audio_packets);
+            queue_overflow.store(true, Ordering::Relaxed);
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            release_audio_packet(pending_audio_packets);
+            set_fault(callback_fault, CallbackFault::EventQueueClosed);
         }
     }
 }
@@ -848,7 +947,7 @@ fn service_progressive(
     started: Instant,
     request_timeout: Duration,
     first_event: Option<ProgressiveEvent>,
-    event_sender: &mpsc::Sender<ProgressiveEvent>,
+    event_sender: &mpsc::SyncSender<ProgressiveEvent>,
     event_receiver: &mpsc::Receiver<ProgressiveEvent>,
     channels: usize,
     pending_audio_packets: &AtomicUsize,
@@ -860,7 +959,6 @@ fn service_progressive(
     trace_enabled: bool,
     jsonl_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut audio_ack = None;
     let mut deferred_post_stop_job = None;
     let mut deferred_manual_ui_event = None;
     let event = match first_event {
@@ -882,15 +980,13 @@ fn service_progressive(
             ProgressiveEvent::Audio {
                 samples,
                 source_timestamp_ms,
-                processed,
             } => {
                 release_audio_packet(pending_audio_packets);
-                audio_ack = Some(processed);
                 let result = if session.is_terminal() {
                     Ok(())
                 } else {
                     (|| -> Result<(), io::Error> {
-                        let mono = super::downmix_interleaved_f32(&samples, channels)?;
+                        let mono = super::downmix_interleaved_f32(&samples.samples, channels)?;
                         session
                             .push_f32_at_with_source_timestamp_ns(
                                 &mono,
@@ -1213,10 +1309,6 @@ fn service_progressive(
         }
     }
 
-    if let Some(audio_ack) = audio_ack {
-        let _ = audio_ack.send(());
-    }
-
     Ok(())
 }
 
@@ -1310,18 +1402,28 @@ fn mac_timezone_name() -> String {
         .unwrap_or_else(|| "UTC".into())
 }
 
-fn set_fault(slot: &Mutex<Option<String>>, message: &str) {
-    if let Ok(mut slot) = slot.lock() {
-        if slot.is_none() {
-            *slot = Some(message.to_owned());
-        }
-    }
+fn set_fault(slot: &AtomicU8, fault: CallbackFault) {
+    let _ = slot.compare_exchange(
+        CallbackFault::None as u8,
+        fault as u8,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    );
 }
 
-fn take_fault(slot: &Mutex<Option<String>>) -> io::Result<Option<String>> {
-    slot.lock()
-        .map(|mut slot| slot.take())
-        .map_err(|_| io::Error::other("CoreAudio error state lock was poisoned"))
+fn take_fault(slot: &AtomicU8) -> Option<&'static str> {
+    match slot.swap(CallbackFault::None as u8, Ordering::AcqRel) {
+        value if value == CallbackFault::SampleBuffer as u8 => {
+            Some("CoreAudio supplied an unsupported or oversized sample buffer")
+        }
+        value if value == CallbackFault::Device as u8 => {
+            Some("CoreAudio input stream reported a device error")
+        }
+        value if value == CallbackFault::EventQueueClosed as u8 => {
+            Some("Progressive event queue closed during capture")
+        }
+        _ => None,
+    }
 }
 
 fn convert_to_f32(data: &Data) -> Option<Vec<f32>> {
@@ -1341,6 +1443,44 @@ fn convert_to_f32(data: &Data) -> Option<Vec<f32>> {
         SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => None,
         _ => None,
     }
+}
+
+fn convert_to_f32_into(data: &Data, output: &mut Vec<f32>) -> bool {
+    if data.len() > output.capacity() {
+        return false;
+    }
+    output.clear();
+    match data.sample_format() {
+        SampleFormat::F32 => convert_samples_into::<f32>(data, output),
+        SampleFormat::F64 => convert_samples_into::<f64>(data, output),
+        SampleFormat::I8 => convert_samples_into::<i8>(data, output),
+        SampleFormat::I16 => convert_samples_into::<i16>(data, output),
+        SampleFormat::I24 => convert_samples_into::<cpal::I24>(data, output),
+        SampleFormat::I32 => convert_samples_into::<i32>(data, output),
+        SampleFormat::I64 => convert_samples_into::<i64>(data, output),
+        SampleFormat::U8 => convert_samples_into::<u8>(data, output),
+        SampleFormat::U16 => convert_samples_into::<u16>(data, output),
+        SampleFormat::U24 => convert_samples_into::<cpal::U24>(data, output),
+        SampleFormat::U32 => convert_samples_into::<u32>(data, output),
+        SampleFormat::U64 => convert_samples_into::<u64>(data, output),
+        SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => false,
+        _ => false,
+    }
+}
+
+fn convert_samples_into<T>(data: &Data, output: &mut Vec<f32>) -> bool
+where
+    T: SizedSample + Sample,
+    f32: FromSample<T>,
+{
+    let Some(samples) = data.as_slice::<T>() else {
+        return false;
+    };
+    if samples.len() > output.capacity() {
+        return false;
+    }
+    output.extend(samples.iter().copied().map(<f32 as Sample>::from_sample));
+    true
 }
 
 fn convert_samples<T>(data: &Data) -> Option<Vec<f32>>
@@ -1448,11 +1588,11 @@ mod progressive_event_tests {
     }
 
     #[test]
-    fn audio_event_is_fifo_and_waits_for_processing_acknowledgement() {
-        let (sender, receiver) = mpsc::channel();
+    fn audio_event_enqueue_is_nonblocking_and_preserves_fifo() {
+        let (sender, receiver) = mpsc::sync_channel(PROGRESSIVE_EVENT_QUEUE_CAPACITY);
         let pending_audio_packets = Arc::new(AtomicUsize::new(0));
         let queue_overflow = Arc::new(AtomicBool::new(false));
-        let callback_fault = Arc::new(Mutex::new(None));
+        let callback_fault = Arc::new(AtomicU8::new(CallbackFault::None as u8));
         let stream_stopping = Arc::new(AtomicBool::new(false));
         let producer_finished = Arc::new(AtomicBool::new(false));
 
@@ -1463,49 +1603,157 @@ mod progressive_event_tests {
         let producer_stopping = Arc::clone(&stream_stopping);
         let producer_finished_flag = Arc::clone(&producer_finished);
         let producer = thread::spawn(move || {
-            enqueue_audio_event(
-                &producer_sender,
-                &producer_pending,
-                &producer_overflow,
-                &producer_fault,
-                &producer_stopping,
-                vec![0.25, -0.5],
-                None,
-            );
+            for (samples, timestamp) in [(vec![0.25, -0.5], Some(1_000)), (vec![0.75], Some(1_125))]
+            {
+                enqueue_audio_event(
+                    &producer_sender,
+                    &producer_pending,
+                    &producer_overflow,
+                    &producer_fault,
+                    &producer_stopping,
+                    AudioBuffer::owned(samples),
+                    timestamp,
+                );
+            }
             producer_finished_flag.store(true, Ordering::Release);
         });
-
-        let ProgressiveEvent::Audio {
-            samples,
-            source_timestamp_ms,
-            processed,
-        } = receiver.recv().unwrap()
-        else {
-            panic!("audio flow must be the first queued generator operation");
-        };
-        release_audio_packet(&pending_audio_packets);
-        assert_eq!(samples, [0.25, -0.5]);
-        assert_eq!(source_timestamp_ms, None);
-        assert!(!producer_finished.load(Ordering::Acquire));
-
-        sender
-            .send(ProgressiveEvent::Completion(ProgressiveCompletion {
-                attempt: 1,
-                status: None,
-                outcome: RecognitionOutcome::TransportFailure,
-                candidates: Vec::new(),
-            }))
-            .unwrap();
-        processed.send(()).unwrap();
         producer.join().unwrap();
         assert!(producer_finished.load(Ordering::Acquire));
+
+        for (expected_samples, expected_timestamp) in
+            [(&[0.25, -0.5][..], Some(1_000)), (&[0.75][..], Some(1_125))]
+        {
+            let ProgressiveEvent::Audio {
+                samples,
+                source_timestamp_ms,
+            } = receiver.recv().unwrap()
+            else {
+                panic!("audio flow must preserve FIFO packet order");
+            };
+            assert_eq!(samples.samples, expected_samples);
+            assert_eq!(source_timestamp_ms, expected_timestamp);
+            release_audio_packet(&pending_audio_packets);
+        }
         assert_eq!(pending_audio_packets.load(Ordering::Acquire), 0);
         assert!(!queue_overflow.load(Ordering::Relaxed));
-        assert!(callback_fault.lock().unwrap().is_none());
-        assert!(matches!(
-            receiver.recv().unwrap(),
-            ProgressiveEvent::Completion(ProgressiveCompletion { attempt: 1, .. })
-        ));
+        assert_eq!(
+            callback_fault.load(Ordering::Acquire),
+            CallbackFault::None as u8
+        );
+    }
+
+    #[test]
+    fn callback_queue_full_is_reported_without_waiting() {
+        let (sender, receiver) = mpsc::sync_channel(0);
+        let pending_audio_packets = AtomicUsize::new(0);
+        let queue_overflow = AtomicBool::new(false);
+        let callback_fault = AtomicU8::new(CallbackFault::None as u8);
+        let stream_stopping = AtomicBool::new(false);
+
+        enqueue_audio_event(
+            &sender,
+            &pending_audio_packets,
+            &queue_overflow,
+            &callback_fault,
+            &stream_stopping,
+            AudioBuffer::owned(vec![0.5]),
+            Some(42),
+        );
+
+        assert!(queue_overflow.load(Ordering::Relaxed));
+        assert_eq!(pending_audio_packets.load(Ordering::Acquire), 0);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            callback_fault.load(Ordering::Acquire),
+            CallbackFault::None as u8
+        );
+    }
+
+    #[test]
+    fn audio_buffer_pool_recycles_preallocated_storage() {
+        let supported = SupportedBufferSize::Range { min: 1, max: 64 };
+        let (sender, receiver) = make_audio_buffer_pool(&supported, 2).unwrap();
+        let buffer = receiver.try_recv().unwrap();
+        let capacity = buffer.capacity();
+        let allocation = buffer.as_ptr();
+        assert!(capacity >= 128);
+
+        drop(AudioBuffer::pooled(buffer, sender.clone()));
+        let recycled: Vec<_> = (0..PACKET_QUEUE_CAPACITY)
+            .map(|_| receiver.try_recv().unwrap())
+            .collect();
+        assert!(recycled.iter().all(|buffer| buffer.capacity() == capacity));
+        assert!(recycled.iter().any(|buffer| buffer.as_ptr() == allocation));
+        assert!(make_audio_buffer_pool(&SupportedBufferSize::Unknown, 2).is_none());
+    }
+
+    #[test]
+    fn nonblocking_audio_handoff_produces_the_same_signature_as_single_input() {
+        use sigx_core::{Config, SigX};
+
+        const SAMPLE_RATE: u32 = 16_000;
+        const FRAMES: usize = SAMPLE_RATE as usize * 3;
+        let samples: Vec<f32> = (0..FRAMES)
+            .map(|index| {
+                let state = (index as u32)
+                    .wrapping_mul(1_103_515_245)
+                    .wrapping_add(12_345);
+                ((state >> 16) as i16) as f32 / 32_768.0
+            })
+            .collect();
+        let config = Config {
+            sample_rate: SAMPLE_RATE,
+            channels: 1,
+            signature_type: 2,
+            signature_options: 0,
+            max_frames: FRAMES,
+        };
+        let mut direct = SigX::new(config).unwrap();
+        direct.push_f32(&samples).unwrap();
+        let expected = direct.signature().unwrap();
+
+        let (sender, receiver) = mpsc::sync_channel(PROGRESSIVE_EVENT_QUEUE_CAPACITY);
+        let pending_audio_packets = AtomicUsize::new(0);
+        let queue_overflow = AtomicBool::new(false);
+        let callback_fault = AtomicU8::new(CallbackFault::None as u8);
+        let stream_stopping = AtomicBool::new(false);
+        let mut start = 0;
+        for chunk_len in [5_137, 7_003, 9_011, 6_281, 8_417, 12_151] {
+            let end = (start + chunk_len).min(FRAMES);
+            if end == start {
+                break;
+            }
+            enqueue_audio_event(
+                &sender,
+                &pending_audio_packets,
+                &queue_overflow,
+                &callback_fault,
+                &stream_stopping,
+                AudioBuffer::owned(samples[start..end].to_vec()),
+                None,
+            );
+            start = end;
+        }
+        if start < FRAMES {
+            enqueue_audio_event(
+                &sender,
+                &pending_audio_packets,
+                &queue_overflow,
+                &callback_fault,
+                &stream_stopping,
+                AudioBuffer::owned(samples[start..].to_vec()),
+                None,
+            );
+        }
+        assert!(!queue_overflow.load(Ordering::Relaxed));
+
+        let mut packetized = SigX::new(config).unwrap();
+        while let Ok(ProgressiveEvent::Audio { samples, .. }) = receiver.try_recv() {
+            packetized.push_f32(&samples.samples).unwrap();
+            release_audio_packet(&pending_audio_packets);
+        }
+        assert_eq!(pending_audio_packets.load(Ordering::Acquire), 0);
+        assert_eq!(packetized.signature().unwrap(), expected);
     }
 
     #[test]

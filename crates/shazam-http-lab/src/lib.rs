@@ -492,6 +492,27 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// Transport boundary for one Config-resolved recognition HTTPS POST.
+/// Implementations must preserve TLS verification, the caller's timeout and
+/// cancellation semantics, and must not follow redirects or use ambient
+/// cookies/proxy credentials.
+pub trait RecognitionHttpTransport: Send + Sync {
+    fn post_json_cancellable(
+        &self,
+        endpoint: &str,
+        body: &[u8],
+        timeout: Duration,
+        cancelled: &AtomicBool,
+        on_transport_started: &mut dyn FnMut(),
+    ) -> Result<HttpResponse, Error>;
+}
+
+/// Existing verified HTTPS transport. It uses the host's curl executable and
+/// remains the default until a native Windows transport is independently
+/// verified against the same request and cancellation tests.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CurlRecognitionTransport;
+
 /// Classification of one progressive recognition HTTP response. The response
 /// body is consumed immediately; callers only receive parsed track data or
 /// bounded control fields.
@@ -1749,6 +1770,75 @@ pub fn post_shazam_json_with_timeout_cancellable_and_dispatch<F>(
 where
     F: FnOnce(),
 {
+    post_shazam_json_with_transport(
+        &CurlRecognitionTransport,
+        endpoint,
+        body,
+        timeout,
+        cancelled,
+        on_transport_started,
+    )
+}
+
+/// Send a validated recognition POST through an explicitly selected
+/// transport. The callback indicates local transport startup, not remote
+/// receipt. Current production paths use [`CurlRecognitionTransport`].
+pub fn post_shazam_json_with_transport<T, F>(
+    transport: &T,
+    endpoint: &str,
+    body: &[u8],
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<HttpResponse, Error>
+where
+    T: RecognitionHttpTransport + ?Sized,
+    F: FnOnce(),
+{
+    if timeout.is_zero() || timeout > Duration::from_secs(600) {
+        return Err(Error::BadResponse(
+            "HTTPS timeout must be greater than zero and at most 600 seconds".into(),
+        ));
+    }
+    validate_shazam_request_endpoint(endpoint)?;
+
+    let mut callback = Some(on_transport_started);
+    transport.post_json_cancellable(endpoint, body, timeout, cancelled, &mut || {
+        if let Some(callback) = callback.take() {
+            callback();
+        }
+    })
+}
+
+impl RecognitionHttpTransport for CurlRecognitionTransport {
+    fn post_json_cancellable(
+        &self,
+        endpoint: &str,
+        body: &[u8],
+        timeout: Duration,
+        cancelled: &AtomicBool,
+        on_transport_started: &mut dyn FnMut(),
+    ) -> Result<HttpResponse, Error> {
+        curl_post_shazam_json_with_timeout_cancellable_and_dispatch(
+            endpoint,
+            body,
+            timeout,
+            cancelled,
+            on_transport_started,
+        )
+    }
+}
+
+fn curl_post_shazam_json_with_timeout_cancellable_and_dispatch<F>(
+    endpoint: &str,
+    body: &[u8],
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<HttpResponse, Error>
+where
+    F: FnOnce(),
+{
     if timeout.is_zero() || timeout > Duration::from_secs(600) {
         return Err(Error::BadResponse(
             "HTTPS timeout must be greater than zero and at most 600 seconds".into(),
@@ -2171,6 +2261,42 @@ pub fn submit_progressive_signature_for_tagging_type_with_transport_started_and_
 where
     F: FnOnce(),
 {
+    submit_progressive_signature_for_tagging_type_with_transport(
+        &CurlRecognitionTransport,
+        configuration,
+        tagging_type,
+        request_context,
+        signature,
+        sample_ms,
+        native_timestamp_ms,
+        timezone,
+        timeout,
+        cancelled,
+        on_transport_started,
+    )
+}
+
+/// Same Progressive recognition request path with an injectable verified
+/// HTTPS transport. Request construction, endpoint allowlisting, and response
+/// interpretation stay shared with the default curl path.
+#[allow(clippy::too_many_arguments)]
+pub fn submit_progressive_signature_for_tagging_type_with_transport<T, F>(
+    transport: &T,
+    configuration: &ShazamConfiguration,
+    tagging_type: NativeTaggingType,
+    request_context: Option<NativeTaggingRequestContext>,
+    signature: &[u8],
+    sample_ms: u64,
+    native_timestamp_ms: Option<u64>,
+    timezone: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    on_transport_started: F,
+) -> Result<ProgressiveRecognitionResult, Error>
+where
+    T: RecognitionHttpTransport + ?Sized,
+    F: FnOnce(),
+{
     let tag_id = random_uuid_v4()?;
     let streaming_provider = std::env::var("SHAZAM_STREAMING_PROVIDER").unwrap_or_default();
     let endpoint = match tagging_type {
@@ -2221,7 +2347,8 @@ where
         json!({}),
         None,
     )?;
-    let response = post_shazam_json_with_timeout_cancellable_and_dispatch(
+    let response = post_shazam_json_with_transport(
+        transport,
         &endpoint,
         &body,
         timeout,
@@ -4985,6 +5112,58 @@ mod tests {
             post_loopback_json("https://127.0.0.1:443/match", body),
             Err(Error::InvalidEndpoint(_))
         ));
+    }
+
+    #[test]
+    fn recognition_transport_is_injectable_behind_shared_request_validation() {
+        struct TestTransport(std::sync::atomic::AtomicUsize);
+
+        impl RecognitionHttpTransport for TestTransport {
+            fn post_json_cancellable(
+                &self,
+                endpoint: &str,
+                body: &[u8],
+                timeout: Duration,
+                _cancelled: &AtomicBool,
+                on_transport_started: &mut dyn FnMut(),
+            ) -> Result<HttpResponse, Error> {
+                assert_eq!(endpoint, "https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/inid/tag?sync=true&webv3=true&sampling=true&connected=&sharehub=false&hidelb=true");
+                assert_eq!(body, b"{\"signature\":{}}");
+                assert_eq!(timeout, Duration::from_secs(7));
+                self.0.fetch_add(1, Ordering::Relaxed);
+                on_transport_started();
+                Ok(HttpResponse {
+                    status: 200,
+                    body: b"{}".to_vec(),
+                })
+            }
+        }
+
+        let transport = TestTransport(std::sync::atomic::AtomicUsize::new(0));
+        let started = std::cell::Cell::new(false);
+        let response = post_shazam_json_with_transport(
+            &transport,
+            "https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/inid/tag?sync=true&webv3=true&sampling=true&connected=&sharehub=false&hidelb=true",
+            b"{\"signature\":{}}",
+            Duration::from_secs(7),
+            &AtomicBool::new(false),
+            || started.set(true),
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert!(started.get());
+        assert_eq!(transport.0.load(Ordering::Relaxed), 1);
+
+        assert!(post_shazam_json_with_transport(
+            &transport,
+            "https://example.com/not-allowlisted",
+            b"{}",
+            Duration::from_secs(7),
+            &AtomicBool::new(false),
+            || {},
+        )
+        .is_err());
+        assert_eq!(transport.0.load(Ordering::Relaxed), 1);
     }
 
     #[test]
