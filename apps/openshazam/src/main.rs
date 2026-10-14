@@ -1087,14 +1087,27 @@ fn recognize_loopback_progressive(
         manual_trigger_immediately: false,
         events: None,
     };
-    recognize_loopback_progressive_controlled(
+    let reason = recognize_loopback_progressive_controlled(
         selected_device_id,
         mode,
         context_state,
         jsonl_output,
         control,
-    )
-    .map(|_| ())
+    )?;
+    match reason {
+        SessionEndReason::Matched | SessionEndReason::NoMatch | SessionEndReason::Stopped => Ok(()),
+        SessionEndReason::Cancelled | SessionEndReason::Shutdown => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "progressive recognition was cancelled",
+        )
+        .into()),
+        SessionEndReason::TimedOut => {
+            Err(io::Error::other("progressive recognition timed out").into())
+        }
+        SessionEndReason::Exhausted | SessionEndReason::Failed => {
+            Err(io::Error::other("progressive recognition ended without a match").into())
+        }
+    }
 }
 
 #[cfg(windows)]
