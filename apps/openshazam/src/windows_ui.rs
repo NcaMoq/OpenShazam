@@ -9045,7 +9045,7 @@ mod tests {
     #[test]
     #[ignore = "requires the Windows Composition graphics device; run explicitly on Windows"]
     fn composition_result_overlay_uploads_pixels_and_resizes_at_fractional_dpi() {
-        use super::{CompositionResultOverlay, LayeredSurface};
+        use super::{CompositionResultOverlay, Interface, LayeredSurface};
 
         unsafe {
             super::CoInitializeEx(None, super::COINIT_APARTMENTTHREADED).unwrap();
@@ -9056,10 +9056,34 @@ mod tests {
                     apartmentType: super::DQTAT_COM_STA,
                 })
                 .unwrap();
+            let instance = super::GetModuleHandleW(None).unwrap();
+            let class_name = super::wide("STATIC");
+            let title = super::wide("OpenShazam Composition Surface Test");
+            let hwnd = super::CreateWindowExW(
+                super::WS_EX_LAYERED,
+                super::PCWSTR(class_name.as_ptr()),
+                super::PCWSTR(title.as_ptr()),
+                super::WS_POPUP,
+                0,
+                0,
+                380,
+                610,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )
+            .unwrap();
             let result = (|| -> windows::core::Result<()> {
                 let compositor = super::Compositor::new()?;
                 let mut overlay = CompositionResultOverlay::new(&compositor, 96)?;
-                let source_96 = LayeredSurface::new(380, 220)?;
+                let desktop_interop: super::ICompositorDesktopInterop = compositor.cast()?;
+                let target = desktop_interop.CreateDesktopWindowTarget(hwnd, true)?;
+                let root = compositor.CreateContainerVisual()?;
+                root.SetSize(super::Vector2 { X: 380.0, Y: 610.0 })?;
+                root.Children()?.InsertAtTop(&overlay.group)?;
+                target.SetRoot(&root)?;
+                let source_96 = LayeredSurface::new(380, 610)?;
                 let bytes_96 = std::slice::from_raw_parts_mut(
                     source_96._pixels.cast::<u8>(),
                     source_96.size.width as usize * source_96.size.height as usize * 4,
@@ -9073,6 +9097,7 @@ mod tests {
                 bytes_96[first_content_pixel_96..first_content_pixel_96 + 4]
                     .copy_from_slice(&[32, 64, 128, 255]);
                 overlay.update_from_layered(&source_96, 10.0, 10.0, 96)?;
+                source_96.present(hwnd, 255)?;
 
                 let source_120 = LayeredSurface::new(475, 280)?;
                 let bytes_120 = std::slice::from_raw_parts_mut(
@@ -9086,6 +9111,7 @@ mod tests {
                 overlay.update_from_layered(&source_120, 12.5, 12.5, 120)?;
                 Ok(())
             })();
+            let _ = super::DestroyWindow(hwnd);
             drop(dispatcher);
             super::CoUninitialize();
             result.unwrap();
