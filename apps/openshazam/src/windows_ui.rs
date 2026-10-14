@@ -11,13 +11,14 @@ use std::{
     process::Command,
     sync::OnceLock,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use windows::{
     core::{implement, Error, Interface, Ref, HSTRING, PCWSTR, PWSTR},
     ApplicationModel::{Activation::ActivationKind, AppInstance},
-    Foundation::{TimeSpan, TypedEventHandler},
+    Foundation::{DateTime, TimeSpan, TypedEventHandler},
+    Globalization::DateTimeFormatting::DateTimeFormatter,
     Graphics::{
         DirectX::{DirectXAlphaMode, DirectXPixelFormat},
         IGeometrySource2D,
@@ -113,8 +114,8 @@ use windows::{
                 WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS,
                 WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
                 WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS,
-                WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WNDPROC, WS_EX_LAYERED,
-                WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+                WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMECHANGE, WM_TIMER, WNDCLASSW, WNDPROC,
+                WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
             },
         },
     },
@@ -320,6 +321,10 @@ struct Track {
     title: String,
     artist: String,
     recognized_at: Instant,
+    recognized_at_utc: SystemTime,
+    recognized_date_label: String,
+    #[allow(dead_code)]
+    timestamp_source: HistoryTimestampSource,
     artwork_url: Option<String>,
     hq_artwork_url: Option<String>,
     #[allow(dead_code)] // Kept distinct from the album-art rendition by the UI data contract.
@@ -328,6 +333,55 @@ struct Track {
     // Retained alongside the Config-resolved page URL for the presentation model.
     track_key: Option<String>,
     page_url: Option<ValidatedWebTrackUrl>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryTimestampSource {
+    HostReceivedFallback,
+}
+
+const WINDOWS_EPOCH_OFFSET_100NS: i64 = 116_444_736_000_000_000;
+const WINDOWS_DATETIME_TEMPLATE: &str = "day month.abbreviated year hour minute";
+
+fn winrt_datetime_from_system_time(value: SystemTime) -> DateTime {
+    let elapsed = value.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+    let unix_100ns =
+        (elapsed.as_secs() as i128) * 10_000_000 + i128::from(elapsed.subsec_nanos() / 100);
+    DateTime {
+        UniversalTime: (unix_100ns + i128::from(WINDOWS_EPOCH_OFFSET_100NS))
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+    }
+}
+
+fn format_history_date_label(value: SystemTime) -> String {
+    let template = HSTRING::from(WINDOWS_DATETIME_TEMPLATE);
+    DateTimeFormatter::CreateDateTimeFormatter(&template)
+        .and_then(|formatter| formatter.Format(winrt_datetime_from_system_time(value)))
+        .map(|formatted| formatted.to_string())
+        .unwrap_or_default()
+}
+
+fn refresh_history_date_labels(history: &mut [Track]) {
+    for track in history {
+        track.recognized_date_label = format_history_date_label(track.recognized_at_utc);
+    }
+}
+
+fn result_panel_draw_top(
+    panel_top: Option<f32>,
+    body_top: f32,
+    composition_cache_ready: bool,
+    composition_cache_hit: bool,
+) -> Option<f32> {
+    panel_top
+        .map(|top| {
+            if composition_cache_ready {
+                (!composition_cache_hit).then_some(body_top)
+            } else {
+                Some(top)
+            }
+        })
+        .flatten()
 }
 
 #[derive(Clone, Debug)]
@@ -435,6 +489,63 @@ enum ResultCardStage {
         started_at: Instant,
         from_offset: f32,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResultOverlayIdentity {
+    Matched {
+        display_id: u64,
+        title: String,
+        artist: String,
+        artwork_url: Option<String>,
+        hq_artwork_url: Option<String>,
+        artwork: Option<(ArtworkSource, usize, usize)>,
+    },
+    NoMatch {
+        entered_at: Instant,
+        offline: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResultOverlayContentKey {
+    identity: ResultOverlayIdentity,
+    theme_generation: u64,
+    dpi: u32,
+    edge: ArrowEdge,
+    language: UiLanguage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResultOverlayMotionKey {
+    MatchEnter {
+        display_id: u64,
+        started_at: Instant,
+    },
+    MatchExit {
+        display_id: u64,
+        started_at: Instant,
+        from_offset_bits: u32,
+    },
+    NoMatchEnter {
+        entered_at: Instant,
+        offline: bool,
+    },
+    NoMatchExit {
+        entered_at: Instant,
+        returned_at: Instant,
+        offline: bool,
+        from_offset_bits: u32,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ResultOverlayMotionAnimation {
+    key: ResultOverlayMotionKey,
+    from_offset: f32,
+    to_offset: f32,
+    remaining: Duration,
+    easing: CubicBezier,
 }
 
 // Native history delivers these independently through Core Data change types.
@@ -645,6 +756,7 @@ struct Renderer {
     target: ID2D1RenderTarget,
     settings_icon: ID2D1Bitmap,
     white_close_icon: ID2D1Bitmap,
+    fallback_match_artwork: Option<(ID2D1Bitmap, ID2D1Bitmap)>,
     hwnd_target: Option<ID2D1HwndRenderTarget>,
     dc_target: Option<ID2D1DCRenderTarget>,
     layered_surface: Option<LayeredSurface>,
@@ -660,11 +772,18 @@ struct Renderer {
     popup_outline: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     popup_header: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     result_details_cache: RefCell<Option<CachedResultDetailsMetrics>>,
+    result_overlay_content_key: Option<ResultOverlayContentKey>,
+    result_overlay_motion_key: Option<ResultOverlayMotionKey>,
     result_overlay_failure_reported: bool,
 }
 
 const SETTINGS_ICON_PIXELS: &[u8; 4096] = include_bytes!("../assets/settings-2x.bgra");
 const WHITE_CLOSE_ICON_PIXELS: &[u8; 2304] = include_bytes!("../assets/WhiteClose-2x.bgra");
+const FALLBACK_MATCH_LIGHT_PIXELS: &[u8; 274_576] =
+    include_bytes!("../assets/fallbackArtworkMatch-light-2x.bgra");
+const FALLBACK_MATCH_DARK_PIXELS: &[u8; 274_576] =
+    include_bytes!("../assets/fallbackArtworkMatch-dark-2x.bgra");
+const FALLBACK_MATCH_LOGICAL_SIDE: f32 = 131.0;
 
 unsafe fn create_ui_icon_bitmap(
     target: &ID2D1RenderTarget,
@@ -834,6 +953,7 @@ struct CompositionResultOverlay {
     _surface: CompositionDrawingSurface,
     surface_interop: ICompositionDrawingSurfaceInterop,
     _surface_brush: CompositionSurfaceBrush,
+    viewport: ContainerVisual,
     group: ContainerVisual,
     bitmap: Option<ID2D1Bitmap1>,
     size: D2D_SIZE_U,
@@ -851,7 +971,7 @@ fn overlay_surface_error(operation: &str, error: windows::core::Error) -> window
 }
 
 impl CompositionResultOverlay {
-    unsafe fn new(compositor: &Compositor, dpi: u32) -> windows::core::Result<Self> {
+    unsafe fn new(compositor: &Compositor, dpi: u32, body_top: f32) -> windows::core::Result<Self> {
         let mut device = None;
         let hardware = D3D11CreateDevice(
             None,
@@ -905,6 +1025,18 @@ impl CompositionResultOverlay {
         let surface_brush = compositor.CreateSurfaceBrushWithSurface(&surface)?;
         surface_brush.SetStretch(CompositionStretch::Fill)?;
 
+        // Keep the clip in a fixed header-sized parent. Only the card group
+        // below this viewport moves during entry/exit, so the transparent
+        // Composition target cannot reveal a card over the D2D history.
+        let viewport = compositor.CreateContainerVisual()?;
+        viewport.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: TOP_HEIGHT as f32,
+        })?;
+        viewport.SetBorderMode(CompositionBorderMode::Soft)?;
+        let clip = compositor.CreateInsetClipWithInsets(0.0, 0.0, 0.0, 0.0)?;
+        viewport.SetClip(&clip)?;
+
         let group = compositor.CreateContainerVisual()?;
         group.SetSize(Vector2 {
             X: CONTENT_WIDTH as f32,
@@ -919,6 +1051,8 @@ impl CompositionResultOverlay {
         })?;
         sprite.SetBrush(&surface_brush)?;
         group.Children()?.InsertAtTop(&sprite)?;
+        viewport.Children()?.InsertAtTop(&group)?;
+        viewport.SetOffset(composition_header_viewport_offset(dpi, body_top))?;
 
         Ok(Self {
             _graphics_device: graphics_device,
@@ -926,6 +1060,7 @@ impl CompositionResultOverlay {
             _surface: surface,
             surface_interop,
             _surface_brush: surface_brush,
+            viewport,
             group,
             bitmap: None,
             size,
@@ -961,22 +1096,28 @@ impl CompositionResultOverlay {
         Ok(())
     }
 
+    fn set_viewport(&self, dpi: u32, body_top: f32) -> windows::core::Result<()> {
+        self.viewport
+            .SetOffset(composition_header_viewport_offset(dpi, body_top))
+    }
+
     unsafe fn update_from_layered(
         &mut self,
         source: &LayeredSurface,
-        panel_top: f32,
+        capture_top: f32,
         body_top: f32,
         dpi: u32,
     ) -> windows::core::Result<()> {
         self.resize(dpi)?;
+        self.set_viewport(dpi, body_top)?;
         let source_len = source.size.width as usize * source.size.height as usize * 4;
         let source_bytes = std::slice::from_raw_parts(source._pixels.cast::<u8>(), source_len);
-        let panel_top_px = (panel_top * self.dpi as f32 / 96.0).round() as i32;
+        let capture_top_px = (capture_top * self.dpi as f32 / 96.0).round() as i32;
         copy_panel_pixels_into(
             source_bytes,
             source.size.width,
             source.size.height,
-            panel_top_px,
+            capture_top_px,
             self.size.width,
             self.size.height,
             &mut self.scratch,
@@ -1046,21 +1187,74 @@ impl CompositionResultOverlay {
             self.has_contents = true;
         }
 
-        let root_snap = composition_button_pixel_snap_offset(self.dpi, body_top);
-        self.group
-            .SetOffset(Vector3 {
-                X: -root_snap.X,
-                Y: panel_top - root_snap.Y,
-                Z: 0.0,
-            })
-            .map_err(|error| overlay_surface_error("SetOffset", error))?;
-        self.group
-            .SetOpacity(1.0)
-            .map_err(|error| overlay_surface_error("SetOpacity", error))?;
         Ok(())
     }
 
+    fn set_position(&self, panel_top: f32, body_top: f32, dpi: u32) -> windows::core::Result<()> {
+        self.set_viewport(dpi, body_top)
+            .map_err(|error| overlay_surface_error("Viewport.SetOffset", error))?;
+        self.group
+            .StopAnimation(&HSTRING::from("Offset.Y"))
+            .map_err(|error| overlay_surface_error("StopAnimation.Offset.Y", error))?;
+        self.group
+            .SetOffset(result_overlay_child_offset(panel_top, body_top))
+            .map_err(|error| overlay_surface_error("SetOffset", error))?;
+        self.group
+            .SetOpacity(1.0)
+            .map_err(|error| overlay_surface_error("SetOpacity", error))
+    }
+
+    fn animate_position(
+        &self,
+        compositor: &Compositor,
+        motion: &ResultOverlayMotionAnimation,
+        body_top: f32,
+        dpi: u32,
+    ) -> windows::core::Result<()> {
+        self.set_viewport(dpi, body_top)
+            .map_err(|error| overlay_surface_error("Viewport.SetOffset", error))?;
+        self.group
+            .StopAnimation(&HSTRING::from("Offset.Y"))
+            .map_err(|error| overlay_surface_error("StopAnimation.Offset.Y", error))?;
+        self.group
+            .SetOffset(Vector3 {
+                X: 0.0,
+                Y: motion.from_offset,
+                Z: 0.0,
+            })
+            .map_err(|error| overlay_surface_error("SetOffset.Start", error))?;
+        let easing = compositor
+            .CreateCubicBezierEasingFunction(
+                Vector2 {
+                    X: motion.easing.x1 as f32,
+                    Y: motion.easing.y1 as f32,
+                },
+                Vector2 {
+                    X: motion.easing.x2 as f32,
+                    Y: motion.easing.y2 as f32,
+                },
+            )
+            .map_err(|error| overlay_surface_error("CreateCubicBezierEasingFunction", error))?;
+        let animation = create_scalar_transition(
+            compositor,
+            motion.from_offset,
+            motion.to_offset,
+            motion.remaining,
+            &easing,
+        )
+        .map_err(|error| overlay_surface_error("CreateOffsetYAnimation", error))?;
+        self.group
+            .StartAnimation(&HSTRING::from("Offset.Y"), &animation)
+            .map_err(|error| overlay_surface_error("StartAnimation.Offset.Y", error))?;
+        self.group
+            .SetOpacity(1.0)
+            .map_err(|error| overlay_surface_error("SetOpacity", error))
+    }
+
     fn hide(&self) -> windows::core::Result<()> {
+        self.group
+            .StopAnimation(&HSTRING::from("Offset.Y"))
+            .map_err(|error| overlay_surface_error("Hide.StopAnimation.Offset.Y", error))?;
         self.group
             .SetOpacity(0.0)
             .map_err(|error| overlay_surface_error("Hide.SetOpacity", error))
@@ -1153,6 +1347,36 @@ fn composition_button_pixel_snap_offset(dpi: u32, body_top: f32) -> Vector3 {
         Y: composition_pixel_phase(body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32, scale),
         Z: 0.0,
     }
+}
+
+fn composition_header_viewport_offset(dpi: u32, body_top: f32) -> Vector3 {
+    let root_snap = composition_button_pixel_snap_offset(dpi, body_top);
+    Vector3 {
+        X: -root_snap.X,
+        Y: body_top - root_snap.Y,
+        Z: 0.0,
+    }
+}
+
+fn result_overlay_child_offset(panel_top: f32, body_top: f32) -> Vector3 {
+    Vector3 {
+        X: 0.0,
+        Y: panel_top - body_top,
+        Z: 0.0,
+    }
+}
+
+#[cfg(test)]
+fn result_header_visible_height(panel_top: f32, body_top: f32) -> f32 {
+    let header_top = body_top;
+    let header_bottom = body_top + TOP_HEIGHT as f32;
+    let card_top = panel_top.max(header_top);
+    let card_bottom = (panel_top + TOP_HEIGHT as f32).min(header_bottom);
+    (card_bottom - card_top).max(0.0)
+}
+
+fn result_header_hit_test_contains(y: f32, body_top: f32) -> bool {
+    (body_top..body_top + TOP_HEIGHT as f32).contains(&y)
 }
 
 fn create_scale_transition(
@@ -2774,13 +2998,13 @@ impl CompositionScene {
             }
         }
 
-        let result_overlay = unsafe { CompositionResultOverlay::new(compositor, dpi)? };
+        let result_overlay = unsafe { CompositionResultOverlay::new(compositor, dpi, body_top)? };
         let root_children = root.Children()?;
         for layer in composition_scene_layer_order() {
             match layer {
                 CompositionSceneLayer::Tagging => root_children.InsertAtTop(&tagging_root)?,
                 CompositionSceneLayer::ResultOverlay => {
-                    root_children.InsertAtTop(&result_overlay.group)?
+                    root_children.InsertAtTop(&result_overlay.viewport)?
                 }
             }
         }
@@ -2905,21 +3129,38 @@ impl CompositionScene {
         })?;
         self.root
             .SetOffset(composition_button_pixel_snap_offset(dpi, self.body_top))?;
-        unsafe { self.result_overlay.resize(dpi) }
+        unsafe {
+            self.result_overlay.resize(dpi)?;
+            self.result_overlay.set_viewport(dpi, self.body_top)
+        }
     }
 
     unsafe fn update_result_overlay(
         &mut self,
         source: Option<&LayeredSurface>,
+        capture_top: Option<f32>,
         panel_top: Option<f32>,
         body_top: f32,
         dpi: u32,
+        motion: Option<&ResultOverlayMotionAnimation>,
+        motion_changed: bool,
     ) -> windows::core::Result<()> {
-        match (source, panel_top) {
-            (Some(source), Some(panel_top)) => self
+        if let (Some(source), Some(capture_top)) = (source, capture_top) {
+            self.result_overlay
+                .update_from_layered(source, capture_top, body_top, dpi)?;
+        } else {
+            self.result_overlay.resize(dpi)?;
+        }
+        match (source, panel_top, motion) {
+            (_, None, _) | (None, Some(_), _) => self.result_overlay.hide(),
+            (Some(_), Some(_), Some(motion)) if motion_changed => self
                 .result_overlay
-                .update_from_layered(source, panel_top, body_top, dpi),
-            _ => self.result_overlay.hide(),
+                .animate_position(&self.compositor, motion, body_top, dpi),
+            (Some(_), Some(_), Some(_)) => Ok(()),
+            (Some(_), Some(panel_top), None) if motion_changed || capture_top.is_some() => {
+                self.result_overlay.set_position(panel_top, body_top, dpi)
+            }
+            (Some(_), Some(_), None) => Ok(()),
         }
     }
 
@@ -2985,6 +3226,7 @@ impl CompositionScene {
                 self.compositor
                     .CreateInsetClipWithInsets(0.0, 0.0, 0.0, bottom_inset.max(0.0))?;
             self.tagging_root.SetClip(&clip)?;
+            self.result_overlay.set_viewport(self.dpi, self.body_top)?;
             let inner_bounds = INNER_MASK_BOUNDS;
             let outer_bounds = ui_model::OUTER_DIAMETERS[0] as f32;
             let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
@@ -3814,6 +4056,19 @@ fn aspect_fit_rect(destination: D2D_RECT_F, source_width: u32, source_height: u3
     rect(left, top, left + width, top + height)
 }
 
+fn fallback_match_artwork_rect(frame: D2D_RECT_F) -> D2D_RECT_F {
+    let width = frame.right - frame.left;
+    let height = frame.bottom - frame.top;
+    let left = frame.left + (width - FALLBACK_MATCH_LOGICAL_SIDE) * 0.5;
+    let top = frame.top + (height - FALLBACK_MATCH_LOGICAL_SIDE) * 0.5;
+    rect(
+        left,
+        top,
+        left + FALLBACK_MATCH_LOGICAL_SIDE,
+        top + FALLBACK_MATCH_LOGICAL_SIDE,
+    )
+}
+
 // [R] DetailsColumn 204pt wide with 20pt insets yields a 164pt text column
 // when preserving its derived x=172 leading edge (UI-3.2).
 const RESULT_DETAILS_LEFT: f32 = 172.0;
@@ -3989,6 +4244,14 @@ impl Renderer {
         target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         let settings_icon = create_ui_icon_bitmap(&target, SETTINGS_ICON_PIXELS, 32, 32)?;
         let white_close_icon = create_ui_icon_bitmap(&target, WHITE_CLOSE_ICON_PIXELS, 24, 24)?;
+        let fallback_match_artwork = if kind == WindowKind::Main {
+            Some((
+                create_ui_icon_bitmap(&target, FALLBACK_MATCH_LIGHT_PIXELS, 262, 262)?,
+                create_ui_icon_bitmap(&target, FALLBACK_MATCH_DARK_PIXELS, 262, 262)?,
+            ))
+        } else {
+            None
+        };
         let palette = create_palette(&target, theme, system_foreground)?;
         let text = create_text_styles(&write_factory)?;
         let composition = if kind == WindowKind::Main {
@@ -4042,6 +4305,7 @@ impl Renderer {
             target,
             settings_icon,
             white_close_icon,
+            fallback_match_artwork,
             hwnd_target,
             dc_target,
             layered_surface,
@@ -4057,7 +4321,44 @@ impl Renderer {
             popup_outline: RefCell::new(None),
             popup_header: RefCell::new(None),
             result_details_cache: RefCell::new(None),
+            result_overlay_content_key: None,
+            result_overlay_motion_key: None,
             result_overlay_failure_reported: false,
+        })
+    }
+
+    fn result_overlay_content_key(
+        &self,
+        app: &AppState,
+        edge: ArrowEdge,
+    ) -> Option<ResultOverlayContentKey> {
+        let identity = match &app.phase {
+            MainPhase::Matched { track, .. } => ResultOverlayIdentity::Matched {
+                display_id: track.display_id,
+                title: track.title.clone(),
+                artist: track.artist.clone(),
+                artwork_url: track.artwork_url.clone(),
+                hq_artwork_url: track.hq_artwork_url.clone(),
+                artwork: self.artwork_bitmaps.borrow().get(&track.display_id).map(
+                    |(source, byte_len, bitmap)| (*source, *byte_len, bitmap.as_raw() as usize),
+                ),
+            },
+            MainPhase::NoMatch { entered_at, .. } => ResultOverlayIdentity::NoMatch {
+                entered_at: *entered_at,
+                offline: false,
+            },
+            MainPhase::Offline { entered_at, .. } => ResultOverlayIdentity::NoMatch {
+                entered_at: *entered_at,
+                offline: true,
+            },
+            _ => return None,
+        };
+        Some(ResultOverlayContentKey {
+            identity,
+            theme_generation: app.theme_generation,
+            dpi: self.dpi,
+            edge,
+            language: ui_language(),
         })
     }
 
@@ -4115,6 +4416,45 @@ impl Renderer {
 
     unsafe fn draw(&mut self, app: &AppState, kind: WindowKind) -> windows::core::Result<()> {
         self.refresh_theme_if_needed(app);
+        let body_top = if app.arrow_edge == ArrowEdge::Top {
+            POPUP_ARROW_HEIGHT as f32
+        } else {
+            0.0
+        };
+        let panel_top = if kind == WindowKind::Main {
+            match &app.phase {
+                MainPhase::Matched { .. }
+                | MainPhase::NoMatch { .. }
+                | MainPhase::Offline { .. } => {
+                    result_panel_top_at(&app.phase, body_top, Instant::now())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let overlay_key = (kind == WindowKind::Main)
+            .then(|| self.result_overlay_content_key(app, app.arrow_edge))
+            .flatten();
+        let overlay_motion = (kind == WindowKind::Main)
+            .then(|| result_overlay_motion_animation(&app.phase, Instant::now()))
+            .flatten();
+        let overlay_motion_key = overlay_motion.as_ref().map(|motion| motion.key.clone());
+        let overlay_motion_changed = self.result_overlay_motion_key != overlay_motion_key;
+        let composition_cache_ready =
+            self.composition.is_some() && self.layered_surface.is_some() && panel_top.is_some();
+        let composition_cache_hit = composition_cache_ready
+            && overlay_key
+                .as_ref()
+                .is_some_and(|key| self.result_overlay_content_key.as_ref() == Some(key));
+        // Rasterize the card once at the fixed header origin. Its animated
+        // offset is applied by the Composition visual.
+        let result_panel_draw_top = result_panel_draw_top(
+            panel_top,
+            body_top,
+            composition_cache_ready,
+            composition_cache_hit,
+        );
         self.target.BeginDraw();
         let clear = d2d_color(0, 0, 0, 0.0);
         self.target.Clear(Some(&clear));
@@ -4141,7 +4481,7 @@ impl Renderer {
             self.target.PushLayer(parameters, layer);
         }
         let draw_result = match kind {
-            WindowKind::Main => self.draw_main(app),
+            WindowKind::Main => self.draw_main(app, result_panel_draw_top),
             WindowKind::Settings => self.draw_settings(app),
             WindowKind::About => self.draw_about(app),
             WindowKind::MicrophoneInfo => self.draw_microphone_info(app),
@@ -4152,34 +4492,50 @@ impl Renderer {
         draw_result?;
         self.target.EndDraw(None, None)?;
         if kind == WindowKind::Main {
-            let body_top = if app.arrow_edge == ArrowEdge::Top {
-                POPUP_ARROW_HEIGHT as f32
-            } else {
-                0.0
-            };
-            let panel_top = match &app.phase {
-                MainPhase::Matched { .. }
-                | MainPhase::NoMatch { .. }
-                | MainPhase::Offline { .. } => {
-                    result_panel_top_at(&app.phase, body_top, Instant::now())
-                }
-                _ => None,
-            };
             let mut overlay_error = None;
+            let mut overlay_update_failed = false;
             if let Some(scene) = self.composition.as_mut() {
-                if let Err(error) = scene.update_result_overlay(
-                    self.layered_surface.as_ref(),
-                    panel_top,
-                    body_top,
-                    self.dpi,
-                ) {
-                    // The result card has already been rendered into the
-                    // layered D2D surface. A failed optional Composition copy
-                    // must not skip UpdateLayeredWindow and leave the whole
-                    // card invisible; hide any stale overlay and present the
-                    // D2D frame as a fallback.
-                    let _ = scene.result_overlay.hide();
-                    overlay_error = Some(error);
+                let overlay_update = if self.layered_surface.is_some() {
+                    scene.update_result_overlay(
+                        self.layered_surface.as_ref(),
+                        (composition_cache_ready && !composition_cache_hit).then_some(body_top),
+                        panel_top,
+                        body_top,
+                        self.dpi,
+                        overlay_motion.as_ref(),
+                        overlay_motion_changed,
+                    )
+                } else {
+                    scene.update_result_overlay(
+                        None,
+                        None,
+                        None,
+                        body_top,
+                        self.dpi,
+                        None,
+                        overlay_motion_changed,
+                    )
+                };
+                match overlay_update {
+                    Ok(()) => {
+                        self.result_overlay_content_key = if composition_cache_ready {
+                            panel_top.and(overlay_key.clone())
+                        } else {
+                            None
+                        };
+                        self.result_overlay_motion_key = overlay_motion_key.clone();
+                    }
+                    Err(error) => {
+                        // The cached Composition surface failed to update.
+                        // Redraw the current frame into the layered D2D target
+                        // below so the card stays visible while the fallback
+                        // path is active.
+                        let _ = scene.result_overlay.hide();
+                        self.result_overlay_content_key = None;
+                        self.result_overlay_motion_key = None;
+                        overlay_update_failed = true;
+                        overlay_error = Some(error);
+                    }
                 }
                 // A failed Composition copy leaves the card in the layered
                 // D2D frame, which is behind the desktop Composition tree.
@@ -4192,6 +4548,12 @@ impl Renderer {
                         overlay_error = Some(overlay_surface_error("FallbackButtonOpacity", error));
                     }
                 }
+            } else {
+                self.result_overlay_content_key = None;
+                self.result_overlay_motion_key = None;
+            }
+            if overlay_update_failed && self.layered_surface.is_some() {
+                self.redraw_main_dynamic_fallback(app, panel_top)?;
             }
             if let Some(error) = overlay_error {
                 if !self.result_overlay_failure_reported {
@@ -4207,6 +4569,39 @@ impl Renderer {
         if let Some(surface) = self.layered_surface.as_ref() {
             surface.present(app.main_hwnd, app.popup_opacity)?;
         }
+        Ok(())
+    }
+
+    unsafe fn redraw_main_dynamic_fallback(
+        &self,
+        app: &AppState,
+        panel_top: Option<f32>,
+    ) -> windows::core::Result<()> {
+        self.target.BeginDraw();
+        let clear = d2d_color(0, 0, 0, 0.0);
+        self.target.Clear(Some(&clear));
+        let parameters = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS {
+            contentBounds: rect(0.0, 0.0, CONTENT_WIDTH as f32, MAIN_WINDOW_HEIGHT as f32),
+            geometricMask: std::mem::ManuallyDrop::new(Some(self.popup_outline(app)?)),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: windows_numerics::Matrix3x2 {
+                M11: 1.0,
+                M22: 1.0,
+                ..Default::default()
+            },
+            opacity: 1.0,
+            opacityBrush: std::mem::ManuallyDrop::new(None),
+            layerOptions: D2D1_LAYER_OPTIONS_NONE,
+        };
+        if let Some(layer) = self.popup_layer.as_ref() {
+            self.target.PushLayer(&parameters, layer);
+        }
+        let draw_result = self.draw_main(app, panel_top);
+        if self.popup_layer.is_some() {
+            self.target.PopLayer();
+        }
+        draw_result?;
+        self.target.EndDraw(None, None)?;
         Ok(())
     }
 
@@ -4335,7 +4730,30 @@ impl Renderer {
         Ok(metrics)
     }
 
-    unsafe fn draw_main(&self, app: &AppState) -> windows::core::Result<()> {
+    unsafe fn with_result_header_clip(
+        &self,
+        body_top: f32,
+        draw: impl FnOnce() -> windows::core::Result<()>,
+    ) -> windows::core::Result<()> {
+        self.target.PushAxisAlignedClip(
+            &rect(
+                0.0,
+                body_top,
+                CONTENT_WIDTH as f32,
+                body_top + TOP_HEIGHT as f32,
+            ),
+            windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+        );
+        let result = draw();
+        self.target.PopAxisAlignedClip();
+        result
+    }
+
+    unsafe fn draw_main(
+        &self,
+        app: &AppState,
+        result_panel_draw_top: Option<f32>,
+    ) -> windows::core::Result<()> {
         let arrow_top = app.arrow_edge == ArrowEdge::Top;
         let body_top = if arrow_top {
             POPUP_ARROW_HEIGHT as f32
@@ -4474,19 +4892,25 @@ impl Renderer {
             }
             MainPhase::Matched { ref track, .. } => {
                 self.draw_status_text(app, body_top);
-                let top =
-                    result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
-                self.draw_result_panel(app, track, top, app.arrow_edge)?;
+                if let Some(top) = result_panel_draw_top {
+                    self.with_result_header_clip(body_top, || {
+                        self.draw_result_panel(app, track, top, app.arrow_edge)
+                    })?;
+                }
             }
             MainPhase::NoMatch { .. } => {
-                let top =
-                    result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
-                self.draw_no_match_panel(top, false, app.arrow_edge)?;
+                if let Some(top) = result_panel_draw_top {
+                    self.with_result_header_clip(body_top, || {
+                        self.draw_no_match_panel(top, false, app.arrow_edge)
+                    })?;
+                }
             }
             MainPhase::Offline { .. } => {
-                let top =
-                    result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
-                self.draw_no_match_panel(top, true, app.arrow_edge)?;
+                if let Some(top) = result_panel_draw_top {
+                    self.with_result_header_clip(body_top, || {
+                        self.draw_no_match_panel(top, true, app.arrow_edge)
+                    })?;
+                }
             }
             MainPhase::Error { ref message, .. } => {
                 self.draw_ready(app, body_top);
@@ -4875,19 +5299,45 @@ impl Renderer {
         let Some((_, _, bitmap)) = bitmaps.get(&track.display_id) else {
             return false;
         };
+        let image_rect = aspect_fit_rect(destination, pixels.width, pixels.height);
+        self.draw_artwork_bitmap(bitmap, destination, image_rect, side)
+    }
+
+    unsafe fn draw_fallback_match_artwork(&self, theme: Theme, frame: D2D_RECT_F) {
+        let Some((light, dark)) = self.fallback_match_artwork.as_ref() else {
+            return;
+        };
+        let bitmap = match theme {
+            Theme::Light => light,
+            Theme::Dark => dark,
+        };
+        // CoreUI stores this match placeholder as a 262px @2x image (131pt).
+        // NSImageCell uses AspectFit and centers that intrinsic size in the
+        // 150pt album-art view; retain the transparent margin and alpha mask.
+        let image_rect = fallback_match_artwork_rect(frame);
+        let _ = self.draw_artwork_bitmap(bitmap, frame, image_rect, 150.0);
+    }
+
+    unsafe fn draw_artwork_bitmap(
+        &self,
+        bitmap: &ID2D1Bitmap,
+        frame: D2D_RECT_F,
+        image_rect: D2D_RECT_F,
+        side: f32,
+    ) -> bool {
         let Some(layer) = self.artwork_layer.as_ref() else {
             return false;
         };
         let mask = &self.artwork_geometries[if side > 100.0 { 0 } else { 1 }].1;
         let parameters = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS {
-            contentBounds: destination,
+            contentBounds: frame,
             geometricMask: std::mem::ManuallyDrop::new(Some(mask.clone())),
             maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
             maskTransform: Matrix3x2 {
                 M11: 1.0,
                 M22: 1.0,
-                M31: destination.left,
-                M32: destination.top,
+                M31: frame.left,
+                M32: frame.top,
                 ..Default::default()
             },
             opacity: 1.0,
@@ -4895,7 +5345,6 @@ impl Renderer {
             layerOptions: D2D1_LAYER_OPTIONS_NONE,
         };
         self.target.PushLayer(&parameters, layer);
-        let image_rect = aspect_fit_rect(destination, pixels.width, pixels.height);
         self.target.DrawBitmap(
             bitmap,
             Some(&image_rect),
@@ -4952,7 +5401,7 @@ impl Renderer {
                 &self.palette.subtitle,
             );
             self.text(
-                "たった今",
+                &track.recognized_date_label,
                 rect(95.0, top + 63.0, 360.0, top + 84.0),
                 &self.text.date,
                 &self.palette.subtitle,
@@ -4981,20 +5430,12 @@ impl Renderer {
         self.fill_gradient_rect(&panel, gradient, top)?;
         let details = self.result_details_metrics(track)?;
         let detail_rects = result_details_rects(top, details.title_height, details.artist_height);
-        let art = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
-            // The image view itself is 150×150pt; do not add UI-144 button-image padding.
-            rect: result_artwork_rect(top, edge),
-            radiusX: RESULT_ARTWORK_CORNER_RADIUS,
-            radiusY: RESULT_ARTWORK_CORNER_RADIUS,
-        };
-        self.target.FillRoundedRectangle(&art, &self.palette.accent);
-        if !self.draw_track_artwork(app, track, result_artwork_rect(top, edge), 150.0) {
-            self.text(
-                "\u{266b}",
-                result_artwork_rect(top, edge),
-                &self.text.centered_heavy,
-                &self.palette.white_ink,
-            );
+        // The image view is 150×150pt and clips at radius5. The native
+        // placeholder has its own centered 131pt intrinsic image size and
+        // alpha, so do not paint an opaque square under it.
+        let artwork_frame = result_artwork_rect(top, edge);
+        if !self.draw_track_artwork(app, track, artwork_frame, 150.0) {
+            self.draw_fallback_match_artwork(app.theme, artwork_frame);
         }
         self.text(
             &track.title,
@@ -5932,10 +6373,20 @@ unsafe fn window_data(hwnd: HWND) -> Option<&'static mut WindowData> {
 }
 
 unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHit {
-    if matches!(
-        app.phase,
-        MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
-    ) {
+    let result_accepts_input = result_header_hit_test_contains(y, body_top)
+        && match &app.phase {
+            MainPhase::Matched { stage, .. } => !matches!(stage, ResultCardStage::Exiting { .. }),
+            MainPhase::NoMatch {
+                returned_to_ready_at,
+                ..
+            }
+            | MainPhase::Offline {
+                returned_to_ready_at,
+                ..
+            } => returned_to_ready_at.is_none(),
+            _ => false,
+        };
+    if result_accepts_input {
         let top = result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
         let offset = top - body_top;
         let close = native_icon_layout(body_top, app.arrow_edge).result_close_hit;
@@ -6568,11 +7019,15 @@ fn show_controller_match(
                 track_key.as_deref(),
             )
         });
+    let recognized_at_utc = SystemTime::now();
     let track = Track {
         display_id,
         title: candidate.title,
         artist: candidate.artist,
         recognized_at: Instant::now(),
+        recognized_at_utc,
+        recognized_date_label: format_history_date_label(recognized_at_utc),
+        timestamp_source: HistoryTimestampSource::HostReceivedFallback,
         artwork_url: metadata.and_then(|metadata| metadata.artwork_url.clone()),
         hq_artwork_url: metadata.and_then(|metadata| metadata.hq_artwork_url.clone()),
         background_artwork_url: metadata.and_then(|metadata| metadata.background_image_url.clone()),
@@ -7193,7 +7648,7 @@ fn result_panel_top_at(phase: &MainPhase, body_top: f32, now: Instant) -> Option
     if let MainPhase::Matched { stage, .. } = phase {
         return Some(match stage {
             ResultCardStage::Entering { started_at } => {
-                let progress = linear_transition_progress(*started_at, now, RESULT_CARD_TRANSITION);
+                let progress = result_card_progress(*started_at, now);
                 body_top - (1.0 - progress) * TOP_HEIGHT as f32
             }
             ResultCardStage::Holding { .. } => body_top,
@@ -7201,7 +7656,7 @@ fn result_panel_top_at(phase: &MainPhase, body_top: f32, now: Instant) -> Option
                 started_at,
                 from_offset,
             } => {
-                let progress = linear_transition_progress(*started_at, now, RESULT_CARD_TRANSITION);
+                let progress = result_card_progress(*started_at, now);
                 body_top + *from_offset * (1.0 - progress) + TOP_HEIGHT as f32 * progress
             }
         });
@@ -7217,17 +7672,204 @@ fn result_panel_top_at(phase: &MainPhase, body_top: f32, now: Instant) -> Option
         } => (*entered_at, *returned_to_ready_at),
         _ => return None,
     };
-    let entrance = ui_model::native_bezier(
-        (now.saturating_duration_since(entered_at).as_secs_f64() / 0.3).clamp(0.0, 1.0),
-    ) as f32;
+    let entrance = result_card_progress(entered_at, now);
     let exit = returned_to_ready_at
-        .map(|start| {
-            ui_model::native_bezier(
-                (now.saturating_duration_since(start).as_secs_f64() / 0.3).clamp(0.0, 1.0),
-            ) as f32
-        })
+        .map(|start| result_card_progress(start, now))
         .unwrap_or(0.0);
     Some(body_top - (1.0 - entrance) * TOP_HEIGHT as f32 + exit * TOP_HEIGHT as f32)
+}
+
+fn result_card_easing() -> CubicBezier {
+    // UI-236 candidate A: Apple's standard Core Animation timing function.
+    // It is the first Windows comparison candidate, not a measured native
+    // Shazam result; the macOS presentation curve remains unresolved.
+    CubicBezier {
+        x1: 0.25,
+        y1: 0.1,
+        x2: 0.25,
+        y2: 1.0,
+    }
+}
+
+fn cubic_coordinate(parameter: f64, first: f64, second: f64) -> f64 {
+    let inverse = 1.0 - parameter;
+    3.0 * inverse * inverse * parameter * first
+        + 3.0 * inverse * parameter * parameter * second
+        + parameter * parameter * parameter
+}
+
+fn cubic_derivative(parameter: f64, first: f64, second: f64) -> f64 {
+    let inverse = 1.0 - parameter;
+    3.0 * inverse * inverse * first
+        + 6.0 * inverse * parameter * (second - first)
+        + 3.0 * parameter * parameter * (1.0 - second)
+}
+
+fn cubic_parameter_for_x(progress: f64, curve: CubicBezier) -> f64 {
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..48 {
+        let mid = (low + high) * 0.5;
+        if cubic_coordinate(mid, curve.x1, curve.x2) < progress {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    (low + high) * 0.5
+}
+
+fn sample_cubic_timing_curve(progress: f64, curve: CubicBezier) -> f64 {
+    let progress = progress.clamp(0.0, 1.0);
+    if progress <= 0.0 || progress >= 1.0 {
+        return progress;
+    }
+    let parameter = cubic_parameter_for_x(progress, curve);
+    cubic_coordinate(parameter, curve.y1, curve.y2)
+}
+
+fn result_card_progress(started_at: Instant, now: Instant) -> f32 {
+    let linear = (now.saturating_duration_since(started_at).as_secs_f64()
+        / RESULT_CARD_TRANSITION.as_secs_f64())
+    .clamp(0.0, 1.0);
+    sample_cubic_timing_curve(linear, result_card_easing()) as f32
+}
+
+fn remaining_cubic_easing(progress: f64, curve: CubicBezier) -> Option<CubicBezier> {
+    if progress >= 1.0 {
+        return None;
+    }
+    if progress <= 0.0 {
+        return Some(curve);
+    }
+    let parameter = cubic_parameter_for_x(progress, curve);
+    let remaining_parameter = 1.0 - parameter;
+    let start_x = cubic_coordinate(parameter, curve.x1, curve.x2);
+    let start_y = cubic_coordinate(parameter, curve.y1, curve.y2);
+    let start_dx = cubic_derivative(parameter, curve.x1, curve.x2);
+    let start_dy = cubic_derivative(parameter, curve.y1, curve.y2);
+    let first_x = start_x + remaining_parameter * start_dx / 3.0;
+    let first_y = start_y + remaining_parameter * start_dy / 3.0;
+    let second_x = 1.0 - remaining_parameter * (1.0 - curve.x2);
+    let second_y = 1.0 - remaining_parameter * (1.0 - curve.y2);
+    let x_scale = 1.0 - start_x;
+    let y_scale = 1.0 - start_y;
+    if x_scale <= f64::EPSILON || y_scale <= f64::EPSILON {
+        return None;
+    }
+    Some(CubicBezier {
+        x1: ((first_x - start_x) / x_scale).clamp(0.0, 1.0),
+        y1: ((first_y - start_y) / y_scale).clamp(0.0, 1.0),
+        x2: ((second_x - start_x) / x_scale).clamp(0.0, 1.0),
+        y2: ((second_y - start_y) / y_scale).clamp(0.0, 1.0),
+    })
+}
+
+fn result_overlay_motion_animation(
+    phase: &MainPhase,
+    now: Instant,
+) -> Option<ResultOverlayMotionAnimation> {
+    let curve = result_card_easing();
+    let (key, from, to, started_at) = match phase {
+        MainPhase::Matched { track, stage } => match stage {
+            ResultCardStage::Entering { started_at } => (
+                ResultOverlayMotionKey::MatchEnter {
+                    display_id: track.display_id,
+                    started_at: *started_at,
+                },
+                -(TOP_HEIGHT as f32),
+                0.0,
+                *started_at,
+            ),
+            ResultCardStage::Exiting {
+                started_at,
+                from_offset,
+            } => (
+                ResultOverlayMotionKey::MatchExit {
+                    display_id: track.display_id,
+                    started_at: *started_at,
+                    from_offset_bits: from_offset.to_bits(),
+                },
+                *from_offset,
+                TOP_HEIGHT as f32,
+                *started_at,
+            ),
+            ResultCardStage::Holding { .. } => return None,
+        },
+        MainPhase::NoMatch {
+            entered_at,
+            returned_to_ready_at,
+        } => match returned_to_ready_at {
+            Some(returned_at) => {
+                let entrance = result_card_progress(*entered_at, *returned_at);
+                let from_offset = -(1.0 - entrance) * TOP_HEIGHT as f32;
+                (
+                    ResultOverlayMotionKey::NoMatchExit {
+                        entered_at: *entered_at,
+                        returned_at: *returned_at,
+                        offline: false,
+                        from_offset_bits: from_offset.to_bits(),
+                    },
+                    from_offset,
+                    TOP_HEIGHT as f32,
+                    *returned_at,
+                )
+            }
+            None => (
+                ResultOverlayMotionKey::NoMatchEnter {
+                    entered_at: *entered_at,
+                    offline: false,
+                },
+                -(TOP_HEIGHT as f32),
+                0.0,
+                *entered_at,
+            ),
+        },
+        MainPhase::Offline {
+            entered_at,
+            returned_to_ready_at,
+        } => match returned_to_ready_at {
+            Some(returned_at) => {
+                let entrance = result_card_progress(*entered_at, *returned_at);
+                let from_offset = -(1.0 - entrance) * TOP_HEIGHT as f32;
+                (
+                    ResultOverlayMotionKey::NoMatchExit {
+                        entered_at: *entered_at,
+                        returned_at: *returned_at,
+                        offline: true,
+                        from_offset_bits: from_offset.to_bits(),
+                    },
+                    from_offset,
+                    TOP_HEIGHT as f32,
+                    *returned_at,
+                )
+            }
+            None => (
+                ResultOverlayMotionKey::NoMatchEnter {
+                    entered_at: *entered_at,
+                    offline: true,
+                },
+                -(TOP_HEIGHT as f32),
+                0.0,
+                *entered_at,
+            ),
+        },
+        _ => return None,
+    };
+
+    let elapsed = now.saturating_duration_since(started_at);
+    if elapsed >= RESULT_CARD_TRANSITION {
+        return None;
+    }
+    let linear = (elapsed.as_secs_f64() / RESULT_CARD_TRANSITION.as_secs_f64()).clamp(0.0, 1.0);
+    let progress = sample_cubic_timing_curve(linear, curve) as f32;
+    Some(ResultOverlayMotionAnimation {
+        key,
+        from_offset: from + (to - from) * progress,
+        to_offset: to,
+        remaining: RESULT_CARD_TRANSITION.saturating_sub(elapsed),
+        easing: remaining_cubic_easing(linear, curve).unwrap_or(curve),
+    })
 }
 
 fn linear_transition_progress(started_at: Instant, now: Instant, duration: Duration) -> f32 {
@@ -7240,18 +7882,40 @@ fn linear_transition_progress(started_at: Instant, now: Instant, duration: Durat
 
 fn advance_result_card_stage(stage: ResultCardStage, now: Instant) -> ResultCardAdvance {
     match stage {
-        ResultCardStage::Entering { started_at }
-            if now.saturating_duration_since(started_at) >= RESULT_CARD_TRANSITION =>
-        {
-            ResultCardAdvance::Stage(ResultCardStage::Holding { started_at: now })
+        ResultCardStage::Entering { started_at } => {
+            let holding_started_at = started_at + RESULT_CARD_TRANSITION;
+            let exiting_started_at = holding_started_at + RESULT_CARD_HOLD;
+            if now >= exiting_started_at {
+                if now.saturating_duration_since(exiting_started_at) >= RESULT_CARD_TRANSITION {
+                    ResultCardAdvance::Ready
+                } else {
+                    ResultCardAdvance::Stage(ResultCardStage::Exiting {
+                        started_at: exiting_started_at,
+                        from_offset: 0.0,
+                    })
+                }
+            } else if now >= holding_started_at {
+                ResultCardAdvance::Stage(ResultCardStage::Holding {
+                    started_at: holding_started_at,
+                })
+            } else {
+                ResultCardAdvance::Unchanged
+            }
         }
-        ResultCardStage::Holding { started_at }
-            if now.saturating_duration_since(started_at) >= RESULT_CARD_HOLD =>
-        {
-            ResultCardAdvance::Stage(ResultCardStage::Exiting {
-                started_at: now,
-                from_offset: 0.0,
-            })
+        ResultCardStage::Holding { started_at } => {
+            let exiting_started_at = started_at + RESULT_CARD_HOLD;
+            if now >= exiting_started_at {
+                if now.saturating_duration_since(exiting_started_at) >= RESULT_CARD_TRANSITION {
+                    ResultCardAdvance::Ready
+                } else {
+                    ResultCardAdvance::Stage(ResultCardStage::Exiting {
+                        started_at: exiting_started_at,
+                        from_offset: 0.0,
+                    })
+                }
+            } else {
+                ResultCardAdvance::Unchanged
+            }
         }
         ResultCardStage::Exiting { started_at, .. }
             if now.saturating_duration_since(started_at) >= RESULT_CARD_TRANSITION =>
@@ -7268,13 +7932,6 @@ fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> 
 
 unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
     refresh_os_theme(app);
-    // The native popup resets its retained result view and dismiss timer when
-    // it is made visible again. Do the same so an interrupted card transition
-    // cannot reappear over the ready/listening screen.
-    if matches!(app.phase, MainPhase::Matched { .. }) {
-        app.phase = MainPhase::Ready;
-        app.success_wave_frame = None;
-    }
     let now = Instant::now();
     // Showing/positioning the popup can produce focus notifications before
     // the deferred SetForegroundWindow call has completed. Do not interpret
@@ -7492,12 +8149,12 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
-        WM_OS_THEME_CHANGED | WM_SETTINGCHANGE | WM_THEMECHANGED
+        WM_OS_THEME_CHANGED | WM_SETTINGCHANGE | WM_THEMECHANGED | WM_TIMECHANGE
             if data.kind == WindowKind::Main =>
         {
-            if refresh_os_theme(app) {
-                update_visible_windows(app);
-            }
+            refresh_os_theme(app);
+            refresh_history_date_labels(&mut app.history);
+            update_visible_windows(app);
             LRESULT(0)
         }
         WM_CREATE => {
@@ -8228,26 +8885,119 @@ mod tests {
     use super::StatusTextAlternator;
     use super::{
         advance_result_card_stage, animation_needs_frame, button_border_arc_points,
-        composition_button_pixel_snap_offset, composition_root_layer_order,
-        composition_scale_for_dpi, composition_scene_layer_order, copy_notification_text,
-        copy_panel_pixels_into, d2d_color_from_system, gradient_origin_transform,
-        header_fill_scope, history_artwork_frame, history_row_top, history_title_color,
-        inverse_circle_clip_radii, is_offline_failure, is_tray_activation_event, localized_ui_text,
-        native_icon_layout, no_match_copy, no_match_icon_rect, phase_needs_timeout, point_in_rect,
-        popup_base_color, resolve_page_link, result_artwork_rect, result_card_link_hit,
-        result_details_rects, result_gradient_colors, result_overlay_occludes_shazam_button,
+        composition_button_pixel_snap_offset, composition_header_viewport_offset,
+        composition_root_layer_order, composition_scale_for_dpi, composition_scene_layer_order,
+        copy_notification_text, copy_panel_pixels_into, d2d_color_from_system,
+        fallback_match_artwork_rect, gradient_origin_transform, header_fill_scope,
+        history_artwork_frame, history_row_top, history_title_color, inverse_circle_clip_radii,
+        is_offline_failure, is_tray_activation_event, localized_ui_text, native_icon_layout,
+        no_match_copy, no_match_icon_rect, phase_needs_timeout, point_in_rect, popup_base_color,
+        resolve_page_link, result_artwork_rect, result_card_link_hit, result_details_rects,
+        result_gradient_colors, result_header_hit_test_contains, result_header_visible_height,
+        result_overlay_child_offset, result_overlay_occludes_shazam_button, result_panel_draw_top,
         result_panel_top_at, select_ui_language_from_multisz, should_hide_popup_on_deactivation,
         should_show_initial_popup, should_start_startup_logo, theme_from_foreground_rgb,
         timeout_copy, ui_model, valid_page_template, visible_history_row_hit, ArrowEdge,
         CaptureMode, CompositionRootLayer, CompositionSceneLayer, HeaderFillScope,
         HistoryMutationEvent, HistoryMutationTransition, MainPhase, NoMatchIconCommand,
         ResultCardAdvance, ResultCardStage, Theme, UiLanguage, UiTextKey, WindowKind,
-        BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, HISTORY_HEIGHT,
+        BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, FALLBACK_MATCH_DARK_PIXELS,
+        FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE, HISTORY_HEIGHT,
         INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE,
-        POPUP_ARROW_HEIGHT, RESULT_ARTWORK_CORNER_RADIUS, RESULT_DETAILS_LEFT,
-        RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
+        POPUP_ARROW_HEIGHT, RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD, RESULT_CARD_TRANSITION,
+        RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT,
+        WHITE_CLOSE_ICON_PIXELS,
     };
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    #[test]
+    fn ui229_history_date_uses_absolute_utc_timestamp_and_localized_formatter() {
+        assert_eq!(
+            super::winrt_datetime_from_system_time(UNIX_EPOCH).UniversalTime,
+            super::WINDOWS_EPOCH_OFFSET_100NS
+        );
+        assert_eq!(
+            super::winrt_datetime_from_system_time(UNIX_EPOCH + Duration::from_millis(1_000))
+                .UniversalTime,
+            super::WINDOWS_EPOCH_OFFSET_100NS + 10_000_000
+        );
+        assert_eq!(
+            super::WINDOWS_DATETIME_TEMPLATE,
+            "day month.abbreviated year hour minute"
+        );
+
+        unsafe {
+            super::CoInitializeEx(None, super::COINIT_APARTMENTTHREADED).unwrap();
+            let label = super::format_history_date_label(UNIX_EPOCH);
+            super::CoUninitialize();
+            assert!(!label.is_empty());
+            assert_ne!(label, "たった今");
+        }
+    }
+
+    #[test]
+    fn ui234_result_card_is_rasterized_once_then_composition_moves_only_its_visual() {
+        let body_top = 10.0;
+        assert_eq!(
+            result_panel_draw_top(Some(body_top - TOP_HEIGHT as f32), body_top, true, false),
+            Some(body_top)
+        );
+        assert_eq!(
+            result_panel_draw_top(Some(body_top + 90.0), body_top, true, true),
+            None
+        );
+        assert_eq!(
+            result_panel_draw_top(Some(body_top + 90.0), body_top, false, false),
+            Some(body_top + 90.0)
+        );
+        assert_eq!(result_panel_draw_top(None, body_top, true, false), None);
+    }
+
+    #[test]
+    fn ui236_result_card_uses_candidate_a_and_residual_curve_without_restarting_time() {
+        let curve = super::result_card_easing();
+        for (time, expected) in [(0.25, 0.4085), (0.5, 0.8024), (0.75, 0.9605)] {
+            assert!(
+                (super::sample_cubic_timing_curve(time, curve) - expected).abs() < 0.001,
+                "progress at {time:.2} should match UI-236 candidate A"
+            );
+        }
+
+        for start in [0.0, 0.1, 0.25, 0.5, 0.75, 0.9] {
+            let residual = super::remaining_cubic_easing(start, curve).unwrap();
+            let y_start = super::sample_cubic_timing_curve(start, curve);
+            for remaining in [0.0, 0.2, 0.5, 0.8, 1.0] {
+                let original =
+                    super::sample_cubic_timing_curve(start + (1.0 - start) * remaining, curve);
+                let resumed = y_start
+                    + (1.0 - y_start) * super::sample_cubic_timing_curve(remaining, residual);
+                assert!(
+                    (original - resumed).abs() < 1e-8,
+                    "curve restart drift at start={start} remaining={remaining}: {original} vs {resumed}"
+                );
+            }
+        }
+
+        let started_at = Instant::now();
+        assert!(
+            (super::result_card_progress(started_at, started_at + Duration::from_millis(75))
+                - 0.4085)
+                .abs()
+                < 0.001
+        );
+        assert!(
+            (super::result_card_progress(started_at, started_at + Duration::from_millis(150))
+                - 0.8024)
+                .abs()
+                < 0.001
+        );
+        assert!(
+            (super::result_card_progress(started_at, started_at + Duration::from_millis(225))
+                - 0.9605)
+                .abs()
+                < 0.001
+        );
+    }
 
     #[test]
     fn ui224_ready_and_auto_status_cycles_keep_native_delays() {
@@ -8863,6 +9613,9 @@ mod tests {
                 title: String::new(),
                 artist: String::new(),
                 recognized_at: entered_at,
+                recognized_at_utc: UNIX_EPOCH,
+                recognized_date_label: String::new(),
+                timestamp_source: super::HistoryTimestampSource::HostReceivedFallback,
                 artwork_url: None,
                 hq_artwork_url: None,
                 background_artwork_url: None,
@@ -8893,6 +9646,9 @@ mod tests {
                 title: String::new(),
                 artist: String::new(),
                 recognized_at: entered_at,
+                recognized_at_utc: UNIX_EPOCH,
+                recognized_date_label: String::new(),
+                timestamp_source: super::HistoryTimestampSource::HostReceivedFallback,
                 artwork_url: None,
                 hq_artwork_url: None,
                 background_artwork_url: None,
@@ -8919,6 +9675,47 @@ mod tests {
     }
 
     #[test]
+    fn ui234_fixed_header_clip_contains_every_result_exit_frame() {
+        for body_top in [0.0, POPUP_ARROW_HEIGHT as f32] {
+            for offset in [0.0, 45.0, 90.0, 135.0, 180.0] {
+                assert_eq!(
+                    result_header_visible_height(body_top + offset, body_top),
+                    180.0 - offset
+                );
+            }
+            assert_eq!(
+                result_header_visible_height(body_top - TOP_HEIGHT as f32, body_top),
+                0.0
+            );
+            assert!(!result_header_hit_test_contains(body_top - 0.01, body_top));
+            assert!(result_header_hit_test_contains(body_top, body_top));
+            assert!(result_header_hit_test_contains(body_top + 179.99, body_top));
+            assert!(!result_header_hit_test_contains(body_top + 180.0, body_top));
+        }
+    }
+
+    #[test]
+    fn ui234_composition_header_viewport_stays_fixed_across_dpi_and_arrow_edges() {
+        for dpi in [96, 120, 144, 192, 240, 288] {
+            for body_top in [0.0, POPUP_ARROW_HEIGHT as f32] {
+                let root_snap = composition_button_pixel_snap_offset(dpi, body_top);
+                let viewport = composition_header_viewport_offset(dpi, body_top);
+                assert!((root_snap.X + viewport.X).abs() < 1e-6);
+                assert!((root_snap.Y + viewport.Y - body_top).abs() < 1e-6);
+
+                for exit_offset in [0.0, 45.0, 90.0, 135.0, 180.0] {
+                    let child = result_overlay_child_offset(body_top + exit_offset, body_top);
+                    assert!((child.Y - exit_offset).abs() < 1e-6);
+                    assert_eq!(
+                        result_header_visible_height(body_top + exit_offset, body_top),
+                        180.0 - exit_offset
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tray_activation_uses_one_semantic_event_per_v4_selection() {
         assert!(!is_tray_activation_event(
             windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP as u16
@@ -8937,31 +9734,61 @@ mod tests {
     #[test]
     fn result_card_holds_ten_seconds_after_entrance_then_exits() {
         let start = std::time::Instant::now();
-        let entrance_finished = start + std::time::Duration::from_millis(320);
-        let holding_start = entrance_finished;
-        let hold_timer_fired = holding_start + std::time::Duration::from_millis(10_040);
-        let exit_start = hold_timer_fired;
+        let entrance_finished = start + RESULT_CARD_TRANSITION;
+        let hold_timer_fired = entrance_finished + RESULT_CARD_HOLD;
         assert!(matches!(
             advance_result_card_stage(
                 ResultCardStage::Entering { started_at: start },
                 entrance_finished
             ),
-            ResultCardAdvance::Stage(ResultCardStage::Holding { started_at }) if started_at == holding_start
+            ResultCardAdvance::Stage(ResultCardStage::Holding { started_at }) if started_at == entrance_finished
         ));
         assert!(matches!(
             advance_result_card_stage(
-                ResultCardStage::Holding { started_at: holding_start },
+                ResultCardStage::Holding { started_at: entrance_finished },
                 hold_timer_fired
             ),
-            ResultCardAdvance::Stage(ResultCardStage::Exiting { started_at, from_offset: 0.0 }) if started_at == exit_start
+            ResultCardAdvance::Stage(ResultCardStage::Exiting { started_at, from_offset: 0.0 }) if started_at == hold_timer_fired
         ));
         assert!(matches!(
             advance_result_card_stage(
                 ResultCardStage::Exiting {
-                    started_at: exit_start,
+                    started_at: hold_timer_fired,
                     from_offset: 0.0
                 },
-                exit_start + std::time::Duration::from_millis(300)
+                hold_timer_fired + RESULT_CARD_TRANSITION
+            ),
+            ResultCardAdvance::Ready
+        ));
+    }
+
+    #[test]
+    fn result_card_deadlines_keep_running_while_popup_is_hidden() {
+        let start = Instant::now();
+        let entrance_finished = start + RESULT_CARD_TRANSITION;
+        let hold_finished = entrance_finished + RESULT_CARD_HOLD;
+        let exit_finished = hold_finished + RESULT_CARD_TRANSITION;
+
+        assert!(matches!(
+            advance_result_card_stage(
+                ResultCardStage::Entering { started_at: start },
+                start + Duration::from_secs(5)
+            ),
+            ResultCardAdvance::Stage(ResultCardStage::Holding { started_at })
+                if started_at == entrance_finished
+        ));
+        assert!(matches!(
+            advance_result_card_stage(
+                ResultCardStage::Entering { started_at: start },
+                hold_finished + Duration::from_millis(150)
+            ),
+            ResultCardAdvance::Stage(ResultCardStage::Exiting { started_at, from_offset: 0.0 })
+                if started_at == hold_finished
+        ));
+        assert!(matches!(
+            advance_result_card_stage(
+                ResultCardStage::Entering { started_at: start },
+                exit_finished
             ),
             ResultCardAdvance::Ready
         ));
@@ -9098,7 +9925,10 @@ mod tests {
     #[test]
     #[ignore = "requires the Windows Composition graphics device; run explicitly on Windows"]
     fn composition_result_overlay_uploads_pixels_and_resizes_at_fractional_dpi() {
-        use super::{CompositionResultOverlay, Interface, LayeredSurface};
+        use super::{
+            result_card_easing, CompositionResultOverlay, Interface, LayeredSurface,
+            ResultOverlayMotionAnimation, ResultOverlayMotionKey, RESULT_CARD_TRANSITION,
+        };
 
         unsafe {
             super::CoInitializeEx(None, super::COINIT_APARTMENTTHREADED).unwrap();
@@ -9129,12 +9959,12 @@ mod tests {
             .unwrap();
             let result = (|| -> windows::core::Result<()> {
                 let compositor = super::Compositor::new()?;
-                let mut overlay = CompositionResultOverlay::new(&compositor, 96)?;
+                let mut overlay = CompositionResultOverlay::new(&compositor, 96, 10.0)?;
                 let desktop_interop: super::ICompositorDesktopInterop = compositor.cast()?;
                 let target = desktop_interop.CreateDesktopWindowTarget(hwnd, true)?;
                 let root = compositor.CreateContainerVisual()?;
                 root.SetSize(super::Vector2 { X: 380.0, Y: 610.0 })?;
-                root.Children()?.InsertAtTop(&overlay.group)?;
+                root.Children()?.InsertAtTop(&overlay.viewport)?;
                 target.SetRoot(&root)?;
                 let source_96 = LayeredSurface::new(380, 610)?;
                 let bytes_96 = std::slice::from_raw_parts_mut(
@@ -9161,7 +9991,22 @@ mod tests {
                 let first_content_pixel_120 = 16 * 475 * 4;
                 bytes_120[first_content_pixel_120..first_content_pixel_120 + 4]
                     .copy_from_slice(&[16, 32, 64, 255]);
-                overlay.update_from_layered(&source_120, 12.5, 12.5, 120)?;
+                overlay.update_from_layered(&source_120, 10.0, 10.0, 120)?;
+                overlay.animate_position(
+                    &compositor,
+                    &ResultOverlayMotionAnimation {
+                        key: ResultOverlayMotionKey::NoMatchEnter {
+                            entered_at: Instant::now(),
+                            offline: false,
+                        },
+                        from_offset: -180.0,
+                        to_offset: 0.0,
+                        remaining: RESULT_CARD_TRANSITION,
+                        easing: result_card_easing(),
+                    },
+                    10.0,
+                    120,
+                )?;
                 Ok(())
             })();
             let _ = super::DestroyWindow(hwnd);
@@ -9264,6 +10109,48 @@ mod tests {
         );
         assert_eq!(history.right - history.left, 65.0);
         assert_eq!(history.bottom - history.top, 65.0);
+    }
+
+    #[test]
+    fn match_fallback_uses_native_intrinsic_size_and_centering() {
+        let frame = result_artwork_rect(10.0, ArrowEdge::Top);
+        let image = fallback_match_artwork_rect(frame);
+        assert_eq!(FALLBACK_MATCH_LOGICAL_SIDE, 131.0);
+        assert_eq!(
+            (image.left, image.top, image.right, image.bottom),
+            (19.5, 39.5, 150.5, 170.5)
+        );
+
+        let bottom_arrow_frame = result_artwork_rect(0.0, ArrowEdge::Bottom);
+        let bottom_arrow_image = fallback_match_artwork_rect(bottom_arrow_frame);
+        assert_eq!(
+            (
+                bottom_arrow_image.left,
+                bottom_arrow_image.top,
+                bottom_arrow_image.right,
+                bottom_arrow_image.bottom,
+            ),
+            (19.5, 19.5, 150.5, 150.5)
+        );
+    }
+
+    #[test]
+    fn match_fallback_theme_assets_preserve_premultiplied_alpha() {
+        fn assert_white_alpha_mask(pixels: &[u8], max_alpha: u8) {
+            assert_eq!(pixels.len(), 262 * 262 * 4);
+            for pixel in pixels.chunks_exact(4) {
+                assert_eq!(pixel[0], pixel[1]);
+                assert_eq!(pixel[1], pixel[2]);
+                assert_eq!(pixel[2], pixel[3]);
+            }
+            let center = (131 * 262 + 131) * 4;
+            assert_eq!(&pixels[center..center + 4], &[0, 0, 0, 0]);
+            assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] == max_alpha));
+        }
+
+        assert_white_alpha_mask(FALLBACK_MATCH_LIGHT_PIXELS, 179);
+        assert_white_alpha_mask(FALLBACK_MATCH_DARK_PIXELS, 77);
+        assert_ne!(FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_DARK_PIXELS);
     }
 
     #[test]
