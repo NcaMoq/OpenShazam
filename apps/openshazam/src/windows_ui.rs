@@ -18,14 +18,17 @@ use windows::{
     core::{implement, Error, Interface, Ref, HSTRING, PCWSTR, PWSTR},
     ApplicationModel::{Activation::ActivationKind, AppInstance},
     Foundation::{TimeSpan, TypedEventHandler},
-    Graphics::IGeometrySource2D,
+    Graphics::{
+        DirectX::{DirectXAlphaMode, DirectXPixelFormat},
+        IGeometrySource2D,
+    },
     System::DispatcherQueueController,
     Win32::Graphics::Imaging::{
         CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
         WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
     },
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME},
         Graphics::{
             Direct2D::{
@@ -35,16 +38,23 @@ use windows::{
                     D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP,
                     D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
                 },
-                D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1Geometry,
-                ID2D1HwndRenderTarget, ID2D1Layer, ID2D1LinearGradientBrush, ID2D1RenderTarget,
-                ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
+                D2D1CreateFactory, ID2D1Bitmap, ID2D1Bitmap1, ID2D1DCRenderTarget,
+                ID2D1DeviceContext, ID2D1Factory, ID2D1Geometry, ID2D1HwndRenderTarget, ID2D1Layer,
+                ID2D1LinearGradientBrush, ID2D1RenderTarget, ID2D1SolidColorBrush,
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_PROPERTIES, D2D1_BITMAP_PROPERTIES1,
                 D2D1_COMBINE_MODE_EXCLUDE, D2D1_COMBINE_MODE_UNION, D2D1_ELLIPSE,
                 D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
-                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_OPTIONS_NONE,
-                D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
-                D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                D2D1_RENDER_TARGET_USAGE_NONE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                D2D1_LAYER_OPTIONS_NONE, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
+                D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
+                D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+                D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+            },
+            Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
+            Direct3D11::{
+                D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_SDK_VERSION,
             },
             DirectWrite::{
                 DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
@@ -68,7 +78,9 @@ use windows::{
                 COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
             },
             LibraryLoader::GetModuleHandleW,
-            WinRT::Composition::ICompositorDesktopInterop,
+            WinRT::Composition::{
+                ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
+            },
             WinRT::Graphics::Direct2D::{IGeometrySource2DInterop, IGeometrySource2DInterop_Impl},
             WinRT::{
                 CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_STA,
@@ -110,11 +122,12 @@ use windows::{
         Color,
         Composition::{
             AnimationIterationBehavior, CompositionBorderMode, CompositionColorBrush,
-            CompositionEllipseGeometry, CompositionGeometricClip, CompositionPath,
-            CompositionPathGeometry, CompositionSpriteShape, CompositionVisualSurface, Compositor,
-            ContainerVisual, CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow,
-            ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual, Vector2KeyFrameAnimation,
-            Vector3KeyFrameAnimation,
+            CompositionDrawingSurface, CompositionEllipseGeometry, CompositionGeometricClip,
+            CompositionGraphicsDevice, CompositionPath, CompositionPathGeometry,
+            CompositionSpriteShape, CompositionStretch, CompositionSurfaceBrush,
+            CompositionVisualSurface, Compositor, ContainerVisual, CubicBezierEasingFunction,
+            Desktop::DesktopWindowTarget, DropShadow, ScalarKeyFrameAnimation, ShapeVisual,
+            SpriteVisual, Vector2KeyFrameAnimation, Vector3KeyFrameAnimation,
         },
     },
 };
@@ -194,6 +207,32 @@ fn native_icon_layout(body_top: f32) -> NativeIconLayout {
 
 fn point_in_rect(point_x: f32, point_y: f32, bounds: [f32; 4]) -> bool {
     (bounds[0]..=bounds[2]).contains(&point_x) && (bounds[1]..=bounds[3]).contains(&point_y)
+}
+
+fn result_card_link_hit(
+    x: f32,
+    y: f32,
+    card_top: f32,
+    close: [f32; 4],
+    action: D2D_RECT_F,
+) -> bool {
+    point_in_rect(
+        x,
+        y,
+        [
+            0.0,
+            card_top,
+            CONTENT_WIDTH as f32,
+            card_top + TOP_HEIGHT as f32,
+        ],
+    ) && !point_in_rect(x, y, close)
+        && !point_in_rect(x, y, [action.left, action.top, action.right, action.bottom])
+}
+
+fn visible_history_row_hit(y: f32, row_top: f32, history_top: f32, history_bottom: f32) -> bool {
+    let visible_top = row_top.max(history_top);
+    let visible_bottom = (row_top + 89.0).min(history_bottom);
+    visible_top <= visible_bottom && (visible_top..=visible_bottom).contains(&y)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -704,6 +743,256 @@ impl Drop for LayeredSurface {
             let _ = DeleteObject(self.bitmap.into());
             let _ = DeleteDC(self.dc);
         }
+    }
+}
+
+// Copy only the current result panel from the premultiplied layered-window
+// surface. The cached bytes become the Composition surface; the original
+// Direct2D panel remains the pixel source so text, artwork, and popup masking
+// stay identical while the result is above the Composition button/ripples.
+fn copy_panel_pixels_into(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    panel_top: i32,
+    output_width: u32,
+    output_height: u32,
+    output: &mut Vec<u8>,
+) {
+    let output_len = output_width as usize * output_height as usize * 4;
+    output.resize(output_len, 0);
+    output.fill(0);
+    let copy_width = source_width.min(output_width) as usize * 4;
+    let source_stride = source_width as usize * 4;
+    let output_stride = output_width as usize * 4;
+
+    for output_y in 0..output_height as usize {
+        let source_y = panel_top + output_y as i32;
+        if !(0..source_height as i32).contains(&source_y) {
+            continue;
+        }
+        let source_start = source_y as usize * source_stride;
+        let output_start = output_y * output_stride;
+        let source_end = source_start + copy_width;
+        let output_end = output_start + copy_width;
+        if source_end <= source.len() && output_end <= output.len() {
+            output[output_start..output_end].copy_from_slice(&source[source_start..source_end]);
+        }
+    }
+}
+
+struct CompositionResultOverlay {
+    _graphics_device: CompositionGraphicsDevice,
+    _surface: CompositionDrawingSurface,
+    surface_interop: ICompositionDrawingSurfaceInterop,
+    _surface_brush: CompositionSurfaceBrush,
+    group: ContainerVisual,
+    bitmap: Option<ID2D1Bitmap1>,
+    size: D2D_SIZE_U,
+    dpi: u32,
+    pixels: Vec<u8>,
+    scratch: Vec<u8>,
+    has_contents: bool,
+}
+
+impl CompositionResultOverlay {
+    unsafe fn new(compositor: &Compositor, dpi: u32) -> windows::core::Result<Self> {
+        let mut device = None;
+        let hardware = D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        );
+        if hardware.is_err() {
+            device = None;
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )?;
+        }
+        let device: ID3D11Device = device.ok_or_else(Error::from_thread)?;
+        let compositor_interop: ICompositorInterop = compositor.cast()?;
+        let graphics_device = compositor_interop.CreateGraphicsDevice(&device)?;
+        let dpi = dpi.max(96);
+        let scale = composition_scale_for_dpi(dpi);
+        let size = D2D_SIZE_U {
+            width: (CONTENT_WIDTH as f32 * scale).ceil() as u32,
+            height: (TOP_HEIGHT as f32 * scale).ceil() as u32,
+        };
+        let surface = graphics_device.CreateDrawingSurface(
+            windows::Foundation::Size {
+                Width: size.width as f32,
+                Height: size.height as f32,
+            },
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            DirectXAlphaMode::Premultiplied,
+        )?;
+        let surface_interop: ICompositionDrawingSurfaceInterop = surface.cast()?;
+        let surface_brush = compositor.CreateSurfaceBrushWithSurface(&surface)?;
+        surface_brush.SetStretch(CompositionStretch::Fill)?;
+
+        let group = compositor.CreateContainerVisual()?;
+        group.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: TOP_HEIGHT as f32,
+        })?;
+        group.SetOpacity(0.0)?;
+        group.SetBorderMode(CompositionBorderMode::Soft)?;
+        let sprite = compositor.CreateSpriteVisual()?;
+        sprite.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: TOP_HEIGHT as f32,
+        })?;
+        sprite.SetBrush(&surface_brush)?;
+        group.Children()?.InsertAtTop(&sprite)?;
+
+        Ok(Self {
+            _graphics_device: graphics_device,
+            _surface: surface,
+            surface_interop,
+            _surface_brush: surface_brush,
+            group,
+            bitmap: None,
+            size,
+            dpi,
+            pixels: Vec::new(),
+            scratch: Vec::new(),
+            has_contents: false,
+        })
+    }
+
+    unsafe fn resize(&mut self, dpi: u32) -> windows::core::Result<()> {
+        let dpi = dpi.max(96);
+        if self.dpi == dpi {
+            return Ok(());
+        }
+        let scale = composition_scale_for_dpi(dpi);
+        let size = D2D_SIZE_U {
+            width: (CONTENT_WIDTH as f32 * scale).ceil() as u32,
+            height: (TOP_HEIGHT as f32 * scale).ceil() as u32,
+        };
+        self.surface_interop.Resize(SIZE {
+            cx: size.width as i32,
+            cy: size.height as i32,
+        })?;
+        self.size = size;
+        self.dpi = dpi;
+        self.bitmap = None;
+        self.pixels.clear();
+        self.scratch.clear();
+        self.has_contents = false;
+        Ok(())
+    }
+
+    unsafe fn update_from_layered(
+        &mut self,
+        source: &LayeredSurface,
+        panel_top: f32,
+        body_top: f32,
+        dpi: u32,
+    ) -> windows::core::Result<()> {
+        self.resize(dpi)?;
+        let source_len = source.size.width as usize * source.size.height as usize * 4;
+        let source_bytes = std::slice::from_raw_parts(source._pixels.cast::<u8>(), source_len);
+        let panel_top_px = (panel_top * self.dpi as f32 / 96.0).round() as i32;
+        copy_panel_pixels_into(
+            source_bytes,
+            source.size.width,
+            source.size.height,
+            panel_top_px,
+            self.size.width,
+            self.size.height,
+            &mut self.scratch,
+        );
+
+        if !self.has_contents || self.scratch != self.pixels {
+            let mut offset = POINT::default();
+            let context = self
+                .surface_interop
+                .BeginDraw::<ID2D1DeviceContext>(None, &mut offset)?;
+            let draw_result = (|| -> windows::core::Result<()> {
+                context.SetDpi(96.0, 96.0);
+                context.SetTransform(&Matrix3x2 {
+                    M11: 1.0,
+                    M22: 1.0,
+                    M31: offset.x as f32,
+                    M32: offset.y as f32,
+                    ..Default::default()
+                });
+                let bitmap = if let Some(bitmap) = self.bitmap.as_ref() {
+                    bitmap.clone()
+                } else {
+                    let properties = D2D1_BITMAP_PROPERTIES1 {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.0,
+                        dpiY: 96.0,
+                        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                        colorContext: std::mem::ManuallyDrop::new(None),
+                    };
+                    let bitmap = context.CreateBitmap(
+                        self.size,
+                        Some(self.scratch.as_ptr().cast()),
+                        self.size.width * 4,
+                        &properties,
+                    )?;
+                    self.bitmap = Some(bitmap.clone());
+                    bitmap
+                };
+                if self.bitmap.is_some() && self.has_contents {
+                    bitmap.CopyFromMemory(
+                        None,
+                        self.scratch.as_ptr().cast(),
+                        self.size.width * 4,
+                    )?;
+                }
+                let transparent = d2d_color(0, 0, 0, 0.0);
+                context.Clear(Some(&transparent));
+                let destination = rect(0.0, 0.0, self.size.width as f32, self.size.height as f32);
+                context.DrawBitmap(
+                    &bitmap,
+                    Some(&destination),
+                    1.0,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    None,
+                    None,
+                );
+                Ok(())
+            })();
+            let end_result = self.surface_interop.EndDraw();
+            draw_result?;
+            end_result?;
+            std::mem::swap(&mut self.pixels, &mut self.scratch);
+            self.has_contents = true;
+        }
+
+        let root_snap = composition_button_pixel_snap_offset(self.dpi, body_top);
+        self.group.SetOffset(Vector3 {
+            X: -root_snap.X,
+            Y: panel_top - root_snap.Y,
+            Z: 0.0,
+        })?;
+        self.group.SetOpacity(1.0)?;
+        Ok(())
+    }
+
+    fn hide(&self) -> windows::core::Result<()> {
+        self.group.SetOpacity(0.0)
     }
 }
 
@@ -1749,6 +2038,8 @@ struct CompositionScene {
     compositor: Compositor,
     _target: DesktopWindowTarget,
     root: ContainerVisual,
+    tagging_root: ContainerVisual,
+    result_overlay: CompositionResultOverlay,
     auto_shadow_root: ContainerVisual,
     auto_shadow_mask: CompositionGeometricClip,
     auto_shadow_brush: CompositionColorBrush,
@@ -1817,6 +2108,19 @@ fn composition_root_layer_order() -> [CompositionRootLayer; 4] {
     ]
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompositionSceneLayer {
+    Tagging,
+    ResultOverlay,
+}
+
+fn composition_scene_layer_order() -> [CompositionSceneLayer; 2] {
+    [
+        CompositionSceneLayer::Tagging,
+        CompositionSceneLayer::ResultOverlay,
+    ]
+}
+
 fn should_start_startup_logo(kind: WindowKind, already_started: bool) -> bool {
     kind == WindowKind::Main && !already_started
 }
@@ -1838,10 +2142,17 @@ impl CompositionScene {
             X: CONTENT_WIDTH as f32,
             Y: MAIN_WINDOW_HEIGHT as f32,
         })?;
-        // The root is scaled to the monitor DPI and clips the popup content.
-        // Inherit soft edges through the subtree so transformed visual and
-        // clip boundaries do not fall back to Composition's aliased default.
+        // UI-228 keeps a full-size scene root for the card overlay. Tagging
+        // visuals retain their own header clip below; the result card is a
+        // sibling so it can cover the Composition button and travel over rows.
+        // Inherit soft edges through both groups after monitor-DPI scaling.
         root.SetBorderMode(CompositionBorderMode::Soft)?;
+        let tagging_root = compositor.CreateContainerVisual()?;
+        tagging_root.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: MAIN_WINDOW_HEIGHT as f32,
+        })?;
+        tagging_root.SetBorderMode(CompositionBorderMode::Soft)?;
         let dpi = dpi.max(96);
         let composition_scale = composition_scale_for_dpi(dpi);
         root.SetScale(Vector3 {
@@ -1857,7 +2168,7 @@ impl CompositionScene {
         root.SetOffset(composition_button_pixel_snap_offset(dpi, body_top))?;
         let clip_bottom = MAIN_WINDOW_HEIGHT as f32 - (body_top + TOP_HEIGHT as f32);
         let clip = compositor.CreateInsetClipWithInsets(0.0, 0.0, 0.0, clip_bottom.max(0.0))?;
-        root.SetClip(&clip)?;
+        tagging_root.SetClip(&clip)?;
 
         let ring_color = composition_tagging_color(theme);
         let easing = compositor.CreateCubicBezierEasingFunction(
@@ -2370,13 +2681,24 @@ impl CompositionScene {
             .InsertAtTop(&no_match_icon_transform)?;
         button.Children()?.InsertAtTop(&button_content)?;
 
-        let children = root.Children()?;
+        let children = tagging_root.Children()?;
         for layer in composition_root_layer_order() {
             match layer {
                 CompositionRootLayer::AutoShadow => children.InsertAtTop(&auto_shadow_root)?,
                 CompositionRootLayer::InnerRipples => children.InsertAtTop(&inner_audio_root)?,
                 CompositionRootLayer::Button => children.InsertAtTop(&button)?,
                 CompositionRootLayer::OuterRipples => children.InsertAtTop(&outer_audio_root)?,
+            }
+        }
+
+        let result_overlay = unsafe { CompositionResultOverlay::new(compositor, dpi)? };
+        let root_children = root.Children()?;
+        for layer in composition_scene_layer_order() {
+            match layer {
+                CompositionSceneLayer::Tagging => root_children.InsertAtTop(&tagging_root)?,
+                CompositionSceneLayer::ResultOverlay => {
+                    root_children.InsertAtTop(&result_overlay.group)?
+                }
             }
         }
 
@@ -2448,6 +2770,8 @@ impl CompositionScene {
             compositor: compositor.clone(),
             _target: target,
             root,
+            tagging_root,
+            result_overlay,
             auto_shadow_root,
             auto_shadow_mask,
             auto_shadow_brush,
@@ -2495,7 +2819,23 @@ impl CompositionScene {
             Z: 1.0,
         })?;
         self.root
-            .SetOffset(composition_button_pixel_snap_offset(dpi, self.body_top))
+            .SetOffset(composition_button_pixel_snap_offset(dpi, self.body_top))?;
+        unsafe { self.result_overlay.resize(dpi) }
+    }
+
+    unsafe fn update_result_overlay(
+        &mut self,
+        source: Option<&LayeredSurface>,
+        panel_top: Option<f32>,
+        body_top: f32,
+        dpi: u32,
+    ) -> windows::core::Result<()> {
+        match (source, panel_top) {
+            (Some(source), Some(panel_top)) => self
+                .result_overlay
+                .update_from_layered(source, panel_top, body_top, dpi),
+            _ => self.result_overlay.hide(),
+        }
     }
 
     fn update(&mut self, snapshot: AnimationSnapshot) -> windows::core::Result<()> {
@@ -2546,7 +2886,7 @@ impl CompositionScene {
             let clip =
                 self.compositor
                     .CreateInsetClipWithInsets(0.0, 0.0, 0.0, bottom_inset.max(0.0))?;
-            self.root.SetClip(&clip)?;
+            self.tagging_root.SetClip(&clip)?;
             let inner_bounds = INNER_MASK_BOUNDS;
             let outer_bounds = ui_model::OUTER_DIAMETERS[0] as f32;
             let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
@@ -3323,6 +3663,13 @@ fn d2d_color(r: u8, g: u8, b: u8, alpha: f32) -> D2D1_COLOR_F {
     }
 }
 
+fn history_title_color(theme: Theme) -> D2D1_COLOR_F {
+    match theme {
+        Theme::Light => d2d_color(0, 0, 0, 0.847),
+        Theme::Dark => d2d_color(255, 255, 255, 0.847),
+    }
+}
+
 fn d2d_color_from_system(color: Color) -> D2D1_COLOR_F {
     d2d_color(color.R, color.G, color.B, f32::from(color.A) / 255.0)
 }
@@ -3338,6 +3685,28 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
 
 fn result_artwork_rect(panel_top: f32) -> D2D_RECT_F {
     rect(10.0, panel_top + 20.0, 160.0, panel_top + 170.0)
+}
+
+fn aspect_fit_rect(destination: D2D_RECT_F, source_width: u32, source_height: u32) -> D2D_RECT_F {
+    // UI-184 records NSImageScale=3: keep the image-view frame as the clip,
+    // but center the proportionally scaled image inside it.
+    let destination_width = destination.right - destination.left;
+    let destination_height = destination.bottom - destination.top;
+    if source_width == 0
+        || source_height == 0
+        || destination_width <= 0.0
+        || destination_height <= 0.0
+    {
+        return destination;
+    }
+
+    let scale =
+        (destination_width / source_width as f32).min(destination_height / source_height as f32);
+    let width = source_width as f32 * scale;
+    let height = source_height as f32 * scale;
+    let left = destination.left + (destination_width - width) * 0.5;
+    let top = destination.top + (destination_height - height) * 0.5;
+    rect(left, top, left + width, top + height)
 }
 
 // [R] DetailsColumn 204pt wide with 20pt insets yields a 164pt text column
@@ -3676,6 +4045,29 @@ impl Renderer {
         }
         draw_result?;
         self.target.EndDraw(None, None)?;
+        if kind == WindowKind::Main {
+            let body_top = if app.arrow_edge == ArrowEdge::Top {
+                POPUP_ARROW_HEIGHT as f32
+            } else {
+                0.0
+            };
+            let panel_top = match &app.phase {
+                MainPhase::Matched { .. }
+                | MainPhase::NoMatch { .. }
+                | MainPhase::Offline { .. } => {
+                    result_panel_top_at(&app.phase, body_top, Instant::now())
+                }
+                _ => None,
+            };
+            if let Some(scene) = self.composition.as_mut() {
+                scene.update_result_overlay(
+                    self.layered_surface.as_ref(),
+                    panel_top,
+                    body_top,
+                    self.dpi,
+                )?;
+            }
+        }
         if let Some(surface) = self.layered_surface.as_ref() {
             surface.present(app.main_hwnd, app.popup_opacity)?;
         }
@@ -4367,9 +4759,10 @@ impl Renderer {
             layerOptions: D2D1_LAYER_OPTIONS_NONE,
         };
         self.target.PushLayer(&parameters, layer);
+        let image_rect = aspect_fit_rect(destination, pixels.width, pixels.height);
         self.target.DrawBitmap(
             bitmap,
-            Some(&destination),
+            Some(&image_rect),
             1.0,
             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
             None,
@@ -4410,16 +4803,11 @@ impl Renderer {
                     &self.palette.white_ink,
                 );
             }
-            let title_color = if app.theme == Theme::Light {
-                &self.palette.title
-            } else {
-                &self.palette.white
-            };
             self.text(
                 &track.title,
                 rect(95.0, top + 8.0, 360.0, top + 38.0),
                 &self.text.title,
-                title_color,
+                &self.palette.title,
             );
             self.text(
                 &track.artist,
@@ -4843,15 +5231,13 @@ unsafe fn create_palette(
     theme: Theme,
     system_foreground: Color,
 ) -> windows::core::Result<Palette> {
-    let (foreground, subtitle, skeleton, separator) = match theme {
+    let (subtitle, skeleton, separator) = match theme {
         Theme::Light => (
-            d2d_color(0, 0, 0, 0.847),
             d2d_color(148, 148, 148, 1.0),
             d2d_color(230, 234, 237, 0.75),
             d2d_color(0, 0, 0, 0.098),
         ),
         Theme::Dark => (
-            d2d_color(255, 255, 255, 0.847),
             d2d_color(212, 212, 212, 1.0),
             d2d_color(55, 66, 73, 0.8),
             d2d_color(255, 255, 255, 0.098),
@@ -4862,7 +5248,7 @@ unsafe fn create_palette(
     let white = solid(target, background)?;
     let white_ink = solid(target, d2d_color(255, 255, 255, 1.0))?;
     let black = solid(target, d2d_color(30, 30, 30, 1.0))?;
-    let title = solid(target, foreground)?;
+    let title = solid(target, history_title_color(theme))?;
     let subtitle = solid(target, subtitle)?;
     // UI-223: Result title and artist follow the active system foreground;
     // history title/subtitle brushes remain independent appearance tokens.
@@ -5437,7 +5823,13 @@ unsafe fn window_data(hwnd: HWND) -> Option<&'static mut WindowData> {
     ptr.as_mut()
 }
 
-unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHit {
+unsafe fn main_hit_test(
+    app: &AppState,
+    renderer: Option<&Renderer>,
+    x: f32,
+    y: f32,
+    body_top: f32,
+) -> MainHit {
     if matches!(
         app.phase,
         MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
@@ -5445,19 +5837,25 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
         let top = result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
         let offset = top - body_top;
         let close = native_icon_layout(body_top).result_close_hit;
-        if point_in_rect(x, y - offset, close) {
+        let local_y = y - offset;
+        if point_in_rect(x, local_y, close) {
             return MainHit::CloseResult;
         }
         if let MainPhase::Matched { track, .. } = &app.phase {
-            let artwork = result_artwork_rect(body_top);
-            if track.page_url.is_some()
-                && point_in_rect(
-                    x,
-                    y - offset,
-                    [artwork.left, artwork.top, artwork.right, artwork.bottom],
-                )
-            {
-                return MainHit::OpenTrack(track.display_id);
+            if track.page_url.is_some() {
+                if let Some(renderer) = renderer {
+                    if let Ok(metrics) = renderer.result_details_metrics(track) {
+                        let action = result_details_rects(
+                            body_top,
+                            metrics.title_height,
+                            metrics.artist_height,
+                        )
+                        .action;
+                        if result_card_link_hit(x, local_y, body_top, close, action) {
+                            return MainHit::OpenTrack(track.display_id);
+                        }
+                    }
+                }
             }
         }
         if matches!(
@@ -5491,7 +5889,10 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
             app.scroll_offset,
             now,
         );
-        if (0.0..=CONTENT_WIDTH as f32).contains(&x) && (row_top..=row_top + 89.0).contains(&y) {
+        let history_bottom = history_top + HISTORY_HEIGHT as f32;
+        if (0.0..=CONTENT_WIDTH as f32).contains(&x)
+            && visible_history_row_hit(y, row_top, history_top, history_bottom)
+        {
             return MainHit::OpenTrack(track.display_id);
         }
     }
@@ -6147,7 +6548,7 @@ fn start_artwork_load(
         return;
     }
     let hwnd_value = hwnd.0 as isize;
-    let required_pixels = 150u32.saturating_mul(dpi.max(96)) / 96;
+    let required_pixels = 150u32.saturating_mul(dpi.max(96)).saturating_add(95) / 96;
     thread::spawn(move || {
         let mut standard_size = None;
         if let Some(url) = standard_url.filter(|url| valid_https_resource_url(url)) {
@@ -6205,7 +6606,7 @@ fn valid_shazam_page_url(url: &str) -> bool {
 }
 
 fn valid_page_template(template: &str) -> bool {
-    valid_shazam_page_url(template) && template.contains("{trackid}")
+    valid_shazam_page_url(template) && template.matches("{trackid}").count() == 1
 }
 
 fn resolve_page_link(
@@ -6227,7 +6628,7 @@ fn resolve_page_link(
             let _ = write!(encoded, "%{byte:02X}");
         }
     }
-    let resolved = template.replace(TOKEN, &encoded);
+    let resolved = template.replacen(TOKEN, &encoded, 1);
     if resolved.contains('{') || resolved.contains('}') || !valid_shazam_page_url(&resolved) {
         return None;
     }
@@ -6732,9 +7133,9 @@ fn result_panel_top_at(phase: &MainPhase, body_top: f32, now: Instant) -> Option
 }
 
 fn linear_transition_progress(started_at: Instant, now: Instant, duration: Duration) -> f32 {
-    // Native NSAnimationContext's default timing function is not established in
-    // the reference, so keep this Windows interpolation deterministic and
-    // replaceable instead of reusing another feature's measured Bezier curve.
+    // UI-226 confirms the spatial endpoints and the 0.3s duration; the native
+    // time-easing curve remains unresolved. Keep the linear time evaluator
+    // explicitly replaceable rather than borrowing an unrelated measured curve.
     (now.saturating_duration_since(started_at).as_secs_f32() / duration.as_secs_f32())
         .clamp(0.0, 1.0)
 }
@@ -7095,7 +7496,8 @@ unsafe extern "system" fn window_proc(
             } else {
                 0.0
             };
-            app.mouse_down_center = main_hit_test(app, x, y, body_top) == MainHit::CenterButton;
+            app.mouse_down_center =
+                main_hit_test(app, data.renderer.as_ref(), x, y, body_top) == MainHit::CenterButton;
             app.long_press_consumed = false;
             if app.mouse_down_center {
                 let _ = SetCapture(hwnd);
@@ -7113,7 +7515,7 @@ unsafe extern "system" fn window_proc(
             } else {
                 0.0
             };
-            if main_hit_test(app, x, y, body_top) == MainHit::CenterButton {
+            if main_hit_test(app, data.renderer.as_ref(), x, y, body_top) == MainHit::CenterButton {
                 app.mouse_down_center = true;
                 app.long_press_consumed = true;
                 if matches!(
@@ -7130,7 +7532,10 @@ unsafe extern "system" fn window_proc(
             } else {
                 app.mouse_down_center = false;
                 app.long_press_consumed = false;
-                process_main_hit(app, main_hit_test(app, x, y, body_top));
+                process_main_hit(
+                    app,
+                    main_hit_test(app, data.renderer.as_ref(), x, y, body_top),
+                );
             }
             update_visible_windows(app);
             LRESULT(0)
@@ -7153,7 +7558,7 @@ unsafe extern "system" fn window_proc(
                 } else {
                     0.0
                 };
-                let hit = main_hit_test(app, x, y, body_top);
+                let hit = main_hit_test(app, data.renderer.as_ref(), x, y, body_top);
                 process_main_hit(app, hit);
                 update_visible_windows(app);
             }
@@ -7298,7 +7703,7 @@ unsafe extern "system" fn window_proc(
             } else {
                 0.0
             };
-            if main_hit_test(app, x, y, body_top) == MainHit::CenterButton {
+            if main_hit_test(app, data.renderer.as_ref(), x, y, body_top) == MainHit::CenterButton {
                 if matches!(
                     app.phase,
                     MainPhase::Listening {
@@ -7730,20 +8135,23 @@ mod tests {
     use super::{
         advance_result_card_stage, animation_needs_frame, button_border_arc_points,
         composition_button_pixel_snap_offset, composition_root_layer_order,
-        composition_scale_for_dpi, copy_notification_text, d2d_color_from_system,
-        gradient_origin_transform, header_fill_scope, history_artwork_frame, history_row_top,
+        composition_scale_for_dpi, composition_scene_layer_order, copy_notification_text,
+        copy_panel_pixels_into, d2d_color_from_system, gradient_origin_transform,
+        header_fill_scope, history_artwork_frame, history_row_top, history_title_color,
         inverse_circle_clip_radii, is_offline_failure, is_tray_activation_event, localized_ui_text,
         native_icon_layout, no_match_copy, no_match_icon_rect, phase_needs_timeout, point_in_rect,
-        popup_base_color, result_artwork_rect, result_details_rects, result_gradient_colors,
-        result_panel_top_at, select_ui_language_from_multisz, should_hide_popup_on_deactivation,
+        popup_base_color, resolve_page_link, result_artwork_rect, result_card_link_hit,
+        result_details_rects, result_gradient_colors, result_panel_top_at,
+        select_ui_language_from_multisz, should_hide_popup_on_deactivation,
         should_show_initial_popup, should_start_startup_logo, theme_from_foreground_rgb,
-        timeout_copy, ui_model, ArrowEdge, CaptureMode, CompositionRootLayer, HeaderFillScope,
+        timeout_copy, ui_model, valid_page_template, visible_history_row_hit, ArrowEdge,
+        CaptureMode, CompositionRootLayer, CompositionSceneLayer, HeaderFillScope,
         HistoryMutationEvent, HistoryMutationTransition, MainPhase, NoMatchIconCommand,
         ResultCardAdvance, ResultCardStage, Theme, UiLanguage, UiTextKey, WindowKind,
-        BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, INNER_MASK_BOUNDS,
-        NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT,
-        RESULT_ARTWORK_CORNER_RADIUS, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT,
-        SETTINGS_ICON_PIXELS, WHITE_CLOSE_ICON_PIXELS,
+        BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, HISTORY_HEIGHT,
+        INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE,
+        POPUP_ARROW_HEIGHT, RESULT_ARTWORK_CORNER_RADIUS, RESULT_DETAILS_LEFT,
+        RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
     };
     use std::time::{Duration, Instant};
 
@@ -8200,6 +8608,78 @@ mod tests {
     }
 
     #[test]
+    fn ui223_history_title_uses_theme_specific_ink_with_documented_alpha() {
+        let light = history_title_color(Theme::Light);
+        assert_eq!((light.r, light.g, light.b), (0.0, 0.0, 0.0));
+        assert!((light.a - 0.847).abs() < f32::EPSILON);
+
+        let dark = history_title_color(Theme::Dark);
+        assert_eq!((dark.r, dark.g, dark.b), (1.0, 1.0, 1.0));
+        assert!((dark.a - 0.847).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn ui222_result_card_link_excludes_close_and_action_controls() {
+        let top = 42.0;
+        let close = [353.0, top + 25.0, 365.0, top + 37.0];
+        let action = result_details_rects(top, 24.0, 18.0).action;
+
+        assert!(result_card_link_hit(30.0, top + 80.0, top, close, action));
+        assert!(!result_card_link_hit(359.0, top + 31.0, top, close, action));
+        assert!(!result_card_link_hit(
+            (action.left + action.right) * 0.5,
+            (action.top + action.bottom) * 0.5,
+            top,
+            close,
+            action,
+        ));
+        assert!(!result_card_link_hit(30.0, top - 0.1, top, close, action));
+        assert!(!result_card_link_hit(
+            30.0,
+            top + TOP_HEIGHT as f32 + 0.1,
+            top,
+            close,
+            action,
+        ));
+    }
+
+    #[test]
+    fn ui222_history_link_hit_respects_viewport_clipping() {
+        let top = 200.0;
+        let bottom = top + HISTORY_HEIGHT as f32;
+        assert!(visible_history_row_hit(top + 1.0, top, top, bottom));
+        assert!(!visible_history_row_hit(top - 1.0, top - 20.0, top, bottom));
+        assert!(!visible_history_row_hit(
+            bottom + 1.0,
+            bottom - 10.0,
+            top,
+            bottom
+        ));
+        assert!(visible_history_row_hit(
+            bottom - 1.0,
+            bottom - 80.0,
+            top,
+            bottom
+        ));
+    }
+
+    #[test]
+    fn ui222_page_template_requires_one_track_key_token() {
+        assert!(valid_page_template(
+            "https://www.shazam.com/track/{trackid}"
+        ));
+        assert!(!valid_page_template(
+            "https://www.shazam.com/track/{trackid}/{trackid}"
+        ));
+        assert!(resolve_page_link(
+            Some("https://www.shazam.com/track/{trackid}"),
+            Some("abc/123")
+        )
+        .is_some_and(|url| url.0 == "https://www.shazam.com/track/abc%2F123"));
+        assert!(resolve_page_link(Some("https://www.shazam.com/track/{trackid}"), None).is_none());
+    }
+
+    #[test]
     fn result_label_color_preserves_system_foreground_rgba() {
         let mapped = d2d_color_from_system(super::Color {
             A: 128,
@@ -8407,6 +8887,37 @@ mod tests {
                 CompositionRootLayer::Button,
                 CompositionRootLayer::OuterRipples,
             ]
+        );
+        assert_eq!(
+            composition_scene_layer_order(),
+            [
+                CompositionSceneLayer::Tagging,
+                CompositionSceneLayer::ResultOverlay,
+            ]
+        );
+    }
+
+    #[test]
+    fn ui228_result_overlay_pixel_copy_preserves_alpha_and_clips_panel_edges() {
+        let source = [
+            1, 2, 3, 4, 5, 6, 7, 8, // first source row
+            9, 10, 11, 12, 13, 14, 15, 16, // second source row
+        ];
+        let mut output = Vec::new();
+        copy_panel_pixels_into(&source, 2, 2, -1, 2, 3, &mut output);
+        assert_eq!(
+            output,
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, // above the host window is transparent
+                1, 2, 3, 4, 5, 6, 7, 8, // alpha and color channels are retained
+                9, 10, 11, 12, 13, 14, 15, 16,
+            ]
+        );
+
+        copy_panel_pixels_into(&source, 2, 2, 1, 2, 2, &mut output);
+        assert_eq!(
+            output,
+            [9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0]
         );
     }
 
