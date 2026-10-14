@@ -1,27 +1,29 @@
 //! Windows-native UI host: Win32 tray/popup and Direct2D/DirectWrite renderer.
 //!
-//! Win32 owns the tray, popup and input. Loopback recognition enters through
-//! the typed controller API; file recognition keeps using its existing CLI.
+//! Win32 owns the tray, popup and input. Product recognition enters only
+//! through the typed controller API and WASAPI loopback.
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     ffi::c_void,
     mem::size_of,
-    path::{Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
-    },
+    process::Command,
+    sync::OnceLock,
     thread,
     time::{Duration, Instant},
 };
 
 use windows::{
     core::{implement, Error, Interface, Ref, HSTRING, PCWSTR, PWSTR},
+    ApplicationModel::{Activation::ActivationKind, AppInstance},
     Foundation::{TimeSpan, TypedEventHandler},
     Graphics::IGeometrySource2D,
     System::DispatcherQueueController,
+    Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+        WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+    },
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME},
@@ -61,7 +63,10 @@ use windows::{
             },
         },
         System::{
-            Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
+            Com::{
+                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+                COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
+            },
             LibraryLoader::GetModuleHandleW,
             WinRT::Composition::ICompositorDesktopInterop,
             WinRT::Graphics::Direct2D::{IGeometrySource2DInterop, IGeometrySource2DInterop_Impl},
@@ -71,33 +76,32 @@ use windows::{
             },
         },
         UI::{
-            Controls::Dialogs::{
-                GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
-            },
             HiDpi::{
                 GetDpiForWindow, SetProcessDpiAwarenessContext,
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
             },
-            Input::KeyboardAndMouse::{
-                GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_ESCAPE,
-            },
+            Input::KeyboardAndMouse::{GetDoubleClickTime, ReleaseCapture, SetCapture, VK_ESCAPE},
             Shell::{
-                Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE,
-                NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
-                NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4,
+                ShellExecuteExW, Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_GUID, NIF_ICON,
+                NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
+                NIM_MODIFY, NIM_SETFOCUS, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
+                NOTIFYICON_VERSION_4, SEE_MASK_DEFAULT, SHELLEXECUTEINFOW,
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-                GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, LoadIconW, PeekMessageW,
-                PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer,
-                SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
-                WaitMessage, CS_DBLCLKS, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION,
-                MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
-                SW_SHOWNORMAL, ULW_ALPHA, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY,
-                WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-                WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-                WM_RBUTTONUP, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WNDPROC,
-                WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+                AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+                DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos, GetWindowLongPtrW,
+                GetWindowRect, KillTimer, LoadCursorW, LoadIconW, PeekMessageW, PostMessageW,
+                PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
+                SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
+                TranslateMessage, UpdateLayeredWindow, WaitMessage, CS_DBLCLKS, CW_USEDEFAULT,
+                GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE,
+                SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
+                SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_ACTIVATE, WM_APP,
+                WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS,
+                WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+                WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS,
+                WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WNDPROC, WS_EX_LAYERED,
+                WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
             },
         },
     },
@@ -121,7 +125,8 @@ use openshazam::WindowsRecognitionBackend;
 use openshazam_controller::{
     ApplicationController, CommandId, CommandResultLookup, CommandStatus, NativeManualResultStage,
     NativeManualUiEvent, RecognitionCommand, RecognitionContext, RecognitionEvent,
-    RecognitionEventKind, SessionId,
+    RecognitionEventCategory, RecognitionEventKind, RecognitionSessionSnapshot, SessionEndReason,
+    SessionPhase, TrackCandidate, UiConfigSnapshot, UiRecognitionEvent,
 };
 
 use crate::ui_model::{
@@ -131,10 +136,22 @@ use crate::ui_model::{
 
 const CLASS_NAME: &str = "OpenShazamNativeUiWindow";
 const WM_TRAYICON_MESSAGE: u32 = WM_APP + 0x41;
-const WM_CAPTURE_FINISHED: u32 = WM_APP + 0x42;
 const WM_SHOW_INITIAL_POPUP: u32 = WM_APP + 0x43;
 const WM_OS_THEME_CHANGED: u32 = WM_APP + 0x44;
+const WM_ARTWORK_READY: u32 = WM_APP + 0x45;
+const WM_ACTIVATE_MAIN_POPUP: u32 = WM_APP + 0x46;
 const TRAY_ICON_ID: u32 = 1;
+const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
+    data1: 0x6a3d77b1,
+    data2: 0x8e9c,
+    data3: 0x4e7d,
+    data4: [0x92, 0x01, 0x5d, 0x34, 0xc1, 0x7a, 0x0f, 0x62],
+};
+const TRAY_TASKBAR_CREATED_NAME: &str = "TaskbarCreated";
+const TRAY_MENU_SETTINGS: usize = 1;
+const TRAY_MENU_EXIT: usize = 2;
+const POPUP_FADE_DURATION: Duration = Duration::from_millis(150);
+const POPUP_ACTIVATION_GRACE: Duration = Duration::from_millis(350);
 const TIMER_SINGLE_CLICK: usize = 0x4f53;
 const TIMER_LONG_PRESS: usize = 0x4f54;
 const TIMER_PHASE: usize = 0x4f55;
@@ -201,12 +218,11 @@ fn theme_from_foreground_rgb(red: u8, green: u8, blue: u8) -> Theme {
     }
 }
 
-fn theme_from_ui_settings(settings: &UISettings) -> windows::core::Result<Theme> {
+fn theme_from_ui_settings(settings: &UISettings) -> windows::core::Result<(Theme, Color)> {
     let foreground = settings.GetColorValue(UIColorType::Foreground)?;
-    Ok(theme_from_foreground_rgb(
-        foreground.R,
-        foreground.G,
-        foreground.B,
+    Ok((
+        theme_from_foreground_rgb(foreground.R, foreground.G, foreground.B),
+        foreground,
     ))
 }
 
@@ -218,9 +234,105 @@ enum ArrowEdge {
 
 #[derive(Clone, Debug)]
 struct Track {
+    display_id: u64,
     title: String,
     artist: String,
     recognized_at: Instant,
+    artwork_url: Option<String>,
+    hq_artwork_url: Option<String>,
+    #[allow(dead_code)] // Kept distinct from the album-art rendition by the UI data contract.
+    background_artwork_url: Option<String>,
+    #[allow(dead_code)]
+    // Retained alongside the Config-resolved page URL for the presentation model.
+    track_key: Option<String>,
+    page_url: Option<ValidatedWebTrackUrl>,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedWebTrackUrl(String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtworkSource {
+    Standard,
+    HighQuality,
+}
+
+#[derive(Clone, Debug)]
+struct ArtworkPixels {
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ArtworkReady {
+    display_id: u64,
+    source: ArtworkSource,
+    result: Result<ArtworkPixels, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusCycle {
+    Ready,
+    Auto,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StatusTextAlternator {
+    cycle: StatusCycle,
+    first: bool,
+    next_at: Instant,
+    transition_started_at: Option<Instant>,
+}
+
+impl StatusTextAlternator {
+    fn ready(now: Instant) -> Self {
+        Self::new(StatusCycle::Ready, now)
+    }
+
+    fn auto(now: Instant) -> Self {
+        Self::new(StatusCycle::Auto, now)
+    }
+
+    fn after_success(now: Instant) -> Self {
+        Self::ready(now)
+    }
+
+    fn new(cycle: StatusCycle, now: Instant) -> Self {
+        Self {
+            cycle,
+            first: true,
+            next_at: now + Duration::from_secs(3),
+            transition_started_at: None,
+        }
+    }
+
+    fn advance(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        while now >= self.next_at {
+            self.first = !self.first;
+            self.transition_started_at = Some(self.next_at);
+            self.next_at += Duration::from_secs(match self.cycle {
+                StatusCycle::Ready if self.first => 7,
+                StatusCycle::Ready => 2,
+                StatusCycle::Auto => 3,
+            });
+            changed = true;
+        }
+        if self.transition_started_at.is_some_and(|started| {
+            now.saturating_duration_since(started) >= Duration::from_millis(400)
+        }) {
+            self.transition_started_at = None;
+            changed = true;
+        }
+        changed
+    }
+
+    fn animating(self, now: Instant) -> bool {
+        self.transition_started_at.is_some_and(|started| {
+            now.saturating_duration_since(started) < Duration::from_millis(400)
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,6 +381,7 @@ enum ResultCardAdvance {
 
 const RESULT_CARD_TRANSITION: Duration = Duration::from_millis(300);
 const RESULT_CARD_HOLD: Duration = Duration::from_secs(10);
+const SUCCESS_SETTLE_TOTAL: Duration = Duration::from_secs(1);
 // [I/U] Native NSTableView slide duration was not recovered. Keep this
 // implementation value replaceable rather than presenting it as native data.
 const HISTORY_INSERT_TRANSITION: Duration = Duration::from_millis(250);
@@ -276,9 +389,17 @@ const HISTORY_INSERT_TRANSITION: Duration = Duration::from_millis(250);
 #[derive(Debug)]
 enum MainPhase {
     Ready,
+    Starting {
+        mode: CaptureMode,
+        entered_at: Instant,
+    },
     Listening {
         mode: CaptureMode,
         started_at: Instant,
+    },
+    Cancelling {
+        mode: CaptureMode,
+        entered_at: Instant,
     },
     Matched {
         track: Track,
@@ -302,15 +423,18 @@ enum MainPhase {
     },
 }
 
-#[derive(Debug)]
-struct CaptureFinished {
-    captured_mode: CaptureMode,
-    result: Result<Output, String>,
-    canceled: bool,
+#[derive(Clone, Copy, Debug)]
+struct RecognitionSessionUi {
+    ticket: openshazam_controller::CommandTicket,
+    mode: CaptureMode,
+    cancel_command_id: Option<CommandId>,
+    last_sequence: u64,
+    result_presented: bool,
 }
 
 struct AppState {
     main_hwnd: HWND,
+    taskbar_created_message: u32,
     settings_hwnd: HWND,
     about_hwnd: HWND,
     microphone_hwnd: HWND,
@@ -320,6 +444,7 @@ struct AppState {
     _dispatcher_queue: DispatcherQueueController,
     theme_settings: UISettings,
     theme_changed_token: Option<i64>,
+    system_foreground: Color,
     phase: MainPhase,
     history: Vec<Track>,
     history_transition: Option<HistoryMutationTransition>,
@@ -333,7 +458,10 @@ struct AppState {
     theme: Theme,
     theme_generation: u64,
     visible: bool,
+    popup_opacity: u8,
+    popup_transition: Option<PopupOpacityTransition>,
     main_activated: bool,
+    popup_activation_grace_until: Option<Instant>,
     phase_timer_active: bool,
     animation_timer_active: bool,
     startup_animation_pending: bool,
@@ -346,11 +474,24 @@ struct AppState {
     mouse_down_center: bool,
     long_press_consumed: bool,
     single_click_pending: bool,
-    capture_canceled: Arc<AtomicBool>,
-    capture_child: Option<Arc<Mutex<Option<Child>>>>,
     recognition_controller: Option<ApplicationController>,
-    recognition_session: Option<(SessionId, CaptureMode, CommandId)>,
+    recognition_session: Option<RecognitionSessionUi>,
+    controller_sequence: u64,
+    dropped_notifications: u64,
+    status_alternator: Option<StatusTextAlternator>,
+    success_wave_frame: Option<ui_model::WaveFrame>,
+    next_display_id: u64,
+    artwork_resources: HashMap<u64, (ArtworkSource, ArtworkPixels)>,
+    ui_configs: HashMap<u64, UiConfigSnapshot>,
     message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PopupOpacityTransition {
+    started_at: Instant,
+    from: u8,
+    to: u8,
+    hide_when_complete: bool,
 }
 
 struct WindowData {
@@ -366,6 +507,7 @@ struct Palette {
     black: ID2D1SolidColorBrush,
     title: ID2D1SolidColorBrush,
     subtitle: ID2D1SolidColorBrush,
+    result_label: ID2D1SolidColorBrush,
     accent: ID2D1SolidColorBrush,
     button: ID2D1SolidColorBrush,
     separator: ID2D1SolidColorBrush,
@@ -427,6 +569,9 @@ struct Renderer {
     theme_generation: u64,
     composition: Option<CompositionScene>,
     popup_layer: Option<ID2D1Layer>,
+    artwork_layer: Option<ID2D1Layer>,
+    artwork_geometries: [(u32, ID2D1Geometry); 2],
+    artwork_bitmaps: RefCell<HashMap<u64, (ArtworkSource, usize, ID2D1Bitmap)>>,
     popup_outline: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     popup_header: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     result_details_cache: RefCell<Option<CachedResultDetailsMetrics>>,
@@ -514,7 +659,7 @@ impl LayeredSurface {
         })
     }
 
-    unsafe fn present(&self, hwnd: HWND) -> windows::core::Result<()> {
+    unsafe fn present(&self, hwnd: HWND, opacity: u8) -> windows::core::Result<()> {
         let mut window = RECT::default();
         GetWindowRect(hwnd, &mut window)?;
         let destination = POINT {
@@ -535,7 +680,7 @@ impl LayeredSurface {
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
-            SourceConstantAlpha: 255,
+            SourceConstantAlpha: opacity,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
         UpdateLayeredWindow(
@@ -648,6 +793,69 @@ fn composition_button_pixel_snap_offset(dpi: u32, body_top: f32) -> Vector3 {
         Y: composition_pixel_phase(body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32, scale),
         Z: 0.0,
     }
+}
+
+fn create_scale_transition(
+    compositor: &Compositor,
+    from: f32,
+    to: f32,
+    duration: Duration,
+    easing: &CubicBezierEasingFunction,
+) -> windows::core::Result<Vector3KeyFrameAnimation> {
+    let animation = compositor.CreateVector3KeyFrameAnimation()?;
+    animation.SetDuration(TimeSpan {
+        Duration: (duration.as_nanos() / 100).min(i64::MAX as u128) as i64,
+    })?;
+    animation.InsertKeyFrame(
+        0.0,
+        Vector3 {
+            X: from,
+            Y: from,
+            Z: 1.0,
+        },
+    )?;
+    animation.InsertKeyFrameWithEasingFunction(
+        1.0,
+        Vector3 {
+            X: to,
+            Y: to,
+            Z: 1.0,
+        },
+        easing,
+    )?;
+    Ok(animation)
+}
+
+fn create_scalar_transition(
+    compositor: &Compositor,
+    from: f32,
+    to: f32,
+    duration: Duration,
+    easing: &CubicBezierEasingFunction,
+) -> windows::core::Result<ScalarKeyFrameAnimation> {
+    let animation = compositor.CreateScalarKeyFrameAnimation()?;
+    animation.SetDuration(TimeSpan {
+        Duration: (duration.as_nanos() / 100).min(i64::MAX as u128) as i64,
+    })?;
+    animation.InsertKeyFrame(0.0, from)?;
+    animation.InsertKeyFrameWithEasingFunction(1.0, to, easing)?;
+    Ok(animation)
+}
+
+fn create_vector2_scale_transition(
+    compositor: &Compositor,
+    from: f32,
+    to: f32,
+    duration: Duration,
+    easing: &CubicBezierEasingFunction,
+) -> windows::core::Result<Vector2KeyFrameAnimation> {
+    let animation = compositor.CreateVector2KeyFrameAnimation()?;
+    animation.SetDuration(TimeSpan {
+        Duration: (duration.as_nanos() / 100).min(i64::MAX as u128) as i64,
+    })?;
+    animation.InsertKeyFrame(0.0, Vector2 { X: from, Y: from })?;
+    animation.InsertKeyFrameWithEasingFunction(1.0, Vector2 { X: to, Y: to }, easing)?;
+    Ok(animation)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1467,6 +1675,11 @@ fn logo_transparent_color(theme: Theme) -> Color {
     }
 }
 
+fn composition_auto_shadow_color(theme: Theme) -> Color {
+    // The native AutoShadow background uses tagButtonBackgroundTransparent.
+    logo_transparent_color(theme)
+}
+
 fn logo_shadow_color(_theme: Theme) -> Color {
     // Native uses the tagButtonTopBorder color. The dark appearance rendition
     // is still unmeasured; the current UI uses the confirmed light alpha/color.
@@ -1536,6 +1749,12 @@ struct CompositionScene {
     compositor: Compositor,
     _target: DesktopWindowTarget,
     root: ContainerVisual,
+    auto_shadow_root: ContainerVisual,
+    auto_shadow_mask: CompositionGeometricClip,
+    auto_shadow_brush: CompositionColorBrush,
+    _auto_shadow_source: ShapeVisual,
+    _auto_shadow_surface: CompositionVisualSurface,
+    auto_shadow: DropShadow,
     inner_audio_root: ContainerVisual,
     inner_wave_root: ContainerVisual,
     inner_inverse_clip: CompositionGeometricClip,
@@ -1553,6 +1772,9 @@ struct CompositionScene {
     idle_started_at: Option<Instant>,
     last_button_scale: f32,
     ripples_active: bool,
+    success_settle_active: bool,
+    success_settle_completed: bool,
+    success_track_id: Option<u64>,
     theme: Theme,
     body_top: f32,
     dpi: u32,
@@ -1571,18 +1793,24 @@ struct AnimationSnapshot {
     levels: UiLevels,
     auto_spring: Option<ui_model::SpringProfile>,
     no_match_elapsed: Option<f64>,
+    success_elapsed: Option<f64>,
+    success_track_id: Option<u64>,
+    success_wave_frame: Option<ui_model::WaveFrame>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompositionRootLayer {
+    AutoShadow,
     InnerRipples,
     Button,
     OuterRipples,
 }
 
-fn composition_root_layer_order() -> [CompositionRootLayer; 3] {
-    // Insert inner circles below the button, then put outer circles in front.
+fn composition_root_layer_order() -> [CompositionRootLayer; 4] {
+    // Insert the Auto shadow behind inner ripples and the button, then put
+    // outer circles in front of the button.
     [
+        CompositionRootLayer::AutoShadow,
         CompositionRootLayer::InnerRipples,
         CompositionRootLayer::Button,
         CompositionRootLayer::OuterRipples,
@@ -1644,6 +1872,78 @@ impl CompositionScene {
         // Native uses a 3.5×96pt inverse mask (336pt) around the button.
         // The largest visible inner fill remains 288pt inside that mask.
         let inner_bounds = INNER_MASK_BOUNDS;
+        let auto_shadow_root = compositor.CreateContainerVisual()?;
+        auto_shadow_root.SetSize(Vector2 {
+            X: inner_bounds,
+            Y: inner_bounds,
+        })?;
+        auto_shadow_root.SetCenterPoint(Vector3 {
+            X: inner_bounds * 0.5,
+            Y: inner_bounds * 0.5,
+            Z: 0.0,
+        })?;
+        auto_shadow_root.SetOffset(Vector3 {
+            X: center_x - inner_bounds * 0.5,
+            Y: center_y - inner_bounds * 0.5,
+            Z: 0.0,
+        })?;
+        auto_shadow_root.SetOpacity(0.0)?;
+        let auto_shadow_mask = unsafe {
+            make_inverse_circle_clip(compositor, d2d_factory, inner_bounds, BUTTON_CLEAR_DIAMETER)?
+        };
+        auto_shadow_mask.SetCenterPoint(Vector2 {
+            X: inner_bounds * 0.5,
+            Y: inner_bounds * 0.5,
+        })?;
+        auto_shadow_root.SetClip(&auto_shadow_mask)?;
+        let auto_shadow_brush =
+            compositor.CreateColorBrushWithColor(composition_auto_shadow_color(theme))?;
+        let auto_shadow_source = compositor.CreateShapeVisual()?;
+        auto_shadow_source.SetSize(Vector2 {
+            X: inner_bounds,
+            Y: inner_bounds,
+        })?;
+        let auto_shadow_geometry: CompositionEllipseGeometry =
+            compositor.CreateEllipseGeometry()?;
+        auto_shadow_geometry.SetCenter(Vector2 {
+            X: inner_bounds * 0.5,
+            Y: inner_bounds * 0.5,
+        })?;
+        auto_shadow_geometry.SetRadius(Vector2 {
+            X: inner_bounds * 0.5,
+            Y: inner_bounds * 0.5,
+        })?;
+        let auto_shadow_shape = compositor.CreateSpriteShapeWithGeometry(&auto_shadow_geometry)?;
+        auto_shadow_shape.SetFillBrush(&auto_shadow_brush)?;
+        auto_shadow_source.Shapes()?.Append(&auto_shadow_shape)?;
+        let auto_shadow_surface = compositor.CreateVisualSurface()?;
+        auto_shadow_surface.SetSourceVisual(&auto_shadow_source)?;
+        auto_shadow_surface.SetSourceOffset(Vector2 { X: 0.0, Y: 0.0 })?;
+        auto_shadow_surface.SetSourceSize(Vector2 {
+            X: inner_bounds,
+            Y: inner_bounds,
+        })?;
+        let auto_shadow_surface_brush =
+            compositor.CreateSurfaceBrushWithSurface(&auto_shadow_surface)?;
+        let auto_shadow = compositor.CreateDropShadow()?;
+        auto_shadow.SetBlurRadius(3.0)?;
+        auto_shadow.SetOffset(Vector3::default())?;
+        auto_shadow.SetOpacity(0.5)?;
+        auto_shadow.SetColor(composition_color(255, 36, 36, 36))?;
+        auto_shadow.SetSourcePolicy(
+            windows::UI::Composition::CompositionDropShadowSourcePolicy::InheritFromVisualContent,
+        )?;
+        let auto_shadow_sprite = compositor.CreateSpriteVisual()?;
+        auto_shadow_sprite.SetSize(Vector2 {
+            X: inner_bounds,
+            Y: inner_bounds,
+        })?;
+        auto_shadow_sprite.SetBrush(&auto_shadow_surface_brush)?;
+        auto_shadow_sprite.SetShadow(&auto_shadow)?;
+        auto_shadow_root
+            .Children()?
+            .InsertAtTop(&auto_shadow_sprite)?;
+
         let inner_audio_root = compositor.CreateContainerVisual()?;
         inner_audio_root.SetSize(Vector2 {
             X: inner_bounds,
@@ -1658,11 +1958,6 @@ impl CompositionScene {
             X: center_x - inner_bounds * 0.5,
             Y: center_y - inner_bounds * 0.5,
             Z: 0.0,
-        })?;
-        let inner_audio_root = compositor.CreateContainerVisual()?;
-        inner_audio_root.SetSize(Vector2 {
-            X: inner_bounds,
-            Y: inner_bounds,
         })?;
         inner_audio_root.SetOpacity(0.0)?;
         let inner_inverse_clip = unsafe {
@@ -2078,6 +2373,7 @@ impl CompositionScene {
         let children = root.Children()?;
         for layer in composition_root_layer_order() {
             match layer {
+                CompositionRootLayer::AutoShadow => children.InsertAtTop(&auto_shadow_root)?,
                 CompositionRootLayer::InnerRipples => children.InsertAtTop(&inner_audio_root)?,
                 CompositionRootLayer::Button => children.InsertAtTop(&button)?,
                 CompositionRootLayer::OuterRipples => children.InsertAtTop(&outer_audio_root)?,
@@ -2152,6 +2448,12 @@ impl CompositionScene {
             compositor: compositor.clone(),
             _target: target,
             root,
+            auto_shadow_root,
+            auto_shadow_mask,
+            auto_shadow_brush,
+            _auto_shadow_source: auto_shadow_source,
+            _auto_shadow_surface: auto_shadow_surface,
+            auto_shadow,
             inner_audio_root,
             inner_wave_root,
             inner_inverse_clip,
@@ -2169,6 +2471,9 @@ impl CompositionScene {
             idle_started_at: None,
             last_button_scale: 1.0,
             ripples_active: false,
+            success_settle_active: false,
+            success_settle_completed: false,
+            success_track_id: None,
             theme,
             body_top,
             dpi,
@@ -2194,12 +2499,39 @@ impl CompositionScene {
     }
 
     fn update(&mut self, snapshot: AnimationSnapshot) -> windows::core::Result<()> {
+        if snapshot.success_track_id != self.success_track_id {
+            if self.success_settle_active {
+                self.stop_success_settle_tracks()?;
+            }
+            self.success_track_id = snapshot.success_track_id;
+            self.success_settle_active = false;
+            self.success_settle_completed = false;
+        }
+        if let Some(elapsed) = snapshot.success_elapsed {
+            if elapsed < SUCCESS_SETTLE_TOTAL.as_secs_f64()
+                && !self.success_settle_active
+                && !self.success_settle_completed
+            {
+                self.start_success_settle(snapshot.success_wave_frame)?;
+            }
+            if elapsed >= SUCCESS_SETTLE_TOTAL.as_secs_f64() && !self.success_settle_completed {
+                self.finish_success_settle()?;
+            }
+        } else {
+            self.success_settle_active = false;
+            self.success_settle_completed = false;
+        }
+
         if self.theme != snapshot.theme {
             self.theme = snapshot.theme;
             self.logo.set_theme(self.theme)?;
             for brush in &self.ring_brushes {
                 brush.SetColor(composition_tagging_color(self.theme))?;
             }
+            self.auto_shadow_brush
+                .SetColor(composition_auto_shadow_color(self.theme))?;
+            self.auto_shadow
+                .SetColor(composition_color(255, 36, 36, 36))?;
             self.button_fill
                 .SetColor(composition_color(77, 255, 255, 255))?;
         }
@@ -2219,6 +2551,11 @@ impl CompositionScene {
             let outer_bounds = ui_model::OUTER_DIAMETERS[0] as f32;
             let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
             let center_y = snapshot.body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32;
+            self.auto_shadow_root.SetOffset(Vector3 {
+                X: center_x - inner_bounds * 0.5,
+                Y: center_y - inner_bounds * 0.5,
+                Z: 0.0,
+            })?;
             self.inner_audio_root.SetOffset(Vector3 {
                 X: center_x - inner_bounds * 0.5,
                 Y: center_y - inner_bounds * 0.5,
@@ -2340,7 +2677,10 @@ impl CompositionScene {
                 }
             }
             self.ripples_active = true;
-        } else if !snapshot.show_ripples && self.ripples_active {
+        } else if !snapshot.show_ripples
+            && self.ripples_active
+            && snapshot.success_elapsed.is_none()
+        {
             for ring in &self.rings[..4] {
                 ring.visual.StopAnimation(&HSTRING::from("Scale"))?;
                 if let Some(container) = &ring.core_container {
@@ -2376,7 +2716,67 @@ impl CompositionScene {
             self.ripples_active = false;
         }
 
-        if !snapshot.show_ripples {
+        if snapshot.show_ripples {
+            if self.idle_active {
+                self.button.StopAnimation(&HSTRING::from("Scale"))?;
+                self.idle_active = false;
+                self.idle_started_at = None;
+            }
+            let frame = ui_model::wave_frame_at_with_auto_spring(
+                snapshot.mode,
+                snapshot.elapsed,
+                snapshot.levels,
+                snapshot.auto_spring,
+            );
+            self.auto_shadow_root
+                .SetOpacity(if snapshot.mode == TaggingMode::Auto {
+                    1.0
+                } else {
+                    0.0
+                })?;
+            self.auto_shadow_root.SetScale(Vector3 {
+                X: frame.auto_shadow_scale as f32,
+                Y: frame.auto_shadow_scale as f32,
+                Z: 1.0,
+            })?;
+            self.button.SetScale(Vector3 {
+                X: frame.button_child_scale as f32,
+                Y: frame.button_child_scale as f32,
+                Z: 1.0,
+            })?;
+            self.inner_wave_root.SetScale(Vector3 {
+                X: (frame.inner_container_factor / 3.0 * frame.inner_audio_scale) as f32,
+                Y: (frame.inner_container_factor / 3.0 * frame.inner_audio_scale) as f32,
+                Z: 1.0,
+            })?;
+            self.inner_inverse_clip.SetScale(Vector2 {
+                X: frame.button_child_scale as f32,
+                Y: frame.button_child_scale as f32,
+            })?;
+            self.inner_audio_root
+                .SetOpacity(frame.inner_audio_opacity as f32)?;
+            self.outer_audio_root.SetScale(Vector3 {
+                X: frame.outer_audio_scale as f32,
+                Y: frame.outer_audio_scale as f32,
+                Z: 1.0,
+            })?;
+            self.outer_audio_root
+                .SetOpacity(frame.outer_audio_opacity as f32)?;
+        } else if snapshot.success_elapsed.is_none() {
+            // Do not write static values over the active success tracks. Once
+            // the result leaves this state, restore the ready scene in one
+            // update and release the Auto shadow layer.
+            self.auto_shadow_root
+                .StopAnimation(&HSTRING::from("Scale"))?;
+            self.auto_shadow_mask
+                .StopAnimation(&HSTRING::from("Scale"))?;
+            self.auto_shadow_root.SetScale(Vector3 {
+                X: 1.0,
+                Y: 1.0,
+                Z: 1.0,
+            })?;
+            self.auto_shadow_mask.SetScale(Vector2 { X: 1.0, Y: 1.0 })?;
+            self.auto_shadow_root.SetOpacity(0.0)?;
             self.inner_audio_root.SetOpacity(0.0)?;
             self.inner_wave_root.SetScale(Vector3 {
                 X: 1.0,
@@ -2427,46 +2827,14 @@ impl CompositionScene {
                     })?;
                 }
             }
-        } else {
-            if self.idle_active {
-                self.button.StopAnimation(&HSTRING::from("Scale"))?;
-                self.idle_active = false;
-                self.idle_started_at = None;
-            }
-            let frame = ui_model::wave_frame_at_with_auto_spring(
-                snapshot.mode,
-                snapshot.elapsed,
-                snapshot.levels,
-                snapshot.auto_spring,
-            );
-            self.button.SetScale(Vector3 {
-                X: frame.button_child_scale as f32,
-                Y: frame.button_child_scale as f32,
-                Z: 1.0,
-            })?;
-            self.inner_wave_root.SetScale(Vector3 {
-                X: (frame.inner_container_factor / 3.0 * frame.inner_audio_scale) as f32,
-                Y: (frame.inner_container_factor / 3.0 * frame.inner_audio_scale) as f32,
-                Z: 1.0,
-            })?;
-            self.inner_inverse_clip.SetScale(Vector2 {
-                X: frame.button_child_scale as f32,
-                Y: frame.button_child_scale as f32,
-            })?;
-            self.inner_audio_root
-                .SetOpacity(frame.inner_audio_opacity as f32)?;
-            self.outer_audio_root.SetScale(Vector3 {
-                X: frame.outer_audio_scale as f32,
-                Y: frame.outer_audio_scale as f32,
-                Z: 1.0,
-            })?;
-            self.outer_audio_root
-                .SetOpacity(frame.outer_audio_opacity as f32)?;
         }
 
         let logo_finished = self.logo.advance()?;
         if snapshot.mode == TaggingMode::Ready {
-            if snapshot.show_button && logo_finished && !self.idle_active {
+            let success_allows_idle = snapshot
+                .success_elapsed
+                .is_none_or(|elapsed| elapsed >= SUCCESS_SETTLE_TOTAL.as_secs_f64());
+            if snapshot.show_button && logo_finished && success_allows_idle && !self.idle_active {
                 self.button.SetScale(Vector3 {
                     X: 1.0,
                     Y: 1.0,
@@ -2476,7 +2844,9 @@ impl CompositionScene {
                     .StartAnimation(&HSTRING::from("Scale"), &self.idle_animation)?;
                 self.idle_active = true;
                 self.idle_started_at = Some(Instant::now());
-            } else if (!snapshot.show_button || !logo_finished) && self.idle_active {
+            } else if (!snapshot.show_button || !logo_finished || !success_allows_idle)
+                && self.idle_active
+            {
                 self.button.StopAnimation(&HSTRING::from("Scale"))?;
                 self.idle_active = false;
                 self.idle_started_at = None;
@@ -2495,6 +2865,161 @@ impl CompositionScene {
             );
             self.last_button_scale = frame.button_child_scale as f32;
         }
+        Ok(())
+    }
+
+    fn start_success_settle(
+        &mut self,
+        frame: Option<ui_model::WaveFrame>,
+    ) -> windows::core::Result<()> {
+        let frame = frame.unwrap_or_else(|| {
+            ui_model::wave_frame_at_with_auto_spring(
+                TaggingMode::Manual,
+                0.0,
+                UiLevels::default(),
+                None,
+            )
+        });
+        if self.idle_active {
+            self.button.StopAnimation(&HSTRING::from("Scale"))?;
+            self.idle_active = false;
+            self.idle_started_at = None;
+        }
+        self.stop_ripple_child_tracks()?;
+
+        let ease_out = self.compositor.CreateCubicBezierEasingFunction(
+            Vector2 { X: 0.0, Y: 0.0 },
+            Vector2 { X: 0.58, Y: 1.0 },
+        )?;
+        let ease_in = self.compositor.CreateCubicBezierEasingFunction(
+            Vector2 { X: 0.42, Y: 0.0 },
+            Vector2 { X: 1.0, Y: 1.0 },
+        )?;
+        let button_scale = create_scale_transition(
+            &self.compositor,
+            frame.button_child_scale as f32,
+            1.0,
+            Duration::from_millis(350),
+            &ease_out,
+        )?;
+        let inner_scale = create_scale_transition(
+            &self.compositor,
+            (frame.inner_container_factor / 3.0 * frame.inner_audio_scale) as f32,
+            0.3,
+            Duration::from_millis(350),
+            &ease_in,
+        )?;
+        let button_mask_scale = create_vector2_scale_transition(
+            &self.compositor,
+            frame.button_child_scale as f32,
+            1.0,
+            Duration::from_millis(350),
+            &ease_out,
+        )?;
+        let auto_shadow_scale = create_scale_transition(
+            &self.compositor,
+            frame.auto_shadow_scale as f32,
+            0.9,
+            Duration::from_secs(1),
+            &ease_in,
+        )?;
+        let auto_shadow_mask_scale = create_vector2_scale_transition(
+            &self.compositor,
+            frame.auto_shadow_scale as f32,
+            0.9,
+            Duration::from_secs(1),
+            &ease_in,
+        )?;
+        let outer_opacity = create_scalar_transition(
+            &self.compositor,
+            frame.outer_audio_opacity as f32,
+            0.0,
+            Duration::from_millis(500),
+            &ease_out,
+        )?;
+        self.button
+            .StartAnimation(&HSTRING::from("Scale"), &button_scale)?;
+        self.inner_inverse_clip
+            .StartAnimation(&HSTRING::from("Scale"), &button_mask_scale)?;
+        self.inner_wave_root
+            .StartAnimation(&HSTRING::from("Scale"), &inner_scale)?;
+        self.outer_audio_root
+            .StartAnimation(&HSTRING::from("Opacity"), &outer_opacity)?;
+        self.auto_shadow_root
+            .StartAnimation(&HSTRING::from("Scale"), &auto_shadow_scale)?;
+        self.auto_shadow_mask
+            .StartAnimation(&HSTRING::from("Scale"), &auto_shadow_mask_scale)?;
+        self.success_settle_active = true;
+        Ok(())
+    }
+
+    fn stop_ripple_child_tracks(&self) -> windows::core::Result<()> {
+        for ring in &self.rings[..4] {
+            ring.visual.StopAnimation(&HSTRING::from("Scale"))?;
+            if let Some(core) = &ring.core_container {
+                core.StopAnimation(&HSTRING::from("Scale"))?;
+                core.StopAnimation(&HSTRING::from("Opacity"))?;
+            }
+            if let Some(sublayer) = &ring.sublayer_container {
+                sublayer.StopAnimation(&HSTRING::from("Scale"))?;
+            }
+        }
+        for ring in &self.rings[4..] {
+            ring.visual.StopAnimation(&HSTRING::from("Scale"))?;
+            if let Some(core) = &ring.core_container {
+                core.StopAnimation(&HSTRING::from("Scale"))?;
+            }
+            if let Some(geometry) = &ring.geometry {
+                geometry.StopAnimation(&HSTRING::from("Radius"))?;
+            }
+            if let Some(shape) = &ring.shape {
+                shape.StopAnimation(&HSTRING::from("StrokeThickness"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_success_settle_tracks(&mut self) -> windows::core::Result<()> {
+        self.button.StopAnimation(&HSTRING::from("Scale"))?;
+        self.inner_inverse_clip
+            .StopAnimation(&HSTRING::from("Scale"))?;
+        self.inner_wave_root
+            .StopAnimation(&HSTRING::from("Scale"))?;
+        self.outer_audio_root
+            .StopAnimation(&HSTRING::from("Opacity"))?;
+        self.auto_shadow_root
+            .StopAnimation(&HSTRING::from("Scale"))?;
+        self.auto_shadow_mask
+            .StopAnimation(&HSTRING::from("Scale"))?;
+        self.success_settle_active = false;
+        Ok(())
+    }
+
+    fn finish_success_settle(&mut self) -> windows::core::Result<()> {
+        self.stop_ripple_child_tracks()?;
+        self.stop_success_settle_tracks()?;
+        self.inner_inverse_clip
+            .SetScale(Vector2 { X: 1.0, Y: 1.0 })?;
+        self.inner_wave_root.SetScale(Vector3 {
+            X: 0.3,
+            Y: 0.3,
+            Z: 1.0,
+        })?;
+        self.outer_audio_root.SetOpacity(0.0)?;
+        self.button.SetScale(Vector3 {
+            X: 1.0,
+            Y: 1.0,
+            Z: 1.0,
+        })?;
+        self.auto_shadow_root.SetScale(Vector3 {
+            X: 0.9,
+            Y: 0.9,
+            Z: 1.0,
+        })?;
+        self.auto_shadow_mask.SetScale(Vector2 { X: 0.9, Y: 0.9 })?;
+        self.success_settle_active = false;
+        self.success_settle_completed = true;
+        self.ripples_active = false;
         Ok(())
     }
 
@@ -2798,6 +3323,10 @@ fn d2d_color(r: u8, g: u8, b: u8, alpha: f32) -> D2D1_COLOR_F {
     }
 }
 
+fn d2d_color_from_system(color: Color) -> D2D1_COLOR_F {
+    d2d_color(color.R, color.G, color.B, f32::from(color.A) / 255.0)
+}
+
 fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
     D2D_RECT_F {
         left,
@@ -2941,6 +3470,7 @@ impl Renderer {
         dpi: u32,
         theme_generation: u64,
         theme: Theme,
+        system_foreground: Color,
         kind: WindowKind,
         animate_startup_logo: bool,
     ) -> windows::core::Result<Self> {
@@ -2985,7 +3515,7 @@ impl Renderer {
         target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         let settings_icon = create_ui_icon_bitmap(&target, SETTINGS_ICON_PIXELS, 32, 32)?;
         let white_close_icon = create_ui_icon_bitmap(&target, WHITE_CLOSE_ICON_PIXELS, 24, 24)?;
-        let palette = create_palette(&target, theme)?;
+        let palette = create_palette(&target, theme, system_foreground)?;
         let text = create_text_styles(&write_factory)?;
         let composition = if kind == WindowKind::Main {
             Some(CompositionScene::new(
@@ -3005,6 +3535,33 @@ impl Renderer {
         } else {
             None
         };
+        let artwork_layer = target.CreateLayer(None)?;
+        let artwork_geometries = [
+            (
+                150,
+                factory
+                    .CreateRoundedRectangleGeometry(
+                        &windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+                            rect: rect(0.0, 0.0, 150.0, 150.0),
+                            radiusX: RESULT_ARTWORK_CORNER_RADIUS,
+                            radiusY: RESULT_ARTWORK_CORNER_RADIUS,
+                        },
+                    )?
+                    .cast()?,
+            ),
+            (
+                65,
+                factory
+                    .CreateRoundedRectangleGeometry(
+                        &windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+                            rect: rect(0.0, 0.0, 65.0, 65.0),
+                            radiusX: 4.0,
+                            radiusY: 4.0,
+                        },
+                    )?
+                    .cast()?,
+            ),
+        ];
         Ok(Self {
             factory,
             write_factory,
@@ -3020,6 +3577,9 @@ impl Renderer {
             theme_generation,
             composition,
             popup_layer,
+            artwork_layer: Some(artwork_layer),
+            artwork_geometries,
+            artwork_bitmaps: RefCell::new(HashMap::new()),
             popup_outline: RefCell::new(None),
             popup_header: RefCell::new(None),
             result_details_cache: RefCell::new(None),
@@ -3063,7 +3623,7 @@ impl Renderer {
             }
         }
         self.on_size(hwnd);
-        if let Ok(palette) = create_palette(&self.target, app.theme) {
+        if let Ok(palette) = create_palette(&self.target, app.theme, app.system_foreground) {
             self.palette = palette;
             self.theme_generation = app.theme_generation;
         }
@@ -3071,7 +3631,7 @@ impl Renderer {
 
     unsafe fn refresh_theme_if_needed(&mut self, app: &AppState) {
         if self.theme_generation != app.theme_generation {
-            if let Ok(palette) = create_palette(&self.target, app.theme) {
+            if let Ok(palette) = create_palette(&self.target, app.theme, app.system_foreground) {
                 self.palette = palette;
                 self.theme_generation = app.theme_generation;
             }
@@ -3117,7 +3677,14 @@ impl Renderer {
         draw_result?;
         self.target.EndDraw(None, None)?;
         if let Some(surface) = self.layered_surface.as_ref() {
-            surface.present(app.main_hwnd)?;
+            surface.present(app.main_hwnd, app.popup_opacity)?;
+        }
+        Ok(())
+    }
+
+    fn set_popup_opacity(&mut self, opacity: u8) -> windows::core::Result<()> {
+        if let Some(scene) = self.composition.as_mut() {
+            scene.root.SetOpacity(f32::from(opacity) / 255.0)?;
         }
         Ok(())
     }
@@ -3262,7 +3829,12 @@ impl Renderer {
             // UI-156: the tagging view owns this gradient from its initial
             // Ready state onward. Listening and Auto use the same colors;
             // result and NoMatch panels are separate overlays below.
-            MainPhase::Ready | MainPhase::Error { .. } | MainPhase::Timeout { .. } => {
+            MainPhase::Ready
+            | MainPhase::Starting { .. }
+            | MainPhase::Cancelling { .. }
+            | MainPhase::Error { .. }
+            | MainPhase::Timeout { .. }
+            | MainPhase::Matched { .. } => {
                 if header_fill_scope(app.arrow_edge) == HeaderFillScope::HeaderAndArrow {
                     self.fill_gradient_geometry(
                         &self.popup_header(app)?,
@@ -3302,7 +3874,7 @@ impl Renderer {
                     )?;
                 }
             }
-            MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. } => {
+            MainPhase::NoMatch { .. } | MainPhase::Offline { .. } => {
                 let result_gradient = if app.arrow_edge == ArrowEdge::Top {
                     &self.palette.result_top
                 } else {
@@ -3360,14 +3932,23 @@ impl Renderer {
 
         match &app.phase {
             MainPhase::Ready => self.draw_ready(app, body_top),
+            MainPhase::Starting { mode, .. } => {
+                self.draw_capture_pending(body_top, *mode, false);
+                self.draw_cancel_button(body_top);
+            }
+            MainPhase::Cancelling { mode, .. } => {
+                self.draw_capture_pending(body_top, *mode, true);
+                self.draw_cancel_button(body_top);
+            }
             MainPhase::Listening { mode, .. } => {
-                self.draw_listening_status(body_top, *mode);
+                self.draw_listening_status(app, body_top, *mode);
                 self.draw_cancel_button(body_top);
             }
             MainPhase::Matched { ref track, .. } => {
+                self.draw_status_text(app, body_top);
                 let top =
                     result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
-                self.draw_result_panel(track, top, app.arrow_edge)?;
+                self.draw_result_panel(app, track, top, app.arrow_edge)?;
             }
             MainPhase::NoMatch { .. } => {
                 let top =
@@ -3385,7 +3966,6 @@ impl Renderer {
             }
             MainPhase::Timeout { .. } => self.draw_timeout_dialog(body_top),
         }
-        self.draw_file_hint(body_bottom);
         Ok(())
     }
 
@@ -3531,9 +4111,93 @@ impl Renderer {
         combined.cast()
     }
 
-    unsafe fn draw_ready(&self, _app: &AppState, body_top: f32) {
+    unsafe fn draw_ready(&self, app: &AppState, body_top: f32) {
+        self.draw_status_text(app, body_top);
+        self.draw_settings_icon(body_top);
+    }
+
+    unsafe fn draw_status_text(&self, app: &AppState, body_top: f32) {
+        let area = rect(
+            8.0,
+            body_top + 141.0,
+            CONTENT_WIDTH as f32 - 8.0,
+            body_top + 160.0,
+        );
+        let Some(status) = app.status_alternator else {
+            self.text(
+                localized_ui_text(UiTextKey::Ready, ui_language()),
+                area,
+                &self.text.centered_title,
+                &self.palette.white_ink,
+            );
+            return;
+        };
+        let language = ui_language();
+        let (first, second) = match status.cycle {
+            StatusCycle::Ready => (
+                localized_ui_text(UiTextKey::Ready, language),
+                localized_ui_text(UiTextKey::AutoStartStatus, language),
+            ),
+            StatusCycle::Auto => (
+                localized_ui_text(UiTextKey::AutoOn, language),
+                localized_ui_text(UiTextKey::AutoTurnOff, language),
+            ),
+        };
+        let current = if status.first { first } else { second };
+        let Some(started_at) = status.transition_started_at else {
+            self.text(
+                current,
+                area,
+                &self.text.centered_title,
+                &self.palette.white_ink,
+            );
+            return;
+        };
+        let progress = ui_model::ease_in_out(
+            (Instant::now()
+                .saturating_duration_since(started_at)
+                .as_secs_f64()
+                / 0.4)
+                .clamp(0.0, 1.0),
+        ) as f32;
+        let previous = if status.first { second } else { first };
+        let line_height = area.bottom - area.top;
+        self.target.PushAxisAlignedClip(
+            &area,
+            windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+        );
         self.text(
-            localized_ui_text(UiTextKey::Ready, ui_language()),
+            previous,
+            rect(
+                area.left,
+                area.top - line_height * progress,
+                area.right,
+                area.bottom - line_height * progress,
+            ),
+            &self.text.centered_title,
+            &self.palette.white_ink,
+        );
+        self.text(
+            current,
+            rect(
+                area.left,
+                area.top + line_height * (1.0 - progress),
+                area.right,
+                area.bottom + line_height * (1.0 - progress),
+            ),
+            &self.text.centered_title,
+            &self.palette.white_ink,
+        );
+        self.target.PopAxisAlignedClip();
+    }
+
+    unsafe fn draw_listening_status(&self, app: &AppState, body_top: f32, mode: CaptureMode) {
+        if mode == CaptureMode::Auto {
+            self.draw_status_text(app, body_top);
+            return;
+        }
+        self.text(
+            localized_ui_text(UiTextKey::Listening, ui_language()),
             rect(
                 8.0,
                 body_top + 141.0,
@@ -3543,15 +4207,21 @@ impl Renderer {
             &self.text.centered_title,
             &self.palette.white_ink,
         );
-        self.draw_settings_icon(body_top);
     }
 
-    unsafe fn draw_listening_status(&self, body_top: f32, mode: CaptureMode) {
+    unsafe fn draw_capture_pending(&self, body_top: f32, mode: CaptureMode, cancelling: bool) {
+        let key = if cancelling {
+            UiTextKey::Cancelling
+        } else {
+            UiTextKey::Starting
+        };
+        let label = if mode == CaptureMode::Auto && !cancelling {
+            "Auto Shazam"
+        } else {
+            localized_ui_text(key, ui_language())
+        };
         self.text(
-            match mode {
-                CaptureMode::Manual => localized_ui_text(UiTextKey::Listening, ui_language()),
-                CaptureMode::Auto => "Auto Shazam",
-            },
+            label,
             rect(
                 10.0,
                 body_top + 142.0,
@@ -3624,6 +4294,90 @@ impl Renderer {
             .FillRectangle(&history, &self.palette.empty_overlay);
     }
 
+    unsafe fn draw_track_artwork(
+        &self,
+        app: &AppState,
+        track: &Track,
+        destination: D2D_RECT_F,
+        side: f32,
+    ) -> bool {
+        let Some((source, pixels)) = app.artwork_resources.get(&track.display_id) else {
+            return false;
+        };
+        let mut bitmaps = self.artwork_bitmaps.borrow_mut();
+        if !bitmaps.contains_key(&track.display_id)
+            || bitmaps
+                .get(&track.display_id)
+                .is_some_and(|(cached_source, _, _)| {
+                    source == &ArtworkSource::HighQuality && cached_source != source
+                })
+        {
+            let properties = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            let Ok(bitmap) = self.target.CreateBitmap(
+                D2D_SIZE_U {
+                    width: pixels.width,
+                    height: pixels.height,
+                },
+                Some(pixels.bgra.as_ptr().cast()),
+                pixels.width.saturating_mul(4),
+                &properties,
+            ) else {
+                return false;
+            };
+            let bytes = pixels.bgra.len();
+            bitmaps.insert(track.display_id, (*source, bytes, bitmap));
+            const BITMAP_CACHE_LIMIT: usize = 24 * 1024 * 1024;
+            while bitmaps.values().map(|(_, bytes, _)| *bytes).sum::<usize>() > BITMAP_CACHE_LIMIT {
+                let oldest = bitmaps
+                    .keys()
+                    .copied()
+                    .filter(|display_id| *display_id != track.display_id)
+                    .min();
+                let Some(oldest) = oldest else { break };
+                bitmaps.remove(&oldest);
+            }
+        }
+        let Some((_, _, bitmap)) = bitmaps.get(&track.display_id) else {
+            return false;
+        };
+        let Some(layer) = self.artwork_layer.as_ref() else {
+            return false;
+        };
+        let mask = &self.artwork_geometries[if side > 100.0 { 0 } else { 1 }].1;
+        let parameters = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS {
+            contentBounds: destination,
+            geometricMask: std::mem::ManuallyDrop::new(Some(mask.clone())),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: Matrix3x2 {
+                M11: 1.0,
+                M22: 1.0,
+                M31: destination.left,
+                M32: destination.top,
+                ..Default::default()
+            },
+            opacity: 1.0,
+            opacityBrush: std::mem::ManuallyDrop::new(None),
+            layerOptions: D2D1_LAYER_OPTIONS_NONE,
+        };
+        self.target.PushLayer(&parameters, layer);
+        self.target.DrawBitmap(
+            bitmap,
+            Some(&destination),
+            1.0,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            None,
+        );
+        self.target.PopLayer();
+        true
+    }
+
     unsafe fn draw_history(&self, app: &AppState, history_top: f32, now: Instant) {
         for (index, track) in app.history.iter().enumerate() {
             let top = history_row_top(
@@ -3648,14 +4402,14 @@ impl Renderer {
             };
             self.target
                 .FillRoundedRectangle(&artwork, &self.palette.result_top);
-            // The existing recognition UI contract has no artwork payload; this glyph is a
-            // placeholder, and the album-art view must not inherit UI-144 button padding.
-            self.text(
-                "♫",
-                history_artwork_frame(top),
-                &self.text.centered_title,
-                &self.palette.white_ink,
-            );
+            if !self.draw_track_artwork(app, track, history_artwork_frame(top), 65.0) {
+                self.text(
+                    "\u{266b}",
+                    history_artwork_frame(top),
+                    &self.text.centered_title,
+                    &self.palette.white_ink,
+                );
+            }
             let title_color = if app.theme == Theme::Light {
                 &self.palette.title
             } else {
@@ -3689,6 +4443,7 @@ impl Renderer {
 
     unsafe fn draw_result_panel(
         &self,
+        app: &AppState,
         track: &Track,
         top: f32,
         edge: ArrowEdge,
@@ -3709,25 +4464,25 @@ impl Renderer {
             radiusY: RESULT_ARTWORK_CORNER_RADIUS,
         };
         self.target.FillRoundedRectangle(&art, &self.palette.accent);
-        // The current recognition result contains title/artist only; keep this as an explicit
-        // placeholder until an existing UI-facing artwork source is available.
-        self.text(
-            "♫",
-            result_artwork_rect(top),
-            &self.text.centered_heavy,
-            &self.palette.white_ink,
-        );
+        if !self.draw_track_artwork(app, track, result_artwork_rect(top), 150.0) {
+            self.text(
+                "\u{266b}",
+                result_artwork_rect(top),
+                &self.text.centered_heavy,
+                &self.palette.white_ink,
+            );
+        }
         self.text(
             &track.title,
             detail_rects.title,
             &self.text.result_title,
-            &self.palette.title,
+            &self.palette.result_label,
         );
         self.text(
             &track.artist,
             detail_rects.artist,
             &self.text.result_artist,
-            &self.palette.subtitle,
+            &self.palette.result_label,
         );
         let pill = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
             rect: detail_rects.action,
@@ -3878,20 +4633,6 @@ impl Renderer {
         );
     }
 
-    unsafe fn draw_file_hint(&self, body_bottom: f32) {
-        self.text(
-            "Ctrl+O 音声ファイルを認識",
-            rect(
-                10.0,
-                body_bottom - 24.0,
-                CONTENT_WIDTH as f32 - 10.0,
-                body_bottom - 5.0,
-            ),
-            &self.text.date,
-            &self.palette.subtitle,
-        );
-    }
-
     unsafe fn draw_settings(&self, app: &AppState) -> windows::core::Result<()> {
         let background = if app.theme == Theme::Light {
             &self.palette.white
@@ -3949,19 +4690,19 @@ impl Renderer {
                 }
                 1 => {
                     self.text(
-                        "ショートカット",
+                        "\u{8a8d}\u{8b58}\u{5165}\u{529b}",
                         rect(56.0, top + 6.0, 300.0, top + 30.0),
                         &self.text.settings,
                         &self.palette.title,
                     );
                     self.text(
-                        "Ctrl + O",
+                        "WASAPI loopback",
                         rect(310.0, top + 6.0, 490.0, top + 30.0),
                         &self.text.trailing_small,
                         &self.palette.subtitle,
                     );
                     self.text(
-                        "音声ファイルを開く",
+                        "\u{30b7}\u{30b9}\u{30c6}\u{30e0}\u{518d}\u{751f}\u{97f3}\u{3092}\u{8a8d}\u{8b58}\u{3057}\u{307e}\u{3059}",
                         rect(56.0, top + 31.0, 490.0, top + 59.0),
                         &self.text.settings_small,
                         &self.palette.subtitle,
@@ -4100,6 +4841,7 @@ impl Renderer {
 unsafe fn create_palette(
     target: &ID2D1RenderTarget,
     theme: Theme,
+    system_foreground: Color,
 ) -> windows::core::Result<Palette> {
     let (foreground, subtitle, skeleton, separator) = match theme {
         Theme::Light => (
@@ -4122,6 +4864,9 @@ unsafe fn create_palette(
     let black = solid(target, d2d_color(30, 30, 30, 1.0))?;
     let title = solid(target, foreground)?;
     let subtitle = solid(target, subtitle)?;
+    // UI-223: Result title and artist follow the active system foreground;
+    // history title/subtitle brushes remain independent appearance tokens.
+    let result_label = solid(target, d2d_color_from_system(system_foreground))?;
     let accent_color = if theme == Theme::Light {
         d2d_color(0, 136, 255, 1.0)
     } else {
@@ -4220,6 +4965,7 @@ unsafe fn create_palette(
         black,
         title,
         subtitle,
+        result_label,
         accent,
         button,
         separator,
@@ -4350,6 +5096,9 @@ unsafe fn create_text_styles(factory: &IDWriteFactory) -> windows::core::Result<
 fn phase_elapsed(phase: &MainPhase) -> f64 {
     let start = match phase {
         MainPhase::Ready => return 0.0,
+        MainPhase::Starting { entered_at, .. } | MainPhase::Cancelling { entered_at, .. } => {
+            *entered_at
+        }
         MainPhase::Listening { started_at, .. } => *started_at,
         MainPhase::Matched { stage, .. } => match stage {
             ResultCardStage::Entering { started_at }
@@ -4363,6 +5112,27 @@ fn phase_elapsed(phase: &MainPhase) -> f64 {
         MainPhase::Timeout { entered_at, .. } => *entered_at,
     };
     start.elapsed().as_secs_f64()
+}
+
+fn is_tray_activation_event(event: u16) -> bool {
+    // With NOTIFYICON_VERSION_4 the shell reports pointer messages (including
+    // WM_LBUTTONUP) as well as the semantic selection notification. Treating
+    // both as toggles makes one physical click show and immediately hide the
+    // popup. NIN_SELECT/NIN_KEYSELECT are the single activation events.
+    event == windows::Win32::UI::Shell::NIN_SELECT as u16
+        || event
+            == (windows::Win32::UI::Shell::NIN_SELECT | windows::Win32::UI::Shell::NINF_KEY) as u16
+}
+
+fn should_show_initial_popup(startup_task_activation: bool) -> bool {
+    !startup_task_activation
+}
+
+fn is_startup_task_activation() -> bool {
+    AppInstance::GetActivatedEventArgs()
+        .ok()
+        .and_then(|args| args.Kind().ok())
+        .is_some_and(|kind| kind == ActivationKind::StartupTask)
 }
 
 unsafe fn create_window(
@@ -4426,9 +5196,10 @@ unsafe fn add_tray_icon(hwnd: HWND) -> windows::core::Result<()> {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: TRAY_ICON_ID,
-        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_GUID,
         uCallbackMessage: WM_TRAYICON_MESSAGE,
         hIcon: LoadIconW(None, IDI_APPLICATION)?,
+        guidItem: TRAY_ICON_GUID,
         ..Default::default()
     };
     let tip = wide("OpenShazam");
@@ -4439,8 +5210,64 @@ unsafe fn add_tray_icon(hwnd: HWND) -> windows::core::Result<()> {
         return Err(Error::from_thread());
     }
     data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-    let _ = Shell_NotifyIconW(NIM_SETVERSION, &data);
+    if !Shell_NotifyIconW(NIM_SETVERSION, &data).as_bool() {
+        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+        return Err(Error::from_thread());
+    }
     Ok(())
+}
+
+unsafe fn restore_tray_icon(hwnd: HWND) {
+    // Explorer drops notification-area registrations when its taskbar process
+    // restarts. Re-add the stable GUID and restore version 4 callback semantics.
+    let _ = add_tray_icon(hwnd);
+}
+
+unsafe fn show_tray_context_menu(app: &mut AppState) {
+    let hwnd = app.main_hwnd;
+    let Ok(menu) = CreatePopupMenu() else {
+        return;
+    };
+    let settings = wide("Settings");
+    let exit = wide("Exit OpenShazam");
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        TRAY_MENU_SETTINGS,
+        PCWSTR(settings.as_ptr()),
+    );
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, TRAY_MENU_EXIT, PCWSTR(exit.as_ptr()));
+    let _ = SetForegroundWindow(hwnd);
+    let mut point = POINT::default();
+    let _ = GetCursorPos(&mut point);
+    let selected = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        point.x,
+        point.y,
+        None,
+        hwnd,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+    let data = NOTIFYICONDATAW {
+        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_GUID,
+        guidItem: TRAY_ICON_GUID,
+        ..Default::default()
+    };
+    let _ = Shell_NotifyIconW(NIM_SETFOCUS, &data);
+    match selected.0 as usize {
+        TRAY_MENU_SETTINGS => open_settings(app),
+        TRAY_MENU_EXIT => {
+            let _ = DestroyWindow(hwnd);
+        }
+        _ => {}
+    }
 }
 
 unsafe fn notify_hidden_match(hwnd: HWND, track: &Track) {
@@ -4449,8 +5276,9 @@ unsafe fn notify_hidden_match(hwnd: HWND, track: &Track) {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: TRAY_ICON_ID,
-        uFlags: NIF_INFO,
+        uFlags: NIF_INFO | NIF_GUID,
         dwInfoFlags: NIIF_INFO,
+        guidItem: TRAY_ICON_GUID,
         ..Default::default()
     };
     copy_notification_text(&mut data.szInfoTitle, "Shazam");
@@ -4476,6 +5304,8 @@ unsafe fn delete_tray_icon(hwnd: HWND) {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: TRAY_ICON_ID,
+        uFlags: NIF_GUID,
+        guidItem: TRAY_ICON_GUID,
         ..Default::default()
     };
     let _ = Shell_NotifyIconW(NIM_DELETE, &data);
@@ -4487,6 +5317,7 @@ unsafe fn anchor_popup(app: &mut AppState) {
         cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
         hWnd: hwnd,
         uID: TRAY_ICON_ID,
+        guidItem: TRAY_ICON_GUID,
         ..Default::default()
     };
     let tray = Shell_NotifyIconGetRect(&identifier).ok();
@@ -4537,24 +5368,64 @@ unsafe fn anchor_popup(app: &mut AppState) {
         let y = raw_y.clamp(work_area.top, y_max);
         app.arrow_center =
             ((tray_center_x - x) as f64 / scale).clamp(14.0, CONTENT_WIDTH - 14.0) as f32;
-        let flags = SWP_SHOWWINDOW;
+        let flags = SWP_SHOWWINDOW | SWP_NOACTIVATE;
         let _ = SetWindowPos(hwnd, None, x, y, width, height, flags);
     } else {
-        app.arrow_edge = ArrowEdge::Top;
-        app.arrow_center = (CONTENT_WIDTH * 0.5) as f32;
+        // The tray rectangle can be unavailable for an overflow icon on some
+        // shell versions. Anchor to the actual click point and its monitor,
+        // rather than placing a guessed arrow at a fixed screen coordinate.
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let click_rect = RECT {
+            left: cursor.x,
+            top: cursor.y,
+            right: cursor.x.saturating_add(1),
+            bottom: cursor.y.saturating_add(1),
+        };
+        let monitor = MonitorFromRect(&click_rect, MONITOR_DEFAULTTONEAREST);
+        let mut monitor_info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let work_area = if GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+            monitor_info.rcWork
+        } else {
+            RECT {
+                left: cursor.x - width / 2,
+                top: cursor.y - height,
+                right: cursor.x + width / 2,
+                bottom: cursor.y + height,
+            }
+        };
+        let below = cursor.y < (work_area.top + work_area.bottom) / 2;
+        app.arrow_edge = if below {
+            ArrowEdge::Top
+        } else {
+            ArrowEdge::Bottom
+        };
+        let raw_x = cursor.x - width / 2;
+        let raw_y = if below { cursor.y } else { cursor.y - height };
+        let x = raw_x.clamp(
+            work_area.left,
+            (work_area.right - width).max(work_area.left),
+        );
+        let y = raw_y.clamp(
+            work_area.top,
+            (work_area.bottom - height).max(work_area.top),
+        );
+        app.arrow_center = ((cursor.x - x) as f64 / scale).clamp(14.0, CONTENT_WIDTH - 14.0) as f32;
         let _ = SetWindowPos(
             hwnd,
             None,
-            0,
-            0,
+            x,
+            y,
             width,
             height,
-            SWP_SHOWWINDOW | SWP_NOZORDER,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE,
         );
     }
     app.visible = true;
     let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
-    let _ = SetForegroundWindow(hwnd);
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
@@ -4574,6 +5445,18 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
         if point_in_rect(x, y - offset, close) {
             return MainHit::CloseResult;
         }
+        if let MainPhase::Matched { track, .. } = &app.phase {
+            let artwork = result_artwork_rect(body_top);
+            if track.page_url.is_some()
+                && point_in_rect(
+                    x,
+                    y - offset,
+                    [artwork.left, artwork.top, artwork.right, artwork.bottom],
+                )
+            {
+                return MainHit::OpenTrack(track.display_id);
+            }
+        }
         if matches!(
             app.phase,
             MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
@@ -4592,12 +5475,29 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
         }
         return MainHit::Other;
     }
-    let file_hint_top = body_top + CONTENT_HEIGHT as f32 - 30.0;
-    if (10.0..=220.0).contains(&x) && y >= file_hint_top {
-        return MainHit::OpenFile;
+    let history_top = body_top + TOP_HEIGHT as f32;
+    let now = Instant::now();
+    for (index, track) in app.history.iter().enumerate() {
+        if track.page_url.is_none() {
+            continue;
+        }
+        let row_top = history_row_top(
+            index,
+            app.history_transition,
+            history_top,
+            app.scroll_offset,
+            now,
+        );
+        if (0.0..=CONTENT_WIDTH as f32).contains(&x) && (row_top..=row_top + 89.0).contains(&y) {
+            return MainHit::OpenTrack(track.display_id);
+        }
     }
     let icons = native_icon_layout(body_top);
-    if matches!(app.phase, MainPhase::Listening { .. }) && point_in_rect(x, y, icons.cancel_hit) {
+    if matches!(
+        app.phase,
+        MainPhase::Listening { .. } | MainPhase::Starting { .. }
+    ) && point_in_rect(x, y, icons.cancel_hit)
+    {
         return MainHit::Cancel;
     }
     if point_in_rect(x, y, icons.settings_hit)
@@ -4609,6 +5509,7 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
     let button_y = body_top + BUTTON_TOP as f32..=body_top + (BUTTON_TOP + BUTTON_SIZE) as f32;
     if button_x.contains(&x)
         && button_y.contains(&y)
+        && app.recognition_session.is_none()
         && !matches!(
             app.phase,
             MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
@@ -4622,13 +5523,13 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MainHit {
     CenterButton,
-    OpenFile,
     Settings,
     Cancel,
     TimeoutRestart,
     TimeoutDismiss,
     TryAgain,
     CloseResult,
+    OpenTrack(u64),
     Other,
 }
 
@@ -4702,240 +5603,285 @@ unsafe fn open_microphone_info(app: &mut AppState) {
 }
 
 fn hide_main(app: &mut AppState) {
+    if !app.visible && app.popup_opacity == 0 && app.popup_transition.is_none() {
+        return;
+    }
+    if app
+        .popup_transition
+        .is_some_and(|transition| !app.visible && transition.hide_when_complete)
+    {
+        return;
+    }
+    let now = Instant::now();
+    let from = popup_opacity_at(app, now);
+    app.popup_opacity = from;
+    app.popup_transition = Some(PopupOpacityTransition {
+        started_at: now,
+        from,
+        to: 0,
+        hide_when_complete: true,
+    });
+    app.visible = false;
+    app.main_activated = false;
+    app.popup_activation_grace_until = None;
     unsafe {
+        sync_main_timers(app);
         if !app.main_hwnd.0.is_null() {
+            let _ = InvalidateRect(Some(app.main_hwnd), None, false);
+        }
+    }
+}
+
+fn popup_opacity_at(app: &AppState, now: Instant) -> u8 {
+    let Some(transition) = app.popup_transition else {
+        return app.popup_opacity;
+    };
+    let elapsed = now.saturating_duration_since(transition.started_at);
+    let progress = (elapsed.as_secs_f64() / POPUP_FADE_DURATION.as_secs_f64()).clamp(0.0, 1.0);
+    let opacity = f64::from(transition.from)
+        + (f64::from(transition.to) - f64::from(transition.from)) * progress;
+    opacity.round().clamp(0.0, 255.0) as u8
+}
+
+unsafe fn advance_popup_transition(app: &mut AppState, now: Instant) -> bool {
+    let Some(transition) = app.popup_transition else {
+        return false;
+    };
+    let elapsed = now.saturating_duration_since(transition.started_at);
+    let complete = elapsed >= POPUP_FADE_DURATION;
+    app.popup_opacity = if complete {
+        transition.to
+    } else {
+        popup_opacity_at(app, now)
+    };
+    if complete {
+        app.popup_transition = None;
+        if transition.hide_when_complete && !app.visible && !app.main_hwnd.0.is_null() {
             let _ = ShowWindow(app.main_hwnd, SW_HIDE);
         }
     }
-    app.visible = false;
-    unsafe { sync_main_timers(app) };
+    true
 }
 
-fn start_capture(app: &mut AppState, mode: CaptureMode, file: Option<PathBuf>) {
-    if matches!(app.phase, MainPhase::Listening { .. }) {
+fn start_capture(app: &mut AppState, mode: CaptureMode) {
+    if app.recognition_session.is_some() || matches!(app.phase, MainPhase::Listening { .. }) {
         return;
     }
-    if file.is_none() {
-        if app.recognition_controller.is_none() {
-            match ApplicationController::spawn(WindowsRecognitionBackend::new(), 16, 64) {
-                Ok(controller) => app.recognition_controller = Some(controller),
-                Err(error) => {
-                    app.phase = MainPhase::Error {
-                        message: format!("認識コントローラーを開始できません: {error}"),
-                        entered_at: Instant::now(),
-                    };
-                    return;
-                }
-            }
-        }
-        let controller = app
-            .recognition_controller
-            .as_ref()
-            .expect("controller created");
-        let ticket = match mode {
-            CaptureMode::Manual => controller.commands.start_manual(),
-            CaptureMode::Auto => controller
-                .commands
-                .start_auto(RecognitionContext::Foreground),
-        };
-        match ticket {
-            Ok(ticket) => {
-                app.recognition_session = Some((ticket.session_id, mode, ticket.command_id));
-                app.phase = MainPhase::Listening {
-                    mode,
-                    started_at: Instant::now(),
-                };
-            }
+    app.status_alternator = None;
+    if app.recognition_controller.is_none() {
+        match ApplicationController::spawn(WindowsRecognitionBackend::new(), 16, 64) {
+            Ok(controller) => app.recognition_controller = Some(controller),
             Err(error) => {
                 app.phase = MainPhase::Error {
-                    message: format!("認識を開始できません: {error:?}"),
-                    entered_at: Instant::now(),
-                };
-            }
-        }
-        return;
-    }
-    let (program, args) = match file {
-        Some(path) => match shazam_http_lab_exe() {
-            Some(exe) => (
-                exe,
-                vec![
-                    "audio-live".to_owned(),
-                    path.to_string_lossy().into_owned(),
-                    "12".to_owned(),
-                ],
-            ),
-            None => {
-                app.phase = MainPhase::Error {
-                    message: "shazam-http-lab.exe が見つかりません".to_owned(),
+                    message: format!("Recognition controller failed to start: {error}"),
                     entered_at: Instant::now(),
                 };
                 return;
             }
-        },
-        None => unreachable!("loopback recognition uses the typed controller"),
+        }
+    }
+    let controller = app
+        .recognition_controller
+        .as_ref()
+        .expect("controller created");
+    let ticket = match mode {
+        CaptureMode::Manual => controller.commands.start_manual(),
+        CaptureMode::Auto => controller
+            .commands
+            .start_auto(RecognitionContext::Foreground),
     };
-
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    match command.spawn() {
-        Ok(mut child) => {
-            drop(child.stdin.take());
-            let slot = Arc::new(Mutex::new(Some(child)));
-            let slot_for_worker = Arc::clone(&slot);
-            let cancel = Arc::new(AtomicBool::new(false));
-            let cancel_for_worker = Arc::clone(&cancel);
-            app.capture_child = Some(slot);
-            app.capture_canceled = cancel;
-            app.phase = MainPhase::Listening {
+    match ticket {
+        Ok(ticket) => {
+            app.recognition_session = Some(RecognitionSessionUi {
+                ticket,
                 mode,
-                started_at: Instant::now(),
-            };
-            let hwnd = app.main_hwnd.0 as isize;
-            thread::spawn(move || {
-                let result = wait_for_capture(slot_for_worker, cancel_for_worker.clone());
-                let canceled = cancel_for_worker.load(Ordering::Acquire);
-                let finished = Box::new(CaptureFinished {
-                    captured_mode: mode,
-                    result,
-                    canceled,
-                });
-                let pointer = Box::into_raw(finished) as isize;
-                let posted = unsafe {
-                    PostMessageW(
-                        Some(HWND(hwnd as *mut c_void)),
-                        WM_CAPTURE_FINISHED,
-                        WPARAM(0),
-                        LPARAM(pointer),
-                    )
-                };
-                if posted.is_err() {
-                    unsafe {
-                        drop(Box::from_raw(pointer as *mut CaptureFinished));
-                    }
-                }
+                cancel_command_id: None,
+                last_sequence: 0,
+                result_presented: false,
             });
+            app.phase = MainPhase::Starting {
+                mode,
+                entered_at: Instant::now(),
+            };
         }
         Err(error) => {
             app.phase = MainPhase::Error {
-                message: format!("認識処理を開始できません: {error}"),
+                message: format!("Recognition request was not accepted: {error:?}"),
                 entered_at: Instant::now(),
             };
         }
     }
 }
-
-fn wait_for_capture(
-    slot: Arc<Mutex<Option<Child>>>,
-    canceled: Arc<AtomicBool>,
-) -> Result<Output, String> {
-    loop {
-        if canceled.load(Ordering::Acquire) {
-            if let Ok(mut guard) = slot.lock() {
-                if let Some(child) = guard.as_mut() {
-                    let _ = child.kill();
-                }
-            }
-        }
-        let finished = {
-            let mut guard = slot
-                .lock()
-                .map_err(|_| "認識処理の状態ロックに失敗しました".to_owned())?;
-            let child = guard
-                .as_mut()
-                .ok_or_else(|| "認識処理が終了しました".to_owned())?;
-            match child.try_wait() {
-                Ok(Some(_)) => true,
-                Ok(None) => false,
-                Err(error) => return Err(format!("認識処理を確認できません: {error}")),
-            }
-        };
-        if finished {
-            let child = slot
-                .lock()
-                .map_err(|_| "認識処理の状態ロックに失敗しました".to_owned())?
-                .take()
-                .ok_or_else(|| "認識処理が終了しました".to_owned())?;
-            return child
-                .wait_with_output()
-                .map_err(|error| format!("認識結果を取得できません: {error}"));
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
 fn cancel_capture(app: &mut AppState) {
-    if let (Some(controller), Some((session_id, _, _))) =
+    if let (Some(controller), Some(session)) =
         (app.recognition_controller.as_ref(), app.recognition_session)
     {
-        let _ = controller
+        if session.cancel_command_id.is_some() {
+            return;
+        }
+        match controller
             .commands
-            .submit(RecognitionCommand::CancelRecognition { session_id });
-        app.recognition_session = None;
-        app.phase = MainPhase::Ready;
-        return;
-    }
-    app.capture_canceled.store(true, Ordering::Release);
-    if let Some(slot) = &app.capture_child {
-        if let Ok(mut guard) = slot.lock() {
-            if let Some(child) = guard.as_mut() {
-                let _ = child.kill();
+            .submit(RecognitionCommand::CancelRecognition {
+                session_id: session.ticket.session_id,
+            }) {
+            Ok(command_id) => {
+                if let Some(active) = app.recognition_session.as_mut() {
+                    active.cancel_command_id = Some(command_id);
+                }
+                app.phase = MainPhase::Cancelling {
+                    mode: session.mode,
+                    entered_at: Instant::now(),
+                };
+            }
+            Err(error) => {
+                app.message = Some(format!("Cancel request was not accepted: {error:?}"));
             }
         }
+        return;
     }
 }
 
 fn poll_recognition_events(app: &mut AppState) -> bool {
-    let mut changed = false;
-    let mut events = Vec::new();
-    if let Some(controller) = &app.recognition_controller {
-        if let Some((_, _, command_id)) = app.recognition_session {
+    let Some(controller) = app.recognition_controller.as_ref() else {
+        return false;
+    };
+    let active = app.recognition_session;
+    let mut sequence_gap = false;
+    if let Some(session) = active {
+        if let CommandResultLookup::Retained(result) = controller
+            .commands
+            .command_result(session.ticket.command_id)
+        {
+            if matches!(result.status, CommandStatus::Failed { .. }) {
+                sequence_gap = true;
+            }
+            let failure = match result.status {
+                CommandStatus::Rejected { reason } | CommandStatus::StartFailed { reason } => {
+                    Some(reason)
+                }
+                _ => None,
+            };
+            if let Some(reason) = failure {
+                app.recognition_session = None;
+                app.phase = MainPhase::Error {
+                    message: format!("Recognition did not start: {reason}"),
+                    entered_at: Instant::now(),
+                };
+                return true;
+            }
+        }
+        if let Some(cancel_id) = session.cancel_command_id {
             if let CommandResultLookup::Retained(result) =
-                controller.commands.command_result(command_id)
+                controller.commands.command_result(cancel_id)
             {
-                if let CommandStatus::StartFailed { reason } | CommandStatus::Rejected { reason } =
-                    result.status
-                {
-                    app.recognition_session = None;
-                    app.phase = MainPhase::Error {
-                        message: format!("認識を開始できません: {reason}"),
-                        entered_at: Instant::now(),
-                    };
-                    changed = true;
+                let failure = match result.status {
+                    CommandStatus::Rejected { reason }
+                    | CommandStatus::StartFailed { reason }
+                    | CommandStatus::Failed { reason } => Some(reason),
+                    _ => None,
+                };
+                if let Some(reason) = failure {
+                    if let Some(current) = app.recognition_session.as_mut() {
+                        current.cancel_command_id = None;
+                    }
+                    app.message = Some(format!("Cancel request failed: {reason}"));
+                    let snapshot = controller.events.snapshot();
+                    let _ = reconcile_controller_snapshot(app, &snapshot);
+                    return true;
                 }
             }
         }
+    }
+    let (events, snapshot) = {
+        let mut events = Vec::new();
         while let Ok(event) = controller.events.try_recv() {
             events.push(event);
         }
-    }
+        (events, controller.events.snapshot())
+    };
+
+    let mut changed = false;
     for event in events {
-        if let Some((session_id, mode, _)) = app.recognition_session {
-            if event.session_id.is_some_and(|id| id != session_id) {
-                continue;
-            }
-            changed |= apply_recognition_event(app, event, mode);
+        if event.sequence > app.controller_sequence.saturating_add(1) {
+            sequence_gap = true;
         }
+        app.controller_sequence = app.controller_sequence.max(event.sequence);
+        let Some(session) = active else { continue };
+        if event.session_id != Some(session.ticket.session_id) {
+            continue;
+        }
+        let last_processed = app
+            .recognition_session
+            .map_or(0, |current| current.last_sequence);
+        if event.sequence <= last_processed {
+            continue;
+        }
+        if event.sequence > session.last_sequence.saturating_add(1) {
+            sequence_gap = true;
+        }
+        if let Some(current) = app.recognition_session.as_mut() {
+            current.last_sequence = current.last_sequence.max(event.sequence);
+        }
+        sequence_gap |= matches!(
+            event.kind,
+            RecognitionEventKind::SessionEnded { .. }
+                | RecognitionEventKind::SessionCancelled
+                | RecognitionEventKind::CommandStatusChanged { .. }
+        );
+        changed |= apply_recognition_event(app, event, session.mode);
+    }
+
+    let notifications_dropped = snapshot.dropped_notifications > app.dropped_notifications;
+    if sequence_gap || notifications_dropped || snapshot.last_sequence > app.controller_sequence {
+        app.controller_sequence = snapshot.last_sequence;
+        app.dropped_notifications = snapshot.dropped_notifications;
+        if let Some(current) = app.recognition_session.as_mut() {
+            current.last_sequence = snapshot.last_sequence;
+        }
+        changed |= reconcile_controller_snapshot(app, &snapshot);
     }
     changed
 }
 
 fn apply_recognition_event(app: &mut AppState, event: RecognitionEvent, mode: CaptureMode) -> bool {
+    let config_generation = event.config_generation;
+    let session_id = event.session_id;
     match event.kind {
+        RecognitionEventKind::UiConfigSnapshot(config) => {
+            if config_generation == Some(config.generation) {
+                app.ui_configs.insert(config.generation, config);
+                while app.ui_configs.len() > 8 {
+                    let Some(oldest) = app.ui_configs.keys().copied().min() else {
+                        break;
+                    };
+                    app.ui_configs.remove(&oldest);
+                }
+            }
+            true
+        }
+        RecognitionEventKind::CaptureStarted
+        | RecognitionEventKind::SignatureReady { .. }
+        | RecognitionEventKind::RequestStarted { .. }
+        | RecognitionEventKind::RetryScheduled { .. } => {
+            if matches!(app.phase, MainPhase::Starting { .. }) {
+                enter_listening(app, mode, Instant::now());
+            }
+            true
+        }
         RecognitionEventKind::ManualUiEvent(NativeManualUiEvent::Result(result))
             if mode == CaptureMode::Manual
                 && result.stage == NativeManualResultStage::TaggingDidFinish =>
         {
-            show_controller_match(
-                app,
-                result.primary_track.title,
-                result.primary_track.artist,
-                mode,
-            );
+            let already_presented = app
+                .recognition_session
+                .is_some_and(|session| session.result_presented);
+            if already_presented {
+                return false;
+            }
+            if let Some(session) = app.recognition_session.as_mut() {
+                session.result_presented = true;
+            }
+            show_controller_match(app, result.primary_track, mode, config_generation);
             true
         }
         RecognitionEventKind::ManualUiEvent(NativeManualUiEvent::NoMatch)
@@ -4947,9 +5893,17 @@ fn apply_recognition_event(app: &mut AppState, event: RecognitionEvent, mode: Ca
             true
         }
         RecognitionEventKind::RecognitionError { message, .. } => {
-            app.phase = MainPhase::Error {
-                message,
-                entered_at: Instant::now(),
+            let entered_at = Instant::now();
+            app.phase = if is_offline_failure(&message) {
+                MainPhase::Offline {
+                    entered_at,
+                    returned_to_ready_at: None,
+                }
+            } else {
+                MainPhase::Error {
+                    message,
+                    entered_at,
+                }
             };
             true
         }
@@ -4961,21 +5915,173 @@ fn apply_recognition_event(app: &mut AppState, event: RecognitionEvent, mode: Ca
             true
         }
         RecognitionEventKind::SessionCancelled | RecognitionEventKind::SessionEnded { .. } => {
-            app.recognition_session = None;
-            if matches!(app.phase, MainPhase::Listening { .. }) {
-                app.phase = MainPhase::Ready;
-            }
+            let _ended_session_id = session_id;
+            // The following authoritative snapshot distinguishes a true terminal
+            // state from an event notification that raced a newer session update.
             true
         }
         _ => false,
     }
 }
 
-fn show_controller_match(app: &mut AppState, title: String, artist: String, mode: CaptureMode) {
+fn reconcile_controller_snapshot(
+    app: &mut AppState,
+    snapshot: &openshazam_controller::ControllerSnapshot,
+) -> bool {
+    let active_id = app
+        .recognition_session
+        .map(|session| session.ticket.session_id);
+    let session_snapshot = snapshot
+        .active_session
+        .as_ref()
+        .filter(|session| Some(session.session_id) == active_id)
+        .or_else(|| {
+            snapshot
+                .last_ended_session
+                .as_ref()
+                .filter(|session| Some(session.session_id) == active_id)
+        });
+    let Some(session_snapshot) = session_snapshot else {
+        return false;
+    };
+    reconcile_session_snapshot(app, session_snapshot)
+}
+
+fn enter_listening(app: &mut AppState, mode: CaptureMode, started_at: Instant) {
+    app.phase = MainPhase::Listening { mode, started_at };
+    app.status_alternator =
+        (mode == CaptureMode::Auto).then(|| StatusTextAlternator::auto(started_at));
+}
+
+fn reconcile_session_snapshot(app: &mut AppState, session: &RecognitionSessionSnapshot) -> bool {
+    let Some(ui_session) = app.recognition_session else {
+        return false;
+    };
+    if session.session_id != ui_session.ticket.session_id {
+        return false;
+    }
+    let mut changed = false;
+    if let Some(config) = session.config.as_ref() {
+        app.ui_configs.insert(config.generation, config.clone());
+    }
+    if !ui_session.result_presented && ui_session.mode == CaptureMode::Manual {
+        if let Some(UiRecognitionEvent::Manual(NativeManualUiEvent::Result(result))) =
+            session.last_result.as_ref()
+        {
+            if result.stage == NativeManualResultStage::TaggingDidFinish {
+                if let Some(current) = app.recognition_session.as_mut() {
+                    current.result_presented = true;
+                }
+                show_controller_match(
+                    app,
+                    result.primary_track.clone(),
+                    ui_session.mode,
+                    session.config.as_ref().map(|config| config.generation),
+                );
+                changed = true;
+            }
+        }
+    }
+    match session.phase {
+        SessionPhase::Starting => {}
+        SessionPhase::Running => {
+            let capture_is_live = session.last_event.is_some_and(|event| {
+                matches!(
+                    event.category,
+                    RecognitionEventCategory::CaptureStarted
+                        | RecognitionEventCategory::SignatureReady
+                        | RecognitionEventCategory::RequestStarted
+                        | RecognitionEventCategory::RetryScheduled
+                        | RecognitionEventCategory::ManualUiEvent
+                        | RecognitionEventCategory::AutoUiEvent
+                )
+            });
+            if capture_is_live && matches!(app.phase, MainPhase::Starting { .. }) {
+                enter_listening(app, ui_session.mode, Instant::now());
+                changed = true;
+            } else if capture_is_live
+                && matches!(app.phase, MainPhase::Cancelling { .. })
+                && app
+                    .recognition_session
+                    .is_some_and(|current| current.cancel_command_id.is_none())
+            {
+                enter_listening(app, ui_session.mode, Instant::now());
+                changed = true;
+            }
+        }
+        SessionPhase::Stopping | SessionPhase::Cancelling => {
+            if !matches!(app.phase, MainPhase::Cancelling { .. }) {
+                app.phase = MainPhase::Cancelling {
+                    mode: ui_session.mode,
+                    entered_at: Instant::now(),
+                };
+                changed = true;
+            }
+        }
+        SessionPhase::Faulted => {
+            app.recognition_session = None;
+            app.phase = MainPhase::Error {
+                message: "Recognition session failed and its resources may not have been released"
+                    .to_owned(),
+                entered_at: Instant::now(),
+            };
+            changed = true;
+        }
+        SessionPhase::Ended(reason) => {
+            app.recognition_session = None;
+            if !matches!(
+                app.phase,
+                MainPhase::Matched { .. }
+                    | MainPhase::NoMatch { .. }
+                    | MainPhase::Timeout { .. }
+                    | MainPhase::Error { .. }
+            ) {
+                app.phase = match reason {
+                    SessionEndReason::NoMatch => MainPhase::NoMatch {
+                        entered_at: Instant::now(),
+                        returned_to_ready_at: None,
+                    },
+                    SessionEndReason::TimedOut => MainPhase::Timeout {
+                        mode: ui_session.mode,
+                        entered_at: Instant::now(),
+                    },
+                    _ => MainPhase::Ready,
+                };
+            }
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn show_controller_match(
+    app: &mut AppState,
+    candidate: TrackCandidate,
+    mode: CaptureMode,
+    config_generation: Option<u64>,
+) {
+    let metadata = candidate.ui_metadata.as_ref();
+    let display_id = app.next_display_id;
+    app.next_display_id = app.next_display_id.wrapping_add(1).max(1);
+    let track_key = metadata.and_then(|metadata| metadata.track_key.clone());
+    let page_url = config_generation
+        .and_then(|generation| app.ui_configs.get(&generation))
+        .and_then(|config| {
+            resolve_page_link(
+                config.web_track_url_template.as_deref(),
+                track_key.as_deref(),
+            )
+        });
     let track = Track {
-        title,
-        artist,
+        display_id,
+        title: candidate.title,
+        artist: candidate.artist,
         recognized_at: Instant::now(),
+        artwork_url: metadata.and_then(|metadata| metadata.artwork_url.clone()),
+        hq_artwork_url: metadata.and_then(|metadata| metadata.hq_artwork_url.clone()),
+        background_artwork_url: metadata.and_then(|metadata| metadata.background_image_url.clone()),
+        track_key,
+        page_url,
     };
     let previous_count = app.history.len();
     app.history.insert(0, track.clone());
@@ -4987,7 +6093,16 @@ fn show_controller_match(app: &mut AppState, title: String, artist: String, mode
         },
     });
     app.history.truncate(40);
+    app.status_alternator = Some(StatusTextAlternator::after_success(track.recognized_at));
+    start_artwork_load(
+        app.main_hwnd,
+        track.display_id,
+        track.artwork_url.clone(),
+        track.hq_artwork_url.clone(),
+        unsafe { GetDpiForWindow(app.main_hwnd) }.max(96),
+    );
     if app.visible {
+        app.success_wave_frame = current_success_wave_frame(app);
         app.phase = MainPhase::Matched {
             track,
             stage: ResultCardStage::Entering {
@@ -4995,6 +6110,7 @@ fn show_controller_match(app: &mut AppState, title: String, artist: String, mode
             },
         };
     } else {
+        app.success_wave_frame = None;
         app.phase = MainPhase::Ready;
         if mode == CaptureMode::Manual {
             unsafe { notify_hidden_match(app.main_hwnd, &track) };
@@ -5002,111 +6118,261 @@ fn show_controller_match(app: &mut AppState, title: String, artist: String, mode
     }
 }
 
-fn complete_capture(app: &mut AppState, finished: CaptureFinished) {
-    app.capture_child = None;
-    app.capture_canceled = Arc::new(AtomicBool::new(false));
-    if finished.canceled {
-        app.phase = MainPhase::Ready;
-        return;
-    }
-    match finished.result {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some((title, artist)) = parse_match(&stdout) {
-                let track = Track {
-                    title,
-                    artist,
-                    recognized_at: Instant::now(),
-                };
-                let history_started_at = Instant::now();
-                let previous_count = app.history.len();
-                app.history.insert(0, track.clone());
-                app.history_transition = Some(HistoryMutationTransition {
-                    started_at: history_started_at,
-                    event: HistoryMutationEvent::Insert {
-                        index: 0,
-                        previous_count,
-                    },
-                });
-                app.history.truncate(40);
-                if app.visible {
-                    app.phase = MainPhase::Matched {
-                        track,
-                        stage: ResultCardStage::Entering {
-                            started_at: Instant::now(),
-                        },
-                    };
-                } else {
-                    // Native posts a notification when the popup is hidden;
-                    // keep that result out of a popup the user closed.
-                    app.phase = MainPhase::Ready;
-                    if finished.captured_mode == CaptureMode::Manual {
-                        unsafe { notify_hidden_match(app.main_hwnd, &track) };
-                    }
-                }
-            } else {
-                app.phase = MainPhase::NoMatch {
-                    entered_at: Instant::now(),
-                    returned_to_ready_at: None,
-                };
-            }
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            if is_timeout_failure(&stderr) {
-                app.phase = MainPhase::Timeout {
-                    mode: finished.captured_mode,
-                    entered_at: Instant::now(),
-                };
-            } else if is_offline_failure(&stderr) {
-                app.phase = MainPhase::Offline {
-                    entered_at: Instant::now(),
-                    returned_to_ready_at: None,
-                };
-            } else {
-                app.phase = MainPhase::Error {
-                    message: if stderr.is_empty() {
-                        format!("認識処理が終了コード {} で失敗しました", output.status)
-                    } else {
-                        stderr.chars().take(100).collect()
-                    },
-                    entered_at: Instant::now(),
-                };
-            }
-        }
-        Err(error) => {
-            if is_timeout_failure(&error) {
-                app.phase = MainPhase::Timeout {
-                    mode: finished.captured_mode,
-                    entered_at: Instant::now(),
-                };
-            } else if is_offline_failure(&error) {
-                app.phase = MainPhase::Offline {
-                    entered_at: Instant::now(),
-                    returned_to_ready_at: None,
-                };
-            } else {
-                app.phase = MainPhase::Error {
-                    message: error,
-                    entered_at: Instant::now(),
-                };
-            }
-        }
-    }
-    let _mode = finished.captured_mode;
+fn current_success_wave_frame(app: &AppState) -> Option<ui_model::WaveFrame> {
+    let MainPhase::Listening { mode, started_at } = &app.phase else {
+        return None;
+    };
+    Some(ui_model::wave_frame_at_with_auto_spring(
+        match *mode {
+            CaptureMode::Manual => TaggingMode::Manual,
+            CaptureMode::Auto => TaggingMode::Auto,
+        },
+        started_at.elapsed().as_secs_f64(),
+        app.ui_levels,
+        app.auto_spring,
+    ))
 }
 
-fn is_timeout_failure(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    [
-        "timeout",
-        "timed out",
-        "timedout",
-        "deadline exceeded",
-        "タイムアウト",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
+fn start_artwork_load(
+    hwnd: HWND,
+    display_id: u64,
+    standard_url: Option<String>,
+    high_quality_url: Option<String>,
+    dpi: u32,
+) {
+    if standard_url.is_none() && high_quality_url.is_none() {
+        return;
+    }
+    let hwnd_value = hwnd.0 as isize;
+    let required_pixels = 150u32.saturating_mul(dpi.max(96)) / 96;
+    thread::spawn(move || {
+        let mut standard_size = None;
+        if let Some(url) = standard_url.filter(|url| valid_https_resource_url(url)) {
+            if let Ok(pixels) = fetch_and_decode_artwork(&url) {
+                standard_size = Some(pixels.width.min(pixels.height));
+                post_artwork_ready(hwnd_value, display_id, ArtworkSource::Standard, Ok(pixels));
+            }
+        }
+        if standard_size.is_none_or(|size| size < required_pixels) {
+            if let Some(url) = high_quality_url.filter(|url| valid_https_resource_url(url)) {
+                if let Ok(pixels) = fetch_and_decode_artwork(&url) {
+                    post_artwork_ready(
+                        hwnd_value,
+                        display_id,
+                        ArtworkSource::HighQuality,
+                        Ok(pixels),
+                    );
+                }
+            }
+        }
+    });
+}
+
+fn valid_https_resource_url(url: &str) -> bool {
+    if url.len() > 4_096 || !url.starts_with("https://") || url.chars().any(char::is_control) {
+        return false;
+    }
+    let authority = url[8..].split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty()
+        && !authority.contains(['@', '\\'])
+        && authority.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | ':' | '[' | ']')
+        })
+}
+
+fn valid_shazam_page_url(url: &str) -> bool {
+    if url.len() > 4_096
+        || !url.starts_with("https://")
+        || url.chars().any(char::is_control)
+        || url.contains('#')
+        || url.contains('@')
+        || url.contains('\\')
+    {
+        return false;
+    }
+    let authority = url[8..].split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .strip_suffix(":443")
+        .unwrap_or(authority)
+        .to_ascii_lowercase();
+    (host == "shazam.com" || host.ends_with(".shazam.com"))
+        && host
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-'))
+}
+
+fn valid_page_template(template: &str) -> bool {
+    valid_shazam_page_url(template) && template.contains("{trackid}")
+}
+
+fn resolve_page_link(
+    template: Option<&str>,
+    track_key: Option<&str>,
+) -> Option<ValidatedWebTrackUrl> {
+    let template = template?;
+    let track_key = track_key?;
+    const TOKEN: &str = "{trackid}";
+    if !valid_page_template(template) || track_key.is_empty() || track_key.len() > 1_024 {
+        return None;
+    }
+    let mut encoded = String::with_capacity(track_key.len());
+    for byte in track_key.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    let resolved = template.replace(TOKEN, &encoded);
+    if resolved.contains('{') || resolved.contains('}') || !valid_shazam_page_url(&resolved) {
+        return None;
+    }
+    Some(ValidatedWebTrackUrl(resolved))
+}
+
+unsafe fn open_track_page(hwnd: HWND, url: &ValidatedWebTrackUrl) -> bool {
+    let verb = wide("open");
+    let target = wide(&url.0);
+    let mut execute = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_DEFAULT,
+        hwnd,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(target.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    ShellExecuteExW(&mut execute).is_ok()
+}
+
+fn fetch_and_decode_artwork(url: &str) -> Result<ArtworkPixels, String> {
+    let output = Command::new("curl.exe")
+        .args([
+            "--fail",
+            "--location",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-redirs",
+            "4",
+            "--max-time",
+            "12",
+            "--max-filesize",
+            "8388608",
+            "--silent",
+            "--show-error",
+            "--output",
+            "-",
+            "--write-out",
+            "\nOPEN SHAZAM IMAGE URL:%{url_effective}",
+            url,
+        ])
+        .output()
+        .map_err(|error| format!("artwork downloader unavailable: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    const MARKER: &[u8] = b"\nOPEN SHAZAM IMAGE URL:";
+    let marker = output
+        .stdout
+        .windows(MARKER.len())
+        .rposition(|window| window == MARKER)
+        .ok_or_else(|| "artwork response did not include its final URL".to_owned())?;
+    let final_url = std::str::from_utf8(&output.stdout[marker + MARKER.len()..])
+        .map_err(|_| "artwork response URL was not valid text".to_owned())?
+        .trim();
+    if !valid_https_resource_url(final_url) {
+        return Err("artwork redirect left HTTPS or exceeded URL limits".to_owned());
+    }
+    decode_artwork_wic(&output.stdout[..marker])
+}
+
+fn decode_artwork_wic(encoded: &[u8]) -> Result<ArtworkPixels, String> {
+    let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+    let result = unsafe {
+        (|| -> windows::core::Result<ArtworkPixels> {
+            let factory: IWICImagingFactory =
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+            let stream = factory.CreateStream()?;
+            stream.InitializeFromMemory(encoded)?;
+            let decoder = factory.CreateDecoderFromStream(
+                &stream,
+                std::ptr::null(),
+                WICDecodeMetadataCacheOnDemand,
+            )?;
+            let frame = decoder.GetFrame(0)?;
+            let mut width = 0u32;
+            let mut height = 0u32;
+            frame.GetSize(&mut width, &mut height)?;
+            if width == 0 || height == 0 || width > 2_048 || height > 2_048 {
+                return Err(windows::core::Error::new(
+                    windows::core::HRESULT(0x8007_0057u32 as i32),
+                    "artwork dimensions are outside the supported range",
+                ));
+            }
+            let stride = width.checked_mul(4).ok_or_else(|| {
+                windows::core::Error::new(
+                    windows::core::HRESULT(0x8007_0057u32 as i32),
+                    "artwork stride overflow",
+                )
+            })?;
+            let byte_len = (stride as usize)
+                .checked_mul(height as usize)
+                .ok_or_else(|| {
+                    windows::core::Error::new(
+                        windows::core::HRESULT(0x8007_0057u32 as i32),
+                        "artwork buffer size overflow",
+                    )
+                })?;
+            let mut bgra = vec![0u8; byte_len];
+            let converter = factory.CreateFormatConverter()?;
+            converter.Initialize(
+                &frame,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )?;
+            converter.CopyPixels(std::ptr::null(), stride, &mut bgra)?;
+            Ok(ArtworkPixels {
+                width,
+                height,
+                bgra,
+            })
+        })()
+    };
+    if initialized {
+        unsafe { CoUninitialize() };
+    }
+    result.map_err(|error| format!("artwork decode failed: {error}"))
+}
+
+fn post_artwork_ready(
+    hwnd: isize,
+    display_id: u64,
+    source: ArtworkSource,
+    result: Result<ArtworkPixels, String>,
+) {
+    let pointer = Box::into_raw(Box::new(ArtworkReady {
+        display_id,
+        source,
+        result,
+    })) as isize;
+    if unsafe {
+        PostMessageW(
+            Some(HWND(hwnd as *mut c_void)),
+            WM_ARTWORK_READY,
+            WPARAM(0),
+            LPARAM(pointer),
+        )
+    }
+    .is_err()
+    {
+        unsafe { drop(Box::from_raw(pointer as *mut ArtworkReady)) };
+    }
 }
 
 fn is_offline_failure(message: &str) -> bool {
@@ -5189,6 +6455,11 @@ fn detect_ui_language() -> UiLanguage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiTextKey {
     Ready,
+    AutoStartStatus,
+    AutoOn,
+    AutoTurnOff,
+    Starting,
+    Cancelling,
     Listening,
     NoMatchTitle,
     NoMatchBody,
@@ -5203,6 +6474,16 @@ fn localized_ui_text(key: UiTextKey, language: UiLanguage) -> &'static str {
     match (key, language) {
         (UiTextKey::Ready, UiLanguage::Japanese) => "クリックしてShazamする",
         (UiTextKey::Ready, UiLanguage::English) => "Click to Shazam",
+        (UiTextKey::AutoStartStatus, UiLanguage::Japanese) => "\u{30c0}\u{30d6}\u{30eb}\u{30af}\u{30ea}\u{30c3}\u{30af}\u{3057}\u{3066}\u{81ea}\u{52d5}Shazam\u{3059}\u{308b}",
+        (UiTextKey::AutoStartStatus, UiLanguage::English) => "Double click to Auto Shazam",
+        (UiTextKey::AutoOn, UiLanguage::Japanese) => "Auto Shazam\u{304c}\u{30aa}\u{30f3}\u{306b}\u{306a}\u{3063}\u{3066}\u{3044}\u{307e}\u{3059}",
+        (UiTextKey::AutoOn, UiLanguage::English) => "Auto Shazam is on",
+        (UiTextKey::AutoTurnOff, UiLanguage::Japanese) => "\u{30af}\u{30ea}\u{30c3}\u{30af}\u{3057}\u{3066}\u{30aa}\u{30d5}\u{306b}\u{3059}\u{308b}",
+        (UiTextKey::AutoTurnOff, UiLanguage::English) => "Click to turn off",
+        (UiTextKey::Starting, UiLanguage::Japanese) => "\u{958b}\u{59cb}\u{4e2d}",
+        (UiTextKey::Starting, UiLanguage::English) => "Starting",
+        (UiTextKey::Cancelling, UiLanguage::Japanese) => "\u{505c}\u{6b62}\u{4e2d}",
+        (UiTextKey::Cancelling, UiLanguage::English) => "Stopping",
         (UiTextKey::Listening, UiLanguage::Japanese) => "聞き取り中",
         (UiTextKey::Listening, UiLanguage::English) => "Listening",
         (UiTextKey::NoMatchTitle, UiLanguage::Japanese) => "結果なし",
@@ -5251,82 +6532,9 @@ fn timeout_copy(language: UiLanguage) -> (&'static str, &'static str, &'static s
     )
 }
 
-fn parse_match(output: &str) -> Option<(String, String)> {
-    for line in output.lines() {
-        let Some(start) = line.find("title=") else {
-            continue;
-        };
-        let (title, after_title) = parse_debug_string(&line[start + "title=".len()..])?;
-        let artist_marker = after_title.find("artist=")?;
-        let (artist, _) = parse_debug_string(&after_title[artist_marker + "artist=".len()..])?;
-        if !title.trim().is_empty() && !artist.trim().is_empty() {
-            return Some((title, artist));
-        }
-    }
-    None
-}
-
-fn parse_debug_string(input: &str) -> Option<(String, &str)> {
-    let input = input.trim_start();
-    if !input.starts_with('"') {
-        return None;
-    }
-    let mut output = String::new();
-    let mut chars = input[1..].char_indices().peekable();
-    while let Some((offset, ch)) = chars.next() {
-        match ch {
-            '"' => return Some((output, &input[offset + 2..])),
-            '\\' => {
-                let (_, escaped) = chars.next()?;
-                match escaped {
-                    'n' => output.push('\n'),
-                    'r' => output.push('\r'),
-                    't' => output.push('\t'),
-                    '0' => output.push('\0'),
-                    '\\' => output.push('\\'),
-                    '"' => output.push('"'),
-                    _ => output.push(escaped),
-                }
-            }
-            _ => output.push(ch),
-        }
-    }
-    None
-}
-
-fn shazam_http_lab_exe() -> Option<PathBuf> {
-    let mut path = std::env::current_exe().ok()?;
-    path.set_file_name("shazam-http-lab.exe");
-    path.exists().then_some(path)
-}
-
-unsafe fn choose_audio_file(hwnd: HWND) -> Option<PathBuf> {
-    let mut path = [0u16; 32_768];
-    let filter = wide("Audio files\0*.mp3;*.wav;*.m4a;*.aac;*.flac;*.ogg\0All files\0*.*\0\0");
-    let title = wide("認識する音声ファイルを選択");
-    let mut dialog = OPENFILENAMEW {
-        lStructSize: size_of::<OPENFILENAMEW>() as u32,
-        hwndOwner: hwnd,
-        lpstrFilter: PCWSTR(filter.as_ptr()),
-        lpstrFile: windows::core::PWSTR(path.as_mut_ptr()),
-        nMaxFile: path.len() as u32,
-        lpstrTitle: PCWSTR(title.as_ptr()),
-        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
-        ..Default::default()
-    };
-    if !GetOpenFileNameW(&mut dialog).as_bool() {
-        return None;
-    }
-    let end = path
-        .iter()
-        .position(|unit| *unit == 0)
-        .unwrap_or(path.len());
-    Some(PathBuf::from(String::from_utf16_lossy(&path[..end])))
-}
-
 unsafe fn update_visible_windows(app: &mut AppState) {
     sync_main_timers(app);
-    if app.visible {
+    if app.visible || app.popup_transition.is_some() {
         let _ = InvalidateRect(Some(app.main_hwnd), None, false);
     }
     if app.settings_visible {
@@ -5350,10 +6558,12 @@ fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
             mode: CaptureMode::Auto,
             ..
         } => (TaggingMode::Auto, true, true),
-        MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. } => {
-            (TaggingMode::Ready, false, false)
-        }
-        MainPhase::Ready | MainPhase::Error { .. } => (TaggingMode::Ready, true, false),
+        MainPhase::Matched { .. } => (TaggingMode::Ready, true, false),
+        MainPhase::NoMatch { .. } | MainPhase::Offline { .. } => (TaggingMode::Ready, false, false),
+        MainPhase::Ready
+        | MainPhase::Starting { .. }
+        | MainPhase::Cancelling { .. }
+        | MainPhase::Error { .. } => (TaggingMode::Ready, true, false),
         MainPhase::Timeout { .. } => (TaggingMode::Ready, false, false),
     };
     AnimationSnapshot {
@@ -5375,15 +6585,27 @@ fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
             }
             _ => None,
         },
+        success_elapsed: match &app.phase {
+            MainPhase::Matched { track, .. } => Some(track.recognized_at.elapsed().as_secs_f64()),
+            _ => None,
+        },
+        success_track_id: match &app.phase {
+            MainPhase::Matched { track, .. } => Some(track.display_id),
+            _ => None,
+        },
+        success_wave_frame: app.success_wave_frame,
     }
 }
 
 unsafe fn sync_main_timers(app: &mut AppState) {
     let hwnd = app.main_hwnd;
-    if (app.visible || app.recognition_session.is_some()) && !hwnd.0.is_null() {
+    if (app.visible || app.recognition_session.is_some() || app.popup_transition.is_some())
+        && !hwnd.0.is_null()
+    {
         let track_phase = phase_needs_timeout(&app.phase)
             || app.history_transition.is_some()
-            || app.recognition_session.is_some();
+            || app.recognition_session.is_some()
+            || app.status_alternator.is_some();
         if track_phase && !app.phase_timer_active {
             let _ = SetTimer(Some(hwnd), TIMER_PHASE, PHASE_TICK_MS, None);
             app.phase_timer_active = true;
@@ -5391,7 +6613,11 @@ unsafe fn sync_main_timers(app: &mut AppState) {
             let _ = KillTimer(Some(hwnd), TIMER_PHASE);
             app.phase_timer_active = false;
         }
-        let animate = animation_needs_frame(&app.phase, app.startup_animation_pending)
+        let animate = app.popup_transition.is_some()
+            || animation_needs_frame(&app.phase, app.startup_animation_pending)
+            || app
+                .status_alternator
+                .is_some_and(|status| status.animating(Instant::now()))
             || app.history_transition.is_some_and(|transition| {
                 Instant::now().saturating_duration_since(transition.started_at)
                     < HISTORY_INSERT_TRANSITION
@@ -5453,7 +6679,11 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
                 || returned_to_ready_at
                     .is_some_and(|start| start.elapsed() < Duration::from_millis(350))
         }
-        MainPhase::Ready | MainPhase::Error { .. } | MainPhase::Timeout { .. } => false,
+        MainPhase::Ready
+        | MainPhase::Starting { .. }
+        | MainPhase::Cancelling { .. }
+        | MainPhase::Error { .. }
+        | MainPhase::Timeout { .. } => false,
     }
 }
 
@@ -5511,15 +6741,13 @@ fn advance_result_card_stage(stage: ResultCardStage, now: Instant) -> ResultCard
         ResultCardStage::Entering { started_at }
             if now.saturating_duration_since(started_at) >= RESULT_CARD_TRANSITION =>
         {
-            ResultCardAdvance::Stage(ResultCardStage::Holding {
-                started_at: started_at + RESULT_CARD_TRANSITION,
-            })
+            ResultCardAdvance::Stage(ResultCardStage::Holding { started_at: now })
         }
         ResultCardStage::Holding { started_at }
             if now.saturating_duration_since(started_at) >= RESULT_CARD_HOLD =>
         {
             ResultCardAdvance::Stage(ResultCardStage::Exiting {
-                started_at: started_at + RESULT_CARD_HOLD,
+                started_at: now,
                 from_offset: 0.0,
             })
         }
@@ -5538,7 +6766,32 @@ fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> 
 
 unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
     refresh_os_theme(app);
+    // The native popup resets its retained result view and dismiss timer when
+    // it is made visible again. Do the same so an interrupted card transition
+    // cannot reappear over the ready/listening screen.
+    if matches!(app.phase, MainPhase::Matched { .. }) {
+        app.phase = MainPhase::Ready;
+        app.success_wave_frame = None;
+    }
+    let now = Instant::now();
+    // Showing/positioning the popup can produce focus notifications before
+    // the deferred SetForegroundWindow call has completed. Do not interpret
+    // that activation handoff as an outside click that should close the UI.
+    app.main_activated = false;
+    app.popup_activation_grace_until = Some(now + POPUP_ACTIVATION_GRACE);
+    let from = popup_opacity_at(app, now);
+    app.popup_opacity = from;
+    app.popup_transition = Some(PopupOpacityTransition {
+        started_at: now,
+        from,
+        to: 255,
+        hide_when_complete: false,
+    });
+    app.visible = true;
     if let Some(renderer) = renderer.as_deref_mut() {
+        if let Err(error) = renderer.set_popup_opacity(from) {
+            app.message = Some(format!("Popup opacity setup failed: {error}"));
+        }
         match renderer.start_startup_logo() {
             Ok(complete) => app.startup_animation_pending = !complete,
             Err(error) => {
@@ -5561,17 +6814,30 @@ unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
             app.message = Some(format!("Composition初期配置に失敗: {error}"));
         }
     }
+    // The main HWND is created hidden so only the tray icon is visible during
+    // initialization. Invalidating it does not make it visible; explicitly
+    // show it after its anchor and initial Composition state are ready.
+    let _ = ShowWindow(app.main_hwnd, SW_SHOWNOACTIVATE);
+    // Explorer may restore focus to the notification area as the tray
+    // callback returns. Defer activation until the callback has unwound.
+    let _ = PostMessageW(
+        Some(app.main_hwnd),
+        WM_ACTIVATE_MAIN_POPUP,
+        WPARAM(0),
+        LPARAM(0),
+    );
     update_visible_windows(app);
 }
 
 fn refresh_os_theme(app: &mut AppState) -> bool {
-    let Ok(theme) = theme_from_ui_settings(&app.theme_settings) else {
+    let Ok((theme, system_foreground)) = theme_from_ui_settings(&app.theme_settings) else {
         return false;
     };
-    if app.theme == theme {
+    if app.theme == theme && app.system_foreground == system_foreground {
         return false;
     }
     app.theme = theme;
+    app.system_foreground = system_foreground;
     app.theme_generation = app.theme_generation.wrapping_add(1);
     true
 }
@@ -5582,11 +6848,11 @@ unsafe fn process_main_hit(app: &mut AppState, hit: MainHit) {
         MainHit::Cancel => cancel_capture(app),
         MainHit::TimeoutRestart => {
             if let MainPhase::Timeout { mode, .. } = app.phase {
-                start_capture(app, mode, None);
+                start_capture(app, mode);
             }
         }
         MainHit::TimeoutDismiss => app.phase = MainPhase::Ready,
-        MainHit::TryAgain => start_capture(app, CaptureMode::Manual, None),
+        MainHit::TryAgain => start_capture(app, CaptureMode::Manual),
         MainHit::CloseResult => {
             let now = Instant::now();
             let body_top = if app.arrow_edge == ArrowEdge::Top {
@@ -5616,16 +6882,29 @@ unsafe fn process_main_hit(app: &mut AppState, hit: MainHit) {
             }
             app.message = None;
         }
+        MainHit::OpenTrack(display_id) => {
+            let url = app
+                .history
+                .iter()
+                .find(|track| track.display_id == display_id)
+                .and_then(|track| track.page_url.clone())
+                .or_else(|| match &app.phase {
+                    MainPhase::Matched { track, .. } if track.display_id == display_id => {
+                        track.page_url.clone()
+                    }
+                    _ => None,
+                });
+            if let Some(url) = url {
+                if !unsafe { open_track_page(app.main_hwnd, &url) } {
+                    app.message = Some("Could not open the track page".to_owned());
+                }
+            }
+        }
         MainHit::CenterButton => {
             if matches!(app.phase, MainPhase::Listening { .. }) {
                 cancel_capture(app);
             } else {
-                start_capture(app, CaptureMode::Manual, None);
-            }
-        }
-        MainHit::OpenFile => {
-            if let Some(path) = choose_audio_file(app.main_hwnd) {
-                start_capture(app, CaptureMode::Manual, Some(path));
+                start_capture(app, CaptureMode::Manual);
             }
         }
         MainHit::Other => {}
@@ -5652,8 +6931,63 @@ unsafe extern "system" fn window_proc(
     let app = &mut *data.app;
 
     match message {
+        _ if message == app.taskbar_created_message && app.taskbar_created_message != 0 => {
+            restore_tray_icon(hwnd);
+            LRESULT(0)
+        }
         WM_SHOW_INITIAL_POPUP if data.kind == WindowKind::Main => {
             show_main(app, data.renderer.as_mut());
+            LRESULT(0)
+        }
+        WM_ACTIVATE_MAIN_POPUP if data.kind == WindowKind::Main => {
+            if app.visible {
+                let _ = SetForegroundWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_ARTWORK_READY if data.kind == WindowKind::Main => {
+            let pointer = lparam.0 as *mut ArtworkReady;
+            if !pointer.is_null() {
+                let ready = Box::from_raw(pointer);
+                let is_current = matches!(
+                    &app.phase,
+                    MainPhase::Matched { track, .. } if track.display_id == ready.display_id
+                );
+                let is_in_history = app
+                    .history
+                    .iter()
+                    .any(|track| track.display_id == ready.display_id);
+                if (is_current || is_in_history) && ready.result.is_ok() {
+                    let pixels = ready.result.expect("checked successful artwork result");
+                    let existing_is_better = app
+                        .artwork_resources
+                        .get(&ready.display_id)
+                        .is_some_and(|(source, _)| {
+                            *source == ArtworkSource::HighQuality
+                                && ready.source == ArtworkSource::Standard
+                        });
+                    if !existing_is_better {
+                        app.artwork_resources
+                            .insert(ready.display_id, (ready.source, pixels));
+                        const ARTWORK_CACHE_LIMIT: usize = 24 * 1024 * 1024;
+                        while app
+                            .artwork_resources
+                            .values()
+                            .map(|(_, image)| image.bgra.len())
+                            .sum::<usize>()
+                            > ARTWORK_CACHE_LIMIT
+                        {
+                            let Some(oldest) = app.artwork_resources.keys().copied().min() else {
+                                break;
+                            };
+                            app.artwork_resources.remove(&oldest);
+                        }
+                        if app.visible {
+                            let _ = InvalidateRect(Some(app.main_hwnd), None, false);
+                        }
+                    }
+                }
+            }
             LRESULT(0)
         }
         WM_OS_THEME_CHANGED | WM_SETTINGCHANGE | WM_THEMECHANGED
@@ -5676,6 +7010,7 @@ unsafe extern "system" fn window_proc(
                 dpi,
                 app.theme_generation,
                 app.theme,
+                app.system_foreground,
                 data.kind,
                 animate_startup_logo,
             ) {
@@ -5735,23 +7070,19 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_TRAYICON_MESSAGE if data.kind == WindowKind::Main => {
-            let event = lparam.0 as u32;
-            if event == windows::Win32::UI::Shell::NIN_SELECT
-                || event == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP
-                || event == windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP
-            {
+            // NOTIFYICON_VERSION_4 packs the event code into LOWORD(lParam)
+            // and the icon ID into HIWORD(lParam). Comparing the full value
+            // silently drops clicks because the upper word is nonzero.
+            let event = (lparam.0 as u32 & 0xffff) as u16;
+            if is_tray_activation_event(event) {
                 if app.visible {
                     hide_main(app);
                 } else {
                     show_main(app, data.renderer.as_mut());
                 }
+            } else if event == windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU as u16 {
+                show_tray_context_menu(app);
             }
-            LRESULT(0)
-        }
-        WM_CAPTURE_FINISHED if data.kind == WindowKind::Main => {
-            let finished = Box::from_raw(lparam.0 as *mut CaptureFinished);
-            complete_capture(app, *finished);
-            update_visible_windows(app);
             LRESULT(0)
         }
         WM_LBUTTONDOWN if data.kind == WindowKind::Main => {
@@ -5791,7 +7122,7 @@ unsafe extern "system" fn window_proc(
                 ) {
                     cancel_capture(app);
                 } else {
-                    start_capture(app, CaptureMode::Auto, None);
+                    start_capture(app, CaptureMode::Auto);
                 }
             } else {
                 app.mouse_down_center = false;
@@ -5827,31 +7158,52 @@ unsafe extern "system" fn window_proc(
         }
         WM_TIMER if data.kind == WindowKind::Main && wparam.0 == TIMER_PHASE => {
             let recognition_changed = poll_recognition_events(app);
-            if update_phase_timers(app) || recognition_changed {
+            let settle_frame = matches!(
+                &app.phase,
+                MainPhase::Matched { track, .. }
+                    if track.recognized_at.elapsed() < SUCCESS_SETTLE_TOTAL
+            );
+            if update_phase_timers(app) || recognition_changed || settle_frame {
                 update_visible_windows(app);
             }
             LRESULT(0)
         }
         WM_TIMER if data.kind == WindowKind::Main && wparam.0 == TIMER_ANIMATION => {
-            if app.visible {
-                if let Some(renderer) = data.renderer.as_mut() {
-                    if let Err(error) = renderer.update_composition(animation_snapshot(app)) {
-                        app.message = Some(format!("Windows Composition update failed: {error}"));
-                        app.startup_animation_pending = false;
-                    } else if app.startup_animation_pending {
-                        app.startup_animation_pending = renderer
-                            .composition
-                            .as_ref()
-                            .is_some_and(|scene| !scene.startup_logo_complete());
+            if app.visible || app.popup_transition.is_some() {
+                let now = Instant::now();
+                let fading = app.popup_transition.is_some();
+                if fading {
+                    advance_popup_transition(app, now);
+                    if let Some(renderer) = data.renderer.as_mut() {
+                        if let Err(error) = renderer.set_popup_opacity(app.popup_opacity) {
+                            app.message = Some(format!("Popup opacity update failed: {error}"));
+                        }
+                    }
+                    if app.visible || app.popup_transition.is_some() {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
-                if matches!(
-                    app.phase,
-                    MainPhase::Matched { .. }
-                        | MainPhase::NoMatch { .. }
-                        | MainPhase::Offline { .. }
-                ) {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
+                if app.visible {
+                    if let Some(renderer) = data.renderer.as_mut() {
+                        if let Err(error) = renderer.update_composition(animation_snapshot(app)) {
+                            app.message =
+                                Some(format!("Windows Composition update failed: {error}"));
+                            app.startup_animation_pending = false;
+                        } else if app.startup_animation_pending {
+                            app.startup_animation_pending = renderer
+                                .composition
+                                .as_ref()
+                                .is_some_and(|scene| !scene.startup_logo_complete());
+                        }
+                    }
+                    if matches!(
+                        app.phase,
+                        MainPhase::Matched { .. }
+                            | MainPhase::NoMatch { .. }
+                            | MainPhase::Offline { .. }
+                    ) {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
                 }
                 sync_main_timers(app);
             }
@@ -5881,7 +7233,7 @@ unsafe extern "system" fn window_proc(
                 ) {
                     cancel_capture(app);
                 } else {
-                    start_capture(app, CaptureMode::Auto, None);
+                    start_capture(app, CaptureMode::Auto);
                 }
                 update_visible_windows(app);
             }
@@ -5933,14 +7285,6 @@ unsafe extern "system" fn window_proc(
                         let _ = ShowWindow(hwnd, SW_HIDE);
                     }
                 }
-            } else if data.kind == WindowKind::Main
-                && wparam.0 == b'O' as usize
-                && GetKeyState(VK_CONTROL.0 as i32) < 0
-            {
-                if let Some(path) = choose_audio_file(hwnd) {
-                    start_capture(app, CaptureMode::Manual, Some(path));
-                }
-                update_visible_windows(app);
             }
             LRESULT(0)
         }
@@ -5961,7 +7305,7 @@ unsafe extern "system" fn window_proc(
                 ) {
                     cancel_capture(app);
                 } else {
-                    start_capture(app, CaptureMode::Auto, None);
+                    start_capture(app, CaptureMode::Auto);
                 }
                 update_visible_windows(app);
             }
@@ -5970,12 +7314,7 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONUP if data.kind == WindowKind::Settings => {
             let x = low_word(lparam.0) as f32 * 96.0 / GetDpiForWindow(hwnd).max(96) as f32;
             let y = high_word(lparam.0) as f32 * 96.0 / GetDpiForWindow(hwnd).max(96) as f32;
-            if (55.0..=500.0).contains(&x) && (180.0..=244.0).contains(&y) {
-                if let Some(path) = choose_audio_file(hwnd) {
-                    start_capture(app, CaptureMode::Manual, Some(path));
-                }
-                update_visible_windows(app);
-            } else if (55.0..=500.0).contains(&x) && (244.0..=310.0).contains(&y) {
+            if (55.0..=500.0).contains(&x) && (244.0..=310.0).contains(&y) {
                 open_microphone_info(app);
             } else if (55.0..=500.0).contains(&x) && y >= 310.0 {
                 open_about(app);
@@ -6010,18 +7349,22 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
-        WM_ACTIVATE if data.kind == WindowKind::Main => {
-            let activation = wparam.0 & 0xffff;
-            if activation == 0 && app.main_activated && no_auxiliary_window_visible(app) {
-                hide_main(app);
-            } else if activation != 0 {
-                app.main_activated = true;
-            }
+        WM_SETFOCUS if data.kind == WindowKind::Main => {
+            app.main_activated = true;
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_KILLFOCUS if data.kind == WindowKind::Main => {
-            if app.main_activated && no_auxiliary_window_visible(app) {
+            if should_hide_main_after_deactivation(app, Instant::now()) {
                 hide_main(app);
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        WM_ACTIVATE if data.kind == WindowKind::Main => {
+            let activation = wparam.0 & 0xffff;
+            if activation == 0 && should_hide_main_after_deactivation(app, Instant::now()) {
+                hide_main(app);
+            } else if activation != 0 {
+                app.main_activated = true;
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
@@ -6066,6 +7409,29 @@ fn no_auxiliary_window_visible(app: &AppState) -> bool {
     !app.settings_visible && !app.about_visible && !app.microphone_visible
 }
 
+fn should_hide_main_after_deactivation(app: &AppState, now: Instant) -> bool {
+    should_hide_popup_on_deactivation(
+        app.visible,
+        app.main_activated,
+        no_auxiliary_window_visible(app),
+        app.popup_activation_grace_until,
+        now,
+    )
+}
+
+fn should_hide_popup_on_deactivation(
+    visible: bool,
+    main_activated: bool,
+    no_auxiliary_window: bool,
+    activation_grace_until: Option<Instant>,
+    now: Instant,
+) -> bool {
+    visible
+        && main_activated
+        && no_auxiliary_window
+        && activation_grace_until.is_none_or(|deadline| now >= deadline)
+}
+
 unsafe fn client_dips(hwnd: HWND, lparam: LPARAM) -> (f32, f32) {
     let scale = 96.0 / GetDpiForWindow(hwnd).max(96) as f32;
     let x = (low_word(lparam.0) as i16 as f32) * scale;
@@ -6090,6 +7456,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let startup_task_activation = is_startup_task_activation();
         let instance = GetModuleHandleW(None)?;
         let class_name = wide(CLASS_NAME);
         let class = window_class(
@@ -6109,9 +7476,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         let compositor = Compositor::new()?;
         let theme_settings = UISettings::new()?;
-        let theme = theme_from_ui_settings(&theme_settings)?;
+        let (theme, system_foreground) = theme_from_ui_settings(&theme_settings)?;
+        let taskbar_created_name = wide(TRAY_TASKBAR_CREATED_NAME);
+        let taskbar_created_message = RegisterWindowMessageW(PCWSTR(taskbar_created_name.as_ptr()));
         let app = Box::new(AppState {
             main_hwnd: HWND::default(),
+            taskbar_created_message,
             settings_hwnd: HWND::default(),
             about_hwnd: HWND::default(),
             microphone_hwnd: HWND::default(),
@@ -6121,6 +7491,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             _dispatcher_queue: dispatcher_queue,
             theme_settings,
             theme_changed_token: None,
+            system_foreground,
             phase: MainPhase::Ready,
             history: Vec::new(),
             history_transition: None,
@@ -6131,7 +7502,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             theme,
             theme_generation: 0,
             visible: false,
+            popup_opacity: 0,
+            popup_transition: None,
             main_activated: false,
+            popup_activation_grace_until: None,
             phase_timer_active: false,
             animation_timer_active: false,
             startup_animation_pending: false,
@@ -6144,10 +7518,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             mouse_down_center: false,
             long_press_consumed: false,
             single_click_pending: false,
-            capture_canceled: Arc::new(AtomicBool::new(false)),
-            capture_child: None,
             recognition_controller: None,
             recognition_session: None,
+            controller_sequence: 0,
+            dropped_notifications: 0,
+            status_alternator: Some(StatusTextAlternator::ready(Instant::now())),
+            success_wave_frame: None,
+            next_display_id: 1,
+            artwork_resources: HashMap::new(),
+            ui_configs: HashMap::new(),
             message: None,
         });
         let app_ptr = Box::into_raw(app);
@@ -6195,7 +7574,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Let Explorer finish publishing the notification icon before asking
         // Shell_NotifyIconGetRect for its anchor. `ui` opens the popup on
         // launch; the tray icon remains available to hide/show it afterward.
-        let _ = PostMessageW(Some(hwnd), WM_SHOW_INITIAL_POPUP, WPARAM(0), LPARAM(0));
+        if should_show_initial_popup(startup_task_activation) {
+            let _ = PostMessageW(Some(hwnd), WM_SHOW_INITIAL_POPUP, WPARAM(0), LPARAM(0));
+        }
         let mut message = MSG::default();
         let mut running = true;
         while running {
@@ -6276,11 +7657,40 @@ fn update_phase_timers(app: &mut AppState) -> bool {
         }
         _ => {}
     }
+    let desired_status_cycle = match &app.phase {
+        MainPhase::Ready | MainPhase::Matched { .. } => Some(StatusCycle::Ready),
+        MainPhase::Listening {
+            mode: CaptureMode::Auto,
+            ..
+        } => Some(StatusCycle::Auto),
+        _ => None,
+    };
+    match desired_status_cycle {
+        Some(cycle)
+            if app
+                .status_alternator
+                .is_none_or(|status| status.cycle != cycle) =>
+        {
+            app.status_alternator = Some(match cycle {
+                StatusCycle::Ready => StatusTextAlternator::ready(now),
+                StatusCycle::Auto => StatusTextAlternator::auto(now),
+            });
+            changed = true;
+        }
+        None if app.status_alternator.is_some() => {
+            app.status_alternator = None;
+            changed = true;
+        }
+        _ => {}
+    }
     if app.history_transition.is_some_and(|transition| {
         now.saturating_duration_since(transition.started_at) >= HISTORY_INSERT_TRANSITION
     }) {
         app.history_transition = None;
         changed = true;
+    }
+    if let Some(status) = app.status_alternator.as_mut() {
+        changed |= status.advance(now);
     }
     changed
 }
@@ -6311,27 +7721,159 @@ fn history_row_top(
     }
 }
 
-fn _assert_only_ui_dependencies_are_used(_: &Path) {}
-
 #[cfg(test)]
 mod tests {
+    use super::StatusTextAlternator;
     use super::{
         advance_result_card_stage, animation_needs_frame, button_border_arc_points,
         composition_button_pixel_snap_offset, composition_root_layer_order,
-        composition_scale_for_dpi, copy_notification_text, gradient_origin_transform,
-        header_fill_scope, history_artwork_frame, history_row_top, inverse_circle_clip_radii,
-        is_offline_failure, is_timeout_failure, localized_ui_text, native_icon_layout,
-        no_match_copy, no_match_icon_rect, parse_debug_string, parse_match, phase_needs_timeout,
-        point_in_rect, popup_base_color, result_artwork_rect, result_details_rects,
-        result_gradient_colors, result_panel_top_at, select_ui_language_from_multisz,
-        should_start_startup_logo, theme_from_foreground_rgb, timeout_copy, ui_model, ArrowEdge,
-        CaptureMode, CompositionRootLayer, HeaderFillScope, HistoryMutationEvent,
-        HistoryMutationTransition, MainPhase, NoMatchIconCommand, ResultCardAdvance,
-        ResultCardStage, Theme, UiLanguage, UiTextKey, WindowKind, BUTTON_CLEAR_DIAMETER,
-        BUTTON_SIZE, BUTTON_TOP, BUTTON_X, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH,
-        OUTER_BASE_OPACITY, POPUP_ARROW_HEIGHT, RESULT_ARTWORK_CORNER_RADIUS, RESULT_DETAILS_LEFT,
-        RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, WHITE_CLOSE_ICON_PIXELS,
+        composition_scale_for_dpi, copy_notification_text, d2d_color_from_system,
+        gradient_origin_transform, header_fill_scope, history_artwork_frame, history_row_top,
+        inverse_circle_clip_radii, is_offline_failure, is_tray_activation_event, localized_ui_text,
+        native_icon_layout, no_match_copy, no_match_icon_rect, phase_needs_timeout, point_in_rect,
+        popup_base_color, result_artwork_rect, result_details_rects, result_gradient_colors,
+        result_panel_top_at, select_ui_language_from_multisz, should_hide_popup_on_deactivation,
+        should_show_initial_popup, should_start_startup_logo, theme_from_foreground_rgb,
+        timeout_copy, ui_model, ArrowEdge, CaptureMode, CompositionRootLayer, HeaderFillScope,
+        HistoryMutationEvent, HistoryMutationTransition, MainPhase, NoMatchIconCommand,
+        ResultCardAdvance, ResultCardStage, Theme, UiLanguage, UiTextKey, WindowKind,
+        BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, INNER_MASK_BOUNDS,
+        NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT,
+        RESULT_ARTWORK_CORNER_RADIUS, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT,
+        SETTINGS_ICON_PIXELS, WHITE_CLOSE_ICON_PIXELS,
     };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn ui224_ready_and_auto_status_cycles_keep_native_delays() {
+        let start = Instant::now();
+        let mut ready = StatusTextAlternator::ready(start);
+        assert!(ready.first);
+        assert_eq!(ready.next_at, start + Duration::from_secs(3));
+
+        assert!(ready.advance(start + Duration::from_secs(3)));
+        assert!(!ready.first);
+        assert_eq!(ready.next_at, start + Duration::from_secs(5));
+        assert_eq!(
+            ready.transition_started_at,
+            Some(start + Duration::from_secs(3))
+        );
+
+        ready.advance(start + Duration::from_secs(5));
+        assert!(ready.first);
+        assert_eq!(ready.next_at, start + Duration::from_secs(12));
+        ready.advance(start + Duration::from_secs(12));
+        assert!(!ready.first);
+        assert_eq!(ready.next_at, start + Duration::from_secs(14));
+
+        let mut auto = StatusTextAlternator::auto(start);
+        assert!(auto.first);
+        auto.advance(start + Duration::from_secs(3));
+        assert!(!auto.first);
+        assert_eq!(auto.next_at, start + Duration::from_secs(6));
+        auto.advance(start + Duration::from_secs(6));
+        assert!(auto.first);
+        assert_eq!(auto.next_at, start + Duration::from_secs(9));
+    }
+
+    #[test]
+    fn preferred_ui_languages_choose_first_supported_language_and_fallback_to_english() {
+        let preferred = "fr-FR\0ja-JP\0en-US\0\0";
+        let encoded: Vec<u16> = preferred.encode_utf16().collect();
+        assert_eq!(
+            select_ui_language_from_multisz(&encoded),
+            UiLanguage::Japanese
+        );
+        let english: Vec<u16> = "de-DE\0en-US\0\0".encode_utf16().collect();
+        assert_eq!(
+            select_ui_language_from_multisz(&english),
+            UiLanguage::English
+        );
+        let unsupported: Vec<u16> = "fr-FR\0de-DE\0\0".encode_utf16().collect();
+        assert_eq!(
+            select_ui_language_from_multisz(&unsupported),
+            UiLanguage::English
+        );
+    }
+
+    #[test]
+    fn localized_recognition_copy_uses_expected_english_product_strings() {
+        assert_eq!(
+            localized_ui_text(UiTextKey::Ready, UiLanguage::English),
+            "Click to Shazam"
+        );
+        assert_eq!(
+            localized_ui_text(UiTextKey::AutoStartStatus, UiLanguage::English),
+            "Double click to Auto Shazam"
+        );
+        assert_eq!(
+            localized_ui_text(UiTextKey::AutoOn, UiLanguage::English),
+            "Auto Shazam is on"
+        );
+        assert_eq!(
+            localized_ui_text(UiTextKey::AutoTurnOff, UiLanguage::English),
+            "Click to turn off"
+        );
+        assert_eq!(no_match_copy(false, UiLanguage::English).0, "No Result");
+        assert_eq!(
+            no_match_copy(true, UiLanguage::English).1,
+            "Please check your connection"
+        );
+        assert_eq!(timeout_copy(UiLanguage::English).1, "Dismiss");
+        assert_eq!(timeout_copy(UiLanguage::English).2, "Restart");
+    }
+
+    #[test]
+    fn recognition_timeout_states_do_not_share_result_dismiss_timers() {
+        let now = Instant::now();
+        assert!(phase_needs_timeout(&MainPhase::NoMatch {
+            entered_at: now,
+            returned_to_ready_at: None,
+        }));
+        assert!(phase_needs_timeout(&MainPhase::Error {
+            message: "error".to_owned(),
+            entered_at: now,
+        }));
+        assert!(!phase_needs_timeout(&MainPhase::Timeout {
+            mode: CaptureMode::Manual,
+            entered_at: now,
+        }));
+        assert!(!phase_needs_timeout(&MainPhase::Listening {
+            mode: CaptureMode::Manual,
+            started_at: now,
+        }));
+    }
+
+    #[test]
+    fn popup_activation_handoff_does_not_close_on_its_initial_focus_loss() {
+        let shown_at = Instant::now();
+        let grace_until = shown_at + POPUP_ACTIVATION_GRACE;
+        let can_close =
+            |now| should_hide_popup_on_deactivation(true, true, true, Some(grace_until), now);
+        assert!(!can_close(shown_at));
+        assert!(!can_close(shown_at + Duration::from_millis(200)));
+        assert!(can_close(grace_until));
+        assert!(!should_hide_popup_on_deactivation(
+            true,
+            false,
+            true,
+            None,
+            grace_until + Duration::from_secs(1)
+        ));
+        assert!(!should_hide_popup_on_deactivation(
+            true,
+            true,
+            false,
+            None,
+            grace_until + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn startup_task_activation_keeps_the_main_popup_hidden() {
+        assert!(should_show_initial_popup(false));
+        assert!(!should_show_initial_popup(true));
+    }
 
     #[test]
     fn no_match_icon_path_preserves_native_command_topology_and_unclamped_controls() {
@@ -6381,18 +7923,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_cli_result_without_changing_recognition_protocol() {
-        let output = "Shazam HTTP status=200\nmatch[1] title=\"I Really Like You\" artist=\"カーリー・レイ・ジェプセン\"\n";
-        assert_eq!(
-            parse_match(output).unwrap(),
-            (
-                "I Really Like You".to_owned(),
-                "カーリー・レイ・ジェプセン".to_owned()
-            )
-        );
-    }
-
-    #[test]
     fn notification_text_is_nul_terminated_without_splitting_surrogate_pairs() {
         let mut buffer = [0xFFFF; 5];
         copy_notification_text(&mut buffer, "A😀B");
@@ -6401,13 +7931,6 @@ mod tests {
         let mut truncated = [0; 3];
         copy_notification_text(&mut truncated, "A😀B");
         assert_eq!(truncated, [b'A' as u16, 0, 0]);
-    }
-
-    #[test]
-    fn parses_escaped_debug_strings() {
-        let (decoded, rest) = parse_debug_string("\"Line\\n\\\"One\\\"\" artist=\"A\"").unwrap();
-        assert_eq!(decoded, "Line\n\"One\"");
-        assert_eq!(rest, " artist=\"A\"");
     }
 
     #[test]
@@ -6674,6 +8197,20 @@ mod tests {
     }
 
     #[test]
+    fn result_label_color_preserves_system_foreground_rgba() {
+        let mapped = d2d_color_from_system(super::Color {
+            A: 128,
+            R: 36,
+            G: 72,
+            B: 144,
+        });
+        assert!((mapped.r - 36.0 / 255.0).abs() < 1e-6);
+        assert!((mapped.g - 72.0 / 255.0).abs() < 1e-6);
+        assert!((mapped.b - 144.0 / 255.0).abs() < 1e-6);
+        assert!((mapped.a - 128.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn native_header_icons_embed_the_high_resolution_catalog_renditions() {
         assert_eq!(SETTINGS_ICON_PIXELS.len(), 32 * 32 * 4);
         assert_eq!(WHITE_CLOSE_ICON_PIXELS.len(), 24 * 24 * 4);
@@ -6690,9 +8227,15 @@ mod tests {
         let returned_at = entered_at + std::time::Duration::from_secs(1);
         let phase = MainPhase::Matched {
             track: super::Track {
+                display_id: 1,
                 title: String::new(),
                 artist: String::new(),
                 recognized_at: entered_at,
+                artwork_url: None,
+                hq_artwork_url: None,
+                background_artwork_url: None,
+                track_key: None,
+                page_url: None,
             },
             stage: ResultCardStage::Entering {
                 started_at: entered_at,
@@ -6714,9 +8257,15 @@ mod tests {
         );
         let exiting = MainPhase::Matched {
             track: super::Track {
+                display_id: 1,
                 title: String::new(),
                 artist: String::new(),
                 recognized_at: entered_at,
+                artwork_url: None,
+                hq_artwork_url: None,
+                background_artwork_url: None,
+                track_key: None,
+                page_url: None,
             },
             stage: ResultCardStage::Exiting {
                 started_at: returned_at,
@@ -6738,16 +8287,40 @@ mod tests {
     }
 
     #[test]
+    fn tray_activation_uses_one_semantic_event_per_v4_selection() {
+        assert!(!is_tray_activation_event(
+            windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP as u16
+        ));
+        assert!(is_tray_activation_event(
+            windows::Win32::UI::Shell::NIN_SELECT as u16
+        ));
+        assert!(is_tray_activation_event(
+            (windows::Win32::UI::Shell::NIN_SELECT | windows::Win32::UI::Shell::NINF_KEY) as u16
+        ));
+        assert!(!is_tray_activation_event(
+            windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP as u16
+        ));
+    }
+
+    #[test]
     fn result_card_holds_ten_seconds_after_entrance_then_exits() {
         let start = std::time::Instant::now();
-        let holding_start = start + std::time::Duration::from_millis(300);
-        let exit_start = holding_start + std::time::Duration::from_secs(10);
+        let entrance_finished = start + std::time::Duration::from_millis(320);
+        let holding_start = entrance_finished;
+        let hold_timer_fired = holding_start + std::time::Duration::from_millis(10_040);
+        let exit_start = hold_timer_fired;
         assert!(matches!(
-            advance_result_card_stage(ResultCardStage::Entering { started_at: start }, holding_start),
+            advance_result_card_stage(
+                ResultCardStage::Entering { started_at: start },
+                entrance_finished
+            ),
             ResultCardAdvance::Stage(ResultCardStage::Holding { started_at }) if started_at == holding_start
         ));
         assert!(matches!(
-            advance_result_card_stage(ResultCardStage::Holding { started_at: holding_start }, exit_start),
+            advance_result_card_stage(
+                ResultCardStage::Holding { started_at: holding_start },
+                hold_timer_fired
+            ),
             ResultCardAdvance::Stage(ResultCardStage::Exiting { started_at, from_offset: 0.0 }) if started_at == exit_start
         ));
         assert!(matches!(
@@ -6808,72 +8381,6 @@ mod tests {
     }
 
     #[test]
-    fn timeout_markers_are_separated_from_generic_failures_and_no_match() {
-        assert!(is_timeout_failure("request timed out"));
-        assert!(is_timeout_failure("recognition timeout"));
-        assert!(is_timeout_failure("タイムアウト"));
-        assert!(!is_timeout_failure("network connection failed"));
-        assert!(!is_timeout_failure("no match"));
-        let timeout = MainPhase::Timeout {
-            mode: CaptureMode::Manual,
-            entered_at: std::time::Instant::now(),
-        };
-        assert!(!phase_needs_timeout(&timeout));
-        assert!(!animation_needs_frame(&timeout, false));
-    }
-
-    #[test]
-    fn preferred_ui_languages_choose_first_supported_language_and_fallback_to_english() {
-        let to_multisz = |tags: &[&str]| {
-            let mut buffer = Vec::new();
-            for tag in tags {
-                buffer.extend(tag.encode_utf16());
-                buffer.push(0);
-            }
-            buffer.push(0);
-            buffer
-        };
-        assert_eq!(
-            select_ui_language_from_multisz(&to_multisz(&["fr-FR", "ja-JP", "en-US"])),
-            UiLanguage::Japanese
-        );
-        assert_eq!(
-            select_ui_language_from_multisz(&to_multisz(&["de-DE", "en-GB", "ja-JP"])),
-            UiLanguage::English
-        );
-        assert_eq!(
-            select_ui_language_from_multisz(&to_multisz(&["fr-FR", "de-DE"])),
-            UiLanguage::English
-        );
-    }
-
-    #[test]
-    fn localized_recognition_copy_uses_source_keys_for_both_languages() {
-        assert_eq!(
-            localized_ui_text(UiTextKey::Ready, UiLanguage::Japanese),
-            "クリックしてShazamする"
-        );
-        assert_eq!(
-            localized_ui_text(UiTextKey::Listening, UiLanguage::English),
-            "Listening"
-        );
-        assert_eq!(
-            no_match_copy(false, UiLanguage::Japanese),
-            ("結果なし", "認識できませんでした。もう一度お試しください。")
-        );
-        assert_eq!(
-            no_match_copy(false, UiLanguage::English),
-            ("No Result", "We didn’t quite catch that. Please try again.")
-        );
-        assert_eq!(
-            no_match_copy(true, UiLanguage::Japanese),
-            ("結果なし", "接続を確認してください")
-        );
-        assert_eq!(timeout_copy(UiLanguage::English).1, "Dismiss");
-        assert_eq!(timeout_copy(UiLanguage::Japanese).2, "再起動");
-    }
-
-    #[test]
     fn offline_markers_are_separated_from_timeout_and_no_match() {
         assert!(is_offline_failure("network is unreachable"));
         assert!(is_offline_failure("could not resolve host"));
@@ -6892,6 +8399,7 @@ mod tests {
         assert_eq!(
             composition_root_layer_order(),
             [
+                CompositionRootLayer::AutoShadow,
                 CompositionRootLayer::InnerRipples,
                 CompositionRootLayer::Button,
                 CompositionRootLayer::OuterRipples,

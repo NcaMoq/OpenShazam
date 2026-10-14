@@ -208,6 +208,16 @@ pub struct SpringProfile {
 /// Cubic Bezier timing function (0.44, 0.05, 0.55, 0.95), solving x(t)=time.
 /// This is the curve used by both native methods named in the source spec.
 pub fn native_bezier(progress: f64) -> f64 {
+    cubic_bezier_timing(progress, BEZIER_X1, BEZIER_Y1, BEZIER_X2, BEZIER_Y2)
+}
+
+/// Core Animation's `kCAMediaTimingFunctionEaseInEaseOut` curve, used by
+/// UI-224's 0.4-second status-text push transition.
+pub fn ease_in_out(progress: f64) -> f64 {
+    cubic_bezier_timing(progress, 0.42, 0.0, 0.58, 1.0)
+}
+
+fn cubic_bezier_timing(progress: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
     let x = finite_unit(progress);
     if x == 0.0 || x == 1.0 {
         return x;
@@ -217,8 +227,8 @@ pub fn native_bezier(progress: f64) -> f64 {
     let mut high = 1.0;
     let mut t = x;
     for _ in 0..8 {
-        let estimated = cubic_component(t, BEZIER_X1, BEZIER_X2);
-        let slope = cubic_component_derivative(t, BEZIER_X1, BEZIER_X2);
+        let estimated = cubic_component(t, x1, x2);
+        let slope = cubic_component_derivative(t, x1, x2);
         if slope.abs() > 1e-8 {
             let candidate = t - (estimated - x) / slope;
             if (low..=high).contains(&candidate) {
@@ -229,14 +239,14 @@ pub fn native_bezier(progress: f64) -> f64 {
         } else {
             t = (low + high) * 0.5;
         }
-        let current_x = cubic_component(t, BEZIER_X1, BEZIER_X2);
+        let current_x = cubic_component(t, x1, x2);
         if current_x < x {
             low = t;
         } else {
             high = t;
         }
     }
-    cubic_component(t, BEZIER_Y1, BEZIER_Y2)
+    cubic_component(t, y1, y2)
 }
 
 /// Deterministic presentation values for the UI-169 one-shot logo drawing.
@@ -1055,6 +1065,16 @@ mod tests {
         }
         assert_eq!(native_bezier(0.0), 0.0);
         assert_eq!(native_bezier(1.0), 1.0);
+    }
+
+    #[test]
+    fn core_animation_ease_in_out_has_expected_endpoints_and_symmetry() {
+        assert_eq!(ease_in_out(0.0), 0.0);
+        assert_eq!(ease_in_out(1.0), 1.0);
+        close(ease_in_out(0.5), 0.5, 0.000_001);
+        let quarter = ease_in_out(0.25);
+        assert!(quarter > 0.0 && quarter < 0.25);
+        close(ease_in_out(0.75), 1.0 - quarter, 0.000_001);
     }
 
     #[test]
