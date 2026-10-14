@@ -315,7 +315,12 @@ pub struct ProgressiveSession {
 #[derive(Default)]
 struct NativeSignatureTimeline {
     current_attempt: Vec<NativeRatedSignature>,
-    all_attempts: Vec<Vec<NativeRatedSignature>>,
+    #[cfg(test)]
+    archived_attempt_count: usize,
+    #[cfg(test)]
+    archived_signature_count: usize,
+    #[cfg(test)]
+    archived_signature_bytes: usize,
 }
 
 struct NativeRatedSignature {
@@ -333,9 +338,25 @@ impl NativeSignatureTimeline {
 
     /// Mirror `createNewCurrentPeriodForRetry:`: archive the current attempt
     /// and replace it with a fresh one before another Signature is generated.
+    /// Only cumulative diagnostics are retained: selection reads only the
+    /// current attempt, so keeping every archived Signature byte would make
+    /// long-running Auto sessions grow without affecting recognition.
     fn create_new_current_period_for_retry(&mut self) {
-        self.all_attempts
-            .push(std::mem::take(&mut self.current_attempt));
+        #[cfg(test)]
+        {
+            self.archived_attempt_count = self.archived_attempt_count.saturating_add(1);
+            self.archived_signature_count = self
+                .archived_signature_count
+                .saturating_add(self.current_attempt.len());
+            let archived_bytes = self
+                .current_attempt
+                .iter()
+                .map(|rated| rated.bytes.len())
+                .fold(0usize, usize::saturating_add);
+            self.archived_signature_bytes =
+                self.archived_signature_bytes.saturating_add(archived_bytes);
+        }
+        drop(std::mem::take(&mut self.current_attempt));
     }
 
     fn pick_last_of_type(&self, signature_type: u8) -> Option<&[u8]> {
@@ -2065,11 +2086,29 @@ mod tests {
         assert_eq!(timeline.pick_last_of_type(2), None);
 
         timeline.create_new_current_period_for_retry();
-        assert_eq!(timeline.all_attempts.len(), 1);
-        assert_eq!(timeline.all_attempts[0].len(), 3);
+        assert_eq!(timeline.archived_attempt_count, 1);
+        assert_eq!(timeline.archived_signature_count, 3);
         assert_eq!(timeline.pick_last_of_type(0), None);
         timeline.store_signature(0, vec![7, 8]);
         assert_eq!(timeline.pick_last_of_type(0), Some([7, 8].as_slice()));
+    }
+
+    #[test]
+    fn archived_signature_history_keeps_only_constant_size_counters() {
+        let mut timeline = NativeSignatureTimeline::default();
+        for _ in 0..10_000 {
+            timeline.store_signature(0, vec![0; 64]);
+            timeline.create_new_current_period_for_retry();
+        }
+
+        assert!(timeline.current_attempt.is_empty());
+        assert_eq!(timeline.archived_attempt_count, 10_000);
+        assert_eq!(timeline.archived_signature_count, 10_000);
+        assert_eq!(timeline.archived_signature_bytes, 640_000);
+        assert_eq!(
+            std::mem::size_of_val(&timeline),
+            std::mem::size_of::<NativeSignatureTimeline>()
+        );
     }
 
     fn pcm(frames: usize) -> Vec<i16> {
@@ -2169,10 +2208,10 @@ mod tests {
         assert_eq!(job.sample_ms, 1_750);
         assert_eq!(job.generated_at_ms, 80_001);
         assert_eq!(job.attempt, 1);
-        assert_eq!(session.signature_timeline.all_attempts.len(), 1);
+        assert_eq!(session.signature_timeline.archived_attempt_count, 1);
         assert_eq!(
-            session.signature_timeline.all_attempts[0][0].bytes,
-            job.signature
+            session.signature_timeline.archived_signature_bytes,
+            job.signature.len()
         );
         assert_eq!(session.signature_timeline.pick_last_of_type(0), None);
         assert_eq!(
@@ -2563,7 +2602,7 @@ mod tests {
         session.push_i16(&first_cycle[..28_000]).unwrap();
         let first = session.poll(0).unwrap().unwrap();
         assert_eq!(first.sample_ms, 1_750);
-        assert_eq!(session.signature_timeline.all_attempts.len(), 1);
+        assert_eq!(session.signature_timeline.archived_attempt_count, 1);
         assert!(session.signature_timeline.current_attempt.is_empty());
         session.push_i16(&first_cycle[28_000..]).unwrap();
         session
@@ -2580,7 +2619,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        assert_eq!(session.signature_timeline.all_attempts.len(), 1);
+        assert_eq!(session.signature_timeline.archived_attempt_count, 1);
         assert!(session.signature_timeline.current_attempt.is_empty());
         assert_eq!(
             session.status(),
@@ -2595,8 +2634,8 @@ mod tests {
         session.push_i16_at(&next_cycle, 12_000).unwrap();
         let second = session.poll(12_000).unwrap().unwrap();
         assert_eq!(second.sample_ms, 6_000);
-        assert_eq!(session.signature_timeline.all_attempts.len(), 2);
-        assert_eq!(session.signature_timeline.all_attempts[0].len(), 1);
+        assert_eq!(session.signature_timeline.archived_attempt_count, 2);
+        assert_eq!(session.signature_timeline.archived_signature_count, 2);
         assert!(session.signature_timeline.current_attempt.is_empty());
         assert_eq!(session.pending_restart_times_ms, [12_100]);
 
@@ -2877,7 +2916,7 @@ mod tests {
         session.push_i16(&pcm(28_000)).unwrap();
         let first = session.poll(1_000).unwrap().unwrap();
         assert_eq!(first.sample_ms, 1_750);
-        assert_eq!(session.signature_timeline.all_attempts.len(), 1);
+        assert_eq!(session.signature_timeline.archived_attempt_count, 1);
         assert!(session.signature_timeline.current_attempt.is_empty());
 
         // Static ARM64: keepTaggingAfterAMatch is true for TaggingType 2.
@@ -2890,7 +2929,7 @@ mod tests {
                 1_250,
             )
             .unwrap();
-        assert_eq!(session.signature_timeline.all_attempts.len(), 1);
+        assert_eq!(session.signature_timeline.archived_attempt_count, 1);
         assert!(session.signature_timeline.current_attempt.is_empty());
         assert_eq!(
             session.status(),
@@ -2909,7 +2948,7 @@ mod tests {
             .expect("Type 2 continues after a match and starts another cycle");
         assert_eq!(second.attempt, 2);
         assert_eq!(second.sample_ms, 6_875);
-        assert_eq!(session.signature_timeline.all_attempts.len(), 2);
+        assert_eq!(session.signature_timeline.archived_attempt_count, 2);
         assert!(session.signature_timeline.current_attempt.is_empty());
     }
 
@@ -3367,10 +3406,10 @@ mod tests {
         assert_eq!(followup.sample_ms, 3_000);
         assert_eq!(followup.generated_at_ms, 4_000);
         assert!(session.take_post_stop_retry_job().is_none());
-        assert_eq!(session.signature_timeline.all_attempts.len(), 1);
+        assert_eq!(session.signature_timeline.archived_attempt_count, 1);
         assert_eq!(
-            session.signature_timeline.all_attempts[0][0].bytes,
-            first.signature
+            session.signature_timeline.archived_signature_bytes,
+            first.signature.len()
         );
         assert_eq!(session.signature_timeline.current_attempt.len(), 1);
         assert_eq!(
@@ -4064,7 +4103,7 @@ mod tests {
         );
         assert_eq!(session.pending_restart_times_ms, [12_000]);
         assert_eq!(session.next_signature_target_frames, None);
-        assert_eq!(session.signature_timeline.all_attempts.len(), 1);
+        assert_eq!(session.signature_timeline.archived_attempt_count, 1);
         assert!(session.signature_timeline.current_attempt.is_empty());
 
         session.push_i16_at(&to_maximum, 600).unwrap();
@@ -4239,10 +4278,10 @@ mod tests {
         let retry = session.poll(10).unwrap().unwrap();
         assert_eq!(retry.sample_ms, 2_500);
         assert_eq!(retry.generated_at_ms, 10);
-        assert_eq!(session.signature_timeline.all_attempts.len(), 1);
+        assert_eq!(session.signature_timeline.archived_attempt_count, 1);
         assert_eq!(
-            session.signature_timeline.all_attempts[0][0].bytes,
-            first.signature
+            session.signature_timeline.archived_signature_bytes,
+            first.signature.len()
         );
         assert_eq!(session.signature_timeline.current_attempt.len(), 1);
         assert_eq!(

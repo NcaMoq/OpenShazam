@@ -2,7 +2,7 @@
 
 use std::{env, io, path::Path, process::ExitCode};
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 use std::io::BufRead;
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -420,18 +420,109 @@ fn qpc_timestamp_to_unix_ms(
     current_unix_ms.checked_sub(elapsed_ms)
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ManualTriggerRead {
+    Enter,
+    EndOfInput,
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ManualTriggerSignal {
+    Enter,
+    EndOfInput,
+    InputError(String),
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ManualTriggerPoll {
+    Pending,
+    Started,
+    Ended,
+    InputError(String),
+    Cancelled,
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn read_manual_trigger<R: BufRead>(reader: &mut R) -> io::Result<ManualTriggerRead> {
+    let mut line = String::new();
+    let bytes_read = reader.read_line(&mut line)?;
+    if bytes_read > 0 && line.ends_with('\n') {
+        Ok(ManualTriggerRead::Enter)
+    } else {
+        Ok(ManualTriggerRead::EndOfInput)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn classify_manual_trigger_poll(
+    cancelled: bool,
+    received: Result<ManualTriggerSignal, std::sync::mpsc::TryRecvError>,
+) -> ManualTriggerPoll {
+    if cancelled {
+        return ManualTriggerPoll::Cancelled;
+    }
+    match received {
+        Ok(ManualTriggerSignal::Enter) => ManualTriggerPoll::Started,
+        Ok(ManualTriggerSignal::EndOfInput) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            ManualTriggerPoll::Ended
+        }
+        Ok(ManualTriggerSignal::InputError(error)) => ManualTriggerPoll::InputError(error),
+        Err(std::sync::mpsc::TryRecvError::Empty) => ManualTriggerPoll::Pending,
+    }
+}
+
+#[cfg(windows)]
+fn poll_manual_trigger(
+    receiver: &std::sync::mpsc::Receiver<ManualTriggerSignal>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Option<bool>, io::Error> {
+    match classify_manual_trigger_poll(
+        cancelled.load(std::sync::atomic::Ordering::Acquire),
+        receiver.try_recv(),
+    ) {
+        ManualTriggerPoll::Pending => Ok(None),
+        ManualTriggerPoll::Started => Ok(Some(true)),
+        ManualTriggerPoll::Ended => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "manual recognition trigger input closed",
+        )),
+        ManualTriggerPoll::InputError(error) => Err(io::Error::other(error)),
+        ManualTriggerPoll::Cancelled => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "cancelled while waiting for manual recognition trigger",
+        )),
+    }
+}
+
 #[cfg(any(windows, target_os = "macos"))]
-fn spawn_manual_trigger_receiver() -> std::sync::mpsc::Receiver<Result<(), String>> {
+fn spawn_manual_trigger_receiver() -> std::sync::mpsc::Receiver<ManualTriggerSignal> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut line = String::new();
-        let result = io::stdin()
-            .read_line(&mut line)
-            .map(|_| ())
-            .map_err(|error| error.to_string());
-        let _ = sender.send(result);
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        let signal = match read_manual_trigger(&mut stdin) {
+            Ok(ManualTriggerRead::Enter) => ManualTriggerSignal::Enter,
+            Ok(ManualTriggerRead::EndOfInput) => ManualTriggerSignal::EndOfInput,
+            Err(error) => ManualTriggerSignal::InputError(error.to_string()),
+        };
+        let _ = sender.send(signal);
     });
     receiver
+}
+
+#[cfg(any(windows, test))]
+fn ignore_expected_timeout<E>(
+    result: Result<(), E>,
+    is_timeout: impl FnOnce(&E) -> bool,
+) -> Result<(), E> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_timeout(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(windows)]
@@ -890,13 +981,27 @@ fn capture_loopback_signature(
     let mut accumulator = CaptureAccumulator::new_for_rate(sample_rate, frames)?;
     let event = audio_client.set_get_eventhandle()?;
     let capture: AudioCaptureClient = audio_client.get_audiocaptureclient()?;
+    let mut packet_scratch = match audio_client.get_buffer_size() {
+        Ok(buffer_frames) => WasapiPacketScratch::with_capacity(
+            buffer_frames as usize,
+            channels,
+            format.get_blockalign() as usize,
+        )?,
+        Err(_) => WasapiPacketScratch::default(),
+    };
 
     println!(
         "Capturing {capture_seconds}s of system playback from {device_name:?} at {sample_rate} Hz, {channels} channel(s)..."
     );
     audio_client.start_stream()?;
-    let capture_result =
-        capture_loopback_frames(&capture, &event, &format, channels, &mut accumulator);
+    let capture_result = capture_loopback_frames(
+        &capture,
+        &event,
+        &format,
+        channels,
+        &mut accumulator,
+        &mut packet_scratch,
+    );
     let stop_result = audio_client.stop_stream();
     capture_result?;
     stop_result?;
@@ -987,6 +1092,14 @@ fn recognize_loopback_progressive(
     let channels = usize::from(format.get_nchannels());
     let event = audio_client.set_get_eventhandle()?;
     let capture: AudioCaptureClient = audio_client.get_audiocaptureclient()?;
+    let mut packet_scratch = match audio_client.get_buffer_size() {
+        Ok(buffer_frames) => WasapiPacketScratch::with_capacity(
+            buffer_frames as usize,
+            channels,
+            format.get_blockalign() as usize,
+        )?,
+        Err(_) => WasapiPacketScratch::default(),
+    };
     let audio_clock = audio_client.get_audioclock().ok();
     if audio_clock.is_none() {
         eprintln!(
@@ -1065,6 +1178,7 @@ fn recognize_loopback_progressive(
                 &mut timestamp_anchor,
                 audio_clock.as_ref(),
                 &mut received_audio_packet,
+                &mut packet_scratch,
             )?;
         }
     })();
@@ -1189,6 +1303,7 @@ fn recognize_loopback_progressive(
             &mut timestamp_anchor,
             audio_clock.as_ref(),
             &mut received_audio_packet,
+            &mut packet_scratch,
         )
         .map(|_| None);
         match result {
@@ -1206,18 +1321,21 @@ fn recognize_loopback_progressive(
             jsonl_output,
             format!("WASAPI rolling pre-record buffer is active; press Enter to start manual recognition (retaining up to {pre_record_capacity_ms} ms; {pre_record_capacity_mode} capacity)."),
         );
+        let manual_trigger_receiver = spawn_manual_trigger_receiver();
         match capture_wasapi_prerecord(
             &event,
             &capture,
             &format,
             channels,
             sample_rate,
+            &manual_trigger_receiver,
             preroll,
             &mut preroll_start_timestamp_ms,
             &mut timestamp_anchor,
             audio_clock.as_ref(),
             &cancelled,
             &mut received_audio_packet,
+            &mut packet_scratch,
         ) {
             Ok(samples) => Some(samples),
             Err(error) => {
@@ -1288,7 +1406,9 @@ fn recognize_loopback_progressive(
                 break;
             }
 
-            event.wait_for_event(100)?;
+            ignore_expected_timeout(event.wait_for_event(100), |error| {
+                matches!(error, wasapi::WasapiError::EventTimeout)
+            })?;
             service_windows_progressive(
                 &mut session,
                 &configuration,
@@ -1319,8 +1439,8 @@ fn recognize_loopback_progressive(
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "packet too large")
                     })?;
-                let mut bytes = vec![0u8; byte_count];
-                let (read_frames, info) = capture.read_from_device(&mut bytes)?;
+                packet_scratch.bytes.resize(byte_count, 0);
+                let (read_frames, info) = capture.read_from_device(&mut packet_scratch.bytes)?;
                 if info.flags.data_discontinuity && received_audio_packet {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1340,27 +1460,36 @@ fn recognize_loopback_progressive(
                         info.timestamp,
                         info.flags.timestamp_error,
                     );
-                    let mono = if info.flags.silent {
-                        vec![0.0; frame_count]
+                    if info.flags.silent {
+                        packet_scratch.mono.resize(frame_count, 0.0);
                     } else {
                         let byte_count = frame_count
                             .checked_mul(format.get_blockalign() as usize)
                             .ok_or_else(|| {
                                 io::Error::new(io::ErrorKind::InvalidData, "packet too large")
                             })?;
-                        let packet_bytes = bytes.get(..byte_count).ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "WASAPI returned fewer bytes than reported frames",
-                            )
-                        })?;
-                        let interleaved =
-                            decode_wasapi_interleaved(packet_bytes, frame_count, &format)?;
-                        downmix_interleaved_f32(&interleaved, channels)?
-                    };
+                        let packet_bytes =
+                            packet_scratch.bytes.get(..byte_count).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "WASAPI returned fewer bytes than reported frames",
+                                )
+                            })?;
+                        decode_wasapi_interleaved_into(
+                            packet_bytes,
+                            frame_count,
+                            &format,
+                            &mut packet_scratch.interleaved,
+                        )?;
+                        downmix_interleaved_f32_into(
+                            &packet_scratch.interleaved,
+                            channels,
+                            &mut packet_scratch.mono,
+                        )?;
+                    }
                     let report = session
                         .push_f32_at_with_source_timestamp_ns(
-                            &mono,
+                            &packet_scratch.mono,
                             elapsed_ns(started),
                             source_timestamp_ms,
                         )
@@ -1549,6 +1678,44 @@ fn push_timed_preroll(
 }
 
 #[cfg(windows)]
+#[derive(Default)]
+struct WasapiPacketScratch {
+    bytes: Vec<u8>,
+    interleaved: Vec<f32>,
+    mono: Vec<f32>,
+}
+
+#[cfg(windows)]
+impl WasapiPacketScratch {
+    fn with_capacity(
+        frames: usize,
+        channels: usize,
+        block_align: usize,
+    ) -> Result<Self, io::Error> {
+        let byte_capacity = frames.checked_mul(block_align).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "WASAPI buffer too large")
+        })?;
+        let sample_capacity = frames.checked_mul(channels).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "WASAPI buffer too large")
+        })?;
+        let mut scratch = Self::default();
+        scratch
+            .bytes
+            .try_reserve_exact(byte_capacity)
+            .map_err(io::Error::other)?;
+        scratch
+            .interleaved
+            .try_reserve_exact(sample_capacity)
+            .map_err(io::Error::other)?;
+        scratch
+            .mono
+            .try_reserve_exact(frames)
+            .map_err(io::Error::other)?;
+        Ok(scratch)
+    }
+}
+
+#[cfg(windows)]
 // Keep WASAPI handles and rolling timestamp state explicit at this adapter boundary.
 #[allow(clippy::too_many_arguments)]
 fn capture_wasapi_prerecord(
@@ -1557,41 +1724,22 @@ fn capture_wasapi_prerecord(
     format: &wasapi::WaveFormat,
     channels: usize,
     sample_rate: u32,
+    trigger_receiver: &std::sync::mpsc::Receiver<ManualTriggerSignal>,
     mut ring: RollingPcmBuffer<f32>,
     preroll_start_timestamp_ms: &mut Option<u64>,
     timestamp_anchor: &mut CaptureTimestampAnchor,
     audio_clock: Option<&wasapi::AudioClock>,
     cancelled: &AtomicBool,
     received_audio_packet: &mut bool,
+    packet_scratch: &mut WasapiPacketScratch,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let trigger_receiver = spawn_manual_trigger_receiver();
     loop {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "cancelled while waiting for manual recognition trigger",
-            )
-            .into());
-        }
-
-        let mut triggered = match trigger_receiver.try_recv() {
-            Ok(Ok(())) => true,
-            Ok(Err(error)) => return Err(io::Error::other(error).into()),
-            Err(TryRecvError::Disconnected) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "manual recognition trigger input closed",
-                )
-                .into());
-            }
-            Err(TryRecvError::Empty) => false,
-        };
+        let mut triggered = poll_manual_trigger(trigger_receiver, cancelled)?.unwrap_or(false);
 
         if !triggered {
-            match event.wait_for_event(100) {
-                Ok(()) | Err(wasapi::WasapiError::EventTimeout) => {}
-                Err(error) => return Err(error.into()),
-            }
+            ignore_expected_timeout(event.wait_for_event(100), |error| {
+                matches!(error, wasapi::WasapiError::EventTimeout)
+            })?;
         }
 
         append_wasapi_packets(
@@ -1604,21 +1752,11 @@ fn capture_wasapi_prerecord(
             timestamp_anchor,
             audio_clock,
             received_audio_packet,
+            packet_scratch,
         )?;
 
         if !triggered {
-            triggered = match trigger_receiver.try_recv() {
-                Ok(Ok(())) => true,
-                Ok(Err(error)) => return Err(io::Error::other(error).into()),
-                Err(TryRecvError::Disconnected) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "manual recognition trigger input closed",
-                    )
-                    .into());
-                }
-                Err(TryRecvError::Empty) => false,
-            };
+            triggered = poll_manual_trigger(trigger_receiver, cancelled)?.unwrap_or(false);
         }
         if triggered {
             return Ok(ring.into_samples());
@@ -1639,6 +1777,7 @@ fn append_wasapi_packets(
     timestamp_anchor: &mut CaptureTimestampAnchor,
     audio_clock: Option<&wasapi::AudioClock>,
     received_audio_packet: &mut bool,
+    packet_scratch: &mut WasapiPacketScratch,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut packet_available = false;
     loop {
@@ -1656,8 +1795,8 @@ fn append_wasapi_packets(
         let byte_count = (packet_frames as usize)
             .checked_mul(format.get_blockalign() as usize)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "packet too large"))?;
-        let mut bytes = vec![0u8; byte_count];
-        let (read_frames, info) = capture.read_from_device(&mut bytes)?;
+        packet_scratch.bytes.resize(byte_count, 0);
+        let (read_frames, info) = capture.read_from_device(&mut packet_scratch.bytes)?;
         if info.flags.data_discontinuity && *received_audio_packet {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1676,25 +1815,34 @@ fn append_wasapi_packets(
         );
         *received_audio_packet = true;
         let frame_count = read_frames as usize;
-        let mono = if info.flags.silent {
-            vec![0.0; frame_count]
+        if info.flags.silent {
+            packet_scratch.mono.resize(frame_count, 0.0);
         } else {
             let byte_count = frame_count
                 .checked_mul(format.get_blockalign() as usize)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "packet too large"))?;
-            let packet_bytes = bytes.get(..byte_count).ok_or_else(|| {
+            let packet_bytes = packet_scratch.bytes.get(..byte_count).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "WASAPI returned fewer bytes than reported frames",
                 )
             })?;
-            let interleaved = decode_wasapi_interleaved(packet_bytes, frame_count, format)?;
-            downmix_interleaved_f32(&interleaved, channels)?
-        };
+            decode_wasapi_interleaved_into(
+                packet_bytes,
+                frame_count,
+                format,
+                &mut packet_scratch.interleaved,
+            )?;
+            downmix_interleaved_f32_into(
+                &packet_scratch.interleaved,
+                channels,
+                &mut packet_scratch.mono,
+            )?;
+        }
         push_timed_preroll(
             ring,
             preroll_start_timestamp_ms,
-            &mono,
+            &packet_scratch.mono,
             source_timestamp_ms,
             sample_rate,
         );
@@ -2158,26 +2306,39 @@ struct WindowsRecognitionCompletion {
     error: Option<&'static str>,
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn downmix_interleaved_f32(samples: &[f32], channels: usize) -> Result<Vec<f32>, io::Error> {
+    let mut mono = Vec::new();
+    downmix_interleaved_f32_into(samples, channels, &mut mono)?;
+    Ok(mono)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn downmix_interleaved_f32_into(
+    samples: &[f32],
+    channels: usize,
+    output: &mut Vec<f32>,
+) -> Result<(), io::Error> {
     if channels == 0 || samples.len() % channels != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "capture packet is not a whole number of interleaved frames",
         ));
     }
-    samples
-        .chunks_exact(channels)
-        .map(|frame| {
-            if frame.iter().any(|sample| !sample.is_finite()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "capture packet contains a non-finite sample",
-                ));
-            }
-            Ok(frame.iter().copied().sum::<f32>() / channels as f32)
-        })
-        .collect()
+    output.clear();
+    output
+        .try_reserve(samples.len() / channels)
+        .map_err(io::Error::other)?;
+    for frame in samples.chunks_exact(channels) {
+        if frame.iter().any(|sample| !sample.is_finite()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "capture packet contains a non-finite sample",
+            ));
+        }
+        output.push(frame.iter().copied().sum::<f32>() / channels as f32);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2219,12 +2380,24 @@ fn sample_rate_supported(sample_rate: u32) -> bool {
     )
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn decode_wasapi_interleaved(
     bytes: &[u8],
     frames: usize,
     format: &wasapi::WaveFormat,
 ) -> io::Result<Vec<f32>> {
+    let mut output = Vec::new();
+    decode_wasapi_interleaved_into(bytes, frames, format, &mut output)?;
+    Ok(output)
+}
+
+#[cfg(windows)]
+fn decode_wasapi_interleaved_into(
+    bytes: &[u8],
+    frames: usize,
+    format: &wasapi::WaveFormat,
+    output: &mut Vec<f32>,
+) -> io::Result<()> {
     use wasapi::SampleType;
 
     if !format_usable_by_sigx(format) {
@@ -2254,50 +2427,47 @@ fn decode_wasapi_interleaved(
             format!("unsupported WASAPI sample type: {error:?}"),
         )
     })?;
-    data.chunks_exact(sample_bytes)
-        .map(|chunk| {
-            let sample = match (sample_type, bits) {
-                (SampleType::Float, 32) => {
-                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                }
-                (SampleType::Float, 64) => {
-                    f64::from_le_bytes(chunk.try_into().expect("validated 64-bit float sample"))
-                        as f32
-                }
-                (SampleType::Int, 8) => (i16::from(chunk[0]) - 128) as f32 / 128.0,
-                (SampleType::Int, 16) => i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32_768.0,
-                (SampleType::Int, 24) => {
-                    let packed = i32::from(chunk[0])
-                        | (i32::from(chunk[1]) << 8)
-                        | (i32::from(chunk[2]) << 16);
-                    let signed = if packed & 0x80_0000 != 0 {
-                        packed | !0xFF_FFFF
-                    } else {
-                        packed
-                    };
-                    signed as f32 / 8_388_608.0
-                }
-                (SampleType::Int, 32) => {
-                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32
-                        / 2_147_483_648.0
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "unsupported WASAPI PCM container width",
-                    ));
-                }
-            };
-            if sample.is_finite() {
-                Ok(sample.clamp(-1.0, 1.0))
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "WASAPI packet contains a non-finite sample",
-                ))
+    output.clear();
+    output.try_reserve(sample_count).map_err(io::Error::other)?;
+    for chunk in data.chunks_exact(sample_bytes) {
+        let sample = match (sample_type, bits) {
+            (SampleType::Float, 32) => f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            (SampleType::Float, 64) => {
+                f64::from_le_bytes(chunk.try_into().expect("validated 64-bit float sample")) as f32
             }
-        })
-        .collect()
+            (SampleType::Int, 8) => (i16::from(chunk[0]) - 128) as f32 / 128.0,
+            (SampleType::Int, 16) => i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32_768.0,
+            (SampleType::Int, 24) => {
+                let packed =
+                    i32::from(chunk[0]) | (i32::from(chunk[1]) << 8) | (i32::from(chunk[2]) << 16);
+                let signed = if packed & 0x80_0000 != 0 {
+                    packed | !0xFF_FFFF
+                } else {
+                    packed
+                };
+                signed as f32 / 8_388_608.0
+            }
+            (SampleType::Int, 32) => {
+                i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32
+                    / 2_147_483_648.0
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "unsupported WASAPI PCM container width",
+                ));
+            }
+        };
+        if sample.is_finite() {
+            output.push(sample.clamp(-1.0, 1.0));
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WASAPI packet contains a non-finite sample",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2307,6 +2477,7 @@ fn capture_loopback_frames(
     format: &wasapi::WaveFormat,
     channels: usize,
     accumulator: &mut CaptureAccumulator,
+    packet_scratch: &mut WasapiPacketScratch,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut empty_wakeups = 0usize;
     let mut received_audio_packet = false;
@@ -2337,8 +2508,8 @@ fn capture_loopback_frames(
             let byte_count = (packet_frames as usize)
                 .checked_mul(format.get_blockalign() as usize)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "packet too large"))?;
-            let mut bytes = vec![0u8; byte_count];
-            let (read_frames, info) = capture.read_from_device(&mut bytes)?;
+            packet_scratch.bytes.resize(byte_count, 0);
+            let (read_frames, info) = capture.read_from_device(&mut packet_scratch.bytes)?;
             if info.flags.data_discontinuity && received_audio_packet {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -2353,20 +2524,29 @@ fn capture_loopback_frames(
 
             let frame_count = (read_frames as usize).min(accumulator.remaining_frames());
             if info.flags.silent {
-                accumulator.push_interleaved_f32(&vec![0.0; frame_count * channels], channels)?;
+                let sample_count = frame_count.checked_mul(channels).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "capture packet too large")
+                })?;
+                packet_scratch.interleaved.resize(sample_count, 0.0);
+                accumulator.push_interleaved_f32(&packet_scratch.interleaved, channels)?;
                 continue;
             }
             let byte_count = frame_count
                 .checked_mul(format.get_blockalign() as usize)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "packet too large"))?;
-            let packet_bytes = bytes.get(..byte_count).ok_or_else(|| {
+            let packet_bytes = packet_scratch.bytes.get(..byte_count).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "WASAPI returned fewer bytes than reported frames",
                 )
             })?;
-            let samples = decode_wasapi_interleaved(packet_bytes, frame_count, format)?;
-            accumulator.push_interleaved_f32(&samples, channels)?;
+            decode_wasapi_interleaved_into(
+                packet_bytes,
+                frame_count,
+                format,
+                &mut packet_scratch.interleaved,
+            )?;
+            accumulator.push_interleaved_f32(&packet_scratch.interleaved, channels)?;
         }
     }
 
@@ -2378,8 +2558,10 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     use super::notify_after_retry_dispatch_ack;
     use super::{
-        decode_mono_f32le, manual_completion_is_normal, milliseconds_for_frames,
-        parse_capture_seconds, qpc_timestamp_to_unix_ms, CaptureAccumulator, CAPTURE_RATE,
+        classify_manual_trigger_poll, decode_mono_f32le, ignore_expected_timeout,
+        manual_completion_is_normal, milliseconds_for_frames, parse_capture_seconds,
+        qpc_timestamp_to_unix_ms, read_manual_trigger, CaptureAccumulator, ManualTriggerPoll,
+        ManualTriggerRead, ManualTriggerSignal, CAPTURE_RATE,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use super::{parse_progressive_capture_options, NativeContextState, ProgressiveCaptureMode};
@@ -2389,6 +2571,97 @@ mod tests {
     use sigx_core::{Config, SigX};
     use sigx_format::Signature;
     use std::cell::RefCell;
+
+    #[test]
+    fn wasapi_event_timeout_is_a_wakeup_not_a_capture_failure() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum WaitError {
+            Timeout,
+            DeviceFailure,
+        }
+
+        assert_eq!(
+            ignore_expected_timeout::<WaitError>(Ok(()), |_| false),
+            Ok(())
+        );
+        assert_eq!(
+            ignore_expected_timeout(Err(WaitError::Timeout), |error| {
+                *error == WaitError::Timeout
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            ignore_expected_timeout(Err(WaitError::DeviceFailure), |error| {
+                *error == WaitError::Timeout
+            }),
+            Err(WaitError::DeviceFailure)
+        );
+    }
+
+    #[test]
+    fn manual_trigger_distinguishes_enter_eof_partial_input_and_read_error() {
+        let mut enter = std::io::Cursor::new(b"\n".as_slice());
+        assert_eq!(
+            read_manual_trigger(&mut enter).unwrap(),
+            ManualTriggerRead::Enter
+        );
+
+        let mut eof = std::io::Cursor::new(Vec::<u8>::new());
+        assert_eq!(
+            read_manual_trigger(&mut eof).unwrap(),
+            ManualTriggerRead::EndOfInput
+        );
+
+        let mut partial = std::io::Cursor::new(b"not-enter".as_slice());
+        assert_eq!(
+            read_manual_trigger(&mut partial).unwrap(),
+            ManualTriggerRead::EndOfInput
+        );
+
+        struct FailingReader;
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic stdin read error"))
+            }
+        }
+        let mut failing = std::io::BufReader::new(FailingReader);
+        assert_eq!(
+            read_manual_trigger(&mut failing).unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn manual_trigger_poll_handles_pending_eof_errors_and_cancellation() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        assert_eq!(
+            classify_manual_trigger_poll(false, receiver.try_recv()),
+            ManualTriggerPoll::Pending
+        );
+
+        sender.send(ManualTriggerSignal::Enter).unwrap();
+        assert_eq!(
+            classify_manual_trigger_poll(false, receiver.try_recv()),
+            ManualTriggerPoll::Started
+        );
+        sender.send(ManualTriggerSignal::EndOfInput).unwrap();
+        assert_eq!(
+            classify_manual_trigger_poll(false, receiver.try_recv()),
+            ManualTriggerPoll::Ended
+        );
+        sender
+            .send(ManualTriggerSignal::InputError("read failed".into()))
+            .unwrap();
+        assert_eq!(
+            classify_manual_trigger_poll(false, receiver.try_recv()),
+            ManualTriggerPoll::InputError("read failed".into())
+        );
+        sender.send(ManualTriggerSignal::Enter).unwrap();
+        assert_eq!(
+            classify_manual_trigger_poll(true, receiver.try_recv()),
+            ManualTriggerPoll::Cancelled
+        );
+    }
 
     #[cfg(any(windows, target_os = "macos"))]
     #[test]
@@ -2550,6 +2823,18 @@ mod tests {
             .flat_map(|sample| sample.to_le_bytes())
             .collect();
         assert_eq!(decode_mono_f32le(&bytes).unwrap(), samples);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn reused_downmix_buffer_preserves_sample_results() {
+        let interleaved = [0.25, 0.5, -0.25, 0.75, 1.0, -1.0];
+        let mut reused = vec![9.0; 16];
+        super::downmix_interleaved_f32_into(&interleaved, 2, &mut reused).unwrap();
+        assert_eq!(reused, [0.375, 0.25, 0.0]);
+
+        super::downmix_interleaved_f32_into(&[0.5, -0.5], 2, &mut reused).unwrap();
+        assert_eq!(reused, [0.0]);
     }
 
     #[cfg(windows)]
