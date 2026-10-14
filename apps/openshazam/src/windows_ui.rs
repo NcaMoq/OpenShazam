@@ -332,6 +332,7 @@ struct Track {
     #[allow(dead_code)]
     // Retained alongside the Config-resolved page URL for the presentation model.
     track_key: Option<String>,
+    config_generation: Option<u64>,
     page_url: Option<ValidatedWebTrackUrl>,
 }
 
@@ -6708,10 +6709,10 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
             return MainHit::CloseResult;
         }
         if let MainPhase::Matched { track, .. } = &app.phase {
-            if track.page_url.is_some() {
-                if result_card_link_hit(x, local_y, body_top, close, None) {
-                    return MainHit::OpenTrack(track.display_id);
-                }
+            if resolve_track_page_url(track, &app.ui_configs).is_some()
+                && result_card_link_hit(x, local_y, body_top, close, None)
+            {
+                return MainHit::OpenTrack(track.display_id);
             }
         }
         if matches!(
@@ -6735,7 +6736,7 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
     let history_top = body_top + TOP_HEIGHT as f32;
     let now = Instant::now();
     for (index, track) in app.history.iter().enumerate() {
-        if track.page_url.is_none() {
+        if resolve_track_page_url(track, &app.ui_configs).is_none() {
             continue;
         }
         let row_top = history_row_top(
@@ -7116,6 +7117,7 @@ fn apply_recognition_event(app: &mut AppState, event: RecognitionEvent, mode: Ca
                     };
                     app.ui_configs.remove(&oldest);
                 }
+                refresh_track_page_urls(app);
             }
             true
         }
@@ -7223,6 +7225,7 @@ fn reconcile_session_snapshot(app: &mut AppState, session: &RecognitionSessionSn
     let mut changed = false;
     if let Some(config) = session.config.as_ref() {
         app.ui_configs.insert(config.generation, config.clone());
+        refresh_track_page_urls(app);
     }
     if !ui_session.result_presented && ui_session.mode == CaptureMode::Manual {
         if let Some(UiRecognitionEvent::Manual(NativeManualUiEvent::Result(result))) =
@@ -7332,6 +7335,15 @@ fn show_controller_match(
                 track_key.as_deref(),
             )
         });
+    if page_url.is_none() {
+        let config = config_generation.and_then(|generation| app.ui_configs.get(&generation));
+        eprintln!(
+            "OpenShazam Shazam link disabled: config_snapshot={}, webtrackurl={}, track_key={}",
+            config.is_some(),
+            config.is_some_and(|config| config.web_track_url_template.is_some()),
+            track_key.is_some(),
+        );
+    }
     let recognized_at_utc = SystemTime::now();
     let track = Track {
         display_id,
@@ -7345,6 +7357,7 @@ fn show_controller_match(
         hq_artwork_url: metadata.and_then(|metadata| metadata.hq_artwork_url.clone()),
         background_artwork_url: metadata.and_then(|metadata| metadata.background_image_url.clone()),
         track_key,
+        config_generation,
         page_url,
     };
     let previous_count = app.history.len();
@@ -7495,7 +7508,7 @@ fn resolve_page_link(
     Some(ValidatedWebTrackUrl(resolved))
 }
 
-unsafe fn open_track_page(hwnd: HWND, url: &ValidatedWebTrackUrl) -> bool {
+unsafe fn open_track_page(hwnd: HWND, url: &ValidatedWebTrackUrl) -> windows::core::Result<()> {
     let verb = wide("open");
     let target = wide(&url.0);
     let mut execute = SHELLEXECUTEINFOW {
@@ -7507,23 +7520,74 @@ unsafe fn open_track_page(hwnd: HWND, url: &ValidatedWebTrackUrl) -> bool {
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
-    ShellExecuteExW(&mut execute).is_ok()
+    ShellExecuteExW(&mut execute)
 }
 
-fn page_url_for_display_id<'a>(
+fn track_for_display_id<'a>(
     history: &'a [Track],
     current_result: Option<&'a Track>,
     display_id: u64,
-) -> Option<&'a ValidatedWebTrackUrl> {
+) -> Option<&'a Track> {
     history
         .iter()
         .find(|track| track.display_id == display_id)
-        .and_then(|track| track.page_url.as_ref())
-        .or_else(|| {
-            current_result
-                .filter(|track| track.display_id == display_id)
-                .and_then(|track| track.page_url.as_ref())
-        })
+        .or_else(|| current_result.filter(|track| track.display_id == display_id))
+}
+
+fn resolve_track_page_url(
+    track: &Track,
+    ui_configs: &HashMap<u64, UiConfigSnapshot>,
+) -> Option<ValidatedWebTrackUrl> {
+    track.page_url.clone().or_else(|| {
+        track
+            .config_generation
+            .and_then(|generation| ui_configs.get(&generation))
+            .and_then(|config| {
+                resolve_page_link(
+                    config.web_track_url_template.as_deref(),
+                    track.track_key.as_deref(),
+                )
+            })
+    })
+}
+
+fn refresh_track_page_urls(app: &mut AppState) {
+    for track in &mut app.history {
+        if track.page_url.is_none() {
+            track.page_url = track
+                .config_generation
+                .and_then(|generation| app.ui_configs.get(&generation))
+                .and_then(|config| {
+                    resolve_page_link(
+                        config.web_track_url_template.as_deref(),
+                        track.track_key.as_deref(),
+                    )
+                });
+        }
+    }
+    if let MainPhase::Matched { track, .. } = &mut app.phase {
+        if track.page_url.is_none() {
+            track.page_url = track
+                .config_generation
+                .and_then(|generation| app.ui_configs.get(&generation))
+                .and_then(|config| {
+                    resolve_page_link(
+                        config.web_track_url_template.as_deref(),
+                        track.track_key.as_deref(),
+                    )
+                });
+        }
+    }
+}
+
+fn page_url_for_display_id(
+    history: &[Track],
+    current_result: Option<&Track>,
+    display_id: u64,
+    ui_configs: &HashMap<u64, UiConfigSnapshot>,
+) -> Option<ValidatedWebTrackUrl> {
+    track_for_display_id(history, current_result, display_id)
+        .and_then(|track| resolve_track_page_url(track, ui_configs))
 }
 
 fn fetch_and_decode_artwork(url: &str) -> Result<ArtworkPixels, String> {
@@ -8409,8 +8473,11 @@ unsafe fn process_main_hit(app: &mut AppState, hit: MainHit) {
                 MainPhase::Matched { track, .. } => Some(track),
                 _ => None,
             };
-            if let Some(url) = page_url_for_display_id(&app.history, current_result, display_id) {
-                if !unsafe { open_track_page(app.main_hwnd, &url) } {
+            if let Some(url) =
+                page_url_for_display_id(&app.history, current_result, display_id, &app.ui_configs)
+            {
+                if let Err(error) = unsafe { open_track_page(app.main_hwnd, &url) } {
+                    eprintln!("OpenShazam could not launch the Shazam page: {error}");
                     app.message = Some("Could not open the track page".to_owned());
                 }
             }
@@ -9260,7 +9327,7 @@ mod tests {
         visible_history_row_hit, ArrowEdge, ArtworkSource, CaptureMode, CompositionRootLayer,
         CompositionSceneLayer, HeaderFillScope, HistoryMutationEvent, HistoryMutationTransition,
         HistoryTimestampSource, MainPhase, NoMatchIconCommand, ResultCardAdvance, ResultCardStage,
-        Theme, Track, UiLanguage, UiTextKey, ValidatedWebTrackUrl, WindowKind,
+        Theme, Track, UiConfigSnapshot, UiLanguage, UiTextKey, ValidatedWebTrackUrl, WindowKind,
         BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, FALLBACK_MATCH_DARK_PIXELS,
         FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE, HISTORY_HEIGHT,
         HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY,
@@ -9955,21 +10022,55 @@ mod tests {
             hq_artwork_url: None,
             background_artwork_url: None,
             track_key: None,
+            config_generation: None,
             page_url: Some(ValidatedWebTrackUrl(url.to_owned())),
         };
         let history_track = make_track(41, "https://www.shazam.com/track/history-41");
         let result_track = make_track(42, "https://www.shazam.com/track/result-42");
         let history = [history_track];
 
+        let configs = std::collections::HashMap::new();
         assert_eq!(
-            page_url_for_display_id(&history, Some(&result_track), 41).map(|url| url.0.as_str()),
-            Some("https://www.shazam.com/track/history-41")
+            page_url_for_display_id(&history, Some(&result_track), 41, &configs).map(|url| url.0),
+            Some("https://www.shazam.com/track/history-41".to_owned())
         );
         assert_eq!(
-            page_url_for_display_id(&history, Some(&result_track), 42).map(|url| url.0.as_str()),
-            Some("https://www.shazam.com/track/result-42")
+            page_url_for_display_id(&history, Some(&result_track), 42, &configs).map(|url| url.0),
+            Some("https://www.shazam.com/track/result-42".to_owned())
         );
-        assert!(page_url_for_display_id(&history, Some(&result_track), 99).is_none());
+        assert!(page_url_for_display_id(&history, Some(&result_track), 99, &configs).is_none());
+    }
+
+    #[test]
+    fn ui222_clicked_track_resolves_page_url_from_its_config_generation() {
+        let recognized_at = Instant::now();
+        let track = Track {
+            display_id: 51,
+            title: "track-51".to_owned(),
+            artist: "artist".to_owned(),
+            recognized_at,
+            recognized_at_utc: UNIX_EPOCH,
+            recognized_date_label: String::new(),
+            timestamp_source: HistoryTimestampSource::HostReceivedFallback,
+            artwork_url: None,
+            hq_artwork_url: None,
+            background_artwork_url: None,
+            track_key: Some("key-51".to_owned()),
+            config_generation: Some(91),
+            page_url: None,
+        };
+        let configs = std::collections::HashMap::from([(
+            91,
+            UiConfigSnapshot {
+                generation: 91,
+                web_track_url_template: Some("https://www.shazam.com/track/{trackid}".to_owned()),
+            },
+        )]);
+
+        assert_eq!(
+            page_url_for_display_id(&[], Some(&track), 51, &configs).map(|url| url.0),
+            Some("https://www.shazam.com/track/key-51".to_owned())
+        );
     }
 
     #[test]
@@ -10046,6 +10147,7 @@ mod tests {
                 hq_artwork_url: None,
                 background_artwork_url: None,
                 track_key: None,
+                config_generation: None,
                 page_url: None,
             },
             stage: ResultCardStage::Entering {
@@ -10079,6 +10181,7 @@ mod tests {
                 hq_artwork_url: None,
                 background_artwork_url: None,
                 track_key: None,
+                config_generation: None,
                 page_url: None,
             },
             stage: ResultCardStage::Exiting {
