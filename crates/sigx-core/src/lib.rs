@@ -45,6 +45,7 @@ pub struct SigX {
     config: Config,
     frames_seen: usize,
     dsp: StreamingDsp,
+    progressive_peak_history: Vec<SpectralPeak>,
 }
 
 /// The Mac Objective-C Float32 entry point multiplies every caller sample
@@ -79,12 +80,16 @@ impl SigX {
             config,
             frames_seen: 0,
             dsp,
+            progressive_peak_history: Vec::new(),
         })
     }
 
     pub fn push_i16(&mut self, samples: &[i16]) -> Result<(), Error> {
         self.reserve_frames(samples.len())?;
+        let pending_before = self.dsp.peaks().len();
         self.dsp.push_i16(samples).map_err(Error::Dsp)?;
+        self.progressive_peak_history
+            .extend_from_slice(&self.dsp.peaks()[pending_before..]);
         self.frames_seen += samples.len();
         Ok(())
     }
@@ -100,8 +105,24 @@ impl SigX {
             .iter()
             .map(|sample| *sample * NATIVE_FLOAT_INPUT_SCALE)
             .collect();
+        let pending_before = self.dsp.peaks().len();
         self.dsp.push_f32(&scaled).map_err(Error::Dsp)?;
+        self.progressive_peak_history
+            .extend_from_slice(&self.dsp.peaks()[pending_before..]);
         self.frames_seen += samples.len();
+        Ok(())
+    }
+
+    /// Increase the accepted streaming-input bound without resetting DSP
+    /// state. Native SignatureGenerator can replace its current frame target
+    /// after a Retry arrives while generation is still active.
+    pub fn extend_max_frames(&mut self, max_frames: usize) -> Result<(), Error> {
+        if max_frames < self.frames_seen {
+            return Err(Error::InvalidConfig(
+                "max_frames cannot be below frames already processed",
+            ));
+        }
+        self.config.max_frames = max_frames;
         Ok(())
     }
 
@@ -128,10 +149,12 @@ impl SigX {
     pub fn reset(&mut self) {
         self.frames_seen = 0;
         self.dsp.reset();
+        self.progressive_peak_history.clear();
     }
 
-    /// Drain the peaks produced by the connected DSP pipeline. This is an
-    /// intermediate diagnostic API; it is not yet the packed `.sig` format.
+    /// Drain peaks pending in the connected DSP pipeline. This diagnostic API
+    /// does not erase the separate cycle history used by Type-2 progressive
+    /// snapshots; a full `reset` starts a new history.
     pub fn drain_peaks(&mut self) -> Vec<SpectralPeak> {
         self.dsp.drain_peaks()
     }
@@ -139,13 +162,44 @@ impl SigX {
     /// Serialize the current live DSP output through the recovered Mac
     /// `basic_signature_t` → `io::pack` legacy path.
     ///
-    /// Clone and flush the live DSP state so the native-style zero-tail
-    /// lookahead contributes any pending temporal peaks. Then apply the
-    /// recovered four-band `BandSpectralPeaks` stage before the legacy pack.
-    /// The method is non-destructive so repeated calls over unchanged state
-    /// are reproducible.
+    /// Clone and zero-tail flush the live DSP state using the recovered
+    /// 61-frame low-level lookahead length, then apply the four-band
+    /// `BandSpectralPeaks` stage before the legacy pack. This existing path is
+    /// retained for one-shot callers. Native TaggingType 2 uses a separate
+    /// live-peak, no-flush freeze path; this method does not claim Native
+    /// Progressive byte parity. It is non-destructive, so later PCM remains
+    /// usable.
     pub fn signature(&self) -> Result<Vec<u8>, Error> {
         self.signature_with_flush_frames(SIGNATURE_FLUSH_FRAMES)
+    }
+
+    /// Snapshot the Native `signatureType=2` cycle's accumulated live peaks
+    /// without zero-tail processing, then clear only the pending peak queue.
+    /// This is distinct from Auto Shazam's `TaggingType=2`: the app's ordinary
+    /// manual `TaggingType=1` path also configures `signatureType=2` with
+    /// options 0. The statically mapped signature-type-2 dispatch calls
+    /// `get_sig(..., false)` and clears the pending deque; unlike other freeze
+    /// branches, it has no direct `flush_fft` checkpoint/zero-tail/rewind call.
+    /// Saved staged-vs-fresh outputs show earlier peaks remain visible to
+    /// later snapshots. `progressive_peak_history` models that observable
+    /// behavior; exact Native internal storage remains unknown. The caller
+    /// supplies Native `signature_info` fields; stream-position mapping is
+    /// controlled by the Progressive adapter.
+    pub fn take_type2_progressive_signature(
+        &mut self,
+        stream_pos_ticks: u64,
+        sample_length_samples: u64,
+    ) -> Result<Vec<u8>, Error> {
+        let signature = self.encode_peaks(
+            &self.progressive_peak_history,
+            stream_pos_ticks,
+            sample_length_samples,
+            CropOrder::FrequencyThenMagnitude,
+            CropResortOrder::TimeThenFrequency,
+            CropUpperEndpointPolicy::IncludeInFinalBand,
+        )?;
+        self.dsp.drain_peaks();
+        Ok(signature)
     }
 
     /// Diagnostic variant that changes only the zero-tail lookahead length.
@@ -245,8 +299,32 @@ impl SigX {
                 .flush_signature_with_frames(flush_frames)
                 .map_err(Error::Dsp)?;
         }
-        let bands = band_spectral_peaks_with_endpoint_policy(
+        let sample_length_samples = (self.config.sample_rate as u64)
+            .saturating_mul(6)
+            .checked_div(25)
+            .and_then(|padding| (self.frames_seen as u64).checked_add(padding))
+            .ok_or(Error::SampleCountOverflow)?;
+        self.encode_peaks(
             finalized_dsp.peaks(),
+            0,
+            sample_length_samples,
+            crop_order,
+            resort_order,
+            endpoint_policy,
+        )
+    }
+
+    fn encode_peaks(
+        &self,
+        peaks: &[SpectralPeak],
+        stream_pos_ticks: u64,
+        sample_length_samples: u64,
+        crop_order: CropOrder,
+        resort_order: CropResortOrder,
+        endpoint_policy: CropUpperEndpointPolicy,
+    ) -> Result<Vec<u8>, Error> {
+        let bands = band_spectral_peaks_with_endpoint_policy(
+            peaks,
             LEGACY_BAND_DENSITY,
             true,
             crop_order,
@@ -265,14 +343,9 @@ impl SigX {
                     .collect()
             })
             .collect();
-        let sample_length_samples = (self.config.sample_rate as u64)
-            .saturating_mul(6)
-            .checked_div(25)
-            .and_then(|padding| (self.frames_seen as u64).checked_add(padding))
-            .ok_or(Error::SampleCountOverflow)?;
         let input = LegacySignatureInput {
             sample_rate: self.config.sample_rate,
-            stream_pos_ticks: 0,
+            stream_pos_ticks,
             sample_length_samples,
             density: sigx_format::LEGACY_DEFAULT_DENSITY,
             sections,
@@ -302,6 +375,48 @@ mod tests {
         assert_eq!(sigx.snapshot().frames_seen, 3);
         sigx.reset();
         assert_eq!(sigx.snapshot().frames_seen, 0);
+    }
+
+    #[test]
+    fn extends_stream_bound_without_resetting_or_changing_signature() {
+        let first: Vec<i16> = (0..10_000)
+            .map(|index| ((index * 73 % 30_001) as i64 - 15_000) as i16)
+            .collect();
+        let second: Vec<i16> = (10_000..12_000)
+            .map(|index| ((index * 73 % 30_001) as i64 - 15_000) as i16)
+            .collect();
+
+        let mut extended = SigX::new(config()).unwrap();
+        extended.push_i16(&first).unwrap();
+        let before = extended.snapshot();
+        extended.extend_max_frames(12_000).unwrap();
+        assert_eq!(extended.snapshot(), before);
+        extended.push_i16(&second).unwrap();
+
+        let mut reference = SigX::new(Config {
+            max_frames: 12_000,
+            ..config()
+        })
+        .unwrap();
+        reference.push_i16(&first).unwrap();
+        reference.push_i16(&second).unwrap();
+        assert_eq!(
+            extended.signature().unwrap(),
+            reference.signature().unwrap()
+        );
+        assert_eq!(extended.snapshot().frames_seen, 12_000);
+    }
+
+    #[test]
+    fn cannot_shrink_stream_bound_below_existing_state() {
+        let mut sigx = SigX::new(config()).unwrap();
+        sigx.push_i16(&[1, 2, 3]).unwrap();
+        assert_eq!(
+            sigx.extend_max_frames(2),
+            Err(Error::InvalidConfig(
+                "max_frames cannot be below frames already processed"
+            ))
+        );
     }
 
     #[test]
@@ -351,6 +466,159 @@ mod tests {
         assert_eq!(signature.legacy_header().rate_marker_be, 24);
         assert_eq!(signature.legacy_header().sample_length_samples, 3_968);
         assert_eq!(signature.section_table().unwrap().sections.len(), 4);
+    }
+
+    #[test]
+    fn type2_progressive_freeze_uses_live_peaks_and_consumes_only_peak_queue() {
+        let input: Vec<i16> = (0..48_000)
+            .map(|index| ((index * 73 % 30_001) as i64 - 15_000) as i16)
+            .collect();
+        let mut progressive_config = config();
+        progressive_config.max_frames = input.len() + 4_000;
+        let mut sigx = SigX::new(progressive_config).unwrap();
+        sigx.push_i16(&input).unwrap();
+        let before = sigx.snapshot();
+
+        let first = sigx
+            .take_type2_progressive_signature(17, input.len() as u64)
+            .unwrap();
+        let first_parsed = sigx_format::Signature::parse(&first).unwrap();
+        assert_eq!(first_parsed.legacy_header().stream_pos_ticks_raw, 17);
+        assert_eq!(
+            first_parsed.legacy_header().sample_length_samples,
+            input.len() as u64
+        );
+        assert_eq!(sigx.snapshot(), before);
+
+        let empty = sigx.take_type2_progressive_signature(18, 0).unwrap();
+        let empty_parsed = sigx_format::Signature::parse(&empty).unwrap();
+        assert_eq!(empty_parsed.legacy_header().stream_pos_ticks_raw, 18);
+        assert_eq!(empty_parsed.legacy_header().sample_length_samples, 0);
+
+        let more = [0_i16; 4_000];
+        sigx.push_i16(&more).unwrap();
+        let later = sigx
+            .take_type2_progressive_signature(19, more.len() as u64)
+            .unwrap();
+        assert_eq!(
+            sigx_format::Signature::parse(&later)
+                .unwrap()
+                .legacy_header()
+                .sample_length_samples,
+            more.len() as u64
+        );
+    }
+
+    #[test]
+    fn type2_progressive_snapshots_are_repeatable_and_match_fresh_cycle() {
+        let samples: Vec<i16> = (0..96_000)
+            .map(|index| ((index * 73 % 30_001) as i64 - 15_000) as i16)
+            .collect();
+        let mut cfg = config();
+        cfg.max_frames = samples.len();
+        let mut staged = SigX::new(cfg).unwrap();
+
+        staged.push_i16(&samples[..48_000]).unwrap();
+        let first_stream_pos = staged.snapshot().fft_frames_processed;
+        let first = staged
+            .take_type2_progressive_signature(first_stream_pos, 51_840)
+            .unwrap();
+        let repeated = staged
+            .take_type2_progressive_signature(first_stream_pos, 51_840)
+            .unwrap();
+        assert_eq!(first, repeated);
+
+        staged.push_i16(&samples[48_000..]).unwrap();
+        let staged_signature = staged
+            .take_type2_progressive_signature(staged.snapshot().fft_frames_processed, 99_840)
+            .unwrap();
+
+        let mut fresh = SigX::new(cfg).unwrap();
+        fresh.push_i16(&samples).unwrap();
+        let fresh_signature = fresh
+            .take_type2_progressive_signature(fresh.snapshot().fft_frames_processed, 99_840)
+            .unwrap();
+        assert_eq!(staged_signature, fresh_signature);
+    }
+
+    #[test]
+    fn type2_progressive_distinct_segments_survive_zero_one_or_two_intermediate_gets() {
+        let segment_a: Vec<i16> = (0..48_000)
+            .map(|index| ((index * 73 % 30_001) as i64 - 15_000) as i16)
+            .collect();
+        let segment_b: Vec<i16> = segment_a.iter().rev().copied().collect();
+        let mut complete = segment_a.clone();
+        complete.extend_from_slice(&segment_b);
+        let mut cfg = config();
+        cfg.max_frames = complete.len();
+
+        let mut final_signatures = Vec::new();
+        for intermediate_gets in 0..=2 {
+            let mut staged = SigX::new(cfg).unwrap();
+            staged.push_i16(&segment_a).unwrap();
+            let first_stream_pos = staged.snapshot().fft_frames_processed;
+            if intermediate_gets > 0 {
+                let first_signature = staged
+                    .take_type2_progressive_signature(first_stream_pos, 51_840)
+                    .unwrap();
+                for _ in 1..intermediate_gets {
+                    assert_eq!(
+                        staged
+                            .take_type2_progressive_signature(first_stream_pos, 51_840)
+                            .unwrap(),
+                        first_signature
+                    );
+                }
+            }
+
+            staged.push_i16(&segment_b).unwrap();
+            let final_signature = staged
+                .take_type2_progressive_signature(staged.snapshot().fft_frames_processed, 99_840)
+                .unwrap();
+            final_signatures.push(final_signature);
+        }
+
+        let mut fresh = SigX::new(cfg).unwrap();
+        fresh.push_i16(&complete).unwrap();
+        let fresh_signature = fresh
+            .take_type2_progressive_signature(fresh.snapshot().fft_frames_processed, 99_840)
+            .unwrap();
+
+        assert!(final_signatures
+            .iter()
+            .all(|signature| *signature == fresh_signature));
+        assert!(final_signatures.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn signature_snapshot_preserves_distinct_segment_stream_state() {
+        let mut cfg = config();
+        cfg.max_frames = 96_000;
+        let segment_a: Vec<i16> = (0..28_000)
+            .map(|index| ((index * 73 % 30_001) as i64 - 15_000) as i16)
+            .collect();
+        let segment_b: Vec<i16> = (0..4_001)
+            .map(|index| ((index * 97 % 27_001) as i64 - 13_500) as i16)
+            .collect();
+
+        let mut staged = SigX::new(cfg).unwrap();
+        staged.push_i16(&segment_a).unwrap();
+        let state_before_snapshot = staged.snapshot();
+        let signature_a = staged.signature().unwrap();
+        assert_eq!(staged.signature().unwrap(), signature_a);
+        assert_eq!(staged.snapshot(), state_before_snapshot);
+
+        staged.push_i16(&segment_b).unwrap();
+        let signature_ab = staged.signature().unwrap();
+
+        let mut concatenated = segment_a;
+        concatenated.extend_from_slice(&segment_b);
+        let mut fresh = SigX::new(cfg).unwrap();
+        fresh.push_i16(&concatenated).unwrap();
+        let fresh_signature_ab = fresh.signature().unwrap();
+
+        assert_ne!(signature_a, signature_ab);
+        assert_eq!(signature_ab, fresh_signature_ab);
     }
 
     #[test]
