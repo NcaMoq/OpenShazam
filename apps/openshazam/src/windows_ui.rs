@@ -732,9 +732,7 @@ struct TextStyles {
 struct ResultDetailsRects {
     title: D2D_RECT_F,
     artist: D2D_RECT_F,
-    // Retained for a future verified provider badge; no store is currently
-    // present in the UI presentation contract, so the control stays hidden.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Reserved for the provider action when UI-233 data becomes available.
     action: D2D_RECT_F,
 }
 
@@ -742,6 +740,28 @@ struct ResultDetailsRects {
 struct ResultDetailsMetrics {
     title_height: f32,
     artist_height: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HistoryTextMetrics {
+    title_height: f32,
+    artist_height: f32,
+    date_height: f32,
+}
+
+#[derive(Clone, Debug)]
+struct CachedHistoryTextMetrics {
+    title: String,
+    artist: String,
+    date: String,
+    metrics: HistoryTextMetrics,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HistoryTextRects {
+    title: D2D_RECT_F,
+    artist: D2D_RECT_F,
+    date: D2D_RECT_F,
 }
 
 struct CachedResultDetailsMetrics {
@@ -772,6 +792,7 @@ struct Renderer {
     popup_outline: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     popup_header: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     result_details_cache: RefCell<Option<CachedResultDetailsMetrics>>,
+    history_text_metrics_cache: RefCell<HashMap<u64, CachedHistoryTextMetrics>>,
     result_overlay_content_key: Option<ResultOverlayContentKey>,
     result_overlay_motion_key: Option<ResultOverlayMotionKey>,
     result_overlay_failure_reported: bool,
@@ -4087,17 +4108,24 @@ fn result_details_rects(
     panel_top: f32,
     title_height: f32,
     artist_height: f32,
+    action_visible: bool,
 ) -> ResultDetailsRects {
-    let total_height = title_height
-        + RESULT_DETAILS_TITLE_ARTIST_GAP
-        + artist_height
-        + RESULT_DETAILS_ARTIST_ACTION_GAP
-        + RESULT_ACTION_HEIGHT;
+    let action_height = if action_visible {
+        RESULT_DETAILS_ARTIST_ACTION_GAP + RESULT_ACTION_HEIGHT
+    } else {
+        0.0
+    };
+    let total_height =
+        title_height + RESULT_DETAILS_TITLE_ARTIST_GAP + artist_height + action_height;
     let title_top = panel_top + RESULT_DETAILS_CENTER_Y - total_height * 0.5;
     let title_bottom = title_top + title_height;
     let artist_top = title_bottom + RESULT_DETAILS_TITLE_ARTIST_GAP;
     let artist_bottom = artist_top + artist_height;
-    let action_top = artist_bottom + RESULT_DETAILS_ARTIST_ACTION_GAP;
+    let action_top = if action_visible {
+        artist_bottom + RESULT_DETAILS_ARTIST_ACTION_GAP
+    } else {
+        artist_bottom
+    };
     ResultDetailsRects {
         title: rect(
             RESULT_DETAILS_LEFT,
@@ -4111,11 +4139,55 @@ fn result_details_rects(
             RESULT_DETAILS_RIGHT,
             artist_bottom,
         ),
-        action: rect(
-            RESULT_DETAILS_LEFT,
-            action_top,
-            RESULT_DETAILS_LEFT + 70.0,
-            action_top + RESULT_ACTION_HEIGHT,
+        action: if action_visible {
+            rect(
+                RESULT_DETAILS_LEFT,
+                action_top,
+                RESULT_DETAILS_LEFT + 70.0,
+                action_top + RESULT_ACTION_HEIGHT,
+            )
+        } else {
+            rect(0.0, 0.0, 0.0, 0.0)
+        },
+    }
+}
+
+const HISTORY_ROW_HEIGHT: f32 = 89.0;
+const HISTORY_TEXT_LEFT: f32 = 95.0;
+const HISTORY_TEXT_RIGHT: f32 = 360.0;
+const HISTORY_TEXT_CENTER_Y: f32 = HISTORY_ROW_HEIGHT * 0.5;
+const HISTORY_TEXT_GAP: f32 = 5.0;
+
+fn history_text_rects(
+    row_top: f32,
+    title_height: f32,
+    artist_height: f32,
+    date_height: f32,
+) -> HistoryTextRects {
+    let total_height = title_height + artist_height + date_height + HISTORY_TEXT_GAP * 2.0;
+    let title_top = row_top + HISTORY_TEXT_CENTER_Y - total_height * 0.5;
+    let title_bottom = title_top + title_height;
+    let artist_top = title_bottom + HISTORY_TEXT_GAP;
+    let artist_bottom = artist_top + artist_height;
+    let date_top = artist_bottom + HISTORY_TEXT_GAP;
+    HistoryTextRects {
+        title: rect(
+            HISTORY_TEXT_LEFT,
+            title_top,
+            HISTORY_TEXT_RIGHT,
+            title_bottom,
+        ),
+        artist: rect(
+            HISTORY_TEXT_LEFT,
+            artist_top,
+            HISTORY_TEXT_RIGHT,
+            artist_top + artist_height,
+        ),
+        date: rect(
+            HISTORY_TEXT_LEFT,
+            date_top,
+            HISTORY_TEXT_RIGHT,
+            date_top + date_height,
         ),
     }
 }
@@ -4170,8 +4242,24 @@ fn create_text_format(
     weight: windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT,
     alignment: windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT,
 ) -> windows::core::Result<IDWriteTextFormat> {
+    create_text_format_with_locale(
+        factory,
+        size,
+        weight,
+        alignment,
+        directwrite_locale(ui_language()),
+    )
+}
+
+fn create_text_format_with_locale(
+    factory: &IDWriteFactory,
+    size: f32,
+    weight: windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT,
+    alignment: windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT,
+    locale: &str,
+) -> windows::core::Result<IDWriteTextFormat> {
     let family = wide("Segoe UI");
-    let locale = wide("ja-JP");
+    let locale = wide(locale);
     unsafe {
         let format = factory.CreateTextFormat(
             PCWSTR(family.as_ptr()),
@@ -4185,6 +4273,17 @@ fn create_text_format(
         format.SetTextAlignment(alignment)?;
         format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
         format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
+        // The source does not establish the native ellipsis policy. Use a
+        // replaceable Windows candidate at Unicode character-cluster
+        // boundaries so constrained labels do not leave a partly drawn line.
+        let trimming = windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING {
+            granularity:
+                windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+            delimiter: 0,
+            delimiterCount: 0,
+        };
+        let trimming_sign = factory.CreateEllipsisTrimmingSign(&format)?;
+        format.SetTrimming(&trimming, &trimming_sign)?;
         Ok(format)
     }
 }
@@ -4321,6 +4420,7 @@ impl Renderer {
             popup_outline: RefCell::new(None),
             popup_header: RefCell::new(None),
             result_details_cache: RefCell::new(None),
+            history_text_metrics_cache: RefCell::new(HashMap::new()),
             result_overlay_content_key: None,
             result_overlay_motion_key: None,
             result_overlay_failure_reported: false,
@@ -4683,20 +4783,48 @@ impl Renderer {
         min_height: f32,
         max_lines: f32,
     ) -> windows::core::Result<f32> {
+        self.measured_text_height_at_width(
+            value,
+            format,
+            RESULT_DETAILS_RIGHT - RESULT_DETAILS_LEFT,
+            min_height,
+            max_lines,
+        )
+    }
+
+    unsafe fn measured_text_height_at_width(
+        &self,
+        value: &str,
+        format: &IDWriteTextFormat,
+        max_width: f32,
+        min_height: f32,
+        max_lines: f32,
+    ) -> windows::core::Result<f32> {
         if value.is_empty() {
             return Ok(min_height);
         }
         let content: Vec<u16> = value.encode_utf16().collect();
-        let max_height = max_lines * min_height;
-        let layout = self.write_factory.CreateTextLayout(
-            &content,
-            format,
-            RESULT_DETAILS_RIGHT - RESULT_DETAILS_LEFT,
-            max_height,
-        )?;
+        let layout = self
+            .write_factory
+            .CreateTextLayout(&content, format, max_width, 512.0)?;
         let mut metrics = DWRITE_TEXT_METRICS::default();
         layout.GetMetrics(&mut metrics)?;
-        Ok(metrics.height.clamp(min_height, max_height))
+        if metrics.lineCount == 0 {
+            return Ok(min_height);
+        }
+        let mut lines = vec![
+            windows::Win32::Graphics::DirectWrite::DWRITE_LINE_METRICS::default();
+            metrics.lineCount as usize
+        ];
+        let mut actual_line_count = 0;
+        layout.GetLineMetrics(Some(&mut lines), &mut actual_line_count)?;
+        let measured_height = lines
+            .iter()
+            .take(actual_line_count as usize)
+            .take(max_lines.ceil() as usize)
+            .map(|line| line.height)
+            .sum::<f32>();
+        Ok(measured_height.max(min_height))
     }
 
     unsafe fn result_details_metrics(
@@ -4727,6 +4855,64 @@ impl Renderer {
             artist: track.artist.clone(),
             metrics,
         });
+        Ok(metrics)
+    }
+
+    unsafe fn history_text_metrics(
+        &self,
+        track: &Track,
+    ) -> windows::core::Result<HistoryTextMetrics> {
+        if let Some(cached) = self
+            .history_text_metrics_cache
+            .borrow()
+            .get(&track.display_id)
+        {
+            if cached.title == track.title
+                && cached.artist == track.artist
+                && cached.date == track.recognized_date_label
+            {
+                return Ok(cached.metrics);
+            }
+        }
+        let width = HISTORY_TEXT_RIGHT - HISTORY_TEXT_LEFT;
+        let metrics = HistoryTextMetrics {
+            title_height: self.measured_text_height_at_width(
+                &track.title,
+                &self.text.title,
+                width,
+                0.0,
+                2.0,
+            )?,
+            artist_height: self.measured_text_height_at_width(
+                &track.artist,
+                &self.text.subtitle,
+                width,
+                0.0,
+                2.0,
+            )?,
+            date_height: self.measured_text_height_at_width(
+                &track.recognized_date_label,
+                &self.text.date,
+                width,
+                0.0,
+                1.0,
+            )?,
+        };
+        let mut cache = self.history_text_metrics_cache.borrow_mut();
+        cache.insert(
+            track.display_id,
+            CachedHistoryTextMetrics {
+                title: track.title.clone(),
+                artist: track.artist.clone(),
+                date: track.recognized_date_label.clone(),
+                metrics,
+            },
+        );
+        if cache.len() > 64 {
+            if let Some(oldest_id) = cache.keys().copied().min() {
+                cache.remove(&oldest_id);
+            }
+        }
         Ok(metrics)
     }
 
@@ -4873,7 +5059,7 @@ impl Renderer {
         {
             self.draw_skeleton(history_rect);
         }
-        self.draw_history(app, history_top, now);
+        self.draw_history(app, history_top, now)?;
         self.target.PopAxisAlignedClip();
 
         match &app.phase {
@@ -5356,7 +5542,12 @@ impl Renderer {
         true
     }
 
-    unsafe fn draw_history(&self, app: &AppState, history_top: f32, now: Instant) {
+    unsafe fn draw_history(
+        &self,
+        app: &AppState,
+        history_top: f32,
+        now: Instant,
+    ) -> windows::core::Result<()> {
         for (index, track) in app.history.iter().enumerate() {
             let top = history_row_top(
                 index,
@@ -5365,10 +5556,17 @@ impl Renderer {
                 app.scroll_offset,
                 now,
             );
-            if top + 89.0 < history_top || top > history_top + HISTORY_HEIGHT as f32 {
+            if top + HISTORY_ROW_HEIGHT < history_top || top > history_top + HISTORY_HEIGHT as f32 {
                 continue;
             }
-            let row = rect(0.0, top, CONTENT_WIDTH as f32, top + 89.0);
+            let row = rect(0.0, top, CONTENT_WIDTH as f32, top + HISTORY_ROW_HEIGHT);
+            let text_metrics = self.history_text_metrics(track)?;
+            let text_rects = history_text_rects(
+                top,
+                text_metrics.title_height,
+                text_metrics.artist_height,
+                text_metrics.date_height,
+            );
             if app.hovered_row == Some(index) {
                 self.fill_rect(row, &self.palette.skeleton);
             }
@@ -5390,28 +5588,29 @@ impl Renderer {
             }
             self.text(
                 &track.title,
-                rect(95.0, top + 8.0, 360.0, top + 38.0),
+                text_rects.title,
                 &self.text.title,
                 &self.palette.title,
             );
             self.text(
                 &track.artist,
-                rect(95.0, top + 38.0, 360.0, top + 63.0),
+                text_rects.artist,
                 &self.text.subtitle,
                 &self.palette.subtitle,
             );
             self.text(
                 &track.recognized_date_label,
-                rect(95.0, top + 63.0, 360.0, top + 84.0),
+                text_rects.date,
                 &self.text.date,
                 &self.palette.subtitle,
             );
             self.fill_rect(
-                rect(10.0, top + 88.0, 370.0, top + 89.0),
+                rect(10.0, top + 88.0, 370.0, top + HISTORY_ROW_HEIGHT),
                 &self.palette.separator,
             );
             let _recognized_age = track.recognized_at.elapsed();
         }
+        Ok(())
     }
 
     unsafe fn draw_result_panel(
@@ -5429,7 +5628,8 @@ impl Renderer {
         };
         self.fill_gradient_rect(&panel, gradient, top)?;
         let details = self.result_details_metrics(track)?;
-        let detail_rects = result_details_rects(top, details.title_height, details.artist_height);
+        let detail_rects =
+            result_details_rects(top, details.title_height, details.artist_height, false);
         // The image view is 150×150pt and clips at radius5. The native
         // placeholder has its own centered 131pt intrinsic image size and
         // alpha, so do not paint an opaque square under it.
@@ -7348,6 +7548,13 @@ enum UiLanguage {
     English,
 }
 
+fn directwrite_locale(language: UiLanguage) -> &'static str {
+    match language {
+        UiLanguage::Japanese => "ja-JP",
+        UiLanguage::English => "en-US",
+    }
+}
+
 static UI_LANGUAGE: OnceLock<UiLanguage> = OnceLock::new();
 
 fn ui_language() -> UiLanguage {
@@ -8894,11 +9101,12 @@ mod tests {
         advance_result_card_stage, animation_needs_frame, button_border_arc_points,
         composition_button_pixel_snap_offset, composition_header_viewport_offset,
         composition_root_layer_order, composition_scale_for_dpi, composition_scene_layer_order,
-        copy_notification_text, copy_panel_pixels_into, d2d_color_from_system,
-        fallback_match_artwork_rect, gradient_origin_transform, header_fill_scope,
-        history_artwork_frame, history_row_top, history_title_color, inverse_circle_clip_radii,
-        is_offline_failure, is_tray_activation_event, localized_ui_text, native_icon_layout,
-        no_match_copy, no_match_icon_rect, phase_needs_timeout, point_in_rect, popup_base_color,
+        copy_notification_text, copy_panel_pixels_into, create_text_format_with_locale,
+        d2d_color_from_system, directwrite_locale, fallback_match_artwork_rect,
+        gradient_origin_transform, header_fill_scope, history_artwork_frame, history_row_top,
+        history_text_rects, history_title_color, inverse_circle_clip_radii, is_offline_failure,
+        is_tray_activation_event, localized_ui_text, native_icon_layout, no_match_copy,
+        no_match_icon_rect, phase_needs_timeout, point_in_rect, popup_base_color,
         resolve_page_link, result_artwork_rect, result_card_link_hit, result_details_rects,
         result_gradient_colors, result_header_hit_test_contains, result_header_visible_height,
         result_overlay_child_offset, result_overlay_occludes_shazam_button, result_panel_draw_top,
@@ -8910,10 +9118,10 @@ mod tests {
         ResultCardAdvance, ResultCardStage, Theme, UiLanguage, UiTextKey, WindowKind,
         BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, FALLBACK_MATCH_DARK_PIXELS,
         FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE, HISTORY_HEIGHT,
-        INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE,
-        POPUP_ARROW_HEIGHT, RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD, RESULT_CARD_TRANSITION,
-        RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT,
-        WHITE_CLOSE_ICON_PIXELS,
+        HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY,
+        POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT, RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD,
+        RESULT_CARD_TRANSITION, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS,
+        TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
     };
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -9046,11 +9254,13 @@ mod tests {
             select_ui_language_from_multisz(&encoded),
             UiLanguage::Japanese
         );
+        assert_eq!(directwrite_locale(UiLanguage::Japanese), "ja-JP");
         let english: Vec<u16> = "de-DE\0en-US\0\0".encode_utf16().collect();
         assert_eq!(
             select_ui_language_from_multisz(&english),
             UiLanguage::English
         );
+        assert_eq!(directwrite_locale(UiLanguage::English), "en-US");
         let unsupported: Vec<u16> = "fr-FR\0de-DE\0\0".encode_utf16().collect();
         assert_eq!(
             select_ui_language_from_multisz(&unsupported),
@@ -9489,7 +9699,7 @@ mod tests {
     fn ui222_result_card_link_excludes_close_and_visible_store_action() {
         let top = 42.0;
         let close = [353.0, top + 25.0, 365.0, top + 37.0];
-        let action = result_details_rects(top, 24.0, 18.0).action;
+        let action = result_details_rects(top, 24.0, 18.0, true).action;
         let action_bounds = [action.left, action.top, action.right, action.bottom];
 
         assert!(result_card_link_hit(
@@ -9533,7 +9743,7 @@ mod tests {
     fn ui233_absent_store_badge_does_not_leave_an_inert_hit_area() {
         let top = 42.0;
         let close = [353.0, top + 25.0, 365.0, top + 37.0];
-        let action = result_details_rects(top, 24.0, 18.0).action;
+        let action = result_details_rects(top, 24.0, 18.0, true).action;
         let action_center = (
             (action.left + action.right) * 0.5,
             (action.top + action.bottom) * 0.5,
@@ -10271,7 +10481,7 @@ mod tests {
 
     #[test]
     fn result_details_stack_tracks_artwork_center_and_expands_for_wrapping() {
-        let single_line = result_details_rects(10.0, 24.0, 18.0);
+        let single_line = result_details_rects(10.0, 24.0, 18.0, true);
         assert_eq!(single_line.title.top, 66.5);
         assert_eq!(single_line.title.bottom, 90.5);
         assert_eq!(single_line.artist.top, 95.5);
@@ -10281,10 +10491,160 @@ mod tests {
             105.0
         );
 
-        let wrapped = result_details_rects(10.0, 48.0, 36.0);
+        let no_action = result_details_rects(10.0, 24.0, 18.0, false);
+        assert_eq!(no_action.title.top, 81.5);
+        assert_eq!(no_action.artist.bottom, 128.5);
+        assert_eq!(no_action.action.left, 0.0);
+        assert_eq!((no_action.title.top + no_action.artist.bottom) * 0.5, 105.0);
+
+        let wrapped = result_details_rects(10.0, 48.0, 36.0, true);
         assert_eq!(wrapped.title.top, 45.5);
         assert_eq!(wrapped.action.bottom, 164.5);
         assert_eq!((wrapped.title.top + wrapped.action.bottom) * 0.5, 105.0);
+    }
+
+    #[test]
+    fn ui235_history_text_stack_uses_measured_lines_and_stays_inside_89_dip_row() {
+        let top = 120.0;
+        let text = history_text_rects(top, 34.0, 28.0, 12.0);
+        assert_eq!(text.title.bottom + 5.0, text.artist.top);
+        assert_eq!(text.artist.bottom + 5.0, text.date.top);
+        assert!(((text.title.top + text.date.bottom) * 0.5 - top - 44.5).abs() < f32::EPSILON);
+        assert!(text.title.top >= top);
+        assert!(text.date.bottom <= top + HISTORY_ROW_HEIGHT);
+
+        // Result text uses measured DirectWrite line heights too. With the
+        // unavailable store action omitted, the maximum title/artist stack
+        // remains centered and does not escape the fixed 180-DIP header.
+        let result = result_details_rects(0.0, 80.0, 74.0, false);
+        assert!(result.title.top >= 0.0);
+        assert!(result.artist.bottom <= TOP_HEIGHT as f32);
+    }
+
+    #[test]
+    fn directwrite_result_and_history_layouts_keep_unicode_clusters_inside_fixed_frames() {
+        let factory: super::IDWriteFactory =
+            unsafe { super::DWriteCreateFactory(super::DWRITE_FACTORY_TYPE_SHARED).unwrap() };
+        let long_unbroken = "OpenShazam-Unbroken-Title-".repeat(18);
+        let cases = [
+            (
+                UiLanguage::Japanese,
+                "カレンダーガール ありがとう こんにちは".to_owned(),
+            ),
+            (UiLanguage::English, long_unbroken),
+            (
+                UiLanguage::Japanese,
+                "女性ボーカル👩🏻‍🎤の曲 e\u{301} と結合文字".to_owned(),
+            ),
+            (
+                UiLanguage::English,
+                "العربية עברית mixed RTL text\r\nnext line".to_owned(),
+            ),
+            (UiLanguage::English, String::new()),
+        ];
+        let mut trimmed_cases = 0usize;
+
+        for (language, value) in cases {
+            let locale = directwrite_locale(language);
+            for (font_size, width, height) in [
+                (20.0, 164.0, 72.0),
+                (14.0, 164.0, 72.0),
+                (14.0, 265.0, 30.0),
+                (12.0, 265.0, 25.0),
+                (10.0, 265.0, 21.0),
+            ] {
+                let format = create_text_format_with_locale(
+                    &factory,
+                    font_size,
+                    super::DWRITE_FONT_WEIGHT_NORMAL,
+                    super::DWRITE_TEXT_ALIGNMENT_LEADING,
+                    locale,
+                )
+                .unwrap();
+                let content: Vec<u16> = value.encode_utf16().collect();
+                if content.is_empty() {
+                    continue;
+                }
+                let layout = unsafe {
+                    factory
+                        .CreateTextLayout(&content, &format, width, height)
+                        .unwrap()
+                };
+                let mut metrics = super::DWRITE_TEXT_METRICS::default();
+                unsafe { layout.GetMetrics(&mut metrics).unwrap() };
+                assert_eq!(metrics.layoutWidth, width);
+                assert_eq!(metrics.layoutHeight, height);
+                assert!(metrics.width.is_finite() && metrics.width >= 0.0);
+                assert!(metrics.height.is_finite() && metrics.height <= height + 0.01);
+
+                let mut line_metrics = vec![
+                    windows::Win32::Graphics::DirectWrite::DWRITE_LINE_METRICS::default();
+                    metrics.lineCount as usize
+                ];
+                let mut actual_line_count = 0;
+                unsafe {
+                    layout
+                        .GetLineMetrics(Some(&mut line_metrics), &mut actual_line_count)
+                        .unwrap()
+                };
+                assert_eq!(actual_line_count, metrics.lineCount);
+                for line in line_metrics.iter().take(actual_line_count as usize) {
+                    assert!(line.height.is_finite() && line.height >= 0.0);
+                }
+                if line_metrics
+                    .iter()
+                    .take(actual_line_count as usize)
+                    .any(|line| line.isTrimmed.as_bool())
+                {
+                    trimmed_cases += 1;
+                }
+
+                let mut clusters = vec![
+                    windows::Win32::Graphics::DirectWrite::DWRITE_CLUSTER_METRICS::default();
+                    content.len()
+                ];
+                let mut actual_cluster_count = 0;
+                unsafe {
+                    layout
+                        .GetClusterMetrics(Some(&mut clusters), &mut actual_cluster_count)
+                        .unwrap()
+                };
+                let mut utf16_end = 0usize;
+                let mut cluster_boundaries = Vec::with_capacity(actual_cluster_count as usize);
+                for cluster in clusters.iter().take(actual_cluster_count as usize) {
+                    utf16_end += usize::from(cluster.length);
+                    assert!(
+                        String::from_utf16(&content[..utf16_end]).is_ok(),
+                        "DirectWrite split a UTF-16 surrogate pair in {value:?}"
+                    );
+                    cluster_boundaries.push(utf16_end);
+                }
+                assert_eq!(utf16_end, content.len(), "text clusters lost UTF-16 units");
+                let combining_sequence: Vec<u16> = "e\u{301}".encode_utf16().collect();
+                if let Some(start) = content
+                    .windows(combining_sequence.len())
+                    .position(|window| window == combining_sequence)
+                {
+                    assert!(
+                        !cluster_boundaries.contains(&(start + 1)),
+                        "DirectWrite split a base character from its combining mark"
+                    );
+                }
+                let emoji_sequence: Vec<u16> = "👩🏻‍🎤".encode_utf16().collect();
+                if let Some(start) = content
+                    .windows(emoji_sequence.len())
+                    .position(|window| window == emoji_sequence)
+                {
+                    for boundary in start + 1..start + emoji_sequence.len() {
+                        assert!(
+                            !cluster_boundaries.contains(&boundary),
+                            "DirectWrite split an emoji ZWJ grapheme cluster"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(trimmed_cases > 0, "matrix did not exercise text trimming");
     }
 
     #[test]
