@@ -2,18 +2,59 @@
 
 use std::{env, io, path::Path, process::ExitCode};
 
+#[cfg(any(windows, target_os = "macos"))]
+use std::io::BufRead;
+
+#[cfg(any(windows, target_os = "macos"))]
+use std::{
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+    thread,
+};
+
+#[cfg(target_os = "macos")]
+use std::process::Command;
+
 #[cfg(any(windows, test, target_os = "macos"))]
 use sigx_core::{Config, SigX};
 
 #[cfg(windows)]
-use std::{fs::OpenOptions, io::Write};
+use std::{
+    collections::BTreeSet,
+    fs::OpenOptions,
+    io::Write,
+    sync::{
+        atomic::AtomicBool,
+        mpsc::{self, TryRecvError},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(windows)]
+use shazam_progressive::{
+    NativeSampleFrameTargets, ProgressiveSession, RecognitionOutcome, RecognitionTiming,
+    RollingPcmBuffer, NATIVE_NETWORK_REQUEST_TIMEOUT_MS, NATIVE_TAGGING_TYPE_1_DEFAULT_INTERVAL_MS,
+    NATIVE_TAGGING_TYPE_2_DEFAULT_INTERVAL_MS,
+};
+
+#[cfg(any(windows, target_os = "macos", test))]
+use shazam_progressive::NativeTaggingType;
+
+#[cfg(any(windows, target_os = "macos", test))]
+use shazam_http_lab::NativeTaggingRequestContext;
+
+#[cfg(any(windows, target_os = "macos", test))]
+use shazam_progressive::SessionStatus;
 
 #[cfg(test)]
 const CAPTURE_RATE: u32 = 16_000;
-#[cfg(windows)]
-const CAPTURE_SECONDS: usize = 12;
 #[cfg(target_os = "macos")]
 mod macos_capture;
+
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -38,14 +79,371 @@ fn main() -> ExitCode {
     }
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProgressiveCaptureMode {
+    tagging_type: NativeTaggingType,
+    request_context: Option<NativeTaggingRequestContext>,
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn parse_progressive_capture_options(
+    args: &[String],
+    allow_device_id: bool,
+) -> Result<(ProgressiveCaptureMode, bool, Option<String>), io::Error> {
+    let mut tagging_type = None;
+    let mut request_context = None;
+    let mut jsonl_output = false;
+    let mut device_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--events-jsonl" if !jsonl_output => jsonl_output = true,
+            "--events-jsonl" => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate --events-jsonl option",
+                ));
+            }
+            "--tagging-type" => {
+                if tagging_type.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "duplicate --tagging-type option",
+                    ));
+                }
+                index += 1;
+                tagging_type = Some(
+                    args.get(index)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "--tagging-type requires manual or auto",
+                            )
+                        })?
+                        .as_str(),
+                );
+            }
+            "--native-context" => {
+                if request_context.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "duplicate --native-context option",
+                    ));
+                }
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--native-context requires foreground or background",
+                    )
+                })?;
+                request_context = Some(match value.as_str() {
+                    "foreground" => NativeTaggingRequestContext::Foreground,
+                    "background" => NativeTaggingRequestContext::Background,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--native-context requires foreground or background",
+                        ));
+                    }
+                });
+            }
+            value if !value.starts_with('-') && allow_device_id && device_id.is_none() => {
+                device_id = Some(value.to_owned());
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unexpected progressive-recognition argument: {}",
+                        args[index]
+                    ),
+                ));
+            }
+        }
+        index += 1;
+    }
+
+    let tagging_type = match tagging_type {
+        None | Some("manual") => NativeTaggingType::Manual,
+        Some("auto") => NativeTaggingType::Auto,
+        Some(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--tagging-type requires manual or auto",
+            ));
+        }
+    };
+    match (tagging_type, request_context) {
+        (NativeTaggingType::Manual, Some(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--native-context is only valid with --tagging-type auto",
+        )),
+        (NativeTaggingType::Auto, None) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Auto recognition requires --native-context foreground or background",
+        )),
+        _ => Ok((
+            ProgressiveCaptureMode {
+                tagging_type,
+                request_context,
+            },
+            jsonl_output,
+            device_id,
+        )),
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[derive(Clone)]
+struct NativeContextState(Arc<AtomicU8>);
+
+#[cfg(any(windows, target_os = "macos"))]
+impl NativeContextState {
+    fn new(initial: Option<NativeTaggingRequestContext>) -> Self {
+        Self(Arc::new(AtomicU8::new(encode_native_context(initial))))
+    }
+
+    fn current(&self) -> Option<NativeTaggingRequestContext> {
+        decode_native_context(self.0.load(Ordering::Acquire))
+    }
+
+    fn set(&self, context: NativeTaggingRequestContext) {
+        self.0
+            .store(encode_native_context(Some(context)), Ordering::Release);
+    }
+
+    fn watch_stdin_updates(
+        initial: Option<NativeTaggingRequestContext>,
+    ) -> Result<Self, io::Error> {
+        let state = Self::new(initial);
+        if initial.is_some() {
+            let updates = state.clone();
+            thread::Builder::new()
+                .name("openshazam-context-input".into())
+                .spawn(move || {
+                    for line in io::stdin().lock().lines() {
+                        match line {
+                            Ok(line) => match line.trim() {
+                                "foreground" => {
+                                    updates.set(NativeTaggingRequestContext::Foreground);
+                                    eprintln!("recognition context updated: foreground");
+                                }
+                                "background" => {
+                                    updates.set(NativeTaggingRequestContext::Background);
+                                    eprintln!("recognition context updated: background");
+                                }
+                                "" => {}
+                                _ => eprintln!(
+                                    "ignored context input; expected foreground or background"
+                                ),
+                            },
+                            Err(error) => {
+                                eprintln!("context input stopped: {error}");
+                                break;
+                            }
+                        }
+                    }
+                })?;
+        }
+        Ok(state)
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+const fn encode_native_context(context: Option<NativeTaggingRequestContext>) -> u8 {
+    match context {
+        None => 0,
+        Some(NativeTaggingRequestContext::Foreground) => 1,
+        Some(NativeTaggingRequestContext::Background) => 2,
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+const fn decode_native_context(value: u8) -> Option<NativeTaggingRequestContext> {
+    match value {
+        1 => Some(NativeTaggingRequestContext::Foreground),
+        2 => Some(NativeTaggingRequestContext::Background),
+        _ => None,
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn progressive_log(jsonl_output: bool, message: impl std::fmt::Display) {
+    if jsonl_output {
+        eprintln!("{message}");
+    } else {
+        println!("{message}");
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn emit_manual_ui_event(event: &shazam_http_lab::NativeManualUiEvent, jsonl_output: bool) {
+    if jsonl_output {
+        println!("{}", shazam_http_lab::native_manual_ui_event_to_json(event));
+        return;
+    }
+
+    match event {
+        shazam_http_lab::NativeManualUiEvent::Result(result) => {
+            println!(
+                "match title={:?} artist={:?}",
+                result.primary_track.title, result.primary_track.artist
+            );
+            if let Some(alternative) = result.alternative_track.as_deref() {
+                println!(
+                    "alternative_track title={:?} artist={:?}",
+                    alternative.title, alternative.artist
+                );
+            }
+        }
+        shazam_http_lab::NativeManualUiEvent::NoMatch => println!("No match."),
+        shazam_http_lab::NativeManualUiEvent::Error { kind } => {
+            eprintln!("Recognition failed ({kind:?}).");
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn emit_auto_ui_event(event: &shazam_http_lab::NativeAutoUiEvent, jsonl_output: bool) {
+    if jsonl_output {
+        println!("{}", shazam_http_lab::native_auto_ui_event_to_json(event));
+        return;
+    }
+
+    match event {
+        shazam_http_lab::NativeAutoUiEvent::ContinuousMatchCandidate(result) => {
+            println!(
+                "continuous match candidate title={:?} artist={:?}",
+                result.primary_track.title, result.primary_track.artist
+            );
+            if let Some(alternative) = result.alternative_track.as_deref() {
+                println!(
+                    "alternative_track title={:?} artist={:?}",
+                    alternative.title, alternative.artist
+                );
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn emit_session_timeout_event(tagging_type: NativeTaggingType, jsonl_output: bool) {
+    if jsonl_output {
+        println!(
+            "{}",
+            shazam_http_lab::native_session_timeout_event_to_json(tagging_type)
+        );
+    } else {
+        println!("Recognition session timed out.");
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[derive(Clone, Copy)]
+struct ProgressiveUiConfigInputs {
+    tagging_type: NativeTaggingType,
+    request_context: Option<NativeTaggingRequestContext>,
+    sample_rate_hz: u32,
+    pre_record_capacity_frames: usize,
+    diagnostic_pre_record_override: bool,
+    request_timeout_ms: u64,
+    jsonl_output: bool,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn emit_progressive_ui_config(
+    configuration: &shazam_http_lab::ShazamConfiguration,
+    inputs: ProgressiveUiConfigInputs,
+) -> Result<(), io::Error> {
+    if !inputs.jsonl_output {
+        return Ok(());
+    }
+    let record = match inputs.tagging_type {
+        NativeTaggingType::Manual => configuration.native_manual_ui_config_json(
+            inputs.sample_rate_hz,
+            inputs.pre_record_capacity_frames,
+            inputs.diagnostic_pre_record_override,
+            inputs.request_timeout_ms,
+        ),
+        NativeTaggingType::Auto => configuration.native_auto_ui_config_json(
+            inputs.sample_rate_hz,
+            inputs.request_context.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Auto UI config requires explicit foreground/background context",
+                )
+            })?,
+            inputs.request_timeout_ms,
+        ),
+    }
+    .map_err(io::Error::other)?;
+    println!("{record}");
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn notify_after_retry_dispatch_ack<E>(
+    wait_for_dispatch_ack: impl FnOnce() -> Result<(), E>,
+    notify: impl FnOnce(),
+) -> Result<(), E> {
+    let dispatch_result = wait_for_dispatch_ack();
+    notify();
+    dispatch_result
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn manual_completion_is_normal(
+    status: SessionStatus,
+    saw_match_event: bool,
+    saw_no_match_event: bool,
+) -> bool {
+    status == SessionStatus::Succeeded
+        || (status == SessionStatus::Exhausted && (saw_match_event || saw_no_match_event))
+}
+
+#[cfg(any(windows, test))]
+fn qpc_timestamp_to_unix_ms(
+    packet_qpc_100ns: u64,
+    current_qpc_100ns: u64,
+    current_unix_ms: u64,
+) -> Option<u64> {
+    let elapsed_ms = current_qpc_100ns
+        .checked_sub(packet_qpc_100ns)?
+        .checked_div(10_000)?;
+    current_unix_ms.checked_sub(elapsed_ms)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn spawn_manual_trigger_receiver() -> std::sync::mpsc::Receiver<Result<(), String>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = io::stdin()
+            .read_line(&mut line)
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
 #[cfg(windows)]
 fn run_windows_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match args.first().map(String::as_str) {
         Some("list-devices") if args.len() == 1 => list_render_devices(),
-        Some("capture-signature-loopback") if (2..=3).contains(&args.len()) => {
+        Some("capture-signature-loopback") if (3..=4).contains(&args.len()) => {
             let output = Path::new(&args[1]);
             refuse_overwrite(output)?;
-            let signature = capture_loopback_signature(args.get(2).map(String::as_str))?;
+            let capture_seconds = parse_capture_seconds(&args[2])?;
+            let signature =
+                capture_loopback_signature(args.get(3).map(String::as_str), capture_seconds)?;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -58,22 +456,16 @@ fn run_windows_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
-        Some("recognize-loopback") if args.len() <= 2 => {
-            let signature = capture_loopback_signature(args.get(1).map(String::as_str))?;
-            let (status, candidates) = shazam_http_lab::recognize_signature_for_windows(
-                &signature,
-                (CAPTURE_SECONDS * 1_000) as u64,
-            )?;
-            println!("Shazam HTTP status={status}");
-            for (index, candidate) in candidates.iter().enumerate() {
-                println!(
-                    "match[{}] title={:?} artist={:?}",
-                    index + 1,
-                    candidate.title,
-                    candidate.artist
-                );
-            }
-            Ok(())
+        Some("recognize-loopback" | "recognize-loopback-progressive") => {
+            let (mode, jsonl_output, selected_device_id) =
+                parse_progressive_capture_options(&args[1..], true)?;
+            let context_state = NativeContextState::watch_stdin_updates(mode.request_context)?;
+            recognize_loopback_progressive(
+                selected_device_id.as_deref(),
+                mode,
+                context_state,
+                jsonl_output,
+            )
         }
         _ => {
             print_windows_usage();
@@ -99,19 +491,139 @@ fn refuse_overwrite(output: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn print_windows_usage() {
     eprintln!("usage: openshazam list-devices");
-    eprintln!("   or: openshazam recognize-loopback [device-id]");
-    eprintln!("   or: openshazam capture-signature-loopback <new-output.sig> [device-id]");
+    eprintln!("   or: openshazam recognize-loopback [device-id] [--tagging-type manual|auto] [--native-context foreground|background] [--events-jsonl]");
+    eprintln!("   or: openshazam recognize-loopback-progressive [device-id] [--tagging-type manual|auto] [--native-context foreground|background] [--events-jsonl] (alias)");
+    eprintln!(
+        "   or: openshazam capture-signature-loopback <new-output.sig> <seconds> [device-id]"
+    );
+}
+
+fn parse_capture_seconds(value: &str) -> Result<usize, io::Error> {
+    let seconds = value.parse::<usize>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "capture duration must be an integer from 1 to 30 seconds",
+        )
+    })?;
+    if !(1..=30).contains(&seconds) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "capture duration must be an integer from 1 to 30 seconds",
+        ));
+    }
+    Ok(seconds)
 }
 
 #[cfg(target_os = "macos")]
 fn run_macos_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    if args.len() != 2 || args[0] != "capture-signature" {
-        eprintln!("usage: openshazam capture-signature <new-output.sig>");
-        return Err(
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid command or arguments").into(),
-        );
+    match args.first().map(String::as_str) {
+        Some("capture-signature") if args.len() == 3 => {
+            let capture_seconds = parse_capture_seconds(&args[2])?;
+            macos_capture::capture_signature(Path::new(&args[1]), capture_seconds)
+        }
+        Some("recognize-microphone-progressive") => {
+            let (mode, jsonl_output, _) = parse_progressive_capture_options(&args[1..], false)?;
+            let context_state = NativeContextState::watch_stdin_updates(mode.request_context)?;
+            macos_capture::recognize_progressive(mode.tagging_type, context_state, jsonl_output)
+        }
+        _ => {
+            eprintln!("usage: openshazam capture-signature <new-output.sig> <seconds>");
+            eprintln!("   or: openshazam recognize-microphone-progressive [--tagging-type manual|auto] [--native-context foreground|background] [--events-jsonl]");
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid command or arguments").into())
+        }
     }
-    macos_capture::capture_signature(Path::new(&args[1]))
+}
+
+#[cfg(target_os = "macos")]
+fn config_request_profile_from_host() -> Result<shazam_http_lab::ConfigRequestProfile, String> {
+    let language = env_setting("SHAZAM_CONFIG_LANGUAGE")
+        .or_else(|| {
+            command_value("defaults", &["read", "-g", "AppleLanguages"]).and_then(|raw| {
+                first_quoted_value(&raw).map(|value| {
+                    value
+                        .split(['-', '_'])
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+            })
+        })
+        .or_else(|| {
+            locale_from_environment().and_then(|locale| locale.split('_').next().map(str::to_owned))
+        })
+        .unwrap_or_else(|| "en".into());
+    let locale = env_setting("SHAZAM_CONFIG_LOCALE")
+        .or_else(|| {
+            command_value("defaults", &["read", "-g", "AppleLocale"])
+                .map(|value| {
+                    value
+                        .trim()
+                        .split('.')
+                        .next()
+                        .unwrap_or_default()
+                        .replace('-', "_")
+                })
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(locale_from_environment)
+        .unwrap_or_else(|| "en_US".into());
+    let model = env_setting("SHAZAM_CONFIG_MODEL")
+        .or_else(|| command_value("sysctl", &["-n", "hw.model"]))
+        .ok_or_else(|| {
+            "could not read the Mac model (set SHAZAM_CONFIG_MODEL to override)".to_owned()
+        })?;
+    let os_version = env_setting("SHAZAM_CONFIG_OS_VERSION")
+        .or_else(|| command_value("sw_vers", &["-productVersion"]))
+        .ok_or_else(|| {
+            "could not read macOS version (set SHAZAM_CONFIG_OS_VERSION to override)".to_owned()
+        })?;
+    let os_build = env_setting("SHAZAM_CONFIG_OS_BUILD")
+        .or_else(|| command_value("sw_vers", &["-buildVersion"]))
+        .ok_or_else(|| {
+            "could not read macOS build (set SHAZAM_CONFIG_OS_BUILD to override)".to_owned()
+        })?;
+
+    Ok(shazam_http_lab::ConfigRequestProfile {
+        country: env_setting("SHAZAM_CONFIG_COUNTRY").unwrap_or_else(|| "-".into()),
+        language,
+        locale,
+        model,
+        os_version,
+        os_build,
+        app_version: "2.11.0".into(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn env_setting(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn command_value(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+#[cfg(target_os = "macos")]
+fn first_quoted_value(value: &str) -> Option<String> {
+    let start = value.find('"')? + 1;
+    let end = start + value[start..].find('"')?;
+    Some(value[start..end].to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn locale_from_environment() -> Option<String> {
+    let locale = env::var("LC_ALL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| env::var("LANG").ok())?;
+    let locale = locale.split('.').next()?.replace('-', "_");
+    (!locale.is_empty()).then_some(locale)
 }
 
 #[cfg(test)]
@@ -309,6 +821,7 @@ fn list_render_devices() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(windows)]
 fn capture_loopback_signature(
     selected_device_id: Option<&str>,
+    capture_seconds: usize,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     use wasapi::{initialize_mta, AudioCaptureClient, DeviceEnumerator, Direction, StreamMode};
 
@@ -372,14 +885,14 @@ fn capture_loopback_signature(
     let sample_rate = format.get_samplespersec();
     let channels = usize::from(format.get_nchannels());
     let frames = (sample_rate as usize)
-        .checked_mul(CAPTURE_SECONDS)
+        .checked_mul(capture_seconds)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "capture length overflow"))?;
     let mut accumulator = CaptureAccumulator::new_for_rate(sample_rate, frames)?;
     let event = audio_client.set_get_eventhandle()?;
     let capture: AudioCaptureClient = audio_client.get_audiocaptureclient()?;
 
     println!(
-        "Capturing {CAPTURE_SECONDS}s of system playback from {device_name:?} at {sample_rate} Hz, {channels} channel(s)..."
+        "Capturing {capture_seconds}s of system playback from {device_name:?} at {sample_rate} Hz, {channels} channel(s)..."
     );
     audio_client.start_stream()?;
     let capture_result =
@@ -390,10 +903,1281 @@ fn capture_loopback_signature(
 
     let signature = accumulator.finish()?;
     println!(
-        "WASAPI loopback capture complete: 12s PCM -> Pure Rust SigX ({} bytes).",
+        "WASAPI loopback capture complete: {capture_seconds}s PCM -> Pure Rust SigX ({} bytes).",
         signature.len()
     );
     Ok(signature)
+}
+
+#[cfg(windows)]
+fn recognize_loopback_progressive(
+    selected_device_id: Option<&str>,
+    mode: ProgressiveCaptureMode,
+    context_state: NativeContextState,
+    jsonl_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use wasapi::{initialize_mta, AudioCaptureClient, DeviceEnumerator, Direction, StreamMode};
+
+    if mode.tagging_type == NativeTaggingType::Auto && context_state.current().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Auto recognition requires an explicit foreground/background context",
+        )
+        .into());
+    }
+
+    initialize_mta().ok()?;
+    let enumerator = DeviceEnumerator::new()?;
+    let device = match selected_device_id {
+        Some(device_id) => enumerator.get_device(device_id)?,
+        None => enumerator
+            .get_default_device(&Direction::Render)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no default Windows playback device is available: {error:?}"),
+                )
+            })?,
+    };
+    if device.get_direction() != Direction::Render {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the selected endpoint is not a playback device; use `list-devices` to choose an output",
+        )
+        .into());
+    }
+    let device_name = device.get_friendlyname()?;
+    let mut audio_client = device.get_iaudioclient()?;
+    let native_format = audio_client.get_mixformat()?;
+    let (format, auto_convert) = if format_usable_by_sigx(&native_format) {
+        let (_, minimum_period_hns) = audio_client.get_device_period()?;
+        let mode = StreamMode::EventsShared {
+            autoconvert: false,
+            buffer_duration_hns: minimum_period_hns.max(200_000),
+        };
+        if audio_client
+            .initialize_client(&native_format, &Direction::Capture, &mode)
+            .is_ok()
+        {
+            (native_format, false)
+        } else {
+            audio_client = device.get_iaudioclient()?;
+            (canonical_loopback_format(), true)
+        }
+    } else {
+        (canonical_loopback_format(), true)
+    };
+    if auto_convert {
+        let (_, minimum_period_hns) = audio_client.get_device_period()?;
+        audio_client.initialize_client(
+            &format,
+            &Direction::Capture,
+            &StreamMode::EventsShared {
+                autoconvert: true,
+                buffer_duration_hns: minimum_period_hns.max(200_000),
+            },
+        )?;
+        progressive_log(
+            jsonl_output,
+            "Using Windows shared-mode conversion for the endpoint mix format.",
+        );
+    }
+
+    let sample_rate = format.get_samplespersec();
+    let channels = usize::from(format.get_nchannels());
+    let event = audio_client.set_get_eventhandle()?;
+    let capture: AudioCaptureClient = audio_client.get_audiocaptureclient()?;
+    let audio_clock = audio_client.get_audioclock().ok();
+    if audio_clock.is_none() {
+        eprintln!(
+            "WASAPI audio clock is unavailable; packet timestamps will use the first-packet wall-clock fallback."
+        );
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal_cancelled = Arc::clone(&cancelled);
+    ctrlc::set_handler(move || signal_cancelled.store(true, Ordering::Release))?;
+    let (completion_sender, completion_receiver) = mpsc::channel();
+    let mut active_workers = BTreeSet::new();
+    let mut saw_match_event = false;
+    let mut saw_no_match_event = false;
+    let mut received_audio_packet = false;
+    let maximum_prerecord_frames = if mode.tagging_type.uses_pre_recorded_audio() {
+        frames_for_ms(sample_rate, 60_000)?
+    } else {
+        0
+    };
+    let mut preroll = RollingPcmBuffer::new(maximum_prerecord_frames);
+    let mut preroll_start_timestamp_ms = None;
+    let mut timestamp_anchor = CaptureTimestampAnchor::default();
+
+    progressive_log(
+        jsonl_output,
+        format!("Starting WASAPI capture from {device_name:?} ({sample_rate} Hz, {channels} channel(s)) while Shazam Config loads; PCM remains in a bounded local rolling buffer. Press Ctrl+C to stop."),
+    );
+    audio_client.start_stream()?;
+
+    let (configuration_sender, configuration_receiver) = mpsc::sync_channel(1);
+    let configuration_task = match thread::Builder::new()
+        .name("openshazam-config-fetch".into())
+        .spawn(move || {
+            let result = windows_progressive_profile(sample_rate, mode.tagging_type)
+                .map_err(|error| error.to_string());
+            let _ = configuration_sender.send(result);
+        }) {
+        Ok(task) => task,
+        Err(error) => {
+            let _ = audio_client.stop_stream();
+            return Err(error.into());
+        }
+    };
+    let configuration_result = (|| -> Result<_, Box<dyn std::error::Error>> {
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "cancelled while loading Shazam Config",
+                )
+                .into());
+            }
+            match configuration_receiver.try_recv() {
+                Ok(result) => break Ok(result.map_err(io::Error::other)?),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Shazam Config worker stopped unexpectedly",
+                    )
+                    .into());
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            match event.wait_for_event(100) {
+                Ok(()) | Err(wasapi::WasapiError::EventTimeout) => {}
+                Err(error) => return Err(error.into()),
+            }
+            append_wasapi_packets(
+                &capture,
+                &format,
+                channels,
+                sample_rate,
+                &mut preroll,
+                &mut preroll_start_timestamp_ms,
+                &mut timestamp_anchor,
+                audio_clock.as_ref(),
+                &mut received_audio_packet,
+            )?;
+        }
+    })();
+    let (configuration, timing, native_frame_targets) = match configuration_result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = audio_client.stop_stream();
+            return Err(error);
+        }
+    };
+    if configuration_task.join().is_err() {
+        let _ = audio_client.stop_stream();
+        return Err(io::Error::other("Shazam Config worker panicked").into());
+    }
+
+    let native_pre_record_capacity_ms = if mode.tagging_type.uses_pre_recorded_audio() {
+        configuration
+            .manual_timing()
+            .effective_pre_record_buffer_ms()
+    } else {
+        0
+    };
+    if native_pre_record_capacity_ms > 60_000 {
+        let _ = audio_client.stop_stream();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Config pre-record buffer exceeds the local 60-second safety limit",
+        )
+        .into());
+    }
+    let pre_record_capacity_override_ms = if mode.tagging_type.uses_pre_recorded_audio() {
+        match env_optional_u64_setting("OPENSHZAM_PRERECORD_BUFFER_MS", 0, 60_000) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = audio_client.stop_stream();
+                return Err(error);
+            }
+        }
+    } else if env::var_os("OPENSHZAM_PRERECORD_BUFFER_MS").is_some() {
+        let _ = audio_client.stop_stream();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "OPENSHZAM_PRERECORD_BUFFER_MS applies only to Manual recognition",
+        )
+        .into());
+    } else {
+        None
+    };
+    let pre_record_capacity_mode = if pre_record_capacity_override_ms.is_some() {
+        "diagnostic override"
+    } else {
+        "Native page-rounded"
+    };
+    let pre_record_capacity_frames = if !mode.tagging_type.uses_pre_recorded_audio() {
+        0
+    } else {
+        match pre_record_capacity_override_ms {
+            Some(duration_ms) => match frames_for_ms(sample_rate, duration_ms) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    let _ = audio_client.stop_stream();
+                    return Err(error.into());
+                }
+            },
+            None => match configuration
+                .manual_timing()
+                .effective_pre_record_capacity_frames(sample_rate)
+            {
+                Ok(frames) => frames,
+                Err(error) => {
+                    let _ = audio_client.stop_stream();
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, error).into());
+                }
+            },
+        }
+    };
+    let pre_record_capacity_ms =
+        match milliseconds_for_frames(sample_rate, pre_record_capacity_frames) {
+            Ok(milliseconds) => milliseconds,
+            Err(error) => {
+                let _ = audio_client.stop_stream();
+                return Err(error.into());
+            }
+        };
+    let frames_before_resize = preroll.frames();
+    preroll.set_capacity_frames(pre_record_capacity_frames);
+    if let Some(start_ms) = preroll_start_timestamp_ms {
+        preroll_start_timestamp_ms = advance_timestamp_ms(
+            start_ms,
+            frames_before_resize.saturating_sub(preroll.frames()),
+            sample_rate,
+        );
+    }
+    emit_progressive_ui_config(
+        &configuration,
+        ProgressiveUiConfigInputs {
+            tagging_type: mode.tagging_type,
+            request_context: context_state.current(),
+            sample_rate_hz: sample_rate,
+            pre_record_capacity_frames,
+            diagnostic_pre_record_override: pre_record_capacity_override_ms.is_some(),
+            request_timeout_ms: timing.request_timeout_ms,
+            jsonl_output,
+        },
+    )?;
+    progressive_log(
+        jsonl_output,
+        format!(
+            "Config resolved: initial_ms={} maximum_ms={} pre_record_capacity_ms={pre_record_capacity_ms} pre_record_capacity_frames={pre_record_capacity_frames} pre_record_capacity_mode={pre_record_capacity_mode}.",
+            timing.initial_sample_ms, timing.maximum_sample_ms
+        ),
+    );
+
+    let pre_recorded = if pre_record_capacity_frames == 0 {
+        let result = append_wasapi_packets(
+            &capture,
+            &format,
+            channels,
+            sample_rate,
+            &mut preroll,
+            &mut preroll_start_timestamp_ms,
+            &mut timestamp_anchor,
+            audio_clock.as_ref(),
+            &mut received_audio_packet,
+        )
+        .map(|_| None);
+        match result {
+            Ok(samples) => {
+                drop(preroll);
+                samples
+            }
+            Err(error) => {
+                let _ = audio_client.stop_stream();
+                return Err(error);
+            }
+        }
+    } else {
+        progressive_log(
+            jsonl_output,
+            format!("WASAPI rolling pre-record buffer is active; press Enter to start manual recognition (retaining up to {pre_record_capacity_ms} ms; {pre_record_capacity_mode} capacity)."),
+        );
+        match capture_wasapi_prerecord(
+            &event,
+            &capture,
+            &format,
+            channels,
+            sample_rate,
+            preroll,
+            &mut preroll_start_timestamp_ms,
+            &mut timestamp_anchor,
+            audio_clock.as_ref(),
+            &cancelled,
+            &mut received_audio_packet,
+        ) {
+            Ok(samples) => Some(samples),
+            Err(error) => {
+                let _ = audio_client.stop_stream();
+                return Err(error);
+            }
+        }
+    };
+    let mut session = match ProgressiveSession::new_for_type_with_native_frame_targets(
+        timing,
+        mode.tagging_type,
+        pre_record_capacity_frames,
+        Some(native_frame_targets),
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = audio_client.stop_stream();
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, error).into());
+        }
+    };
+    let session_start_timestamp_ms = if mode.tagging_type.uses_pre_recorded_audio() {
+        preroll_start_timestamp_ms.or_else(unix_timestamp_ms)
+    } else {
+        unix_timestamp_ms()
+    }
+    .ok_or_else(|| io::Error::other("system clock is before Unix epoch"))?;
+    if let Err(error) = session.set_session_start_timestamp_ms(session_start_timestamp_ms) {
+        let _ = audio_client.stop_stream();
+        return Err(io::Error::new(io::ErrorKind::InvalidData, error).into());
+    }
+    if let Some(pre_recorded) = pre_recorded {
+        let seeded_frames = match session.prime_pre_recorded_f32(&pre_recorded) {
+            Ok(frames) => frames,
+            Err(error) => {
+                let _ = audio_client.stop_stream();
+                return Err(io::Error::new(io::ErrorKind::InvalidData, error).into());
+            }
+        };
+        progressive_log(
+            jsonl_output,
+            format!("Manual recognition started with {seeded_frames} buffered PCM frames."),
+        );
+    }
+    let started = Instant::now();
+
+    let capture_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        while !session.is_terminal() {
+            if cancelled.load(Ordering::Acquire) {
+                session.cancel();
+                break;
+            }
+
+            service_windows_progressive(
+                &mut session,
+                &configuration,
+                context_state.clone(),
+                started,
+                jsonl_output,
+                timing.request_timeout_ms,
+                &completion_sender,
+                &completion_receiver,
+                &cancelled,
+                &mut active_workers,
+                &mut saw_match_event,
+                &mut saw_no_match_event,
+            )?;
+            if session.is_terminal() {
+                break;
+            }
+
+            event.wait_for_event(100)?;
+            service_windows_progressive(
+                &mut session,
+                &configuration,
+                context_state.clone(),
+                started,
+                jsonl_output,
+                timing.request_timeout_ms,
+                &completion_sender,
+                &completion_receiver,
+                &cancelled,
+                &mut active_workers,
+                &mut saw_match_event,
+                &mut saw_no_match_event,
+            )?;
+            loop {
+                let Some(packet_frames) = capture.get_next_packet_size()? else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "WASAPI capture client did not report shared-mode packet sizes",
+                    )
+                    .into());
+                };
+                if packet_frames == 0 {
+                    break;
+                }
+                let byte_count = (packet_frames as usize)
+                    .checked_mul(format.get_blockalign() as usize)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "packet too large")
+                    })?;
+                let mut bytes = vec![0u8; byte_count];
+                let (read_frames, info) = capture.read_from_device(&mut bytes)?;
+                if info.flags.data_discontinuity && received_audio_packet {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "WASAPI reported a capture discontinuity; retry after playback is stable",
+                    )
+                    .into());
+                }
+                if read_frames == 0 {
+                    continue;
+                }
+                received_audio_packet = true;
+                let frame_count = read_frames as usize;
+                if frame_count != 0 {
+                    let source_timestamp_ms = capture_timestamp_ms(
+                        &mut timestamp_anchor,
+                        audio_clock.as_ref(),
+                        info.timestamp,
+                        info.flags.timestamp_error,
+                    );
+                    let mono = if info.flags.silent {
+                        vec![0.0; frame_count]
+                    } else {
+                        let byte_count = frame_count
+                            .checked_mul(format.get_blockalign() as usize)
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidData, "packet too large")
+                            })?;
+                        let packet_bytes = bytes.get(..byte_count).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "WASAPI returned fewer bytes than reported frames",
+                            )
+                        })?;
+                        let interleaved =
+                            decode_wasapi_interleaved(packet_bytes, frame_count, &format)?;
+                        downmix_interleaved_f32(&interleaved, channels)?
+                    };
+                    let report = session
+                        .push_f32_at_with_source_timestamp_ns(
+                            &mono,
+                            elapsed_ns(started),
+                            source_timestamp_ms,
+                        )
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    let _ = report;
+                }
+
+                service_windows_progressive(
+                    &mut session,
+                    &configuration,
+                    context_state.clone(),
+                    started,
+                    jsonl_output,
+                    timing.request_timeout_ms,
+                    &completion_sender,
+                    &completion_receiver,
+                    &cancelled,
+                    &mut active_workers,
+                    &mut saw_match_event,
+                    &mut saw_no_match_event,
+                )?;
+                if session.is_terminal() {
+                    break;
+                }
+            }
+
+            // Loopback can legitimately have no packet while playback is
+            // idle. Native ends the session using its Config-derived timeout
+            // when present; otherwise the user can stop it with Ctrl+C. Don't
+            // substitute a shorter local empty-wakeup deadline here.
+            service_windows_progressive(
+                &mut session,
+                &configuration,
+                context_state.clone(),
+                started,
+                jsonl_output,
+                timing.request_timeout_ms,
+                &completion_sender,
+                &completion_receiver,
+                &cancelled,
+                &mut active_workers,
+                &mut saw_match_event,
+                &mut saw_no_match_event,
+            )?;
+        }
+        Ok(())
+    })();
+
+    let stop_result = audio_client.stop_stream();
+    capture_result?;
+    stop_result?;
+    session.finish_input();
+
+    while !session.is_terminal() || !active_workers.is_empty() {
+        if cancelled.load(Ordering::Acquire) {
+            session.cancel();
+            break;
+        }
+        service_windows_progressive(
+            &mut session,
+            &configuration,
+            context_state.clone(),
+            started,
+            jsonl_output,
+            timing.request_timeout_ms,
+            &completion_sender,
+            &completion_receiver,
+            &cancelled,
+            &mut active_workers,
+            &mut saw_match_event,
+            &mut saw_no_match_event,
+        )?;
+        if active_workers.is_empty() && !session.is_terminal() {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    cancelled.store(true, Ordering::Release);
+
+    let status = session.status();
+    if matches!(
+        status,
+        SessionStatus::Failed(shazam_progressive::StopReason::SessionTimeout)
+    ) {
+        emit_session_timeout_event(session.tagging_type(), jsonl_output);
+    }
+    if manual_completion_is_normal(status, saw_match_event, saw_no_match_event) {
+        return Ok(());
+    }
+    match status {
+        SessionStatus::Cancelled => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "progressive recognition was cancelled",
+        )
+        .into()),
+        status => Err(io::Error::other(format!(
+            "progressive recognition ended without a match ({status:?}) after {} ms of audio",
+            session.sample_ms()
+        ))
+        .into()),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct CaptureTimestampAnchor {
+    first_qpc_timestamp_100ns: Option<u64>,
+    first_wall_timestamp_ms: Option<u64>,
+}
+
+#[cfg(windows)]
+fn unix_timestamp_ms() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
+}
+
+#[cfg(windows)]
+fn capture_timestamp_ms(
+    anchor: &mut CaptureTimestampAnchor,
+    audio_clock: Option<&wasapi::AudioClock>,
+    qpc_timestamp_100ns: u64,
+    timestamp_error: bool,
+) -> Option<u64> {
+    if timestamp_error {
+        return None;
+    }
+    if let Some(audio_clock) = audio_clock {
+        if let (Ok((_, current_qpc_100ns)), Some(current_unix_ms)) =
+            (audio_clock.get_position(), unix_timestamp_ms())
+        {
+            if let Some(timestamp_ms) =
+                qpc_timestamp_to_unix_ms(qpc_timestamp_100ns, current_qpc_100ns, current_unix_ms)
+            {
+                return Some(timestamp_ms);
+            }
+        }
+    }
+    if anchor.first_qpc_timestamp_100ns.is_none() {
+        anchor.first_wall_timestamp_ms = unix_timestamp_ms();
+        anchor.first_qpc_timestamp_100ns = Some(qpc_timestamp_100ns);
+    }
+    let elapsed_ms = qpc_timestamp_100ns.checked_sub(anchor.first_qpc_timestamp_100ns?)? / 10_000;
+    anchor.first_wall_timestamp_ms?.checked_add(elapsed_ms)
+}
+
+#[cfg(windows)]
+fn advance_timestamp_ms(timestamp_ms: u64, frames: usize, sample_rate: u32) -> Option<u64> {
+    if sample_rate == 0 {
+        return None;
+    }
+    let elapsed_ms = (frames as u128)
+        .checked_mul(1_000)?
+        .checked_div(u128::from(sample_rate))?;
+    timestamp_ms.checked_add(u64::try_from(elapsed_ms).ok()?)
+}
+
+#[cfg(windows)]
+fn push_timed_preroll(
+    ring: &mut RollingPcmBuffer<f32>,
+    start_timestamp_ms: &mut Option<u64>,
+    samples: &[f32],
+    packet_timestamp_ms: Option<u64>,
+    sample_rate: u32,
+) {
+    let old_frames = ring.frames();
+    ring.push(samples);
+    let discarded_frames = old_frames
+        .saturating_add(samples.len())
+        .saturating_sub(ring.frames());
+    if let Some(start_ms) = *start_timestamp_ms {
+        if discarded_frames > 0 {
+            *start_timestamp_ms = advance_timestamp_ms(start_ms, discarded_frames, sample_rate);
+        }
+    } else if old_frames == 0 && !samples.is_empty() {
+        *start_timestamp_ms = packet_timestamp_ms.and_then(|packet_start| {
+            advance_timestamp_ms(
+                packet_start,
+                samples.len().saturating_sub(ring.frames()),
+                sample_rate,
+            )
+        });
+    }
+}
+
+#[cfg(windows)]
+// Keep WASAPI handles and rolling timestamp state explicit at this adapter boundary.
+#[allow(clippy::too_many_arguments)]
+fn capture_wasapi_prerecord(
+    event: &wasapi::Handle,
+    capture: &wasapi::AudioCaptureClient,
+    format: &wasapi::WaveFormat,
+    channels: usize,
+    sample_rate: u32,
+    mut ring: RollingPcmBuffer<f32>,
+    preroll_start_timestamp_ms: &mut Option<u64>,
+    timestamp_anchor: &mut CaptureTimestampAnchor,
+    audio_clock: Option<&wasapi::AudioClock>,
+    cancelled: &AtomicBool,
+    received_audio_packet: &mut bool,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let trigger_receiver = spawn_manual_trigger_receiver();
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "cancelled while waiting for manual recognition trigger",
+            )
+            .into());
+        }
+
+        let mut triggered = match trigger_receiver.try_recv() {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => return Err(io::Error::other(error).into()),
+            Err(TryRecvError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "manual recognition trigger input closed",
+                )
+                .into());
+            }
+            Err(TryRecvError::Empty) => false,
+        };
+
+        if !triggered {
+            match event.wait_for_event(100) {
+                Ok(()) | Err(wasapi::WasapiError::EventTimeout) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        append_wasapi_packets(
+            capture,
+            format,
+            channels,
+            sample_rate,
+            &mut ring,
+            preroll_start_timestamp_ms,
+            timestamp_anchor,
+            audio_clock,
+            received_audio_packet,
+        )?;
+
+        if !triggered {
+            triggered = match trigger_receiver.try_recv() {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => return Err(io::Error::other(error).into()),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "manual recognition trigger input closed",
+                    )
+                    .into());
+                }
+                Err(TryRecvError::Empty) => false,
+            };
+        }
+        if triggered {
+            return Ok(ring.into_samples());
+        }
+    }
+}
+
+#[cfg(windows)]
+// Keep packet conversion and timestamp state explicit at this adapter boundary.
+#[allow(clippy::too_many_arguments)]
+fn append_wasapi_packets(
+    capture: &wasapi::AudioCaptureClient,
+    format: &wasapi::WaveFormat,
+    channels: usize,
+    sample_rate: u32,
+    ring: &mut RollingPcmBuffer<f32>,
+    preroll_start_timestamp_ms: &mut Option<u64>,
+    timestamp_anchor: &mut CaptureTimestampAnchor,
+    audio_clock: Option<&wasapi::AudioClock>,
+    received_audio_packet: &mut bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut packet_available = false;
+    loop {
+        let Some(packet_frames) = capture.get_next_packet_size()? else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "WASAPI capture client did not report shared-mode packet sizes",
+            )
+            .into());
+        };
+        if packet_frames == 0 {
+            break;
+        }
+        packet_available = true;
+        let byte_count = (packet_frames as usize)
+            .checked_mul(format.get_blockalign() as usize)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "packet too large"))?;
+        let mut bytes = vec![0u8; byte_count];
+        let (read_frames, info) = capture.read_from_device(&mut bytes)?;
+        if info.flags.data_discontinuity && *received_audio_packet {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WASAPI reported a capture discontinuity while buffering pre-record audio",
+            )
+            .into());
+        }
+        if read_frames == 0 {
+            continue;
+        }
+        let source_timestamp_ms = capture_timestamp_ms(
+            timestamp_anchor,
+            audio_clock,
+            info.timestamp,
+            info.flags.timestamp_error,
+        );
+        *received_audio_packet = true;
+        let frame_count = read_frames as usize;
+        let mono = if info.flags.silent {
+            vec![0.0; frame_count]
+        } else {
+            let byte_count = frame_count
+                .checked_mul(format.get_blockalign() as usize)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "packet too large"))?;
+            let packet_bytes = bytes.get(..byte_count).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WASAPI returned fewer bytes than reported frames",
+                )
+            })?;
+            let interleaved = decode_wasapi_interleaved(packet_bytes, frame_count, format)?;
+            downmix_interleaved_f32(&interleaved, channels)?
+        };
+        push_timed_preroll(
+            ring,
+            preroll_start_timestamp_ms,
+            &mono,
+            source_timestamp_ms,
+            sample_rate,
+        );
+    }
+    Ok(packet_available)
+}
+
+#[cfg(windows)]
+fn windows_progressive_profile(
+    sample_rate: u32,
+    tagging_type: NativeTaggingType,
+) -> Result<
+    (
+        shazam_http_lab::ShazamConfiguration,
+        RecognitionTiming,
+        NativeSampleFrameTargets,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let profile = shazam_http_lab::windows_config_request_profile()?;
+    let configuration = shazam_http_lab::fetch_shazam_config(&profile)?;
+    let manual = configuration.manual_timing();
+    let native_frame_targets =
+        configuration.native_frame_targets_for_type(tagging_type, sample_rate)?;
+    let timeout_ms = env_u64_setting(
+        "OPENSHZAM_PROGRESSIVE_REQUEST_TIMEOUT_MS",
+        NATIVE_NETWORK_REQUEST_TIMEOUT_MS,
+        1,
+        600_000,
+    )?;
+    let retry_delay_cap_ms =
+        env_optional_u64_setting("OPENSHZAM_PROGRESSIVE_RETRY_DELAY_CAP_MS", 0, 600_000)?;
+    let attempts = env_optional_u64_setting("OPENSHZAM_PROGRESSIVE_MAX_ATTEMPTS", 1, u64::MAX)?;
+    let default_interval_ms = match tagging_type {
+        NativeTaggingType::Manual => NATIVE_TAGGING_TYPE_1_DEFAULT_INTERVAL_MS,
+        NativeTaggingType::Auto => NATIVE_TAGGING_TYPE_2_DEFAULT_INTERVAL_MS,
+    };
+    let timing = match tagging_type {
+        NativeTaggingType::Manual => manual.recognition_timing(
+            sample_rate,
+            shazam_http_lab::NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS,
+            default_interval_ms,
+            timeout_ms,
+            retry_delay_cap_ms,
+            attempts,
+        )?,
+        NativeTaggingType::Auto => manual.auto_recognition_timing(
+            sample_rate,
+            shazam_http_lab::NATIVE_DEFAULT_MINIMUM_SIGNATURE_LENGTH_MS,
+            default_interval_ms,
+            timeout_ms,
+            retry_delay_cap_ms,
+            attempts,
+        )?,
+    };
+    Ok((configuration, timing, native_frame_targets))
+}
+
+#[cfg(windows)]
+fn env_u64_setting(
+    name: &str,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let value = match env::var(name) {
+        Ok(value) => value.parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be an unsigned integer"),
+            )
+        })?,
+        Err(env::VarError::NotPresent) => default,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} is not Unicode"),
+            )
+            .into());
+        }
+    };
+    if !(minimum..=maximum).contains(&value) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be between {minimum} and {maximum}"),
+        )
+        .into());
+    }
+    Ok(value)
+}
+
+#[cfg(windows)]
+fn env_optional_u64_setting(
+    name: &str,
+    minimum: u64,
+    maximum: u64,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed = value.parse::<u64>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be an unsigned integer"),
+                )
+            })?;
+            if !(minimum..=maximum).contains(&parsed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be between {minimum} and {maximum}"),
+                )
+                .into());
+            }
+            Ok(Some(parsed))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} is not Unicode"),
+        )
+        .into()),
+    }
+}
+
+fn frames_for_ms(sample_rate: u32, duration_ms: u64) -> Result<usize, io::Error> {
+    let frames = u64::from(sample_rate)
+        .checked_mul(duration_ms)
+        .and_then(|value| value.checked_add(999))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Config duration overflows frame count",
+            )
+        })?
+        / 1_000;
+    usize::try_from(frames).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Config duration exceeds addressable PCM",
+        )
+    })
+}
+
+fn milliseconds_for_frames(sample_rate: u32, frames: usize) -> Result<u64, io::Error> {
+    if sample_rate == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sample rate must be nonzero when converting pre-record capacity",
+        ));
+    }
+    let milliseconds = (frames as u128)
+        .checked_mul(1_000)
+        .and_then(|value| value.checked_add(u128::from(sample_rate) - 1))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "duration overflow"))?
+        / u128::from(sample_rate);
+    u64::try_from(milliseconds)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "duration exceeds u64"))
+}
+
+#[cfg(windows)]
+// Keep capture, worker, and cancellation handles explicit at this adapter boundary.
+#[allow(clippy::too_many_arguments)]
+fn service_windows_progressive(
+    session: &mut ProgressiveSession,
+    configuration: &shazam_http_lab::ShazamConfiguration,
+    context_state: NativeContextState,
+    started: Instant,
+    jsonl_output: bool,
+    timeout_ms: u64,
+    sender: &mpsc::Sender<WindowsRecognitionCompletion>,
+    receiver: &mpsc::Receiver<WindowsRecognitionCompletion>,
+    cancelled: &Arc<AtomicBool>,
+    active_workers: &mut BTreeSet<u64>,
+    saw_match_event: &mut bool,
+    saw_no_match_event: &mut bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut post_stop_job = None;
+    let mut deferred_manual_ui_event = None;
+    loop {
+        let completion = match receiver.try_recv() {
+            Ok(completion) => completion,
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "recognition worker channel disconnected",
+                )
+                .into());
+            }
+        };
+        active_workers.remove(&completion.attempt);
+        if let Some(status) = completion.status {
+            progressive_log(
+                jsonl_output,
+                format!(
+                    "recognition attempt {} returned HTTP {status}",
+                    completion.attempt
+                ),
+            );
+        }
+        if let Some(message) = completion.error {
+            eprintln!("recognition attempt {}: {message}", completion.attempt);
+        }
+        let tracked = session.in_flight_attempts().contains(&completion.attempt);
+        let was_terminal = session.is_terminal();
+        if tracked {
+            let delivery = shazam_http_lab::apply_progressive_response_at_ns(
+                session,
+                completion.attempt,
+                completion.outcome,
+                completion.candidates.clone(),
+                elapsed_ns(started),
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if !delivery.delivered_to_matcher {
+                progressive_log(
+                    jsonl_output,
+                    format!(
+                        "recognition attempt {} response was ignored by the Native context gate (state={:?})",
+                        completion.attempt,
+                        delivery.status
+                    ),
+                );
+            }
+            let newly_stopped_retry = session.take_post_stop_retry_job();
+            let has_newly_stopped_retry = newly_stopped_retry.is_some();
+            post_stop_job = newly_stopped_retry.or(post_stop_job);
+            if !was_terminal && delivery.delivered_to_matcher {
+                if let Some(event) = delivery.native_manual_ui_event() {
+                    match &event {
+                        shazam_http_lab::NativeManualUiEvent::Result(_) => {
+                            *saw_match_event = true;
+                        }
+                        shazam_http_lab::NativeManualUiEvent::NoMatch => {
+                            *saw_no_match_event = true;
+                        }
+                        shazam_http_lab::NativeManualUiEvent::Error { .. } => {}
+                    }
+                    if has_newly_stopped_retry
+                        && matches!(event, shazam_http_lab::NativeManualUiEvent::NoMatch)
+                    {
+                        deferred_manual_ui_event = Some(event);
+                    } else {
+                        emit_manual_ui_event(&event, jsonl_output);
+                    }
+                } else if let Some(event) = delivery.native_auto_ui_event() {
+                    *saw_match_event = true;
+                    emit_auto_ui_event(&event, jsonl_output);
+                } else if !delivery.candidates.is_empty() {
+                    *saw_match_event = true;
+                    progressive_log(
+                        jsonl_output,
+                        "match response withheld: Native UI ordering is unverified for this response shape",
+                    );
+                }
+            }
+        }
+    }
+
+    let now_ns = elapsed_ns(started);
+    let tagging_type = session.tagging_type();
+    let detached_post_stop_job = post_stop_job.is_some();
+    let mut jobs = Vec::new();
+    if let Some(job) = post_stop_job {
+        jobs.push(job);
+    } else {
+        while let Some(job) = session
+            .poll_at_ns(now_ns)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        {
+            jobs.push(job);
+        }
+    }
+    for job in jobs {
+        let attempt = job.attempt;
+        let sample_ms = job.sample_ms;
+        let configuration = configuration.clone();
+        let worker_cancelled = if detached_post_stop_job {
+            Arc::new(AtomicBool::new(false))
+        } else {
+            Arc::clone(cancelled)
+        };
+        let (dispatch_ack_sender, dispatch_ack_receiver) = if detached_post_stop_job {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let sender = sender.clone();
+        let context_state_for_worker = context_state.clone();
+        let spawn_result = thread::Builder::new()
+            .name(format!("openshazam-recognition-{attempt}"))
+            .spawn(move || {
+                let request_context = context_state_for_worker.current();
+                let mut transport_started = false;
+                let result = if let Some(dispatch_ack_sender) = &dispatch_ack_sender {
+                    shazam_http_lab::submit_progressive_signature_for_windows_tagging_type_with_transport_started_and_timestamp_ms(
+                        &configuration,
+                        tagging_type,
+                        request_context,
+                        &job.signature,
+                        sample_ms,
+                        job.signature_timestamp_ms,
+                        Duration::from_millis(timeout_ms),
+                        &worker_cancelled,
+                        || {
+                            transport_started = true;
+                            let _ = dispatch_ack_sender.send(true);
+                        },
+                    )
+                } else {
+                    shazam_http_lab::submit_progressive_signature_for_windows_tagging_type_with_transport_started_and_timestamp_ms(
+                        &configuration,
+                        tagging_type,
+                        request_context,
+                        &job.signature,
+                        sample_ms,
+                        job.signature_timestamp_ms,
+                        Duration::from_millis(timeout_ms),
+                        &worker_cancelled,
+                        || {},
+                    )
+                };
+                if let Some(dispatch_ack_sender) = &dispatch_ack_sender {
+                    if !transport_started {
+                        let _ = dispatch_ack_sender.send(false);
+                    }
+                }
+                let completion = match result {
+                    Ok(result) => match result.response {
+                        shazam_http_lab::ProgressiveHttpResponse::Matched { candidates, retry } => {
+                            WindowsRecognitionCompletion {
+                                attempt,
+                                status: Some(result.status),
+                                outcome: RecognitionOutcome::Match { retry },
+                                candidates,
+                                error: None,
+                            }
+                        }
+                        shazam_http_lab::ProgressiveHttpResponse::NoMatch(retry) => {
+                            WindowsRecognitionCompletion {
+                                attempt,
+                                status: Some(result.status),
+                                outcome: RecognitionOutcome::NoMatch { retry },
+                                candidates: Vec::new(),
+                                error: None,
+                            }
+                        }
+                        shazam_http_lab::ProgressiveHttpResponse::HttpError { status, retry } => {
+                            WindowsRecognitionCompletion {
+                                attempt,
+                                status: Some(status),
+                                outcome: RecognitionOutcome::MatcherFailure { retry },
+                                candidates: Vec::new(),
+                                error: Some(if retry.is_some() {
+                                    "HTTP response was unsuccessful; following its Retry directive"
+                                } else {
+                                    "HTTP response was unsuccessful; body withheld"
+                                }),
+                            }
+                        }
+                        shazam_http_lab::ProgressiveHttpResponse::InvalidResponse => {
+                            WindowsRecognitionCompletion {
+                                attempt,
+                                status: Some(result.status),
+                                outcome: RecognitionOutcome::InvalidResponse,
+                                candidates: Vec::new(),
+                                error: Some("response had no recognized track or retry metadata"),
+                            }
+                        }
+                        shazam_http_lab::ProgressiveHttpResponse::ParseFailure { retry } => {
+                            WindowsRecognitionCompletion {
+                                attempt,
+                                status: Some(result.status),
+                                outcome: RecognitionOutcome::MatcherFailure { retry },
+                                candidates: Vec::new(),
+                                error: Some(if retry.is_some() {
+                                    "response parsing failed; following Native retry to the configured maximum"
+                                } else {
+                                    "response parsing failed; no Native retry is available"
+                                }),
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        let retry = shazam_http_lab::native_retry_for_network_failure_for_tagging_type(
+                            tagging_type,
+                            &error,
+                            job.sample_ms,
+                            configuration
+                                .manual_timing()
+                                .effective_maximum_signature_length_ms(),
+                            worker_cancelled.load(Ordering::Acquire),
+                        );
+                        WindowsRecognitionCompletion {
+                            attempt,
+                            status: None,
+                            outcome: retry.map_or(RecognitionOutcome::TransportFailure, |retry| {
+                                RecognitionOutcome::MatcherFailure { retry: Some(retry) }
+                            }),
+                            candidates: Vec::new(),
+                            error: Some(if retry.is_some() {
+                                "HTTPS request failed; following Native retry to the configured maximum"
+                            } else {
+                                "HTTPS request failed; response details withheld"
+                            }),
+                        }
+                    }
+                };
+                let _ = sender.send(completion);
+            });
+        if let Err(error) = spawn_result {
+            if detached_post_stop_job {
+                if let Some(event) = deferred_manual_ui_event.take() {
+                    emit_manual_ui_event(&event, jsonl_output);
+                }
+            }
+            return Err(error.into());
+        }
+        if detached_post_stop_job {
+            let dispatch_ack_receiver = dispatch_ack_receiver
+                .expect("detached Retry has a dispatch acknowledgement receiver");
+            notify_after_retry_dispatch_ack(
+                || {
+                    let transport_started = dispatch_ack_receiver.recv().map_err(|_| {
+                        io::Error::other("Retry worker exited before transport dispatch")
+                    })?;
+                    if transport_started {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other(
+                            "Retry request failed before transport startup",
+                        ))
+                    }
+                },
+                || {
+                    if let Some(event) = deferred_manual_ui_event.take() {
+                        emit_manual_ui_event(&event, jsonl_output);
+                    }
+                },
+            )?;
+        }
+        active_workers.insert(attempt);
+        if detached_post_stop_job {
+            session.finish_post_stop_retry_submission();
+        }
+    }
+
+    if session.is_terminal() && session.in_flight_attempts().is_empty() && active_workers.is_empty()
+    {
+        cancelled.store(true, Ordering::Release);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsRecognitionCompletion {
+    attempt: u64,
+    status: Option<u16>,
+    outcome: RecognitionOutcome,
+    candidates: Vec<shazam_http_lab::TrackCandidate>,
+    error: Option<&'static str>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn downmix_interleaved_f32(samples: &[f32], channels: usize) -> Result<Vec<f32>, io::Error> {
+    if channels == 0 || samples.len() % channels != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "capture packet is not a whole number of interleaved frames",
+        ));
+    }
+    samples
+        .chunks_exact(channels)
+        .map(|frame| {
+            if frame.iter().any(|sample| !sample.is_finite()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "capture packet contains a non-finite sample",
+                ));
+            }
+            Ok(frame.iter().copied().sum::<f32>() / channels as f32)
+        })
+        .collect()
 }
 
 #[cfg(windows)]
@@ -591,9 +2375,172 @@ fn capture_loopback_frames(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_mono_f32le, CaptureAccumulator, CAPTURE_RATE};
+    #[cfg(any(windows, target_os = "macos"))]
+    use super::notify_after_retry_dispatch_ack;
+    use super::{
+        decode_mono_f32le, manual_completion_is_normal, milliseconds_for_frames,
+        parse_capture_seconds, qpc_timestamp_to_unix_ms, CaptureAccumulator, CAPTURE_RATE,
+    };
+    #[cfg(any(windows, target_os = "macos"))]
+    use super::{parse_progressive_capture_options, NativeContextState, ProgressiveCaptureMode};
+    #[cfg(any(windows, target_os = "macos"))]
+    use shazam_http_lab::NativeTaggingRequestContext;
+    use shazam_progressive::{SessionStatus, StopReason};
     use sigx_core::{Config, SigX};
     use sigx_format::Signature;
+    use std::cell::RefCell;
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn progressive_cli_requires_explicit_auto_context_and_preserves_manual_default() {
+        let (manual, jsonl, device) = parse_progressive_capture_options(&[], false).unwrap();
+        assert_eq!(
+            manual,
+            ProgressiveCaptureMode {
+                tagging_type: shazam_progressive::NativeTaggingType::Manual,
+                request_context: None,
+            }
+        );
+        assert!(!jsonl);
+        assert_eq!(device, None);
+
+        let arguments = [
+            "--tagging-type",
+            "auto",
+            "--native-context",
+            "background",
+            "--events-jsonl",
+        ]
+        .map(str::to_owned);
+        let (auto, jsonl, device) = parse_progressive_capture_options(&arguments, false).unwrap();
+        assert_eq!(
+            auto,
+            ProgressiveCaptureMode {
+                tagging_type: shazam_progressive::NativeTaggingType::Auto,
+                request_context: Some(NativeTaggingRequestContext::Background),
+            }
+        );
+        assert!(jsonl);
+        assert_eq!(device, None);
+
+        for arguments in [
+            vec!["--tagging-type".into(), "auto".into()],
+            vec![
+                "--tagging-type".into(),
+                "manual".into(),
+                "--native-context".into(),
+                "foreground".into(),
+            ],
+        ] {
+            assert!(parse_progressive_capture_options(&arguments, false).is_err());
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn native_context_state_changes_are_observed_by_later_request_workers() {
+        let state = NativeContextState::new(Some(NativeTaggingRequestContext::Foreground));
+        assert_eq!(
+            state.current(),
+            Some(NativeTaggingRequestContext::Foreground)
+        );
+        state.set(NativeTaggingRequestContext::Background);
+        assert_eq!(
+            state.current(),
+            Some(NativeTaggingRequestContext::Background)
+        );
+    }
+
+    #[test]
+    fn page_rounded_prerecord_duration_is_reported_without_rounding_down() {
+        assert_eq!(milliseconds_for_frames(44_100, 135_168).unwrap(), 3_066);
+        assert_eq!(milliseconds_for_frames(48_000, 147_456).unwrap(), 3_072);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn dispatch_ack_helper_runs_callback_after_acknowledgement() {
+        let order = RefCell::new(Vec::new());
+        let result = notify_after_retry_dispatch_ack(
+            || {
+                order.borrow_mut().push("retry transport started");
+                Ok::<(), ()>(())
+            },
+            || order.borrow_mut().push("callback"),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(*order.borrow(), ["retry transport started", "callback"]);
+
+        order.borrow_mut().clear();
+        let result = notify_after_retry_dispatch_ack(
+            || {
+                order.borrow_mut().push("retry transport startup failed");
+                Err("startup error")
+            },
+            || order.borrow_mut().push("callback"),
+        );
+        assert_eq!(result, Err("startup error"));
+        assert_eq!(
+            *order.borrow(),
+            ["retry transport startup failed", "callback"]
+        );
+    }
+
+    #[test]
+    fn manual_no_match_event_is_a_normal_completion_but_failure_is_not() {
+        assert!(manual_completion_is_normal(
+            SessionStatus::Succeeded,
+            false,
+            false
+        ));
+        assert!(manual_completion_is_normal(
+            SessionStatus::Exhausted,
+            true,
+            false
+        ));
+        assert!(manual_completion_is_normal(
+            SessionStatus::Exhausted,
+            false,
+            true
+        ));
+        assert!(!manual_completion_is_normal(
+            SessionStatus::Exhausted,
+            false,
+            false
+        ));
+        assert!(!manual_completion_is_normal(
+            SessionStatus::Failed(StopReason::TransportFailure),
+            false,
+            false
+        ));
+        assert!(!manual_completion_is_normal(
+            SessionStatus::Cancelled,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn local_capture_duration_must_be_explicit_and_bounded() {
+        assert_eq!(parse_capture_seconds("1").unwrap(), 1);
+        assert_eq!(parse_capture_seconds("30").unwrap(), 30);
+        for invalid in ["0", "31", "", "12s"] {
+            assert!(
+                parse_capture_seconds(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn maps_wasapi_qpc_packet_timestamp_to_unix_time() {
+        assert_eq!(
+            qpc_timestamp_to_unix_ms(1_000_000, 1_025_000, 50_000),
+            Some(49_998)
+        );
+        assert_eq!(qpc_timestamp_to_unix_ms(2_000, 1_000, 50_000), None);
+        assert_eq!(qpc_timestamp_to_unix_ms(0, 20_000, 1), None);
+    }
 
     #[test]
     fn decodes_mono_f32_little_endian_samples() {
