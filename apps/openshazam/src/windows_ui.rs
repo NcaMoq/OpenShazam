@@ -387,8 +387,33 @@ fn result_panel_draw_top(
         .flatten()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ValidatedWebTrackUrl(String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageLinkFailure {
+    MissingConfigGeneration,
+    MissingConfigSnapshot,
+    MissingTemplate,
+    InvalidTemplate,
+    MissingTrackKey,
+    InvalidTrackKey,
+    InvalidResolvedUrl,
+}
+
+impl PageLinkFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingConfigGeneration => "missing_config_generation",
+            Self::MissingConfigSnapshot => "missing_config_snapshot",
+            Self::MissingTemplate => "missing_webtrackurl",
+            Self::InvalidTemplate => "invalid_webtrackurl_template",
+            Self::MissingTrackKey => "missing_track_key",
+            Self::InvalidTrackKey => "invalid_track_key",
+            Self::InvalidResolvedUrl => "invalid_resolved_url",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArtworkSource {
@@ -7329,21 +7354,18 @@ fn show_controller_match(
     let display_id = app.next_display_id;
     app.next_display_id = app.next_display_id.wrapping_add(1).max(1);
     let track_key = metadata.and_then(|metadata| metadata.track_key.clone());
-    let page_url = config_generation
-        .and_then(|generation| app.ui_configs.get(&generation))
-        .and_then(|config| {
-            resolve_page_link(
-                config.web_track_url_template.as_deref(),
-                track_key.as_deref(),
-            )
-        });
-    if page_url.is_none() {
+    let page_link =
+        resolve_page_link_for_generation(config_generation, &app.ui_configs, track_key.as_deref());
+    let page_url = page_link.as_ref().ok().cloned();
+    if let Err(reason) = page_link {
         let config = config_generation.and_then(|generation| app.ui_configs.get(&generation));
         eprintln!(
-            "OpenShazam Shazam link disabled: config_snapshot={}, webtrackurl={}, track_key={}",
+            "OpenShazam Shazam page link unavailable: config_generation={}, config_snapshot={}, webtrackurl={}, track_key={}, reason={}",
+            config_generation.is_some(),
             config.is_some(),
             config.is_some_and(|config| config.web_track_url_template.is_some()),
             track_key.is_some(),
+            reason.as_str(),
         );
     }
     let recognized_at_utc = SystemTime::now();
@@ -7759,11 +7781,21 @@ fn resolve_page_link(
     template: Option<&str>,
     track_key: Option<&str>,
 ) -> Option<ValidatedWebTrackUrl> {
-    let template = template?;
-    let track_key = track_key?;
+    resolve_page_link_checked(template, track_key).ok()
+}
+
+fn resolve_page_link_checked(
+    template: Option<&str>,
+    track_key: Option<&str>,
+) -> Result<ValidatedWebTrackUrl, PageLinkFailure> {
+    let template = template.ok_or(PageLinkFailure::MissingTemplate)?;
+    let track_key = track_key.ok_or(PageLinkFailure::MissingTrackKey)?;
     const TOKEN: &str = "{trackid}";
-    if !valid_page_template(template) || track_key.is_empty() || track_key.len() > 1_024 {
-        return None;
+    if !valid_page_template(template) {
+        return Err(PageLinkFailure::InvalidTemplate);
+    }
+    if track_key.is_empty() || track_key.len() > 1_024 {
+        return Err(PageLinkFailure::InvalidTrackKey);
     }
     let mut encoded = String::with_capacity(track_key.len());
     for byte in track_key.bytes() {
@@ -7776,9 +7808,9 @@ fn resolve_page_link(
     }
     let resolved = template.replacen(TOKEN, &encoded, 1);
     if resolved.contains('{') || resolved.contains('}') || !valid_shazam_page_url(&resolved) {
-        return None;
+        return Err(PageLinkFailure::InvalidResolvedUrl);
     }
-    Some(ValidatedWebTrackUrl(resolved))
+    Ok(ValidatedWebTrackUrl(resolved))
 }
 
 unsafe fn open_track_page(hwnd: HWND, url: &ValidatedWebTrackUrl) -> windows::core::Result<()> {
@@ -7811,17 +7843,33 @@ fn resolve_track_page_url(
     track: &Track,
     ui_configs: &HashMap<u64, UiConfigSnapshot>,
 ) -> Option<ValidatedWebTrackUrl> {
-    track.page_url.clone().or_else(|| {
-        track
-            .config_generation
-            .and_then(|generation| ui_configs.get(&generation))
-            .and_then(|config| {
-                resolve_page_link(
-                    config.web_track_url_template.as_deref(),
-                    track.track_key.as_deref(),
-                )
-            })
-    })
+    resolve_track_page_url_checked(track, ui_configs).ok()
+}
+
+fn resolve_track_page_url_checked(
+    track: &Track,
+    ui_configs: &HashMap<u64, UiConfigSnapshot>,
+) -> Result<ValidatedWebTrackUrl, PageLinkFailure> {
+    if let Some(url) = track.page_url.as_ref() {
+        return Ok(url.clone());
+    }
+    resolve_page_link_for_generation(
+        track.config_generation,
+        ui_configs,
+        track.track_key.as_deref(),
+    )
+}
+
+fn resolve_page_link_for_generation(
+    config_generation: Option<u64>,
+    ui_configs: &HashMap<u64, UiConfigSnapshot>,
+    track_key: Option<&str>,
+) -> Result<ValidatedWebTrackUrl, PageLinkFailure> {
+    let generation = config_generation.ok_or(PageLinkFailure::MissingConfigGeneration)?;
+    let config = ui_configs
+        .get(&generation)
+        .ok_or(PageLinkFailure::MissingConfigSnapshot)?;
+    resolve_page_link_checked(config.web_track_url_template.as_deref(), track_key)
 }
 
 fn refresh_track_page_urls(app: &mut AppState) {
@@ -9588,7 +9636,8 @@ mod tests {
         history_title_color, inverse_circle_clip_radii, is_offline_failure,
         is_tray_activation_event, localized_ui_text, native_icon_layout, no_match_copy,
         no_match_icon_rect, page_url_for_display_id, phase_needs_timeout, point_in_rect,
-        popup_base_color, resolve_page_link, result_artwork_rect, result_card_link_hit,
+        popup_base_color, resolve_page_link, resolve_page_link_checked,
+        resolve_page_link_for_generation, result_artwork_rect, result_card_link_hit,
         result_details_rects, result_gradient_colors, result_header_hit_test_contains,
         result_header_visible_height, result_overlay_child_offset,
         result_overlay_occludes_shazam_button, result_panel_draw_top, result_panel_top_at,
@@ -9597,14 +9646,15 @@ mod tests {
         theme_from_foreground_rgb, timeout_copy, ui_model, valid_page_template,
         visible_history_row_hit, ArrowEdge, ArtworkSource, CaptureMode, CompositionRootLayer,
         CompositionSceneLayer, HeaderFillScope, HistoryMutationEvent, HistoryMutationTransition,
-        HistoryTimestampSource, MainPhase, NoMatchIconCommand, ResultCardAdvance, ResultCardStage,
-        Theme, Track, UiConfigSnapshot, UiLanguage, UiTextKey, ValidatedWebTrackUrl, WindowKind,
-        BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, FALLBACK_MATCH_DARK_PIXELS,
-        FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE, HISTORY_HEIGHT,
-        HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY,
-        POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT, RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD,
-        RESULT_CARD_TRANSITION, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS,
-        TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
+        HistoryTimestampSource, MainPhase, NoMatchIconCommand, PageLinkFailure, ResultCardAdvance,
+        ResultCardStage, Theme, Track, UiConfigSnapshot, UiLanguage, UiTextKey,
+        ValidatedWebTrackUrl, WindowKind, BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X,
+        FALLBACK_MATCH_DARK_PIXELS, FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE,
+        HISTORY_HEIGHT, HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH,
+        OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT,
+        RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD, RESULT_CARD_TRANSITION,
+        RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT,
+        WHITE_CLOSE_ICON_PIXELS,
     };
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
