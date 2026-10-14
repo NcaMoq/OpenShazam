@@ -38,13 +38,14 @@ use windows::{
                     D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP,
                     D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
                 },
-                D2D1CreateFactory, ID2D1Bitmap, ID2D1Bitmap1, ID2D1DCRenderTarget,
-                ID2D1DeviceContext, ID2D1Factory, ID2D1Geometry, ID2D1HwndRenderTarget, ID2D1Layer,
-                ID2D1LinearGradientBrush, ID2D1RenderTarget, ID2D1SolidColorBrush,
-                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_PROPERTIES, D2D1_BITMAP_PROPERTIES1,
-                D2D1_COMBINE_MODE_EXCLUDE, D2D1_COMBINE_MODE_UNION, D2D1_ELLIPSE,
-                D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
+                D2D1CreateDevice, D2D1CreateFactory, ID2D1Bitmap, ID2D1Bitmap1,
+                ID2D1DCRenderTarget, ID2D1Device, ID2D1DeviceContext, ID2D1Factory, ID2D1Geometry,
+                ID2D1HwndRenderTarget, ID2D1Layer, ID2D1LinearGradientBrush, ID2D1RenderTarget,
+                ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_OPTIONS_NONE,
+                D2D1_BITMAP_PROPERTIES, D2D1_BITMAP_PROPERTIES1, D2D1_COMBINE_MODE_EXCLUDE,
+                D2D1_COMBINE_MODE_UNION, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
                 D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
                 D2D1_LAYER_OPTIONS_NONE, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
                 D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
@@ -64,7 +65,7 @@ use windows::{
                 DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
                 DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_WRAP,
             },
-            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Dxgi::{Common::DXGI_FORMAT_B8G8R8A8_UNORM, IDXGIDevice},
             Gdi::{
                 BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
                 GetMonitorInfoW, InvalidateRect, MonitorFromRect, SelectObject, AC_SRC_ALPHA,
@@ -614,6 +615,7 @@ struct Renderer {
     popup_outline: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     popup_header: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     result_details_cache: RefCell<Option<CachedResultDetailsMetrics>>,
+    result_overlay_failure_reported: bool,
 }
 
 const SETTINGS_ICON_PIXELS: &[u8; 4096] = include_bytes!("../assets/settings-2x.bgra");
@@ -783,6 +785,7 @@ fn copy_panel_pixels_into(
 
 struct CompositionResultOverlay {
     _graphics_device: CompositionGraphicsDevice,
+    _rendering_device: ID2D1Device,
     _surface: CompositionDrawingSurface,
     surface_interop: ICompositionDrawingSurfaceInterop,
     _surface_brush: CompositionSurfaceBrush,
@@ -793,6 +796,13 @@ struct CompositionResultOverlay {
     pixels: Vec<u8>,
     scratch: Vec<u8>,
     has_contents: bool,
+}
+
+fn overlay_surface_error(operation: &str, error: windows::core::Error) -> windows::core::Error {
+    Error::new(
+        error.code(),
+        format!("Composition result surface {operation}: {error}"),
+    )
 }
 
 impl CompositionResultOverlay {
@@ -824,8 +834,14 @@ impl CompositionResultOverlay {
             )?;
         }
         let device: ID3D11Device = device.ok_or_else(Error::from_thread)?;
+        let dxgi_device: IDXGIDevice = device.cast()?;
+        // CompositionDrawingSurfaceInterop::BeginDraw is requested as an
+        // ID2D1DeviceContext below, so back its graphics device with the D2D
+        // device created from this D3D11 adapter. Keep the rendering-device
+        // interface consistent with the requested drawing interface.
+        let rendering_device = D2D1CreateDevice(&dxgi_device, None)?;
         let compositor_interop: ICompositorInterop = compositor.cast()?;
-        let graphics_device = compositor_interop.CreateGraphicsDevice(&device)?;
+        let graphics_device = compositor_interop.CreateGraphicsDevice(&rendering_device)?;
         let dpi = dpi.max(96);
         let scale = composition_scale_for_dpi(dpi);
         let size = D2D_SIZE_U {
@@ -861,6 +877,7 @@ impl CompositionResultOverlay {
 
         Ok(Self {
             _graphics_device: graphics_device,
+            _rendering_device: rendering_device,
             _surface: surface,
             surface_interop,
             _surface_brush: surface_brush,
@@ -884,10 +901,12 @@ impl CompositionResultOverlay {
             width: (CONTENT_WIDTH as f32 * scale).ceil() as u32,
             height: (TOP_HEIGHT as f32 * scale).ceil() as u32,
         };
-        self.surface_interop.Resize(SIZE {
-            cx: size.width as i32,
-            cy: size.height as i32,
-        })?;
+        self.surface_interop
+            .Resize(SIZE {
+                cx: size.width as i32,
+                cy: size.height as i32,
+            })
+            .map_err(|error| overlay_surface_error("Resize", error))?;
         self.size = size;
         self.dpi = dpi;
         self.bitmap = None;
@@ -922,7 +941,8 @@ impl CompositionResultOverlay {
             let mut offset = POINT::default();
             let context = self
                 .surface_interop
-                .BeginDraw::<ID2D1DeviceContext>(None, &mut offset)?;
+                .BeginDraw::<ID2D1DeviceContext>(None, &mut offset)
+                .map_err(|error| overlay_surface_error("BeginDraw", error))?;
             let draw_result = (|| -> windows::core::Result<()> {
                 context.SetDpi(96.0, 96.0);
                 context.SetTransform(&Matrix3x2 {
@@ -945,21 +965,21 @@ impl CompositionResultOverlay {
                         bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
                         colorContext: std::mem::ManuallyDrop::new(None),
                     };
-                    let bitmap = context.CreateBitmap(
-                        self.size,
-                        Some(self.scratch.as_ptr().cast()),
-                        self.size.width * 4,
-                        &properties,
-                    )?;
+                    let bitmap = context
+                        .CreateBitmap(
+                            self.size,
+                            Some(self.scratch.as_ptr().cast()),
+                            self.size.width * 4,
+                            &properties,
+                        )
+                        .map_err(|error| overlay_surface_error("CreateBitmap", error))?;
                     self.bitmap = Some(bitmap.clone());
                     bitmap
                 };
                 if self.bitmap.is_some() && self.has_contents {
-                    bitmap.CopyFromMemory(
-                        None,
-                        self.scratch.as_ptr().cast(),
-                        self.size.width * 4,
-                    )?;
+                    bitmap
+                        .CopyFromMemory(None, self.scratch.as_ptr().cast(), self.size.width * 4)
+                        .map_err(|error| overlay_surface_error("CopyFromMemory", error))?;
                 }
                 let transparent = d2d_color(0, 0, 0, 0.0);
                 context.Clear(Some(&transparent));
@@ -976,18 +996,22 @@ impl CompositionResultOverlay {
             })();
             let end_result = self.surface_interop.EndDraw();
             draw_result?;
-            end_result?;
+            end_result.map_err(|error| overlay_surface_error("EndDraw", error))?;
             std::mem::swap(&mut self.pixels, &mut self.scratch);
             self.has_contents = true;
         }
 
         let root_snap = composition_button_pixel_snap_offset(self.dpi, body_top);
-        self.group.SetOffset(Vector3 {
-            X: -root_snap.X,
-            Y: panel_top - root_snap.Y,
-            Z: 0.0,
-        })?;
-        self.group.SetOpacity(1.0)?;
+        self.group
+            .SetOffset(Vector3 {
+                X: -root_snap.X,
+                Y: panel_top - root_snap.Y,
+                Z: 0.0,
+            })
+            .map_err(|error| overlay_surface_error("SetOffset", error))?;
+        self.group
+            .SetOpacity(1.0)
+            .map_err(|error| overlay_surface_error("SetOpacity", error))?;
         Ok(())
     }
 
@@ -3952,6 +3976,7 @@ impl Renderer {
             popup_outline: RefCell::new(None),
             popup_header: RefCell::new(None),
             result_details_cache: RefCell::new(None),
+            result_overlay_failure_reported: false,
         })
     }
 
@@ -4059,6 +4084,7 @@ impl Renderer {
                 }
                 _ => None,
             };
+            let mut overlay_error = None;
             if let Some(scene) = self.composition.as_mut() {
                 if let Err(error) = scene.update_result_overlay(
                     self.layered_surface.as_ref(),
@@ -4072,10 +4098,18 @@ impl Renderer {
                     // card invisible; hide any stale overlay and present the
                     // D2D frame as a fallback.
                     let _ = scene.result_overlay.hide();
+                    overlay_error = Some(error);
+                }
+            }
+            if let Some(error) = overlay_error {
+                if !self.result_overlay_failure_reported {
                     eprintln!(
                         "Windows UI result overlay update failed; using D2D fallback: {error}"
                     );
+                    self.result_overlay_failure_reported = true;
                 }
+            } else {
+                self.result_overlay_failure_reported = false;
             }
         }
         if let Some(surface) = self.layered_surface.as_ref() {
