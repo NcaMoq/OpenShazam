@@ -6,7 +6,7 @@ use openshazam_controller::{
     RecognitionEventKind, RecognitionMode, SessionEndReason, SessionId,
 };
 use shazam_http_lab::NativeTaggingRequestContext;
-use shazam_progressive::{NativeTaggingType, SessionStatus};
+use shazam_progressive::NativeTaggingType;
 use std::{
     collections::HashMap,
     sync::{
@@ -19,6 +19,7 @@ use std::{
 struct SessionWorker {
     cancelled: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
+    accepted_control: Arc<std::sync::atomic::AtomicU8>,
     shutting_down: Arc<AtomicBool>,
     context: NativeContextState,
     mode: RecognitionMode,
@@ -129,13 +130,14 @@ impl RecognitionBackend for WindowsRecognitionBackend {
         let context_state = NativeContextState::new(request_context);
         let cancelled = Arc::new(AtomicBool::new(false));
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let accepted_control = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let config_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let config_fetching = Arc::new(AtomicBool::new(false));
         let cleanup_failed = Arc::new(AtomicBool::new(false));
         let run_cancelled = Arc::clone(&cancelled);
         let run_stop_requested = Arc::clone(&stop_requested);
-        let run_shutting_down = Arc::clone(&shutting_down);
+        let run_accepted_control = Arc::clone(&accepted_control);
         let run_config_generation = Arc::clone(&config_generation);
         let run_config_fetching = Arc::clone(&config_fetching);
         let run_cleanup_failed = Arc::clone(&cleanup_failed);
@@ -151,7 +153,7 @@ impl RecognitionBackend for WindowsRecognitionBackend {
                     stop_requested: run_stop_requested.clone(),
                     config_generation: run_config_generation.clone(),
                     config_fetching: run_config_fetching.clone(),
-                    shutdown_requested: run_shutting_down.clone(),
+                    accepted_control: run_accepted_control.clone(),
                     cleanup_failed: run_cleanup_failed.clone(),
                     manual_trigger_receiver: if mode == RecognitionMode::Manual {
                         let (sender, receiver) = std::sync::mpsc::channel();
@@ -197,14 +199,7 @@ impl RecognitionBackend for WindowsRecognitionBackend {
                                 message,
                             },
                         );
-                        crate::session_end::resolve_session_end(
-                            SessionStatus::Capturing,
-                            false,
-                            false,
-                            run_stop_requested.load(Ordering::Acquire),
-                            run_cancelled.load(Ordering::Acquire),
-                            run_shutting_down.load(Ordering::Acquire),
-                        )
+                        SessionEndReason::Failed
                     }
                     Err(payload) => {
                         run_faulted.store(true, Ordering::Release);
@@ -243,6 +238,7 @@ impl RecognitionBackend for WindowsRecognitionBackend {
             SessionWorker {
                 cancelled,
                 stop_requested,
+                accepted_control,
                 shutting_down,
                 context: context_state,
                 mode,
@@ -258,6 +254,10 @@ impl RecognitionBackend for WindowsRecognitionBackend {
             .get(&session_id)
             .ok_or_else(|| format!("no Windows recognition worker for {session_id:?}"))?;
         session.stop_requested.store(true, Ordering::Release);
+        let _ =
+            session
+                .accepted_control
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
         Ok(())
     }
 
@@ -267,6 +267,10 @@ impl RecognitionBackend for WindowsRecognitionBackend {
             .get(&session_id)
             .ok_or_else(|| format!("no Windows recognition worker for {session_id:?}"))?;
         session.cancelled.store(true, Ordering::Release);
+        let _ =
+            session
+                .accepted_control
+                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
         Ok(())
     }
 
@@ -292,6 +296,12 @@ impl RecognitionBackend for WindowsRecognitionBackend {
         for session in sessions.values() {
             session.shutting_down.store(true, Ordering::Release);
             session.cancelled.store(true, Ordering::Release);
+            let _ = session.accepted_control.compare_exchange(
+                0,
+                3,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
         let mut panicked = false;
         for (_, session) in sessions {

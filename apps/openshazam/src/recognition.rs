@@ -3,9 +3,6 @@
 #[cfg(any(windows, target_os = "macos", test))]
 use std::io;
 
-#[cfg(any(test, all(feature = "dev-cli", any(windows, target_os = "macos"))))]
-use std::io::BufRead;
-
 #[cfg(any(windows, target_os = "macos"))]
 use std::env;
 
@@ -123,7 +120,7 @@ const fn decode_native_context(value: u8) -> Option<NativeTaggingRequestContext>
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(all(feature = "dev-cli", any(windows, target_os = "macos")))]
 fn progressive_log(jsonl_output: bool, message: impl std::fmt::Display) {
     if jsonl_output {
         eprintln!("{message}");
@@ -132,14 +129,14 @@ fn progressive_log(jsonl_output: bool, message: impl std::fmt::Display) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dev-cli"))]
 fn progressive_log_for_backend(
     events: &Option<(SessionId, RecognitionMode, EventEmitter)>,
     jsonl_output: bool,
-    message: impl std::fmt::Display,
+    message: impl FnOnce() -> String,
 ) {
     if events.is_none() {
-        progressive_log(jsonl_output, message);
+        progressive_log(jsonl_output, message());
     }
 }
 
@@ -148,7 +145,15 @@ fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(all(windows, not(feature = "dev-cli")))]
+fn progressive_log_for_backend(
+    _events: &Option<(SessionId, RecognitionMode, EventEmitter)>,
+    _jsonl_output: bool,
+    _message: impl FnOnce() -> String,
+) {
+}
+
+#[cfg(all(feature = "dev-cli", any(windows, target_os = "macos")))]
 fn emit_manual_ui_event(
     event: &shazam_http_lab::NativeManualUiEvent,
     jsonl_output: bool,
@@ -189,7 +194,7 @@ fn emit_manual_ui_event(
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(all(feature = "dev-cli", any(windows, target_os = "macos")))]
 fn emit_auto_ui_event(
     event: &shazam_http_lab::NativeAutoUiEvent,
     jsonl_output: bool,
@@ -226,12 +231,12 @@ fn emit_auto_ui_event(
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(all(feature = "dev-cli", any(windows, target_os = "macos")))]
 fn ui_config_snapshot_jsonl_enabled() -> bool {
     env::var_os("OPENSHZAM_UI_CONFIG_SNAPSHOT_JSONL").is_some_and(|value| value == "1")
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(all(feature = "dev-cli", any(windows, target_os = "macos")))]
 fn emit_session_timeout_event(tagging_type: NativeTaggingType, jsonl_output: bool) {
     if jsonl_output {
         println!(
@@ -255,7 +260,7 @@ struct ProgressiveUiConfigInputs {
     jsonl_output: bool,
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(all(feature = "dev-cli", any(windows, target_os = "macos")))]
 fn emit_progressive_ui_config(
     configuration: &shazam_http_lab::ShazamConfiguration,
     inputs: ProgressiveUiConfigInputs,
@@ -290,6 +295,14 @@ fn emit_progressive_ui_config(
     Ok(generation)
 }
 
+#[cfg(all(not(feature = "dev-cli"), any(windows, target_os = "macos")))]
+fn emit_progressive_ui_config(
+    _configuration: &shazam_http_lab::ShazamConfiguration,
+    _inputs: ProgressiveUiConfigInputs,
+) -> Result<u64, io::Error> {
+    Ok(NEXT_UI_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel))
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 fn notify_after_retry_dispatch_ack<E>(
     wait_for_dispatch_ack: impl FnOnce() -> Result<(), E>,
@@ -312,15 +325,7 @@ fn qpc_timestamp_to_unix_ms(
     current_unix_ms.checked_sub(elapsed_ms)
 }
 
-#[cfg(any(test, all(feature = "dev-cli", any(windows, target_os = "macos"))))]
-#[derive(Debug, PartialEq, Eq)]
-enum ManualTriggerRead {
-    Enter,
-    #[cfg(any(test, feature = "dev-cli"))]
-    EndOfInput,
-}
-
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, test))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ManualTriggerSignal {
     Enter,
@@ -339,17 +344,6 @@ enum ManualTriggerPoll {
     #[cfg(any(test, feature = "dev-cli"))]
     InputError(String),
     Cancelled,
-}
-
-#[cfg(any(test, all(feature = "dev-cli", any(windows, target_os = "macos"))))]
-fn read_manual_trigger<R: BufRead>(reader: &mut R) -> io::Result<ManualTriggerRead> {
-    let mut line = String::new();
-    let bytes_read = reader.read_line(&mut line)?;
-    if bytes_read > 0 && line.ends_with('\n') {
-        Ok(ManualTriggerRead::Enter)
-    } else {
-        Ok(ManualTriggerRead::EndOfInput)
-    }
 }
 
 #[cfg(any(windows, test))]
@@ -393,23 +387,6 @@ fn poll_manual_trigger(
             "cancelled while waiting for manual recognition trigger",
         )),
     }
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-#[cfg(feature = "dev-cli")]
-pub(crate) fn spawn_manual_trigger_receiver() -> std::sync::mpsc::Receiver<ManualTriggerSignal> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut stdin = stdin.lock();
-        let signal = match read_manual_trigger(&mut stdin) {
-            Ok(ManualTriggerRead::Enter) => ManualTriggerSignal::Enter,
-            Ok(ManualTriggerRead::EndOfInput) => ManualTriggerSignal::EndOfInput,
-            Err(error) => ManualTriggerSignal::InputError(error.to_string()),
-        };
-        let _ = sender.send(signal);
-    });
-    receiver
 }
 
 #[cfg(any(windows, test))]
@@ -680,7 +657,7 @@ impl CaptureAccumulator {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dev-cli"))]
 pub fn list_render_devices() -> Result<(), Box<dyn std::error::Error>> {
     use wasapi::{initialize_mta, DeviceEnumerator, Direction};
 
@@ -708,7 +685,7 @@ pub fn list_render_devices() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dev-cli"))]
 pub fn capture_loopback_signature(
     selected_device_id: Option<&str>,
     capture_seconds: usize,
@@ -820,7 +797,7 @@ pub(crate) struct WindowsProgressiveControl {
     pub(crate) stop_requested: Arc<AtomicBool>,
     pub(crate) config_generation: Arc<AtomicU64>,
     pub(crate) config_fetching: Arc<AtomicBool>,
-    pub(crate) shutdown_requested: Arc<AtomicBool>,
+    pub(crate) accepted_control: Arc<std::sync::atomic::AtomicU8>,
     pub(crate) cleanup_failed: Arc<AtomicBool>,
     pub(crate) manual_trigger_receiver: Option<std::sync::mpsc::Receiver<ManualTriggerSignal>>,
     pub(crate) events: Option<(SessionId, RecognitionMode, EventEmitter)>,
@@ -968,11 +945,9 @@ pub(crate) fn recognize_loopback_progressive_controlled(
                 buffer_duration_hns: minimum_period_hns.max(200_000),
             },
         )?;
-        progressive_log_for_backend(
-            &control.events,
-            jsonl_output,
-            "Using Windows shared-mode conversion for the endpoint mix format.",
-        );
+        progressive_log_for_backend(&control.events, jsonl_output, || {
+            "Using Windows shared-mode conversion for the endpoint mix format.".to_owned()
+        });
     }
 
     let sample_rate = format.get_samplespersec();
@@ -989,6 +964,7 @@ pub(crate) fn recognize_loopback_progressive_controlled(
     };
     let audio_clock = audio_client.get_audioclock().ok();
     if audio_clock.is_none() {
+        #[cfg(feature = "dev-cli")]
         if control.events.is_none() {
             eprintln!(
                 "WASAPI audio clock is unavailable; packet timestamps will use the first-packet wall-clock fallback."
@@ -1015,11 +991,9 @@ pub(crate) fn recognize_loopback_progressive_controlled(
     let mut preroll_start_timestamp_ms = None;
     let mut timestamp_anchor = CaptureTimestampAnchor::default();
 
-    progressive_log_for_backend(
-        &control.events,
-        jsonl_output,
-        format!("Starting WASAPI capture from {device_name:?} ({sample_rate} Hz, {channels} channel(s)) while Shazam Config loads; PCM remains in a bounded local rolling buffer. Press Ctrl+C to stop."),
-    );
+    progressive_log_for_backend(&control.events, jsonl_output, || {
+        format!("Starting WASAPI capture from {device_name:?} ({sample_rate} Hz, {channels} channel(s)) while Shazam Config loads; PCM remains in a bounded local rolling buffer. Press Ctrl+C to stop.")
+    });
     audio_client.start_stream()?;
     let mut audio_client = WindowsAudioStream::started(audio_client);
     emit_backend_event(&control.events, None, RecognitionEventKind::CaptureStarted);
@@ -1041,9 +1015,11 @@ pub(crate) fn recognize_loopback_progressive_controlled(
         }
     };
     active_workers.insert(u64::MAX, configuration_task);
+    let mut configuration_interrupted_by_control = false;
     let configuration_result = (|| -> Result<_, Box<dyn std::error::Error>> {
         loop {
             if cancelled.load(Ordering::Acquire) {
+                configuration_interrupted_by_control = true;
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "cancelled while loading Shazam Config",
@@ -1051,6 +1027,7 @@ pub(crate) fn recognize_loopback_progressive_controlled(
                 .into());
             }
             if control.stop_requested.load(Ordering::Acquire) {
+                configuration_interrupted_by_control = true;
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "stopped while loading Shazam Config",
@@ -1089,9 +1066,23 @@ pub(crate) fn recognize_loopback_progressive_controlled(
     let (configuration, timing, native_frame_targets) = match configuration_result {
         Ok(result) => result,
         Err(error) => {
-            let _ = audio_client.stop();
+            let stop_result = audio_client.stop();
             request_cancelled.store(true, Ordering::Release);
-            let _ = active_workers.join_all();
+            let cleanup_result = active_workers.join_all();
+            stop_result?;
+            cleanup_result?;
+            if configuration_interrupted_by_control {
+                return Ok(crate::session_end::resolve_session_end(
+                    SessionStatus::Capturing,
+                    None,
+                    false,
+                    false,
+                    crate::session_end::SessionControlRequests::from_first_request(
+                        control.accepted_control.load(Ordering::Acquire),
+                    ),
+                    false,
+                ));
+            }
             return Err(error);
         }
     };
@@ -1211,14 +1202,12 @@ pub(crate) fn recognize_loopback_progressive_controlled(
             ),
         );
     }
-    progressive_log_for_backend(
-        &control.events,
-        jsonl_output,
+    progressive_log_for_backend(&control.events, jsonl_output, || {
         format!(
             "Config resolved: initial_ms={} maximum_ms={} pre_record_capacity_ms={pre_record_capacity_ms} pre_record_capacity_frames={pre_record_capacity_frames} pre_record_capacity_mode={pre_record_capacity_mode}.",
             timing.initial_sample_ms, timing.maximum_sample_ms
-        ),
-    );
+        )
+    });
 
     let pre_recorded = if pre_record_capacity_frames == 0 {
         let result = append_wasapi_packets(
@@ -1245,11 +1234,9 @@ pub(crate) fn recognize_loopback_progressive_controlled(
             }
         }
     } else {
-        progressive_log_for_backend(
-            &control.events,
-            jsonl_output,
-            format!("WASAPI rolling pre-record buffer is active; press Enter to start manual recognition (retaining up to {pre_record_capacity_ms} ms; {pre_record_capacity_mode} capacity)."),
-        );
+        progressive_log_for_backend(&control.events, jsonl_output, || {
+            format!("WASAPI rolling pre-record buffer is active; press Enter to start manual recognition (retaining up to {pre_record_capacity_ms} ms; {pre_record_capacity_mode} capacity).")
+        });
         let manual_trigger_receiver = control.manual_trigger_receiver.take().unwrap_or_else(|| {
             let (sender, receiver) = mpsc::channel();
             let _ = sender.send(ManualTriggerSignal::Enter);
@@ -1267,10 +1254,28 @@ pub(crate) fn recognize_loopback_progressive_controlled(
             &mut timestamp_anchor,
             audio_clock.as_ref(),
             &cancelled,
+            &control.stop_requested,
             &mut received_audio_packet,
             &mut packet_scratch,
         ) {
-            Ok(samples) => Some(samples),
+            Ok(PreRecordEnd::Triggered(samples)) => Some(samples),
+            Ok(PreRecordEnd::Stopped | PreRecordEnd::Cancelled) => {
+                request_cancelled.store(true, Ordering::Release);
+                let stop_result = audio_client.stop();
+                let cleanup_result = active_workers.join_all();
+                stop_result?;
+                cleanup_result?;
+                return Ok(crate::session_end::resolve_session_end(
+                    SessionStatus::Capturing,
+                    None,
+                    false,
+                    false,
+                    crate::session_end::SessionControlRequests::from_first_request(
+                        control.accepted_control.load(Ordering::Acquire),
+                    ),
+                    false,
+                ));
+            }
             Err(error) => {
                 let _ = audio_client.stop();
                 return Err(error);
@@ -1307,16 +1312,14 @@ pub(crate) fn recognize_loopback_progressive_controlled(
                 return Err(io::Error::new(io::ErrorKind::InvalidData, error).into());
             }
         };
-        progressive_log_for_backend(
-            &control.events,
-            jsonl_output,
-            format!("Manual recognition started with {seeded_frames} buffered PCM frames."),
-        );
+        progressive_log_for_backend(&control.events, jsonl_output, || {
+            format!("Manual recognition started with {seeded_frames} buffered PCM frames.")
+        });
     }
     let started = Instant::now();
 
     let capture_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        while !session.is_terminal() {
+        'capture: while !session.is_terminal() {
             if cancelled.load(Ordering::Acquire) {
                 session.cancel();
                 request_cancelled.store(true, Ordering::Release);
@@ -1349,6 +1352,14 @@ pub(crate) fn recognize_loopback_progressive_controlled(
             ignore_expected_timeout(event.wait_for_event(100), |error| {
                 matches!(error, wasapi::WasapiError::EventTimeout)
             })?;
+            if cancelled.load(Ordering::Acquire) {
+                session.cancel();
+                request_cancelled.store(true, Ordering::Release);
+                break;
+            }
+            if control.stop_requested.load(Ordering::Acquire) {
+                break;
+            }
             service_windows_progressive(
                 &mut session,
                 &configuration,
@@ -1439,6 +1450,15 @@ pub(crate) fn recognize_loopback_progressive_controlled(
                     let _ = report;
                 }
 
+                if cancelled.load(Ordering::Acquire) {
+                    session.cancel();
+                    request_cancelled.store(true, Ordering::Release);
+                    break 'capture;
+                }
+                if control.stop_requested.load(Ordering::Acquire) {
+                    break 'capture;
+                }
+
                 service_windows_progressive(
                     &mut session,
                     &configuration,
@@ -1488,6 +1508,7 @@ pub(crate) fn recognize_loopback_progressive_controlled(
     let recognition_result = (|| -> Result<SessionEndReason, Box<dyn std::error::Error>> {
         capture_result?;
         stop_result?;
+        let terminal_before_input_end = session.is_terminal().then(|| session.lifecycle_status());
         session.finish_input();
 
         while !session.is_terminal() || !active_workers.is_empty() {
@@ -1518,12 +1539,14 @@ pub(crate) fn recognize_loopback_progressive_controlled(
         }
 
         Ok(crate::session_end::resolve_session_end(
-            session.status(),
+            session.lifecycle_status(),
+            terminal_before_input_end,
             saw_match_event,
             saw_no_match_event,
-            control.stop_requested.load(Ordering::Acquire),
-            cancelled.load(Ordering::Acquire),
-            control.shutdown_requested.load(Ordering::Acquire),
+            crate::session_end::SessionControlRequests::from_first_request(
+                control.accepted_control.load(Ordering::Acquire),
+            ),
+            false,
         ))
     })();
 
@@ -1540,6 +1563,7 @@ pub(crate) fn recognize_loopback_progressive_controlled(
         status,
         SessionStatus::Failed(shazam_progressive::StopReason::SessionTimeout)
     ) {
+        #[cfg(feature = "dev-cli")]
         if control.events.is_none() {
             emit_session_timeout_event(session.tagging_type(), jsonl_output);
         }
@@ -1678,6 +1702,13 @@ impl WasapiPacketScratch {
 }
 
 #[cfg(windows)]
+enum PreRecordEnd {
+    Triggered(Vec<f32>),
+    Stopped,
+    Cancelled,
+}
+
+#[cfg(windows)]
 // Keep WASAPI handles and rolling timestamp state explicit at this adapter boundary.
 #[allow(clippy::too_many_arguments)]
 fn capture_wasapi_prerecord(
@@ -1692,16 +1723,30 @@ fn capture_wasapi_prerecord(
     timestamp_anchor: &mut CaptureTimestampAnchor,
     audio_clock: Option<&wasapi::AudioClock>,
     cancelled: &AtomicBool,
+    stop_requested: &AtomicBool,
     received_audio_packet: &mut bool,
     packet_scratch: &mut WasapiPacketScratch,
-) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+) -> Result<PreRecordEnd, Box<dyn std::error::Error>> {
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(PreRecordEnd::Cancelled);
+        }
+        if stop_requested.load(Ordering::Acquire) {
+            return Ok(PreRecordEnd::Stopped);
+        }
         let mut triggered = poll_manual_trigger(trigger_receiver, cancelled)?.unwrap_or(false);
 
         if !triggered {
             ignore_expected_timeout(event.wait_for_event(100), |error| {
                 matches!(error, wasapi::WasapiError::EventTimeout)
             })?;
+        }
+
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(PreRecordEnd::Cancelled);
+        }
+        if stop_requested.load(Ordering::Acquire) {
+            return Ok(PreRecordEnd::Stopped);
         }
 
         append_wasapi_packets(
@@ -1721,7 +1766,7 @@ fn capture_wasapi_prerecord(
             triggered = poll_manual_trigger(trigger_receiver, cancelled)?.unwrap_or(false);
         }
         if triggered {
-            return Ok(ring.into_samples());
+            return Ok(PreRecordEnd::Triggered(ring.into_samples()));
         }
     }
 }
@@ -1984,6 +2029,8 @@ fn service_windows_progressive(
     saw_no_match_event: &mut bool,
     backend_events: &Option<(SessionId, RecognitionMode, EventEmitter)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(feature = "dev-cli"))]
+    let _ = config_generation;
     let mut post_stop_job = None;
     let mut deferred_manual_ui_event = None;
     loop {
@@ -2004,19 +2051,20 @@ fn service_windows_progressive(
                 .map_err(|_| io::Error::other("recognition HTTP worker panicked"))?;
         }
         if let Some(status) = completion.status {
-            progressive_log_for_backend(
-                backend_events,
-                jsonl_output,
+            progressive_log_for_backend(backend_events, jsonl_output, || {
                 format!(
                     "recognition attempt {} returned HTTP {status}",
                     completion.attempt
-                ),
-            );
+                )
+            });
         }
         if let Some(message) = completion.error {
+            #[cfg(feature = "dev-cli")]
             if backend_events.is_none() {
                 eprintln!("recognition attempt {}: {message}", completion.attempt);
             }
+            #[cfg(not(feature = "dev-cli"))]
+            let _ = message;
         }
         let tracked = session.in_flight_attempts().contains(&completion.attempt);
         let was_terminal = session.is_terminal();
@@ -2045,15 +2093,13 @@ fn service_windows_progressive(
             )
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             if !delivery.delivered_to_matcher {
-                progressive_log_for_backend(
-                    backend_events,
-                    jsonl_output,
+                progressive_log_for_backend(backend_events, jsonl_output, || {
                     format!(
                         "recognition attempt {} response was ignored by the Native context gate (state={:?})",
                         completion.attempt,
                         delivery.status
-                    ),
-                );
+                    )
+                });
             }
             let newly_stopped_retry = session.take_post_stop_retry_job();
             let has_newly_stopped_retry = newly_stopped_retry.is_some();
@@ -2108,6 +2154,7 @@ fn service_windows_progressive(
                         deferred_manual_ui_event = Some((event, completion.attempt));
                     } else {
                         emit_backend_manual_event(backend_events, completion.attempt, &event);
+                        #[cfg(feature = "dev-cli")]
                         if backend_events.is_none() {
                             emit_manual_ui_event(&event, jsonl_output, config_generation);
                         }
@@ -2119,16 +2166,15 @@ fn service_windows_progressive(
                         Some(completion.attempt),
                         RecognitionEventKind::AutoUiEvent(event.clone()),
                     );
+                    #[cfg(feature = "dev-cli")]
                     if backend_events.is_none() {
                         emit_auto_ui_event(&event, jsonl_output, config_generation);
                     }
                 } else if !delivery.candidates.is_empty() {
                     *saw_match_event = true;
-                    progressive_log_for_backend(
-                        backend_events,
-                        jsonl_output,
-                        "match response withheld: Native UI ordering is unverified for this response shape",
-                    );
+                    progressive_log_for_backend(backend_events, jsonl_output, || {
+                        "match response withheld: Native UI ordering is unverified for this response shape".to_owned()
+                    });
                 }
             }
         }
@@ -2323,6 +2369,7 @@ fn service_windows_progressive(
                 if detached_post_stop_job {
                     if let Some((event, attempt_id)) = deferred_manual_ui_event.take() {
                         emit_backend_manual_event(backend_events, attempt_id, &event);
+                        #[cfg(feature = "dev-cli")]
                         if backend_events.is_none() {
                             emit_manual_ui_event(&event, jsonl_output, config_generation);
                         }
@@ -2350,6 +2397,7 @@ fn service_windows_progressive(
                 || {
                     if let Some((event, attempt_id)) = deferred_manual_ui_event.take() {
                         emit_backend_manual_event(backend_events, attempt_id, &event);
+                        #[cfg(feature = "dev-cli")]
                         if backend_events.is_none() {
                             emit_manual_ui_event(&event, jsonl_output, config_generation);
                         }
@@ -2665,8 +2713,7 @@ mod tests {
     use super::{
         classify_manual_trigger_poll, decode_mono_f32le, fill_silent_samples,
         ignore_expected_timeout, milliseconds_for_frames, qpc_timestamp_to_unix_ms,
-        read_manual_trigger, CaptureAccumulator, ManualTriggerPoll, ManualTriggerRead,
-        ManualTriggerSignal, CAPTURE_RATE,
+        CaptureAccumulator, ManualTriggerPoll, ManualTriggerSignal, CAPTURE_RATE,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use shazam_http_lab::NativeTaggingRequestContext;
@@ -2698,39 +2745,6 @@ mod tests {
                 *error == WaitError::Timeout
             }),
             Err(WaitError::DeviceFailure)
-        );
-    }
-
-    #[test]
-    fn manual_trigger_distinguishes_enter_eof_partial_input_and_read_error() {
-        let mut enter = std::io::Cursor::new(b"\n".as_slice());
-        assert_eq!(
-            read_manual_trigger(&mut enter).unwrap(),
-            ManualTriggerRead::Enter
-        );
-
-        let mut eof = std::io::Cursor::new(Vec::<u8>::new());
-        assert_eq!(
-            read_manual_trigger(&mut eof).unwrap(),
-            ManualTriggerRead::EndOfInput
-        );
-
-        let mut partial = std::io::Cursor::new(b"not-enter".as_slice());
-        assert_eq!(
-            read_manual_trigger(&mut partial).unwrap(),
-            ManualTriggerRead::EndOfInput
-        );
-
-        struct FailingReader;
-        impl std::io::Read for FailingReader {
-            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("synthetic stdin read error"))
-            }
-        }
-        let mut failing = std::io::BufReader::new(FailingReader);
-        assert_eq!(
-            read_manual_trigger(&mut failing).unwrap_err().kind(),
-            std::io::ErrorKind::Other
         );
     }
 

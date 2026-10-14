@@ -481,6 +481,14 @@ impl ProgressiveSession {
             })
     }
 
+    /// The generator lifecycle state, even when [`ProgressiveSession::status`]
+    /// is reporting an outstanding HTTP attempt. Use this with
+    /// [`ProgressiveSession::is_terminal`] to distinguish a completed capture
+    /// lifecycle from work that is still being drained.
+    pub fn lifecycle_status(&self) -> SessionStatus {
+        self.lifecycle_status
+    }
+
     /// Tagging policy selected for this session. Adapters can use this to
     /// expose Native callback semantics without inferring them from timing.
     pub const fn tagging_type(&self) -> NativeTaggingType {

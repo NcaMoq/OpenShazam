@@ -4,6 +4,8 @@
 
 #[cfg(any(windows, target_os = "macos"))]
 use crate::recognition;
+#[cfg(windows)]
+use crate::recognition::ManualTriggerSignal;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::recognition::NativeContextState;
 #[cfg(any(windows, target_os = "macos", test))]
@@ -13,6 +15,40 @@ use shazam_http_lab::NativeTaggingRequestContext;
 #[cfg(any(windows, target_os = "macos", test))]
 use shazam_progressive::NativeTaggingType;
 use std::{io, process::ExitCode};
+
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ManualTriggerRead {
+    Enter,
+    EndOfInput,
+}
+
+#[cfg(any(windows, test))]
+fn read_manual_trigger<R: io::BufRead>(reader: &mut R) -> io::Result<ManualTriggerRead> {
+    let mut line = String::new();
+    let bytes_read = reader.read_line(&mut line)?;
+    if bytes_read > 0 && line.ends_with('\n') {
+        Ok(ManualTriggerRead::Enter)
+    } else {
+        Ok(ManualTriggerRead::EndOfInput)
+    }
+}
+
+#[cfg(windows)]
+fn spawn_manual_trigger_receiver() -> std::sync::mpsc::Receiver<ManualTriggerSignal> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        let signal = match read_manual_trigger(&mut stdin) {
+            Ok(ManualTriggerRead::Enter) => ManualTriggerSignal::Enter,
+            Ok(ManualTriggerRead::EndOfInput) => ManualTriggerSignal::EndOfInput,
+            Err(error) => ManualTriggerSignal::InputError(error.to_string()),
+        };
+        let _ = sender.send(signal);
+    });
+    receiver
+}
 
 pub fn run_exit_code() -> ExitCode {
     match run() {
@@ -219,17 +255,25 @@ fn run_windows_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             let context_state = watch_stdin_context_updates(mode.request_context)?;
             let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let signal_cancelled = std::sync::Arc::clone(&cancelled);
+            let accepted_control = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let signal_control = std::sync::Arc::clone(&accepted_control);
             ctrlc::set_handler(move || {
-                signal_cancelled.store(true, std::sync::atomic::Ordering::Release)
+                signal_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                let _ = signal_control.compare_exchange(
+                    0,
+                    2,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                );
             })?;
             let manual_trigger_receiver = (mode.tagging_type == NativeTaggingType::Manual)
-                .then(recognition::spawn_manual_trigger_receiver);
+                .then(spawn_manual_trigger_receiver);
             let control = recognition::WindowsProgressiveControl {
                 cancelled,
                 stop_requested: Default::default(),
+                accepted_control,
                 config_generation: Default::default(),
                 config_fetching: Default::default(),
-                shutdown_requested: Default::default(),
                 cleanup_failed: Default::default(),
                 manual_trigger_receiver,
                 events: None,
@@ -335,7 +379,10 @@ fn parse_capture_seconds(value: &str) -> Result<usize, io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_capture_seconds, parse_progressive_capture_options};
+    use super::{
+        parse_capture_seconds, parse_progressive_capture_options, read_manual_trigger,
+        ManualTriggerRead,
+    };
     use shazam_http_lab::NativeTaggingRequestContext;
     use shazam_progressive::NativeTaggingType;
 
@@ -367,5 +414,34 @@ mod tests {
         assert!(parse_progressive_capture_options(&args, false).is_err());
         assert_eq!(parse_capture_seconds("30").unwrap(), 30);
         assert!(parse_capture_seconds("31").is_err());
+    }
+
+    #[test]
+    fn cli_stdin_trigger_distinguishes_enter_eof_partial_input_and_read_error() {
+        assert_eq!(
+            read_manual_trigger(&mut std::io::Cursor::new(b"\n".as_slice())).unwrap(),
+            ManualTriggerRead::Enter
+        );
+        assert_eq!(
+            read_manual_trigger(&mut std::io::Cursor::new(Vec::<u8>::new())).unwrap(),
+            ManualTriggerRead::EndOfInput
+        );
+        assert_eq!(
+            read_manual_trigger(&mut std::io::Cursor::new(b"partial".as_slice())).unwrap(),
+            ManualTriggerRead::EndOfInput
+        );
+
+        struct FailingReader;
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic stdin read error"))
+            }
+        }
+        assert_eq!(
+            read_manual_trigger(&mut std::io::BufReader::new(FailingReader))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Other
+        );
     }
 }
