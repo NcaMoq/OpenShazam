@@ -31,6 +31,8 @@ const SHAZAM_MAC_PLATFORM: &str = "MAC";
 const SHAZAM_MAC_APP_VERSION: &str = "2.11.0";
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_HEADER_BYTES: usize = 16_384;
+/// Maximum retained UI web-track template size (4 KiB).
+pub const MAX_WEB_TRACK_URL_TEMPLATE_BYTES: usize = 4_096;
 const CURL_STATUS_MARKER: &[u8] = b"\n__OPENSHZAM_HTTP_STATUS__";
 
 fn progressive_request_timestamp_ms(source_timestamp_ms: Option<u64>) -> Result<u64, Error> {
@@ -80,6 +82,9 @@ pub enum TrackCandidateOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeTrackUiMetadata {
+    /// Response string selected for Native UI handoff. This is deliberately
+    /// distinct from `TrackCandidate::track_id`; no numeric ID fallback is
+    /// inferred for web-page links.
     pub track_key: Option<String>,
     pub album_adam_id: Option<String>,
     pub isrc: Option<String>,
@@ -574,11 +579,68 @@ pub enum NativeTaggingRequestContext {
 #[derive(Clone)]
 pub struct ShazamConfiguration {
     tag_url_template: String,
+    web_track_url_template: Option<String>,
     continuous_foreground_url_template: Option<String>,
     continuous_background_url_template: Option<String>,
     installation_id: String,
     manual_timing: ManualTaggingTiming,
     native_frame_seconds: NativeFrameSeconds,
+}
+
+/// Minimal Config data intended for a UI PageLinkResolver. The generation is
+/// assigned by the caller that owns Config/session lifecycle, not by parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiConfigSnapshot {
+    pub generation: u64,
+    pub web_track_url_template: Option<String>,
+}
+
+impl UiConfigSnapshot {
+    /// Versioned standalone record for an explicitly opted-in UI JSONL host.
+    pub fn to_json(&self) -> String {
+        json!({
+            "schema": "openshazam.ui-config-snapshot.v1",
+            "event": "ui_config_snapshot",
+            "generation": self.generation,
+            "web_track_url_template": self.web_track_url_template.as_deref(),
+        })
+        .to_string()
+    }
+}
+
+/// Typed UI result input paired with the Config generation active for its
+/// recognition session. Track Key remains inside the existing result event;
+/// this wrapper does not generate or validate a page URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiRecognitionInput {
+    pub config_generation: u64,
+    pub event: UiRecognitionEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiRecognitionEvent {
+    Manual(NativeManualUiEvent),
+    Auto(NativeAutoUiEvent),
+}
+
+impl UiRecognitionInput {
+    /// Independent versioned record for hosts that explicitly opt into the
+    /// new JSONL bridge. Existing Manual/Auto event schemas are nested intact.
+    pub fn to_json(&self) -> String {
+        let event_json = match &self.event {
+            UiRecognitionEvent::Manual(event) => native_manual_ui_event_to_json(event),
+            UiRecognitionEvent::Auto(event) => native_auto_ui_event_to_json(event),
+        };
+        let recognition_event: Value = serde_json::from_str(&event_json)
+            .expect("existing UI event serializers always produce JSON");
+        json!({
+            "schema": "openshazam.ui-recognition-input.v1",
+            "event": "recognition_ui_input",
+            "config_generation": self.config_generation,
+            "recognition_event": recognition_event,
+        })
+        .to_string()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -763,6 +825,23 @@ impl ManualTaggingTiming {
 }
 
 impl ShazamConfiguration {
+    /// Optional UI page-link template from `settings.webtrackurl`. This is
+    /// separate from `tag_url_template()`, which is an internal recognition
+    /// POST route. The value is not validated as a safe URL and is not
+    /// expanded with a track identifier; those are UI responsibilities.
+    pub fn web_track_url_template(&self) -> Option<&str> {
+        self.web_track_url_template.as_deref()
+    }
+
+    /// Project only the UI-safe page-link input. `generation` belongs to the
+    /// caller's Config/session lifecycle and is not allocated by the parser.
+    pub fn ui_config_snapshot(&self, generation: u64) -> UiConfigSnapshot {
+        UiConfigSnapshot {
+            generation,
+            web_track_url_template: self.web_track_url_template.clone(),
+        }
+    }
+
     pub fn resolve_tag_url(&self, tag_id: &str, streaming_provider: &str) -> Result<String, Error> {
         resolve_shazam_tag_url(
             &self.tag_url_template,
@@ -1217,8 +1296,17 @@ pub fn parse_shazam_config(body: &[u8]) -> Result<ShazamConfiguration, Error> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
+    // This optional UI value has no bearing on the recognition route and must
+    // never make an otherwise valid recognition Config unusable.
+    let web_track_url_template = root
+        .get("settings")
+        .and_then(|settings| settings.get("webtrackurl"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_WEB_TRACK_URL_TEMPLATE_BYTES)
+        .map(str::to_owned);
     Ok(ShazamConfiguration {
         tag_url_template: tag_url_template.to_owned(),
+        web_track_url_template,
         continuous_foreground_url_template,
         continuous_background_url_template,
         installation_id: installation_id.to_owned(),
@@ -2812,8 +2900,14 @@ fn track_candidate(track: &Value, origin: TrackCandidateOrigin) -> Option<TrackC
     let ui_metadata = NativeTrackUiMetadata {
         track_key: track
             .get("key")
-            .or_else(|| track.get("trackKey"))
             .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                track
+                    .get("trackKey")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+            })
             .map(str::to_owned),
         album_adam_id: track
             .get("albumadamid")
@@ -3707,6 +3801,156 @@ mod tests {
         assert_eq!(candidates[0].track_id.as_deref(), Some("mock-key"));
         assert_eq!(candidates[0].title, "Mock Song");
         assert_eq!(candidates[0].artist, "Test Artist");
+    }
+
+    #[test]
+    fn native_track_key_prefers_valid_string_fields_without_id_fallbacks() {
+        let cases = [
+            (r#"{"key":"key-only"}"#, Some("key-only")),
+            (r#"{"trackKey":"camel-only"}"#, Some("camel-only")),
+            (
+                r#"{"key":"preferred","trackKey":"secondary"}"#,
+                Some("preferred"),
+            ),
+            (r#"{"key":null,"trackKey":"camel"}"#, Some("camel")),
+            (r#"{"key":42,"trackKey":"camel"}"#, Some("camel")),
+            (r#"{"key":"","trackKey":"camel"}"#, Some("camel")),
+            (r#"{"trackid":"wire-id"}"#, None),
+            (r#"{"trackId":123}"#, None),
+        ];
+        for (fields, expected) in cases {
+            let body = format!(
+                r#"{{"track":{{"title":"Song","subtitle":"Artist",{}}}}}"#,
+                &fields[1..fields.len() - 1]
+            );
+            let candidates = parse_track_candidates(body.as_bytes()).unwrap();
+            let metadata = candidates[0].ui_metadata.as_ref();
+            assert_eq!(
+                metadata.and_then(|metadata| metadata.track_key.as_deref()),
+                expected
+            );
+        }
+
+        let matches_only = parse_track_candidates(
+            br#"{"matches":[{"track":{"trackid":"match-id","title":"Song","subtitle":"Artist"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(matches_only[0].ui_metadata, None);
+        assert_eq!(matches_only[0].track_id.as_deref(), Some("match-id"));
+    }
+
+    #[test]
+    fn web_track_config_is_optional_bounded_and_independent_of_tag_route() {
+        let base = json!({
+            "inid":"private-installation-id",
+            "apis":{"tag":{"href":"https://amp.shazam.com/discovery/v5/ja/JP/mac/-/tag/{inid}/{tagid}?sync=true&webv3=true&sampling=true&connected=&sharehub=false&hidelb=true"}},
+        });
+        let parse = |web: Option<Value>| {
+            let mut root = base.clone();
+            if let Some(web) = web {
+                root["settings"] = json!({"webtrackurl": web});
+            }
+            parse_shazam_config(root.to_string().as_bytes()).unwrap()
+        };
+        assert_eq!(parse(None).web_track_url_template(), None);
+        let mut settings_without_web_template = base.clone();
+        settings_without_web_template["settings"] = json!({});
+        assert_eq!(
+            parse_shazam_config(settings_without_web_template.to_string().as_bytes())
+                .unwrap()
+                .web_track_url_template(),
+            None
+        );
+        for invalid in [json!(null), json!(""), json!(7), json!([]), json!({})] {
+            assert_eq!(parse(Some(invalid)).web_track_url_template(), None);
+        }
+        assert_eq!(
+            parse(Some(json!("https://web.invalid/track/{trackid}"))).web_track_url_template(),
+            Some("https://web.invalid/track/{trackid}")
+        );
+        assert_eq!(
+            parse(Some(
+                json!("x".repeat(MAX_WEB_TRACK_URL_TEMPLATE_BYTES + 1))
+            ))
+            .web_track_url_template(),
+            None
+        );
+        let config = parse(Some(json!("https://web.invalid/track/{trackid}")));
+        assert!(config
+            .tag_url_template()
+            .starts_with("https://amp.shazam.com/"));
+        let snapshot = config.ui_config_snapshot(17);
+        assert_eq!(snapshot.generation, 17);
+        assert_eq!(
+            snapshot.web_track_url_template.as_deref(),
+            config.web_track_url_template()
+        );
+        let serialized: Value = serde_json::from_str(&snapshot.to_json()).unwrap();
+        assert_eq!(serialized["schema"], "openshazam.ui-config-snapshot.v1");
+        assert_eq!(serialized["generation"], 17);
+        assert_eq!(
+            serialized["web_track_url_template"],
+            "https://web.invalid/track/{trackid}"
+        );
+        assert!(snapshot.to_json().contains("web.invalid"));
+        assert!(!snapshot.to_json().contains("private-installation-id"));
+        assert!(!snapshot.to_json().contains("amp.shazam.com"));
+
+        let updated =
+            parse(Some(json!("https://new-web.invalid/song/{trackid}"))).ui_config_snapshot(18);
+        assert_ne!(snapshot.generation, updated.generation);
+        assert_ne!(
+            snapshot.web_track_url_template,
+            updated.web_track_url_template
+        );
+    }
+
+    #[test]
+    fn ui_recognition_input_preserves_result_schema_and_config_generation() {
+        let input = UiRecognitionInput {
+            config_generation: 23,
+            event: UiRecognitionEvent::Manual(NativeManualUiEvent::NoMatch),
+        };
+        let record: Value = serde_json::from_str(&input.to_json()).unwrap();
+        assert_eq!(record["schema"], "openshazam.ui-recognition-input.v1");
+        assert_eq!(record["config_generation"], 23);
+        assert_eq!(
+            record["recognition_event"]["schema"],
+            "openshazam.manual-ui-event.v2"
+        );
+        assert_eq!(record["recognition_event"]["event"], "no_match");
+
+        let candidates =
+            parse_track_candidates(br#"{"track":{"title":"Song","subtitle":"Artist"}}"#).unwrap();
+        let no_key_event =
+            NativeManualUiEvent::Result(native_manual_result_event(candidates, None).unwrap());
+        let missing_web_config = UiConfigSnapshot {
+            generation: 24,
+            web_track_url_template: None,
+        };
+        let result_without_key = UiRecognitionInput {
+            config_generation: missing_web_config.generation,
+            event: UiRecognitionEvent::Manual(no_key_event),
+        };
+        assert!(missing_web_config.web_track_url_template.is_none());
+        assert_eq!(
+            serde_json::from_str::<Value>(&result_without_key.to_json()).unwrap()
+                ["config_generation"],
+            24
+        );
+
+        let alternative = parse_track_candidates(
+            br#"{"track":{"key":"primary-key","title":"Song","subtitle":"Artist"},"alternativetrack":{"trackKey":"alternative-key","title":"Other Song","subtitle":"Other Artist"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            alternative[0]
+                .alternative_track
+                .as_deref()
+                .and_then(|track| track.ui_metadata.as_ref())
+                .and_then(|metadata| metadata.track_key.as_deref()),
+            Some("alternative-key")
+        );
     }
 
     #[test]

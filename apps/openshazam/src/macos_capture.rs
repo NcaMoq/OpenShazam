@@ -827,10 +827,13 @@ struct ProgressiveCompletion {
     candidates: Vec<shazam_http_lab::TrackCandidate>,
 }
 
-// Native flowAudioData synchronously enters the generator's serial queue while
-// Retry updates are asynchronously enqueued on that same queue. Keep both
-// operations in one FIFO and acknowledge audio only after its session work and
-// any threshold-triggered request have been dispatched.
+// CoreAudio callbacks enqueue PCM with try_send and never wait for controller
+// work or an acknowledgement. The receiver applies successfully enqueued PCM
+// and HTTP completions serially in channel receive order. When independent
+// producers race, that order is whichever send wins the channel lock; a single
+// FIFO does not prove Native's cross-producer ordering. Native flowAudioData
+// and updateRetry both reach a serial generator queue, but their relative order
+// under this callback/HTTP race has not been established by observation.
 enum ProgressiveEvent {
     Audio {
         samples: AudioBuffer,
@@ -1640,6 +1643,62 @@ mod progressive_event_tests {
             callback_fault.load(Ordering::Acquire),
             CallbackFault::None as u8
         );
+    }
+
+    #[test]
+    fn serialized_pcm_and_http_events_are_consumed_in_channel_order() {
+        // Drive both possible event orders explicitly. This proves the local
+        // receiver's FIFO contract without relying on thread scheduling; it
+        // does not claim which producer Native's generator queue would order
+        // first when PCM and Retry race.
+        for completion_first in [false, true] {
+            let (sender, receiver) = mpsc::sync_channel(2);
+            let audio = || ProgressiveEvent::Audio {
+                samples: AudioBuffer::owned(vec![0.25]),
+                source_timestamp_ms: Some(17),
+            };
+            let completion = || {
+                ProgressiveEvent::Completion(ProgressiveCompletion {
+                    attempt: 4,
+                    status: Some(200),
+                    outcome: RecognitionOutcome::NoMatch { retry: None },
+                    candidates: Vec::new(),
+                })
+            };
+
+            if completion_first {
+                sender.send(completion()).unwrap();
+                sender.send(audio()).unwrap();
+            } else {
+                sender.send(audio()).unwrap();
+                sender.send(completion()).unwrap();
+            }
+
+            let received: Vec<_> = (0..2)
+                .map(|_| match receiver.recv().unwrap() {
+                    ProgressiveEvent::Audio {
+                        samples,
+                        source_timestamp_ms,
+                    } => {
+                        assert_eq!(samples.samples, [0.25]);
+                        assert_eq!(source_timestamp_ms, Some(17));
+                        "pcm"
+                    }
+                    ProgressiveEvent::Completion(completion) => {
+                        assert_eq!(completion.attempt, 4);
+                        "http"
+                    }
+                })
+                .collect();
+            assert_eq!(
+                received,
+                if completion_first {
+                    ["http", "pcm"]
+                } else {
+                    ["pcm", "http"]
+                }
+            );
+        }
     }
 
     #[test]

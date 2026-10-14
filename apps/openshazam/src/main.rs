@@ -1,6 +1,12 @@
 #![allow(unknown_lints, clippy::manual_is_multiple_of)]
 
-use std::{env, io, path::Path, process::ExitCode};
+use std::{io, process::ExitCode};
+
+#[cfg(any(windows, target_os = "macos"))]
+use std::env;
+
+#[cfg(any(windows, target_os = "macos"))]
+use std::path::Path;
 
 #[cfg(any(windows, target_os = "macos", test))]
 use std::io::BufRead;
@@ -8,11 +14,16 @@ use std::io::BufRead;
 #[cfg(any(windows, target_os = "macos"))]
 use std::{
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     thread,
 };
+
+#[cfg(any(windows, target_os = "macos"))]
+static NEXT_UI_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(1);
+#[cfg(any(windows, target_os = "macos"))]
+static ACTIVE_UI_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -39,10 +50,10 @@ use shazam_progressive::{
     NATIVE_TAGGING_TYPE_2_DEFAULT_INTERVAL_MS,
 };
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 use shazam_progressive::NativeTaggingType;
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 use shazam_http_lab::NativeTaggingRequestContext;
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -57,6 +68,7 @@ mod macos_capture;
 use std::time::Instant;
 
 fn main() -> ExitCode {
+    #[cfg(any(windows, target_os = "macos"))]
     let args: Vec<String> = env::args().skip(1).collect();
     #[cfg(windows)]
     let result = run_windows_command(&args);
@@ -79,14 +91,14 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProgressiveCaptureMode {
     tagging_type: NativeTaggingType,
     request_context: Option<NativeTaggingRequestContext>,
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 fn parse_progressive_capture_options(
     args: &[String],
     allow_device_id: bool,
@@ -287,6 +299,16 @@ fn elapsed_ns(started: Instant) -> u64 {
 fn emit_manual_ui_event(event: &shazam_http_lab::NativeManualUiEvent, jsonl_output: bool) {
     if jsonl_output {
         println!("{}", shazam_http_lab::native_manual_ui_event_to_json(event));
+        if ui_config_snapshot_jsonl_enabled() {
+            println!(
+                "{}",
+                shazam_http_lab::UiRecognitionInput {
+                    config_generation: ACTIVE_UI_CONFIG_GENERATION.load(Ordering::Acquire),
+                    event: shazam_http_lab::UiRecognitionEvent::Manual(event.clone()),
+                }
+                .to_json()
+            );
+        }
         return;
     }
 
@@ -314,6 +336,16 @@ fn emit_manual_ui_event(event: &shazam_http_lab::NativeManualUiEvent, jsonl_outp
 fn emit_auto_ui_event(event: &shazam_http_lab::NativeAutoUiEvent, jsonl_output: bool) {
     if jsonl_output {
         println!("{}", shazam_http_lab::native_auto_ui_event_to_json(event));
+        if ui_config_snapshot_jsonl_enabled() {
+            println!(
+                "{}",
+                shazam_http_lab::UiRecognitionInput {
+                    config_generation: ACTIVE_UI_CONFIG_GENERATION.load(Ordering::Acquire),
+                    event: shazam_http_lab::UiRecognitionEvent::Auto(event.clone()),
+                }
+                .to_json()
+            );
+        }
         return;
     }
 
@@ -331,6 +363,11 @@ fn emit_auto_ui_event(event: &shazam_http_lab::NativeAutoUiEvent, jsonl_output: 
             }
         }
     }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn ui_config_snapshot_jsonl_enabled() -> bool {
+    env::var_os("OPENSHZAM_UI_CONFIG_SNAPSHOT_JSONL").is_some_and(|value| value == "1")
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -365,6 +402,8 @@ fn emit_progressive_ui_config(
     if !inputs.jsonl_output {
         return Ok(());
     }
+    let generation = NEXT_UI_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel);
+    ACTIVE_UI_CONFIG_GENERATION.store(generation, Ordering::Release);
     let record = match inputs.tagging_type {
         NativeTaggingType::Manual => configuration.native_manual_ui_config_json(
             inputs.sample_rate_hz,
@@ -385,6 +424,9 @@ fn emit_progressive_ui_config(
     }
     .map_err(io::Error::other)?;
     println!("{record}");
+    if ui_config_snapshot_jsonl_enabled() {
+        println!("{}", configuration.ui_config_snapshot(generation).to_json());
+    }
     Ok(())
 }
 
@@ -589,6 +631,7 @@ fn print_windows_usage() {
     );
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn parse_capture_seconds(value: &str) -> Result<usize, io::Error> {
     let seconds = value.parse::<usize>().map_err(|_| {
         io::Error::new(
@@ -1972,6 +2015,7 @@ fn env_optional_u64_setting(
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn frames_for_ms(sample_rate: u32, duration_ms: u64) -> Result<usize, io::Error> {
     let frames = u64::from(sample_rate)
         .checked_mul(duration_ms)
@@ -1991,6 +2035,7 @@ fn frames_for_ms(sample_rate: u32, duration_ms: u64) -> Result<usize, io::Error>
     })
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn milliseconds_for_frames(sample_rate: u32, frames: usize) -> Result<u64, io::Error> {
     if sample_rate == 0 {
         return Err(io::Error::new(
@@ -2576,6 +2621,7 @@ mod tests {
     use shazam_progressive::{SessionStatus, StopReason};
     use sigx_core::{Config, SigX};
     use sigx_format::Signature;
+    #[cfg(any(windows, target_os = "macos"))]
     use std::cell::RefCell;
 
     #[test]

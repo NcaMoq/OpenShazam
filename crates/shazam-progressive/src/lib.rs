@@ -4537,7 +4537,75 @@ mod tests {
         let job = session.poll(0).unwrap().unwrap();
         assert_eq!(session.cancel(), Some(job.attempt));
         assert_eq!(session.status(), SessionStatus::Cancelled);
+        assert_eq!(
+            session.complete_with_delivery(
+                job.attempt,
+                RecognitionOutcome::Match { retry: None },
+                1,
+            ),
+            Err(EngineError::NoRequestInFlight)
+        );
         assert_eq!(session.push_i16(&[0]).unwrap_err(), EngineError::Closed);
+    }
+
+    #[test]
+    fn manual_retry_and_queued_pcm_order_has_a_deterministic_boundary() {
+        fn run(retry_before_queued_pcm: bool) -> (RecognitionJob, usize) {
+            let mut configured = timing(6_000, 3);
+            configured.initial_sample_ms = 1_000;
+            configured.default_retry_interval_ms = NATIVE_TAGGING_TYPE_1_DEFAULT_INTERVAL_MS;
+            let mut session =
+                ProgressiveSession::new_for_type(configured, NativeTaggingType::Manual).unwrap();
+            let samples = pcm(40_000);
+
+            // First deterministic queue event reaches the initial signature
+            // threshold and dispatches the request.
+            session.push_i16_at(&samples[..16_000], 10).unwrap();
+            let first = session.poll(10).unwrap().unwrap();
+            assert_eq!(first.sample_ms, 1_000);
+
+            let apply_retry = |session: &mut ProgressiveSession| {
+                session
+                    .complete(
+                        first.attempt,
+                        RecognitionOutcome::MatcherFailure {
+                            retry: Some(RetryDirective {
+                                retry_duration_ms: Some(2_500),
+                                interval_ms: Some(0),
+                                retry_duration_seconds_bits: None,
+                                interval_seconds_bits: None,
+                            }),
+                        },
+                        20,
+                    )
+                    .unwrap();
+            };
+            let push_queued_pcm = |session: &mut ProgressiveSession, now_ms| {
+                session.push_i16_at(&samples[16_000..], now_ms).unwrap();
+            };
+
+            if retry_before_queued_pcm {
+                apply_retry(&mut session);
+                push_queued_pcm(&mut session, 21);
+            } else {
+                push_queued_pcm(&mut session, 15);
+                apply_retry(&mut session);
+                // PCM consumed before Retry cannot satisfy a threshold that
+                // the generator installs after it has crossed that point.
+                assert!(session.poll(22).unwrap().is_none());
+                session.push_i16_at(&[0], 23).unwrap();
+            }
+
+            (session.poll(24).unwrap().unwrap(), session.frames_seen)
+        }
+
+        let (retry_first, retry_first_frames) = run(true);
+        let (pcm_first, pcm_first_frames) = run(false);
+        assert_eq!(retry_first.attempt, 2);
+        assert_eq!(pcm_first.attempt, 2);
+        assert_eq!(retry_first_frames, 40_000);
+        assert_eq!(pcm_first_frames, 40_001);
+        assert_eq!(retry_first.sample_ms, pcm_first.sample_ms);
     }
 
     #[test]
