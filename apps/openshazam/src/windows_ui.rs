@@ -2171,13 +2171,13 @@ enum CompositionRootLayer {
 }
 
 fn composition_root_layer_order() -> [CompositionRootLayer; 4] {
-    // Insert the Auto shadow behind inner ripples and the button, then put
-    // outer circles in front of the button.
+    // Insert back-to-front: keep the Auto shadow behind both ripple groups,
+    // and keep every ripple below the Shazam button.
     [
         CompositionRootLayer::AutoShadow,
+        CompositionRootLayer::OuterRipples,
         CompositionRootLayer::InnerRipples,
         CompositionRootLayer::Button,
-        CompositionRootLayer::OuterRipples,
     ]
 }
 
@@ -9027,14 +9027,14 @@ mod tests {
     }
 
     #[test]
-    fn listening_layers_keep_inner_ripples_behind_button_and_outer_ripples_in_front() {
+    fn listening_layers_keep_all_ripples_behind_the_button() {
         assert_eq!(
             composition_root_layer_order(),
             [
                 CompositionRootLayer::AutoShadow,
+                CompositionRootLayer::OuterRipples,
                 CompositionRootLayer::InnerRipples,
                 CompositionRootLayer::Button,
-                CompositionRootLayer::OuterRipples,
             ]
         );
         assert_eq!(
