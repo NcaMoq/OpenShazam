@@ -194,15 +194,57 @@ struct NativeIconLayout {
     result_close_hit: [f32; 4],
 }
 
-fn native_icon_layout(body_top: f32) -> NativeIconLayout {
+fn bottom_arrow_visual_top_adjustment(edge: ArrowEdge) -> f32 {
+    // UI-232's Windows Bottom projection is user-requested while the Mac
+    // runtime geometry remains unmeasured. Keep the 10-DIP adjustment in one
+    // place so the visible rectangles and their hit targets move together.
+    if edge == ArrowEdge::Bottom {
+        POPUP_ARROW_HEIGHT as f32
+    } else {
+        0.0
+    }
+}
+
+fn native_icon_layout(body_top: f32, edge: ArrowEdge) -> NativeIconLayout {
+    let top_adjustment = bottom_arrow_visual_top_adjustment(edge);
     NativeIconLayout {
-        settings_visual: [349.0, body_top + 25.0, 365.0, body_top + 41.0],
+        settings_visual: [
+            349.0,
+            body_top + 25.0 - top_adjustment,
+            365.0,
+            body_top + 41.0 - top_adjustment,
+        ],
         // The popup's stored 30x28 frame is constrained to the 16x16 gear.
-        settings_hit: [349.0, body_top + 25.0, 365.0, body_top + 41.0],
-        cancel_visual: [351.0, body_top + 27.0, 363.0, body_top + 39.0],
-        cancel_hit: [351.0, body_top + 27.0, 363.0, body_top + 39.0],
-        result_close_visual: [353.0, body_top + 25.0, 365.0, body_top + 37.0],
-        result_close_hit: [353.0, body_top + 25.0, 365.0, body_top + 37.0],
+        settings_hit: [
+            349.0,
+            body_top + 25.0 - top_adjustment,
+            365.0,
+            body_top + 41.0 - top_adjustment,
+        ],
+        cancel_visual: [
+            351.0,
+            body_top + 27.0 - top_adjustment,
+            363.0,
+            body_top + 39.0 - top_adjustment,
+        ],
+        cancel_hit: [
+            351.0,
+            body_top + 27.0 - top_adjustment,
+            363.0,
+            body_top + 39.0 - top_adjustment,
+        ],
+        result_close_visual: [
+            353.0,
+            body_top + 25.0 - top_adjustment,
+            365.0,
+            body_top + 37.0 - top_adjustment,
+        ],
+        result_close_hit: [
+            353.0,
+            body_top + 25.0 - top_adjustment,
+            365.0,
+            body_top + 37.0 - top_adjustment,
+        ],
     }
 }
 
@@ -3742,8 +3784,9 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
     }
 }
 
-fn result_artwork_rect(panel_top: f32) -> D2D_RECT_F {
-    rect(10.0, panel_top + 20.0, 160.0, panel_top + 170.0)
+fn result_artwork_rect(panel_top: f32, edge: ArrowEdge) -> D2D_RECT_F {
+    let top = panel_top + 20.0 - bottom_arrow_visual_top_adjustment(edge);
+    rect(10.0, top, 160.0, top + 150.0)
 }
 
 fn aspect_fit_rect(destination: D2D_RECT_F, source_width: u32, source_height: u32) -> D2D_RECT_F {
@@ -4416,15 +4459,15 @@ impl Renderer {
             MainPhase::Ready => self.draw_ready(app, body_top),
             MainPhase::Starting { mode, .. } => {
                 self.draw_capture_pending(body_top, *mode, false);
-                self.draw_cancel_button(body_top);
+                self.draw_cancel_button(body_top, app.arrow_edge);
             }
             MainPhase::Cancelling { mode, .. } => {
                 self.draw_capture_pending(body_top, *mode, true);
-                self.draw_cancel_button(body_top);
+                self.draw_cancel_button(body_top, app.arrow_edge);
             }
             MainPhase::Listening { mode, .. } => {
                 self.draw_listening_status(app, body_top, *mode);
-                self.draw_cancel_button(body_top);
+                self.draw_cancel_button(body_top, app.arrow_edge);
             }
             MainPhase::Matched { ref track, .. } => {
                 self.draw_status_text(app, body_top);
@@ -4595,7 +4638,7 @@ impl Renderer {
 
     unsafe fn draw_ready(&self, app: &AppState, body_top: f32) {
         self.draw_status_text(app, body_top);
-        self.draw_settings_icon(body_top);
+        self.draw_settings_icon(body_top, app.arrow_edge);
     }
 
     unsafe fn draw_status_text(&self, app: &AppState, body_top: f32) {
@@ -4715,8 +4758,8 @@ impl Renderer {
         );
     }
 
-    unsafe fn draw_cancel_button(&self, body_top: f32) {
-        let [left, top, right, bottom] = native_icon_layout(body_top).cancel_visual;
+    unsafe fn draw_cancel_button(&self, body_top: f32, edge: ArrowEdge) {
+        let [left, top, right, bottom] = native_icon_layout(body_top, edge).cancel_visual;
         let destination = rect(left, top, right, bottom);
         self.target.DrawBitmap(
             &self.white_close_icon,
@@ -4727,8 +4770,8 @@ impl Renderer {
         );
     }
 
-    unsafe fn draw_settings_icon(&self, body_top: f32) {
-        let [left, top, right, bottom] = native_icon_layout(body_top).settings_visual;
+    unsafe fn draw_settings_icon(&self, body_top: f32, edge: ArrowEdge) {
+        let [left, top, right, bottom] = native_icon_layout(body_top, edge).settings_visual;
         let destination = rect(left, top, right, bottom);
         self.target.DrawBitmap(
             &self.settings_icon,
@@ -4937,15 +4980,15 @@ impl Renderer {
         let detail_rects = result_details_rects(top, details.title_height, details.artist_height);
         let art = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
             // The image view itself is 150×150pt; do not add UI-144 button-image padding.
-            rect: result_artwork_rect(top),
+            rect: result_artwork_rect(top, edge),
             radiusX: RESULT_ARTWORK_CORNER_RADIUS,
             radiusY: RESULT_ARTWORK_CORNER_RADIUS,
         };
         self.target.FillRoundedRectangle(&art, &self.palette.accent);
-        if !self.draw_track_artwork(app, track, result_artwork_rect(top), 150.0) {
+        if !self.draw_track_artwork(app, track, result_artwork_rect(top, edge), 150.0) {
             self.text(
                 "\u{266b}",
-                result_artwork_rect(top),
+                result_artwork_rect(top, edge),
                 &self.text.centered_heavy,
                 &self.palette.white_ink,
             );
@@ -4975,7 +5018,7 @@ impl Renderer {
             &self.text.date,
             &self.palette.white_ink,
         );
-        self.draw_result_close_icon(top);
+        self.draw_result_close_icon(top, edge);
         Ok(())
     }
 
@@ -5018,36 +5061,18 @@ impl Renderer {
             &self.text.button,
             &self.palette.white_ink,
         );
-        self.draw_result_close_icon(top);
+        self.draw_result_close_icon(top, edge);
         Ok(())
     }
 
-    unsafe fn draw_result_close_icon(&self, body_top: f32) {
-        let [left, top, right, bottom] = native_icon_layout(body_top).result_close_visual;
-        self.target.DrawLine(
-            Vector2 {
-                X: left + 2.0,
-                Y: top + 2.0,
-            },
-            Vector2 {
-                X: right - 2.0,
-                Y: bottom - 2.0,
-            },
-            &self.palette.subtitle,
-            1.2,
-            None,
-        );
-        self.target.DrawLine(
-            Vector2 {
-                X: right - 2.0,
-                Y: top + 2.0,
-            },
-            Vector2 {
-                X: left + 2.0,
-                Y: bottom - 2.0,
-            },
-            &self.palette.subtitle,
-            1.2,
+    unsafe fn draw_result_close_icon(&self, body_top: f32, edge: ArrowEdge) {
+        let [left, top, right, bottom] = native_icon_layout(body_top, edge).result_close_visual;
+        let destination = rect(left, top, right, bottom);
+        self.target.DrawBitmap(
+            &self.white_close_icon,
+            Some(&destination),
+            1.0,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
             None,
         );
     }
@@ -5926,7 +5951,7 @@ unsafe fn main_hit_test(
     ) {
         let top = result_panel_top_at(&app.phase, body_top, Instant::now()).unwrap_or(body_top);
         let offset = top - body_top;
-        let close = native_icon_layout(body_top).result_close_hit;
+        let close = native_icon_layout(body_top, app.arrow_edge).result_close_hit;
         let local_y = y - offset;
         if point_in_rect(x, local_y, close) {
             return MainHit::CloseResult;
@@ -5986,7 +6011,7 @@ unsafe fn main_hit_test(
             return MainHit::OpenTrack(track.display_id);
         }
     }
-    let icons = native_icon_layout(body_top);
+    let icons = native_icon_layout(body_top, app.arrow_edge);
     if matches!(
         app.phase,
         MainPhase::Listening { .. } | MainPhase::Starting { .. }
@@ -8648,7 +8673,8 @@ mod tests {
 
     #[test]
     fn native_icon_visual_frames_and_hit_targets_are_independent() {
-        let layout = native_icon_layout(0.0);
+        // Check canonical TopRegion-local values independently of popup edge.
+        let layout = native_icon_layout(0.0, ArrowEdge::Top);
         assert_eq!(layout.settings_visual, [349.0, 25.0, 365.0, 41.0]);
         assert_eq!(layout.settings_hit, layout.settings_visual);
         assert_eq!(layout.cancel_visual, [351.0, 27.0, 363.0, 39.0]);
@@ -8676,15 +8702,15 @@ mod tests {
             ),
             (359.0, 31.0)
         );
-        let bottom_anchored = native_icon_layout(0.0);
-        let top_anchored = native_icon_layout(POPUP_ARROW_HEIGHT as f32);
+        let bottom_anchored = native_icon_layout(0.0, ArrowEdge::Bottom);
+        let top_anchored = native_icon_layout(POPUP_ARROW_HEIGHT as f32, ArrowEdge::Top);
         assert_eq!(
             top_anchored.settings_visual[1] - bottom_anchored.settings_visual[1],
-            POPUP_ARROW_HEIGHT as f32
+            POPUP_ARROW_HEIGHT as f32 * 2.0
         );
         assert_eq!(
             top_anchored.cancel_hit[1] - bottom_anchored.cancel_hit[1],
-            POPUP_ARROW_HEIGHT as f32
+            POPUP_ARROW_HEIGHT as f32 * 2.0
         );
         assert!(point_in_rect(349.0, 25.0, layout.settings_hit));
         assert!(!point_in_rect(348.9, 26.0, layout.settings_hit));
@@ -8693,6 +8719,21 @@ mod tests {
         assert!(point_in_rect(353.0, 25.0, layout.result_close_hit));
         assert!(!point_in_rect(352.9, 25.0, layout.result_close_hit));
         assert!(!point_in_rect(349.0, 25.0, layout.result_close_hit));
+    }
+
+    #[test]
+    fn ui232_bottom_arrow_moves_header_icons_and_hit_targets_up_ten_dip() {
+        let layout = native_icon_layout(0.0, ArrowEdge::Bottom);
+        assert_eq!(layout.settings_visual, [349.0, 15.0, 365.0, 31.0]);
+        assert_eq!(layout.settings_hit, layout.settings_visual);
+        assert_eq!(layout.result_close_visual, [353.0, 15.0, 365.0, 27.0]);
+        assert_eq!(layout.result_close_hit, layout.result_close_visual);
+        assert_eq!(layout.cancel_visual, [351.0, 17.0, 363.0, 29.0]);
+        assert_eq!(layout.cancel_hit, layout.cancel_visual);
+        assert!(point_in_rect(357.0, 15.0, layout.settings_hit));
+        assert!(point_in_rect(359.0, 21.0, layout.result_close_hit));
+        assert!(point_in_rect(357.0, 23.0, layout.cancel_hit));
+        assert!(!point_in_rect(357.0, 14.9, layout.settings_hit));
     }
 
     #[test]
@@ -9184,7 +9225,7 @@ mod tests {
 
     #[test]
     fn album_art_frames_keep_native_view_sizes_without_button_padding() {
-        let result = result_artwork_rect(10.0);
+        let result = result_artwork_rect(10.0, ArrowEdge::Top);
         assert_eq!(
             (result.left, result.top, result.right, result.bottom),
             (10.0, 30.0, 160.0, 180.0)
@@ -9192,6 +9233,17 @@ mod tests {
         assert_eq!(result.right - result.left, 150.0);
         assert_eq!(result.bottom - result.top, 150.0);
         assert_eq!(RESULT_ARTWORK_CORNER_RADIUS, 5.0);
+
+        let bottom_arrow_result = result_artwork_rect(0.0, ArrowEdge::Bottom);
+        assert_eq!(
+            (
+                bottom_arrow_result.left,
+                bottom_arrow_result.top,
+                bottom_arrow_result.right,
+                bottom_arrow_result.bottom,
+            ),
+            (10.0, 10.0, 160.0, 160.0)
+        );
 
         let history = history_artwork_frame(200.0);
         assert_eq!(
@@ -9250,14 +9302,18 @@ mod tests {
         for (dpi, expected_pixel_size) in dpi_sizes {
             let scale = composition_scale_for_dpi(dpi);
             for panel_top in [-180.0, -170.0, -90.0, 0.0, 10.0, 180.0, 190.0] {
-                let art = result_artwork_rect(panel_top);
-                assert_eq!(art.left, 10.0);
-                assert_eq!(art.top - panel_top, 20.0);
-                assert_eq!(art.right, 160.0);
-                assert_eq!(art.bottom - panel_top, 170.0);
-                assert_eq!(art.right - art.left, 150.0);
-                assert_eq!(art.bottom - art.top, 150.0);
-                assert_eq!((150.0 * scale).round() as i32, expected_pixel_size);
+                for (edge, expected_top_inset) in
+                    [(ArrowEdge::Top, 20.0), (ArrowEdge::Bottom, 10.0)]
+                {
+                    let art = result_artwork_rect(panel_top, edge);
+                    assert_eq!(art.left, 10.0);
+                    assert_eq!(art.top - panel_top, expected_top_inset);
+                    assert_eq!(art.right, 160.0);
+                    assert_eq!(art.bottom - panel_top, expected_top_inset + 150.0);
+                    assert_eq!(art.right - art.left, 150.0);
+                    assert_eq!(art.bottom - art.top, 150.0);
+                    assert_eq!((150.0 * scale).round() as i32, expected_pixel_size);
+                }
             }
         }
     }
