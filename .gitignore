@@ -4,6 +4,8 @@
 **/.DS_Store
 .env
 .env.*
+**/bin/
+**/obj/
 *.pcm
 *.wav
 *.flac

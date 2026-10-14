@@ -42,15 +42,20 @@ cargo run --locked -p openshazam -- list-devices
 cargo run --locked -p openshazam -- recognize-loopback [device-id]
 ```
 
-### UI page-link inputs
+Launch the Windows tray UI:
 
-The engine exposes the optional `settings.webtrackurl` value as
-`ShazamConfiguration::web_track_url_template()` and
-`UiConfigSnapshot`. It exposes a result's response-string `track_key` through
-the existing Manual/Auto UI result types. A host must combine those inputs in
-its own PageLinkResolver; OpenShazam does not substitute `{trackid}`, validate
-or open a page URL. The Config snapshot omits the recognition POST endpoint,
-installation ID, and other Config values.
+```sh
+cargo build --locked -p shazam-http-lab -p openshazam
+cargo run --locked -p openshazam -- ui
+```
+
+### Windows UI page links
+
+The Windows tray UI resolves `UiConfigSnapshot.web_track_url_template` with a
+result's `track_key`, validates the resulting Shazam HTTPS URL, and opens it in
+the default browser. The link stays disabled if either input is unavailable;
+the UI does not guess a URL. Config snapshots omit recognition endpoints,
+installation IDs, and other Config values.
 
 For CLI hosts, set `OPENSHZAM_UI_CONFIG_SNAPSHOT_JSONL=1` together with
 `--events-jsonl`. This opts into independent `openshazam.ui-config-snapshot.v1`
