@@ -7672,11 +7672,18 @@ fn result_panel_top_at(phase: &MainPhase, body_top: f32, now: Instant) -> Option
         } => (*entered_at, *returned_to_ready_at),
         _ => return None,
     };
-    let entrance = result_card_progress(entered_at, now);
-    let exit = returned_to_ready_at
-        .map(|start| result_card_progress(start, now))
-        .unwrap_or(0.0);
-    Some(body_top - (1.0 - entrance) * TOP_HEIGHT as f32 + exit * TOP_HEIGHT as f32)
+    if let Some(returned_at) = returned_to_ready_at {
+        // Freeze the entry position at the close event. Advancing the entry
+        // clock during exit makes the D2D fallback drift away from the
+        // Composition track when a NoMatch card is closed mid-entry.
+        let from_offset =
+            -(1.0 - result_card_progress(entered_at, returned_at)) * TOP_HEIGHT as f32;
+        let exit = result_card_progress(returned_at, now);
+        Some(body_top + from_offset + (TOP_HEIGHT as f32 - from_offset) * exit)
+    } else {
+        let entrance = result_card_progress(entered_at, now);
+        Some(body_top - (1.0 - entrance) * TOP_HEIGHT as f32)
+    }
 }
 
 fn result_card_easing() -> CubicBezier {
@@ -9672,6 +9679,45 @@ mod tests {
             ),
             Some(body_top + super::TOP_HEIGHT as f32)
         );
+    }
+
+    #[test]
+    fn ui236_no_match_fallback_exit_freezes_mid_entry_position_like_composition() {
+        let entered_at = Instant::now();
+        let returned_at = entered_at + Duration::from_millis(75);
+        let body_top = 42.0;
+        let phases = [
+            MainPhase::NoMatch {
+                entered_at,
+                returned_to_ready_at: Some(returned_at),
+            },
+            MainPhase::Offline {
+                entered_at,
+                returned_to_ready_at: Some(returned_at),
+            },
+        ];
+        let ingress = super::result_card_progress(entered_at, returned_at);
+        let from_offset = -(1.0 - ingress) * super::TOP_HEIGHT as f32;
+
+        for phase in phases {
+            let at_close = result_panel_top_at(&phase, body_top, returned_at).unwrap();
+            assert!((at_close - (body_top + from_offset)).abs() < 1e-4);
+
+            for (elapsed_ms, normalized) in [(75, 0.4085), (150, 0.8024), (225, 0.9605)] {
+                let now = returned_at + Duration::from_millis(elapsed_ms);
+                let expected =
+                    body_top + from_offset + (super::TOP_HEIGHT as f32 - from_offset) * normalized;
+                let fallback = result_panel_top_at(&phase, body_top, now).unwrap();
+                let composition = super::result_overlay_motion_animation(&phase, now).unwrap();
+                assert!((fallback - expected).abs() < 0.15);
+                assert!((fallback - (body_top + composition.from_offset)).abs() < 1e-4);
+            }
+
+            let finished =
+                result_panel_top_at(&phase, body_top, returned_at + Duration::from_millis(300))
+                    .unwrap();
+            assert!((finished - (body_top + super::TOP_HEIGHT as f32)).abs() < 1e-4);
+        }
     }
 
     #[test]
