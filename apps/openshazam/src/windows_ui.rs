@@ -5425,7 +5425,10 @@ unsafe fn anchor_popup(app: &mut AppState) {
         );
     }
     app.visible = true;
-    let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+    // SetWindowPos above already shows the popup with SWP_NOACTIVATE. Calling
+    // ShowWindow(SW_SHOWNORMAL) here immediately steals activation while the
+    // tray callback is still unwinding, which can make Windows send a focus
+    // loss before the deferred popup activation has settled.
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
