@@ -7,8 +7,10 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     ffi::c_void,
+    io::Read,
     mem::size_of,
-    process::Command,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
+    process::{Command, Stdio},
     sync::OnceLock,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -7446,15 +7448,286 @@ fn start_artwork_load(
 }
 
 fn valid_https_resource_url(url: &str) -> bool {
-    if url.len() > 4_096 || !url.starts_with("https://") || url.chars().any(char::is_control) {
+    if url.len() > 4_096
+        || !url.starts_with("https://")
+        || url.contains('#')
+        || url.chars().any(char::is_control)
+    {
         return false;
     }
-    let authority = url[8..].split(['/', '?', '#']).next().unwrap_or_default();
-    !authority.is_empty()
-        && !authority.contains(['@', '\\'])
-        && authority.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | ':' | '[' | ']')
+    resource_host_port(url).is_some_and(|(host, _)| {
+        host.parse::<IpAddr>()
+            .map(is_public_artwork_address)
+            .unwrap_or(true)
+    })
+}
+
+fn resource_host_port(url: &str) -> Option<(String, u16)> {
+    let remainder = url.strip_prefix("https://")?;
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if authority.is_empty() || authority.contains(['@', '\\']) {
+        return None;
+    }
+
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed.find(']')?;
+        let host = &bracketed[..close];
+        host.parse::<Ipv6Addr>().ok()?;
+        let suffix = &bracketed[close + 1..];
+        let port = if suffix.is_empty() {
+            443
+        } else {
+            suffix.strip_prefix(':')?.parse::<u16>().ok()?
+        };
+        (host, port)
+    } else {
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, port.parse::<u16>().ok()?),
+            Some(_) => return None,
+            None => (authority, 443),
+        };
+        if host.is_empty() || host.contains(['[', ']']) {
+            return None;
+        }
+        if host.parse::<Ipv4Addr>().is_err() && !valid_dns_host(host) {
+            return None;
+        }
+        (host, port)
+    };
+    (port == 443).then(|| (host.to_ascii_lowercase(), port))
+}
+
+fn valid_dns_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || host.ends_with('.') {
+        return false;
+    }
+    // Reject shortened or otherwise ambiguous numeric IPv4 spellings such as
+    // 127.1; curl and platform resolvers may interpret those as IP literals.
+    if host.chars().all(|ch| ch.is_ascii_digit() || ch == '.') {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+fn is_public_artwork_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_private()
+                && !ip.is_link_local()
+                && !ip.is_broadcast()
+                && !ip.is_multicast()
+                && a != 0
+                && a < 224
+                && !(a == 100 && (64..=127).contains(&b))
+                && !(a == 192 && b == 0)
+                && !(a == 192 && b == 88 && c == 99)
+                && !(a == 192 && b == 0 && c == 2)
+                && !(a == 198 && (b == 18 || b == 19))
+                && !(a == 198 && b == 51 && c == 100)
+                && !(a == 203 && b == 0 && c == 113)
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_public_artwork_address(IpAddr::V4(mapped));
+            }
+            let segments = ip.segments();
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && !ip.is_unique_local()
+                && !ip.is_unicast_link_local()
+                && segments[0] & 0xe000 == 0x2000 // Global unicast 2000::/3.
+                && !(segments[0] == 0x2001 && segments[1] & 0xfe00 == 0) // IETF assignments.
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8) // Documentation.
+                && !(segments[0] == 0x2001 && segments[1] & 0xfff0 == 0x0010) // ORCHID.
+                && !(segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
+                && segments[0] != 0x2002 // 6to4 can encode private IPv4 destinations.
+                && segments[0] != 0x3fff // Documentation prefix.
+        }
+    }
+}
+
+fn resolve_public_artwork_addresses(host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
+    let addresses = if let Ok(address) = host.parse::<IpAddr>() {
+        vec![address]
+    } else {
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|error| format!("artwork host lookup failed: {error}"))?
+            .map(|socket| socket.ip())
+            .collect::<Vec<_>>()
+    };
+    if addresses.is_empty() || addresses.iter().any(|ip| !is_public_artwork_address(*ip)) {
+        return Err("artwork host resolved to a non-public address".to_owned());
+    }
+    let mut unique = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        if !unique.contains(&address) {
+            unique.push(address);
+        }
+    }
+    Ok(unique)
+}
+
+fn curl_resolve_entry(host: &str, port: u16, addresses: &[IpAddr]) -> Option<String> {
+    if host.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    let addresses = addresses
+        .iter()
+        .map(|address| match address {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
         })
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("{host}:{port}:{addresses}"))
+}
+
+fn supported_artwork_content_type(content_type: &str) -> bool {
+    matches!(
+        content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "image/jpeg" | "image/png" | "image/webp"
+    )
+}
+
+const MAX_ARTWORK_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ARTWORK_METADATA_BYTES: usize = 8 * 1024;
+const MAX_ARTWORK_REDIRECTS: usize = 4;
+const ARTWORK_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
+const ARTWORK_RESPONSE_MARKER: &[u8] = b"\nOPEN SHAZAM IMAGE RESPONSE:";
+
+struct CurlArtworkResponse {
+    status: u16,
+    redirect_url: String,
+    content_type: String,
+    remote_ip: IpAddr,
+    body: Vec<u8>,
+}
+
+fn parse_curl_artwork_output(output: &[u8]) -> Result<CurlArtworkResponse, String> {
+    if output.len() > MAX_ARTWORK_BYTES + MAX_ARTWORK_METADATA_BYTES {
+        return Err("artwork response exceeded the byte limit".to_owned());
+    }
+    let marker = output
+        .windows(ARTWORK_RESPONSE_MARKER.len())
+        .rposition(|window| window == ARTWORK_RESPONSE_MARKER)
+        .ok_or_else(|| "artwork response metadata was missing".to_owned())?;
+    let metadata = std::str::from_utf8(&output[marker + ARTWORK_RESPONSE_MARKER.len()..])
+        .map_err(|_| "artwork response metadata was not valid text".to_owned())?;
+    let mut fields = metadata.splitn(4, '\n');
+    let status = fields
+        .next()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .ok_or_else(|| "artwork response status was invalid".to_owned())?;
+    let redirect_url = fields.next().unwrap_or_default().trim().to_owned();
+    let content_type = fields.next().unwrap_or_default().trim().to_owned();
+    let remote_ip = fields
+        .next()
+        .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        .ok_or_else(|| "artwork server address was missing or invalid".to_owned())?;
+    if marker > MAX_ARTWORK_BYTES {
+        return Err("artwork response exceeded the byte limit".to_owned());
+    }
+    Ok(CurlArtworkResponse {
+        status,
+        redirect_url,
+        content_type,
+        remote_ip,
+        body: output[..marker].to_vec(),
+    })
+}
+
+fn curl_artwork_request(
+    url: &str,
+    resolve: Option<&str>,
+    remaining: Duration,
+) -> Result<CurlArtworkResponse, String> {
+    let timeout = format!("{:.3}", remaining.as_secs_f64().max(0.1));
+    let max_bytes = MAX_ARTWORK_BYTES.to_string();
+    let write_out = format!(
+        "\nOPEN SHAZAM IMAGE RESPONSE:%{{http_code}}\n%{{redirect_url}}\n%{{content_type}}\n%{{remote_ip}}"
+    );
+    let mut command = Command::new("curl.exe");
+    command.args([
+        "--disable",
+        "--fail",
+        "--proto",
+        "=https",
+        "--max-time",
+        &timeout,
+        "--max-filesize",
+        &max_bytes,
+        "--silent",
+        "--show-error",
+        "--proxy",
+        "",
+        "--output",
+        "-",
+    ]);
+    if let Some(resolve) = resolve {
+        command.args(["--resolve", resolve]);
+    }
+    let mut child = command
+        .args(["--write-out", &write_out, url])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("artwork downloader unavailable: {error}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "artwork downloader output was unavailable".to_owned())?;
+    let output_limit = MAX_ARTWORK_BYTES + MAX_ARTWORK_METADATA_BYTES + 1;
+    let mut output = Vec::with_capacity(64 * 1024);
+    let read_result = stdout
+        .by_ref()
+        .take(output_limit as u64)
+        .read_to_end(&mut output);
+    drop(stdout);
+    if let Err(error) = read_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("artwork response read failed: {error}"));
+    }
+    if output.len() > MAX_ARTWORK_BYTES + MAX_ARTWORK_METADATA_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("artwork response exceeded the byte limit".to_owned());
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("artwork downloader wait failed: {error}"))?;
+    if !status.success() {
+        return Err("artwork download failed or exceeded its transfer limits".to_owned());
+    }
+
+    parse_curl_artwork_output(&output)
 }
 
 fn valid_shazam_page_url(url: &str) -> bool {
@@ -7591,46 +7864,44 @@ fn page_url_for_display_id(
 }
 
 fn fetch_and_decode_artwork(url: &str) -> Result<ArtworkPixels, String> {
-    let output = Command::new("curl.exe")
-        .args([
-            "--fail",
-            "--location",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--max-redirs",
-            "4",
-            "--max-time",
-            "12",
-            "--max-filesize",
-            "8388608",
-            "--silent",
-            "--show-error",
-            "--output",
-            "-",
-            "--write-out",
-            "\nOPEN SHAZAM IMAGE URL:%{url_effective}",
-            url,
-        ])
-        .output()
-        .map_err(|error| format!("artwork downloader unavailable: {error}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    if !valid_https_resource_url(url) {
+        return Err("artwork URL was not a public HTTPS resource".to_owned());
     }
-    const MARKER: &[u8] = b"\nOPEN SHAZAM IMAGE URL:";
-    let marker = output
-        .stdout
-        .windows(MARKER.len())
-        .rposition(|window| window == MARKER)
-        .ok_or_else(|| "artwork response did not include its final URL".to_owned())?;
-    let final_url = std::str::from_utf8(&output.stdout[marker + MARKER.len()..])
-        .map_err(|_| "artwork response URL was not valid text".to_owned())?
-        .trim();
-    if !valid_https_resource_url(final_url) {
-        return Err("artwork redirect left HTTPS or exceeded URL limits".to_owned());
+    let started_at = Instant::now();
+    let mut current_url = url.to_owned();
+    for redirect_count in 0..=MAX_ARTWORK_REDIRECTS {
+        let (host, port) = resource_host_port(&current_url)
+            .ok_or_else(|| "artwork URL authority was invalid".to_owned())?;
+        let addresses = resolve_public_artwork_addresses(&host, port)?;
+        let resolve = curl_resolve_entry(&host, port, &addresses);
+        let remaining = ARTWORK_FETCH_TIMEOUT.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return Err("artwork download timed out".to_owned());
+        }
+        let response = curl_artwork_request(&current_url, resolve.as_deref(), remaining)?;
+        if !addresses.contains(&response.remote_ip)
+            || !is_public_artwork_address(response.remote_ip)
+        {
+            return Err("artwork connection did not use its validated public address".to_owned());
+        }
+        if (300..400).contains(&response.status) && !response.redirect_url.is_empty() {
+            if redirect_count == MAX_ARTWORK_REDIRECTS
+                || !valid_https_resource_url(&response.redirect_url)
+            {
+                return Err("artwork redirect was invalid or exceeded its limit".to_owned());
+            }
+            current_url = response.redirect_url;
+            continue;
+        }
+        if response.status != 200 {
+            return Err(format!("artwork server returned HTTP {}", response.status));
+        }
+        if !supported_artwork_content_type(&response.content_type) {
+            return Err("artwork response MIME type was unsupported".to_owned());
+        }
+        return decode_artwork_wic(&response.body);
     }
-    decode_artwork_wic(&output.stdout[..marker])
+    Err("artwork redirect was invalid or exceeded its limit".to_owned())
 }
 
 fn artwork_pixel_fingerprint(width: u32, height: u32, bgra: &[u8]) -> u128 {
@@ -9989,6 +10260,120 @@ mod tests {
             top,
             bottom
         ));
+    }
+
+    #[test]
+    fn ui209_artwork_urls_reject_unsafe_authorities_and_private_ip_literals() {
+        assert!(super::valid_https_resource_url(
+            "https://images.example.test/cover.webp?size=300"
+        ));
+        assert!(super::valid_https_resource_url(
+            "https://[2001:4860:4860::8888]/cover.webp"
+        ));
+        assert!(!super::valid_https_resource_url(
+            "http://images.example.test/cover.jpg"
+        ));
+        assert!(!super::valid_https_resource_url(
+            "https://images.example.test:8443/cover.jpg"
+        ));
+        assert!(!super::valid_https_resource_url(
+            "https://user@images.example.test/cover.jpg"
+        ));
+        assert!(!super::valid_https_resource_url(
+            "https://images.example.test/cover.jpg#frag"
+        ));
+        assert!(!super::valid_https_resource_url(
+            "https://127.0.0.1/cover.jpg"
+        ));
+        assert!(!super::valid_https_resource_url("https://127.1/cover.jpg"));
+        assert!(!super::valid_https_resource_url("https://[::1]/cover.jpg"));
+    }
+
+    #[test]
+    fn ui209_artwork_address_policy_rejects_private_reserved_and_tunnel_ranges() {
+        for value in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.0.1",
+            "192.0.2.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+            "2001:2::1",
+            "2001:10::1",
+            "2002::1",
+            "3fff::1",
+        ] {
+            let address = value
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid test IP {value}"));
+            assert!(
+                !super::is_public_artwork_address(address),
+                "{value} must not be a public artwork destination"
+            );
+        }
+        for value in ["1.1.1.1", "8.8.8.8", "2001:4860:4860::8888"] {
+            let address = value
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid test IP {value}"));
+            assert!(
+                super::is_public_artwork_address(address),
+                "{value} should remain available for public artwork"
+            );
+        }
+    }
+
+    #[test]
+    fn ui209_artwork_host_resolution_is_pinned_and_mime_allowlist_is_narrow() {
+        let addresses = [
+            "8.8.8.8".parse().unwrap(),
+            "2001:4860:4860::8888".parse().unwrap(),
+        ];
+        assert_eq!(
+            super::curl_resolve_entry("images.example.test", 443, &addresses),
+            Some("images.example.test:443:8.8.8.8,[2001:4860:4860::8888]".to_owned())
+        );
+        assert!(super::curl_resolve_entry("8.8.8.8", 443, &addresses).is_none());
+        assert!(super::supported_artwork_content_type("image/jpeg"));
+        assert!(super::supported_artwork_content_type(
+            "IMAGE/PNG; charset=binary"
+        ));
+        assert!(super::supported_artwork_content_type("image/webp"));
+        assert!(!super::supported_artwork_content_type("text/html"));
+        assert!(!super::supported_artwork_content_type("image/svg+xml"));
+    }
+
+    #[test]
+    fn ui209_curl_artwork_output_is_bounded_and_extracts_response_metadata() {
+        let output = b"image-bytes\nOPEN SHAZAM IMAGE RESPONSE:302\nhttps://cdn.example.test/cover.png\nimage/png\n8.8.8.8";
+        let response = super::parse_curl_artwork_output(output).unwrap();
+        assert_eq!(response.status, 302);
+        assert_eq!(response.redirect_url, "https://cdn.example.test/cover.png");
+        assert_eq!(response.content_type, "image/png");
+        assert_eq!(
+            response.remote_ip,
+            "8.8.8.8".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(response.body, b"image-bytes");
+
+        let oversized =
+            vec![b'x'; super::MAX_ARTWORK_BYTES + super::MAX_ARTWORK_METADATA_BYTES + 1];
+        assert!(super::parse_curl_artwork_output(&oversized).is_err());
+        let oversized_body = format!(
+            "{}\nOPEN SHAZAM IMAGE RESPONSE:200\n\nimage/jpeg\n8.8.8.8",
+            "x".repeat(super::MAX_ARTWORK_BYTES + 1)
+        );
+        assert!(super::parse_curl_artwork_output(oversized_body.as_bytes()).is_err());
     }
 
     #[test]
