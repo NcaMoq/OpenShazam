@@ -393,11 +393,37 @@ enum ArtworkSource {
     HighQuality,
 }
 
+fn should_replace_cached_artwork(
+    cached: Option<(ArtworkSource, u128)>,
+    incoming_source: ArtworkSource,
+    incoming_fingerprint: u128,
+) -> bool {
+    match cached {
+        None => true,
+        Some((ArtworkSource::HighQuality, _)) if incoming_source == ArtworkSource::Standard => {
+            false
+        }
+        Some((cached_source, cached_fingerprint)) => {
+            cached_source != incoming_source || cached_fingerprint != incoming_fingerprint
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ArtworkPixels {
     width: u32,
     height: u32,
+    fingerprint: u128,
     bgra: Vec<u8>,
+}
+
+struct CachedArtworkBitmap {
+    source: ArtworkSource,
+    width: u32,
+    height: u32,
+    byte_len: usize,
+    fingerprint: u128,
+    bitmap: ID2D1Bitmap,
 }
 
 #[derive(Debug)]
@@ -499,7 +525,7 @@ enum ResultOverlayIdentity {
         artist: String,
         artwork_url: Option<String>,
         hq_artwork_url: Option<String>,
-        artwork: Option<(ArtworkSource, usize, usize)>,
+        artwork: Option<(ArtworkSource, usize, u128)>,
     },
     NoMatch {
         entered_at: Instant,
@@ -742,11 +768,28 @@ struct ResultDetailsMetrics {
     artist_height: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct MeasuredTextLayout {
+    height: f32,
+    #[allow(dead_code)] // Retained separately from TextFrame for native baseline comparison.
+    first_baseline: f32,
+    #[allow(dead_code)] // Retained separately from TextFrame for native baseline comparison.
+    last_baseline: f32,
+    #[allow(dead_code)] // DirectWrite overhang is a layout metric, not a pixel-exact ink mask.
+    overhang_left: f32,
+    #[allow(dead_code)]
+    overhang_top: f32,
+    #[allow(dead_code)]
+    overhang_right: f32,
+    #[allow(dead_code)]
+    overhang_bottom: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HistoryTextMetrics {
-    title_height: f32,
-    artist_height: f32,
-    date_height: f32,
+    title: MeasuredTextLayout,
+    artist: MeasuredTextLayout,
+    date: MeasuredTextLayout,
 }
 
 #[derive(Clone, Debug)]
@@ -788,7 +831,7 @@ struct Renderer {
     popup_layer: Option<ID2D1Layer>,
     artwork_layer: Option<ID2D1Layer>,
     artwork_geometries: [(u32, ID2D1Geometry); 2],
-    artwork_bitmaps: RefCell<HashMap<u64, (ArtworkSource, usize, ID2D1Bitmap)>>,
+    artwork_bitmaps: RefCell<HashMap<u64, CachedArtworkBitmap>>,
     popup_outline: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     popup_header: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     result_details_cache: RefCell<Option<CachedResultDetailsMetrics>>,
@@ -4155,7 +4198,10 @@ fn result_details_rects(
 const HISTORY_ROW_HEIGHT: f32 = 89.0;
 const HISTORY_TEXT_LEFT: f32 = 95.0;
 const HISTORY_TEXT_RIGHT: f32 = 360.0;
-const HISTORY_TEXT_CENTER_Y: f32 = HISTORY_ROW_HEIGHT * 0.5;
+const HISTORY_ARTWORK_SIZE: f32 = 65.0;
+const HISTORY_ARTWORK_LEFT: f32 = 20.0;
+const HISTORY_ARTWORK_TOP: f32 = 11.0;
+const HISTORY_ARTWORK_CENTER_Y: f32 = HISTORY_ARTWORK_TOP + HISTORY_ARTWORK_SIZE * 0.5;
 const HISTORY_TEXT_GAP: f32 = 5.0;
 
 fn history_text_rects(
@@ -4165,7 +4211,7 @@ fn history_text_rects(
     date_height: f32,
 ) -> HistoryTextRects {
     let total_height = title_height + artist_height + date_height + HISTORY_TEXT_GAP * 2.0;
-    let title_top = row_top + HISTORY_TEXT_CENTER_Y - total_height * 0.5;
+    let title_top = row_top + HISTORY_ARTWORK_CENTER_Y - total_height * 0.5;
     let title_bottom = title_top + title_height;
     let artist_top = title_bottom + HISTORY_TEXT_GAP;
     let artist_bottom = artist_top + artist_height;
@@ -4224,7 +4270,12 @@ fn result_gradient_colors(theme: Theme, edge: ArrowEdge) -> [(u8, u8, u8); 2] {
 }
 
 fn history_artwork_frame(row_top: f32) -> D2D_RECT_F {
-    rect(20.0, row_top + 12.0, 85.0, row_top + 77.0)
+    rect(
+        HISTORY_ARTWORK_LEFT,
+        row_top + HISTORY_ARTWORK_TOP,
+        HISTORY_ARTWORK_LEFT + HISTORY_ARTWORK_SIZE,
+        row_top + HISTORY_ARTWORK_TOP + HISTORY_ARTWORK_SIZE,
+    )
 }
 
 fn gradient_origin_transform(top: f32) -> Matrix3x2 {
@@ -4286,6 +4337,64 @@ fn create_text_format_with_locale(
         format.SetTrimming(&trimming, &trimming_sign)?;
         Ok(format)
     }
+}
+
+unsafe fn measure_directwrite_text_layout(
+    factory: &IDWriteFactory,
+    value: &str,
+    format: &IDWriteTextFormat,
+    max_width: f32,
+    min_height: f32,
+    max_lines: f32,
+) -> windows::core::Result<MeasuredTextLayout> {
+    if value.is_empty() {
+        return Ok(MeasuredTextLayout {
+            height: min_height,
+            ..Default::default()
+        });
+    }
+    let content: Vec<u16> = value.encode_utf16().collect();
+    let layout = factory.CreateTextLayout(&content, format, max_width, 512.0)?;
+    let mut text_metrics = DWRITE_TEXT_METRICS::default();
+    layout.GetMetrics(&mut text_metrics)?;
+    if text_metrics.lineCount == 0 {
+        return Ok(MeasuredTextLayout {
+            height: min_height,
+            ..Default::default()
+        });
+    }
+    let mut lines = vec![
+        windows::Win32::Graphics::DirectWrite::DWRITE_LINE_METRICS::default();
+        text_metrics.lineCount as usize
+    ];
+    let mut actual_line_count = 0;
+    layout.GetLineMetrics(Some(&mut lines), &mut actual_line_count)?;
+
+    let mut height = 0.0;
+    let mut first_baseline = 0.0;
+    let mut last_baseline = 0.0;
+    for (index, line) in lines
+        .iter()
+        .take(actual_line_count as usize)
+        .take(max_lines.ceil() as usize)
+        .enumerate()
+    {
+        if index == 0 {
+            first_baseline = line.baseline;
+        }
+        last_baseline = height + line.baseline;
+        height += line.height;
+    }
+    let overhang = layout.GetOverhangMetrics().unwrap_or_default();
+    Ok(MeasuredTextLayout {
+        height: height.max(min_height),
+        first_baseline,
+        last_baseline,
+        overhang_left: overhang.left,
+        overhang_top: overhang.top,
+        overhang_right: overhang.right,
+        overhang_bottom: overhang.bottom,
+    })
 }
 
 impl Renderer {
@@ -4439,9 +4548,10 @@ impl Renderer {
                 artist: track.artist.clone(),
                 artwork_url: track.artwork_url.clone(),
                 hq_artwork_url: track.hq_artwork_url.clone(),
-                artwork: self.artwork_bitmaps.borrow().get(&track.display_id).map(
-                    |(source, byte_len, bitmap)| (*source, *byte_len, bitmap.as_raw() as usize),
-                ),
+                artwork: app
+                    .artwork_resources
+                    .get(&track.display_id)
+                    .map(|(source, pixels)| (*source, pixels.bgra.len(), pixels.fingerprint)),
             },
             MainPhase::NoMatch { entered_at, .. } => ResultOverlayIdentity::NoMatch {
                 entered_at: *entered_at,
@@ -4800,31 +4910,15 @@ impl Renderer {
         min_height: f32,
         max_lines: f32,
     ) -> windows::core::Result<f32> {
-        if value.is_empty() {
-            return Ok(min_height);
-        }
-        let content: Vec<u16> = value.encode_utf16().collect();
-        let layout = self
-            .write_factory
-            .CreateTextLayout(&content, format, max_width, 512.0)?;
-        let mut metrics = DWRITE_TEXT_METRICS::default();
-        layout.GetMetrics(&mut metrics)?;
-        if metrics.lineCount == 0 {
-            return Ok(min_height);
-        }
-        let mut lines = vec![
-            windows::Win32::Graphics::DirectWrite::DWRITE_LINE_METRICS::default();
-            metrics.lineCount as usize
-        ];
-        let mut actual_line_count = 0;
-        layout.GetLineMetrics(Some(&mut lines), &mut actual_line_count)?;
-        let measured_height = lines
-            .iter()
-            .take(actual_line_count as usize)
-            .take(max_lines.ceil() as usize)
-            .map(|line| line.height)
-            .sum::<f32>();
-        Ok(measured_height.max(min_height))
+        Ok(measure_directwrite_text_layout(
+            &self.write_factory,
+            value,
+            format,
+            max_width,
+            min_height,
+            max_lines,
+        )?
+        .height)
     }
 
     unsafe fn result_details_metrics(
@@ -4876,21 +4970,24 @@ impl Renderer {
         }
         let width = HISTORY_TEXT_RIGHT - HISTORY_TEXT_LEFT;
         let metrics = HistoryTextMetrics {
-            title_height: self.measured_text_height_at_width(
+            title: measure_directwrite_text_layout(
+                &self.write_factory,
                 &track.title,
                 &self.text.title,
                 width,
                 0.0,
                 2.0,
             )?,
-            artist_height: self.measured_text_height_at_width(
+            artist: measure_directwrite_text_layout(
+                &self.write_factory,
                 &track.artist,
                 &self.text.subtitle,
                 width,
                 0.0,
                 2.0,
             )?,
-            date_height: self.measured_text_height_at_width(
+            date: measure_directwrite_text_layout(
+                &self.write_factory,
                 &track.recognized_date_label,
                 &self.text.date,
                 width,
@@ -5443,13 +5540,14 @@ impl Renderer {
             return false;
         };
         let mut bitmaps = self.artwork_bitmaps.borrow_mut();
-        if !bitmaps.contains_key(&track.display_id)
-            || bitmaps
-                .get(&track.display_id)
-                .is_some_and(|(cached_source, _, _)| {
-                    source == &ArtworkSource::HighQuality && cached_source != source
-                })
-        {
+        let replace_cached = bitmaps.get(&track.display_id).is_none_or(|cached| {
+            should_replace_cached_artwork(
+                Some((cached.source, cached.fingerprint)),
+                *source,
+                pixels.fingerprint,
+            )
+        });
+        if replace_cached {
             let properties = D2D1_BITMAP_PROPERTIES {
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -5470,9 +5568,24 @@ impl Renderer {
                 return false;
             };
             let bytes = pixels.bgra.len();
-            bitmaps.insert(track.display_id, (*source, bytes, bitmap));
+            bitmaps.insert(
+                track.display_id,
+                CachedArtworkBitmap {
+                    source: *source,
+                    width: pixels.width,
+                    height: pixels.height,
+                    byte_len: bytes,
+                    fingerprint: pixels.fingerprint,
+                    bitmap,
+                },
+            );
             const BITMAP_CACHE_LIMIT: usize = 24 * 1024 * 1024;
-            while bitmaps.values().map(|(_, bytes, _)| *bytes).sum::<usize>() > BITMAP_CACHE_LIMIT {
+            while bitmaps
+                .values()
+                .map(|cached| cached.byte_len)
+                .sum::<usize>()
+                > BITMAP_CACHE_LIMIT
+            {
                 let oldest = bitmaps
                     .keys()
                     .copied()
@@ -5482,11 +5595,11 @@ impl Renderer {
                 bitmaps.remove(&oldest);
             }
         }
-        let Some((_, _, bitmap)) = bitmaps.get(&track.display_id) else {
+        let Some(cached) = bitmaps.get(&track.display_id) else {
             return false;
         };
-        let image_rect = aspect_fit_rect(destination, pixels.width, pixels.height);
-        self.draw_artwork_bitmap(bitmap, destination, image_rect, side)
+        let image_rect = aspect_fit_rect(destination, cached.width, cached.height);
+        self.draw_artwork_bitmap(&cached.bitmap, destination, image_rect, side)
     }
 
     unsafe fn draw_fallback_match_artwork(&self, theme: Theme, frame: D2D_RECT_F) {
@@ -5563,9 +5676,9 @@ impl Renderer {
             let text_metrics = self.history_text_metrics(track)?;
             let text_rects = history_text_rects(
                 top,
-                text_metrics.title_height,
-                text_metrics.artist_height,
-                text_metrics.date_height,
+                text_metrics.title.height,
+                text_metrics.artist.height,
+                text_metrics.date.height,
             );
             if app.hovered_row == Some(index) {
                 self.fill_rect(row, &self.palette.skeleton);
@@ -7397,6 +7510,22 @@ unsafe fn open_track_page(hwnd: HWND, url: &ValidatedWebTrackUrl) -> bool {
     ShellExecuteExW(&mut execute).is_ok()
 }
 
+fn page_url_for_display_id<'a>(
+    history: &'a [Track],
+    current_result: Option<&'a Track>,
+    display_id: u64,
+) -> Option<&'a ValidatedWebTrackUrl> {
+    history
+        .iter()
+        .find(|track| track.display_id == display_id)
+        .and_then(|track| track.page_url.as_ref())
+        .or_else(|| {
+            current_result
+                .filter(|track| track.display_id == display_id)
+                .and_then(|track| track.page_url.as_ref())
+        })
+}
+
 fn fetch_and_decode_artwork(url: &str) -> Result<ArtworkPixels, String> {
     let output = Command::new("curl.exe")
         .args([
@@ -7438,6 +7567,24 @@ fn fetch_and_decode_artwork(url: &str) -> Result<ArtworkPixels, String> {
         return Err("artwork redirect left HTTPS or exceeded URL limits".to_owned());
     }
     decode_artwork_wic(&output.stdout[..marker])
+}
+
+fn artwork_pixel_fingerprint(width: u32, height: u32, bgra: &[u8]) -> u128 {
+    // A small content key lets the renderer replace a bitmap when a track's
+    // artwork bytes are refreshed under the same display identity. It is only
+    // a process-local cache key, not a security or file-integrity hash.
+    let bytes = width
+        .to_le_bytes()
+        .into_iter()
+        .chain(height.to_le_bytes())
+        .chain(bgra.iter().copied());
+    let mut left = 0xcbf2_9ce4_8422_2325u64;
+    let mut right = 0x8422_2325_cbf2_9ce4u64;
+    for byte in bytes {
+        left = (left ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        right = (right ^ u64::from(byte).wrapping_add(0x9d)).wrapping_mul(0x9e37_79b1_85eb_ca87);
+    }
+    (u128::from(left) << 64) | u128::from(right)
 }
 
 fn decode_artwork_wic(encoded: &[u8]) -> Result<ArtworkPixels, String> {
@@ -7488,9 +7635,11 @@ fn decode_artwork_wic(encoded: &[u8]) -> Result<ArtworkPixels, String> {
                 WICBitmapPaletteTypeCustom,
             )?;
             converter.CopyPixels(std::ptr::null(), stride, &mut bgra)?;
+            let fingerprint = artwork_pixel_fingerprint(width, height, &bgra);
             Ok(ArtworkPixels {
                 width,
                 height,
+                fingerprint,
                 bgra,
             })
         })()
@@ -8256,18 +8405,11 @@ unsafe fn process_main_hit(app: &mut AppState, hit: MainHit) {
             app.message = None;
         }
         MainHit::OpenTrack(display_id) => {
-            let url = app
-                .history
-                .iter()
-                .find(|track| track.display_id == display_id)
-                .and_then(|track| track.page_url.clone())
-                .or_else(|| match &app.phase {
-                    MainPhase::Matched { track, .. } if track.display_id == display_id => {
-                        track.page_url.clone()
-                    }
-                    _ => None,
-                });
-            if let Some(url) = url {
+            let current_result = match &app.phase {
+                MainPhase::Matched { track, .. } => Some(track),
+                _ => None,
+            };
+            if let Some(url) = page_url_for_display_id(&app.history, current_result, display_id) {
                 if !unsafe { open_track_page(app.main_hwnd, &url) } {
                     app.message = Some("Could not open the track page".to_owned());
                 }
@@ -9098,24 +9240,27 @@ fn history_row_top(
 mod tests {
     use super::StatusTextAlternator;
     use super::{
-        advance_result_card_stage, animation_needs_frame, button_border_arc_points,
-        composition_button_pixel_snap_offset, composition_header_viewport_offset,
-        composition_root_layer_order, composition_scale_for_dpi, composition_scene_layer_order,
-        copy_notification_text, copy_panel_pixels_into, create_text_format_with_locale,
-        d2d_color_from_system, directwrite_locale, fallback_match_artwork_rect,
-        gradient_origin_transform, header_fill_scope, history_artwork_frame, history_row_top,
-        history_text_rects, history_title_color, inverse_circle_clip_radii, is_offline_failure,
+        advance_result_card_stage, animation_needs_frame, artwork_pixel_fingerprint,
+        button_border_arc_points, composition_button_pixel_snap_offset,
+        composition_header_viewport_offset, composition_root_layer_order,
+        composition_scale_for_dpi, composition_scene_layer_order, copy_notification_text,
+        copy_panel_pixels_into, create_text_format_with_locale, d2d_color_from_system,
+        directwrite_locale, fallback_match_artwork_rect, gradient_origin_transform,
+        header_fill_scope, history_artwork_frame, history_row_top, history_text_rects,
+        history_title_color, inverse_circle_clip_radii, is_offline_failure,
         is_tray_activation_event, localized_ui_text, native_icon_layout, no_match_copy,
-        no_match_icon_rect, phase_needs_timeout, point_in_rect, popup_base_color,
-        resolve_page_link, result_artwork_rect, result_card_link_hit, result_details_rects,
-        result_gradient_colors, result_header_hit_test_contains, result_header_visible_height,
-        result_overlay_child_offset, result_overlay_occludes_shazam_button, result_panel_draw_top,
-        result_panel_top_at, select_ui_language_from_multisz, should_hide_popup_on_deactivation,
-        should_show_initial_popup, should_start_startup_logo, theme_from_foreground_rgb,
-        timeout_copy, ui_model, valid_page_template, visible_history_row_hit, ArrowEdge,
-        CaptureMode, CompositionRootLayer, CompositionSceneLayer, HeaderFillScope,
-        HistoryMutationEvent, HistoryMutationTransition, MainPhase, NoMatchIconCommand,
-        ResultCardAdvance, ResultCardStage, Theme, UiLanguage, UiTextKey, WindowKind,
+        no_match_icon_rect, page_url_for_display_id, phase_needs_timeout, point_in_rect,
+        popup_base_color, resolve_page_link, result_artwork_rect, result_card_link_hit,
+        result_details_rects, result_gradient_colors, result_header_hit_test_contains,
+        result_header_visible_height, result_overlay_child_offset,
+        result_overlay_occludes_shazam_button, result_panel_draw_top, result_panel_top_at,
+        select_ui_language_from_multisz, should_hide_popup_on_deactivation,
+        should_replace_cached_artwork, should_show_initial_popup, should_start_startup_logo,
+        theme_from_foreground_rgb, timeout_copy, ui_model, valid_page_template,
+        visible_history_row_hit, ArrowEdge, ArtworkSource, CaptureMode, CompositionRootLayer,
+        CompositionSceneLayer, HeaderFillScope, HistoryMutationEvent, HistoryMutationTransition,
+        HistoryTimestampSource, MainPhase, NoMatchIconCommand, ResultCardAdvance, ResultCardStage,
+        Theme, Track, UiLanguage, UiTextKey, ValidatedWebTrackUrl, WindowKind,
         BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, FALLBACK_MATCH_DARK_PIXELS,
         FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE, HISTORY_HEIGHT,
         HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY,
@@ -9796,6 +9941,70 @@ mod tests {
     }
 
     #[test]
+    fn ui222_result_and_history_page_lookup_uses_the_clicked_track_identity() {
+        let recognized_at = Instant::now();
+        let make_track = |display_id, url: &str| Track {
+            display_id,
+            title: format!("track-{display_id}"),
+            artist: "artist".to_owned(),
+            recognized_at,
+            recognized_at_utc: UNIX_EPOCH,
+            recognized_date_label: String::new(),
+            timestamp_source: HistoryTimestampSource::HostReceivedFallback,
+            artwork_url: None,
+            hq_artwork_url: None,
+            background_artwork_url: None,
+            track_key: None,
+            page_url: Some(ValidatedWebTrackUrl(url.to_owned())),
+        };
+        let history_track = make_track(41, "https://www.shazam.com/track/history-41");
+        let result_track = make_track(42, "https://www.shazam.com/track/result-42");
+        let history = [history_track];
+
+        assert_eq!(
+            page_url_for_display_id(&history, Some(&result_track), 41).map(|url| url.0.as_str()),
+            Some("https://www.shazam.com/track/history-41")
+        );
+        assert_eq!(
+            page_url_for_display_id(&history, Some(&result_track), 42).map(|url| url.0.as_str()),
+            Some("https://www.shazam.com/track/result-42")
+        );
+        assert!(page_url_for_display_id(&history, Some(&result_track), 99).is_none());
+    }
+
+    #[test]
+    fn artwork_bitmap_cache_replaces_changed_pixels_without_downgrading_quality() {
+        let first = artwork_pixel_fingerprint(1, 1, &[1, 2, 3, 4]);
+        let refreshed = artwork_pixel_fingerprint(1, 1, &[5, 6, 7, 8]);
+        assert_ne!(first, refreshed);
+        assert!(should_replace_cached_artwork(
+            None,
+            ArtworkSource::Standard,
+            first
+        ));
+        assert!(!should_replace_cached_artwork(
+            Some((ArtworkSource::Standard, first)),
+            ArtworkSource::Standard,
+            first,
+        ));
+        assert!(should_replace_cached_artwork(
+            Some((ArtworkSource::Standard, first)),
+            ArtworkSource::Standard,
+            refreshed,
+        ));
+        assert!(should_replace_cached_artwork(
+            Some((ArtworkSource::Standard, first)),
+            ArtworkSource::HighQuality,
+            first,
+        ));
+        assert!(!should_replace_cached_artwork(
+            Some((ArtworkSource::HighQuality, refreshed)),
+            ArtworkSource::Standard,
+            first,
+        ));
+    }
+
+    #[test]
     fn result_label_color_preserves_system_foreground_rgba() {
         let mapped = d2d_color_from_system(super::Color {
             A: 128,
@@ -10361,7 +10570,7 @@ mod tests {
         let history = history_artwork_frame(200.0);
         assert_eq!(
             (history.left, history.top, history.right, history.bottom),
-            (20.0, 212.0, 85.0, 277.0)
+            (20.0, 211.0, 85.0, 276.0)
         );
         assert_eq!(history.right - history.left, 65.0);
         assert_eq!(history.bottom - history.top, 65.0);
@@ -10509,7 +10718,7 @@ mod tests {
         let text = history_text_rects(top, 34.0, 28.0, 12.0);
         assert_eq!(text.title.bottom + 5.0, text.artist.top);
         assert_eq!(text.artist.bottom + 5.0, text.date.top);
-        assert!(((text.title.top + text.date.bottom) * 0.5 - top - 44.5).abs() < f32::EPSILON);
+        assert!(((text.title.top + text.date.bottom) * 0.5 - top - 43.5).abs() < f32::EPSILON);
         assert!(text.title.top >= top);
         assert!(text.date.bottom <= top + HISTORY_ROW_HEIGHT);
 
@@ -10519,6 +10728,23 @@ mod tests {
         let result = result_details_rects(0.0, 80.0, 74.0, false);
         assert!(result.title.top >= 0.0);
         assert!(result.artist.bottom <= TOP_HEIGHT as f32);
+    }
+
+    #[test]
+    fn ui237_history_artwork_and_text_stack_share_the_constraint_resolved_center() {
+        for row_top in [0.0, 11.0, 200.0] {
+            let artwork = history_artwork_frame(row_top);
+            let artwork_center_y = (artwork.top + artwork.bottom) * 0.5;
+            assert_eq!(artwork.left, 20.0);
+            assert_eq!(artwork.top, row_top + 11.0);
+            assert_eq!(artwork.right - artwork.left, 65.0);
+            assert!((artwork_center_y - (row_top + 43.5)).abs() < f32::EPSILON);
+
+            let text = history_text_rects(row_top, 34.0, 28.0, 12.0);
+            let text_center_y = (text.title.top + text.date.bottom) * 0.5;
+            assert_eq!(text.title.left, artwork.right + 10.0);
+            assert!((text_center_y - artwork_center_y).abs() < f32::EPSILON);
+        }
     }
 
     #[test]
@@ -10590,7 +10816,33 @@ mod tests {
                 assert_eq!(actual_line_count, metrics.lineCount);
                 for line in line_metrics.iter().take(actual_line_count as usize) {
                     assert!(line.height.is_finite() && line.height >= 0.0);
+                    assert!(line.baseline.is_finite() && line.baseline >= 0.0);
                 }
+                let measured = unsafe {
+                    super::measure_directwrite_text_layout(
+                        &factory,
+                        &value,
+                        &format,
+                        width,
+                        0.0,
+                        if width == 164.0 {
+                            4.0
+                        } else if font_size == 10.0 {
+                            1.0
+                        } else {
+                            2.0
+                        },
+                    )
+                    .unwrap()
+                };
+                assert!(measured.height.is_finite() && measured.height >= 0.0);
+                assert!(measured.first_baseline.is_finite());
+                assert!(measured.last_baseline.is_finite());
+                assert!(measured.last_baseline <= measured.height + 0.01);
+                assert!(measured.overhang_left.is_finite());
+                assert!(measured.overhang_top.is_finite());
+                assert!(measured.overhang_right.is_finite());
+                assert!(measured.overhang_bottom.is_finite());
                 if line_metrics
                     .iter()
                     .take(actual_line_count as usize)
