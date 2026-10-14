@@ -1016,7 +1016,9 @@ impl CompositionResultOverlay {
     }
 
     fn hide(&self) -> windows::core::Result<()> {
-        self.group.SetOpacity(0.0)
+        self.group
+            .SetOpacity(0.0)
+            .map_err(|error| overlay_surface_error("Hide.SetOpacity", error))
     }
 }
 
@@ -2076,6 +2078,8 @@ struct CompositionScene {
     outer_audio_root: ContainerVisual,
     rings: [CompositionRing; 6],
     button: ContainerVisual,
+    button_visible: bool,
+    result_fallback_occludes_button: bool,
     button_content: ContainerVisual,
     button_fill: CompositionColorBrush,
     logo: CompositionLogo,
@@ -2143,6 +2147,16 @@ fn composition_scene_layer_order() -> [CompositionSceneLayer; 2] {
         CompositionSceneLayer::Tagging,
         CompositionSceneLayer::ResultOverlay,
     ]
+}
+
+fn result_overlay_occludes_shazam_button(panel_top: Option<f32>, body_top: f32) -> bool {
+    let Some(panel_top) = panel_top else {
+        return false;
+    };
+    let panel_bottom = panel_top + TOP_HEIGHT as f32;
+    let button_top = body_top + BUTTON_TOP as f32;
+    let button_bottom = button_top + BUTTON_SIZE as f32;
+    panel_top < button_bottom && panel_bottom > button_top
 }
 
 fn should_start_startup_logo(kind: WindowKind, already_started: bool) -> bool {
@@ -2808,6 +2822,8 @@ impl CompositionScene {
             outer_audio_root,
             rings,
             button,
+            button_visible: true,
+            result_fallback_occludes_button: false,
             button_content,
             button_fill,
             logo,
@@ -2860,6 +2876,19 @@ impl CompositionScene {
                 .update_from_layered(source, panel_top, body_top, dpi),
             _ => self.result_overlay.hide(),
         }
+    }
+
+    fn set_result_fallback_occlusion(
+        &mut self,
+        occludes_button: bool,
+    ) -> windows::core::Result<()> {
+        self.result_fallback_occludes_button = occludes_button;
+        self.button
+            .SetOpacity(if self.button_visible && !occludes_button {
+                1.0
+            } else {
+                0.0
+            })
     }
 
     fn update(&mut self, snapshot: AnimationSnapshot) -> windows::core::Result<()> {
@@ -2989,8 +3018,14 @@ impl CompositionScene {
                 Z: 0.0,
             })?;
         }
-        self.button
-            .SetOpacity(if snapshot.show_button { 1.0 } else { 0.0 })?;
+        self.button_visible = snapshot.show_button;
+        self.button.SetOpacity(
+            if snapshot.show_button && !self.result_fallback_occludes_button {
+                1.0
+            } else {
+                0.0
+            },
+        )?;
 
         if snapshot.show_ripples && !self.ripples_active {
             for ring in &self.rings[..4] {
@@ -4099,6 +4134,17 @@ impl Renderer {
                     // D2D frame as a fallback.
                     let _ = scene.result_overlay.hide();
                     overlay_error = Some(error);
+                }
+                // A failed Composition copy leaves the card in the layered
+                // D2D frame, which is behind the desktop Composition tree.
+                // Hide only the Shazam button while the fallback card crosses
+                // its bounds; restore it as soon as the card clears the area.
+                let fallback_occludes_button = overlay_error.is_some()
+                    && result_overlay_occludes_shazam_button(panel_top, body_top);
+                if let Err(error) = scene.set_result_fallback_occlusion(fallback_occludes_button) {
+                    if overlay_error.is_none() {
+                        overlay_error = Some(overlay_surface_error("FallbackButtonOpacity", error));
+                    }
                 }
             }
             if let Some(error) = overlay_error {
@@ -6922,11 +6968,17 @@ fn localized_ui_text(key: UiTextKey, language: UiLanguage) -> &'static str {
     match (key, language) {
         (UiTextKey::Ready, UiLanguage::Japanese) => "クリックしてShazamする",
         (UiTextKey::Ready, UiLanguage::English) => "Click to Shazam",
-        (UiTextKey::AutoStartStatus, UiLanguage::Japanese) => "\u{30c0}\u{30d6}\u{30eb}\u{30af}\u{30ea}\u{30c3}\u{30af}\u{3057}\u{3066}\u{81ea}\u{52d5}Shazam\u{3059}\u{308b}",
+        (UiTextKey::AutoStartStatus, UiLanguage::Japanese) => {
+            "\u{30c0}\u{30d6}\u{30eb}\u{30af}\u{30ea}\u{30c3}\u{30af}\u{3057}\u{3066}\u{81ea}\u{52d5}Shazam\u{3059}\u{308b}"
+        }
         (UiTextKey::AutoStartStatus, UiLanguage::English) => "Double click to Auto Shazam",
-        (UiTextKey::AutoOn, UiLanguage::Japanese) => "Auto Shazam\u{304c}\u{30aa}\u{30f3}\u{306b}\u{306a}\u{3063}\u{3066}\u{3044}\u{307e}\u{3059}",
+        (UiTextKey::AutoOn, UiLanguage::Japanese) => {
+            "Auto Shazam\u{304c}\u{30aa}\u{30f3}\u{306b}\u{306a}\u{3063}\u{3066}\u{3044}\u{307e}\u{3059}"
+        }
         (UiTextKey::AutoOn, UiLanguage::English) => "Auto Shazam is on",
-        (UiTextKey::AutoTurnOff, UiLanguage::Japanese) => "\u{30af}\u{30ea}\u{30c3}\u{30af}\u{3057}\u{3066}\u{30aa}\u{30d5}\u{306b}\u{3059}\u{308b}",
+        (UiTextKey::AutoTurnOff, UiLanguage::Japanese) => {
+            "\u{30af}\u{30ea}\u{30c3}\u{30af}\u{3057}\u{3066}\u{30aa}\u{30d5}\u{306b}\u{3059}\u{308b}"
+        }
         (UiTextKey::AutoTurnOff, UiLanguage::English) => "Click to turn off",
         (UiTextKey::Starting, UiLanguage::Japanese) => "\u{958b}\u{59cb}\u{4e2d}",
         (UiTextKey::Starting, UiLanguage::English) => "Starting",
@@ -8185,8 +8237,8 @@ mod tests {
         inverse_circle_clip_radii, is_offline_failure, is_tray_activation_event, localized_ui_text,
         native_icon_layout, no_match_copy, no_match_icon_rect, phase_needs_timeout, point_in_rect,
         popup_base_color, resolve_page_link, result_artwork_rect, result_card_link_hit,
-        result_details_rects, result_gradient_colors, result_panel_top_at,
-        select_ui_language_from_multisz, should_hide_popup_on_deactivation,
+        result_details_rects, result_gradient_colors, result_overlay_occludes_shazam_button,
+        result_panel_top_at, select_ui_language_from_multisz, should_hide_popup_on_deactivation,
         should_show_initial_popup, should_start_startup_logo, theme_from_foreground_rgb,
         timeout_copy, ui_model, valid_page_template, visible_history_row_hit, ArrowEdge,
         CaptureMode, CompositionRootLayer, CompositionSceneLayer, HeaderFillScope,
@@ -8939,6 +8991,31 @@ mod tests {
                 CompositionSceneLayer::ResultOverlay,
             ]
         );
+    }
+
+    #[test]
+    fn result_fallback_hides_shazam_button_only_while_the_card_crosses_it() {
+        let body_top = POPUP_ARROW_HEIGHT as f32;
+        let button_top = body_top + BUTTON_TOP as f32;
+        let button_bottom = button_top + BUTTON_SIZE as f32;
+
+        assert!(!result_overlay_occludes_shazam_button(None, body_top));
+        assert!(!result_overlay_occludes_shazam_button(
+            Some(button_top - TOP_HEIGHT as f32),
+            body_top
+        ));
+        assert!(result_overlay_occludes_shazam_button(
+            Some(button_top - TOP_HEIGHT as f32 + 0.01),
+            body_top
+        ));
+        assert!(result_overlay_occludes_shazam_button(
+            Some(body_top),
+            body_top
+        ));
+        assert!(!result_overlay_occludes_shazam_button(
+            Some(button_bottom),
+            body_top
+        ));
     }
 
     #[test]
