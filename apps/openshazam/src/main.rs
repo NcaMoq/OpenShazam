@@ -18,6 +18,13 @@ use std::{
         Arc,
     },
     thread,
+    thread::JoinHandle,
+};
+
+#[cfg(windows)]
+use openshazam_controller::{
+    EventEmitter, RecognitionErrorKind, RecognitionEventKind, RecognitionMode, SessionEndReason,
+    SessionId,
 };
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -31,7 +38,7 @@ use sigx_core::{Config, SigX};
 
 #[cfg(windows)]
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     fs::OpenOptions,
     io::Write,
     sync::{
@@ -91,9 +98,9 @@ fn main() -> ExitCode {
 
 #[cfg(any(windows, target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProgressiveCaptureMode {
-    tagging_type: NativeTaggingType,
-    request_context: Option<NativeTaggingRequestContext>,
+pub(crate) struct ProgressiveCaptureMode {
+    pub(crate) tagging_type: NativeTaggingType,
+    pub(crate) request_context: Option<NativeTaggingRequestContext>,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -207,19 +214,19 @@ fn parse_progressive_capture_options(
 
 #[cfg(any(windows, target_os = "macos"))]
 #[derive(Clone)]
-struct NativeContextState(Arc<AtomicU8>);
+pub(crate) struct NativeContextState(Arc<AtomicU8>);
 
 #[cfg(any(windows, target_os = "macos"))]
 impl NativeContextState {
-    fn new(initial: Option<NativeTaggingRequestContext>) -> Self {
+    pub(crate) fn new(initial: Option<NativeTaggingRequestContext>) -> Self {
         Self(Arc::new(AtomicU8::new(encode_native_context(initial))))
     }
 
-    fn current(&self) -> Option<NativeTaggingRequestContext> {
+    pub(crate) fn current(&self) -> Option<NativeTaggingRequestContext> {
         decode_native_context(self.0.load(Ordering::Acquire))
     }
 
-    fn set(&self, context: NativeTaggingRequestContext) {
+    pub(crate) fn set(&self, context: NativeTaggingRequestContext) {
         self.0
             .store(encode_native_context(Some(context)), Ordering::Release);
     }
@@ -1069,6 +1076,76 @@ fn recognize_loopback_progressive(
     context_state: NativeContextState,
     jsonl_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal_cancelled = Arc::clone(&cancelled);
+    ctrlc::set_handler(move || signal_cancelled.store(true, Ordering::Release))?;
+    let control = WindowsProgressiveControl {
+        cancelled,
+        stop_requested: Arc::new(AtomicBool::new(false)),
+        config_generation: Arc::new(AtomicU64::new(0)),
+        config_fetching: Arc::new(AtomicBool::new(false)),
+        manual_trigger_immediately: false,
+        events: None,
+    };
+    recognize_loopback_progressive_controlled(
+        selected_device_id,
+        mode,
+        context_state,
+        jsonl_output,
+        control,
+    )
+    .map(|_| ())
+}
+
+#[cfg(windows)]
+pub(crate) struct WindowsProgressiveControl {
+    pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) stop_requested: Arc<AtomicBool>,
+    pub(crate) config_generation: Arc<AtomicU64>,
+    pub(crate) config_fetching: Arc<AtomicBool>,
+    pub(crate) manual_trigger_immediately: bool,
+    pub(crate) events: Option<(SessionId, RecognitionMode, EventEmitter)>,
+}
+
+#[cfg(windows)]
+fn emit_backend_event(
+    events: &Option<(SessionId, RecognitionMode, EventEmitter)>,
+    attempt_id: Option<u64>,
+    kind: RecognitionEventKind,
+) {
+    if let Some((session_id, mode, emitter)) = events {
+        let _ = emitter.emit_attempt(Some(*session_id), Some(*mode), attempt_id, kind);
+    }
+}
+
+#[cfg(windows)]
+fn emit_backend_manual_event(
+    events: &Option<(SessionId, RecognitionMode, EventEmitter)>,
+    attempt_id: u64,
+    event: &shazam_http_lab::NativeManualUiEvent,
+) {
+    emit_backend_event(
+        events,
+        Some(attempt_id),
+        RecognitionEventKind::ManualUiEvent(event.clone()),
+    );
+    if matches!(event, shazam_http_lab::NativeManualUiEvent::NoMatch) {
+        emit_backend_event(
+            events,
+            Some(attempt_id),
+            RecognitionEventKind::NoMatch { attempt_id },
+        );
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn recognize_loopback_progressive_controlled(
+    selected_device_id: Option<&str>,
+    mode: ProgressiveCaptureMode,
+    context_state: NativeContextState,
+    jsonl_output: bool,
+    mut control: WindowsProgressiveControl,
+) -> Result<SessionEndReason, Box<dyn std::error::Error>> {
     use wasapi::{initialize_mta, AudioCaptureClient, DeviceEnumerator, Direction, StreamMode};
 
     if mode.tagging_type == NativeTaggingType::Auto && context_state.current().is_none() {
@@ -1155,11 +1232,9 @@ fn recognize_loopback_progressive(
         );
     }
 
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let signal_cancelled = Arc::clone(&cancelled);
-    ctrlc::set_handler(move || signal_cancelled.store(true, Ordering::Release))?;
+    let cancelled = Arc::clone(&control.cancelled);
     let (completion_sender, completion_receiver) = mpsc::channel();
-    let mut active_workers = BTreeSet::new();
+    let mut active_workers = BTreeMap::new();
     let mut saw_match_event = false;
     let mut saw_no_match_event = false;
     let mut received_audio_packet = false;
@@ -1177,8 +1252,10 @@ fn recognize_loopback_progressive(
         format!("Starting WASAPI capture from {device_name:?} ({sample_rate} Hz, {channels} channel(s)) while Shazam Config loads; PCM remains in a bounded local rolling buffer. Press Ctrl+C to stop."),
     );
     audio_client.start_stream()?;
+    emit_backend_event(&control.events, None, RecognitionEventKind::CaptureStarted);
 
     let (configuration_sender, configuration_receiver) = mpsc::sync_channel(1);
+    control.config_fetching.store(true, Ordering::Release);
     let configuration_task = match thread::Builder::new()
         .name("openshazam-config-fetch".into())
         .spawn(move || {
@@ -1188,6 +1265,7 @@ fn recognize_loopback_progressive(
         }) {
         Ok(task) => task,
         Err(error) => {
+            control.config_fetching.store(false, Ordering::Release);
             let _ = audio_client.stop_stream();
             return Err(error.into());
         }
@@ -1198,6 +1276,13 @@ fn recognize_loopback_progressive(
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "cancelled while loading Shazam Config",
+                )
+                .into());
+            }
+            if control.stop_requested.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "stopped while loading Shazam Config",
                 )
                 .into());
             }
@@ -1234,9 +1319,11 @@ fn recognize_loopback_progressive(
         Ok(result) => result,
         Err(error) => {
             let _ = audio_client.stop_stream();
+            let _ = configuration_task.join();
             return Err(error);
         }
     };
+    control.config_fetching.store(false, Ordering::Release);
     if configuration_task.join().is_err() {
         let _ = audio_client.stop_stream();
         return Err(io::Error::other("Shazam Config worker panicked").into());
@@ -1332,6 +1419,20 @@ fn recognize_loopback_progressive(
             jsonl_output,
         },
     )?;
+    control
+        .config_generation
+        .store(config_generation, Ordering::Release);
+    if let Some((session_id, recognition_mode, emitter)) = control.events.clone() {
+        let emitter = emitter.with_config_generation(config_generation);
+        control.events = Some((session_id, recognition_mode, emitter.clone()));
+        emit_backend_event(
+            &control.events,
+            None,
+            RecognitionEventKind::UiConfigSnapshot(
+                configuration.ui_config_snapshot(config_generation),
+            ),
+        );
+    }
     progressive_log(
         jsonl_output,
         format!(
@@ -1369,7 +1470,13 @@ fn recognize_loopback_progressive(
             jsonl_output,
             format!("WASAPI rolling pre-record buffer is active; press Enter to start manual recognition (retaining up to {pre_record_capacity_ms} ms; {pre_record_capacity_mode} capacity)."),
         );
-        let manual_trigger_receiver = spawn_manual_trigger_receiver();
+        let manual_trigger_receiver = if control.manual_trigger_immediately {
+            let (sender, receiver) = mpsc::channel();
+            let _ = sender.send(ManualTriggerSignal::Enter);
+            receiver
+        } else {
+            spawn_manual_trigger_receiver()
+        };
         match capture_wasapi_prerecord(
             &event,
             &capture,
@@ -1435,6 +1542,9 @@ fn recognize_loopback_progressive(
                 session.cancel();
                 break;
             }
+            if control.stop_requested.load(Ordering::Acquire) {
+                break;
+            }
 
             service_windows_progressive(
                 &mut session,
@@ -1450,6 +1560,7 @@ fn recognize_loopback_progressive(
                 &mut active_workers,
                 &mut saw_match_event,
                 &mut saw_no_match_event,
+                &control.events,
             )?;
             if session.is_terminal() {
                 break;
@@ -1472,6 +1583,7 @@ fn recognize_loopback_progressive(
                 &mut active_workers,
                 &mut saw_match_event,
                 &mut saw_no_match_event,
+                &control.events,
             )?;
             loop {
                 let Some(packet_frames) = capture.get_next_packet_size()? else {
@@ -1561,6 +1673,7 @@ fn recognize_loopback_progressive(
                     &mut active_workers,
                     &mut saw_match_event,
                     &mut saw_no_match_event,
+                    &control.events,
                 )?;
                 if session.is_terminal() {
                     break;
@@ -1585,6 +1698,7 @@ fn recognize_loopback_progressive(
                 &mut active_workers,
                 &mut saw_match_event,
                 &mut saw_no_match_event,
+                &control.events,
             )?;
         }
         Ok(())
@@ -1614,6 +1728,7 @@ fn recognize_loopback_progressive(
             &mut active_workers,
             &mut saw_match_event,
             &mut saw_no_match_event,
+            &control.events,
         )?;
         if active_workers.is_empty() && !session.is_terminal() {
             thread::sleep(Duration::from_millis(20));
@@ -1621,22 +1736,57 @@ fn recognize_loopback_progressive(
     }
     cancelled.store(true, Ordering::Release);
 
+    // Cancellation suppresses matcher delivery immediately, but still drains
+    // and joins every HTTP worker before the session reports cleanup complete.
+    while !active_workers.is_empty() {
+        match completion_receiver.recv_timeout(Duration::from_millis(20)) {
+            Ok(completion) => {
+                if let Some(worker) = active_workers.remove(&completion.attempt) {
+                    worker
+                        .join()
+                        .map_err(|_| io::Error::other("recognition HTTP worker panicked"))?;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "recognition HTTP workers stopped before cleanup completed",
+                )
+                .into());
+            }
+        }
+    }
+
     let status = session.status();
     if matches!(
         status,
         SessionStatus::Failed(shazam_progressive::StopReason::SessionTimeout)
     ) {
         emit_session_timeout_event(session.tagging_type(), jsonl_output);
+        emit_backend_event(&control.events, None, RecognitionEventKind::SessionTimedOut);
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(SessionEndReason::Cancelled);
+    }
+    if control.stop_requested.load(Ordering::Acquire) {
+        return Ok(SessionEndReason::Stopped);
+    }
+    if matches!(
+        status,
+        SessionStatus::Failed(shazam_progressive::StopReason::SessionTimeout)
+    ) {
+        return Ok(SessionEndReason::TimedOut);
     }
     if manual_completion_is_normal(status, saw_match_event, saw_no_match_event) {
-        return Ok(());
+        return Ok(if saw_match_event {
+            SessionEndReason::Matched
+        } else {
+            SessionEndReason::NoMatch
+        });
     }
     match status {
-        SessionStatus::Cancelled => Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "progressive recognition was cancelled",
-        )
-        .into()),
+        SessionStatus::Cancelled => Ok(SessionEndReason::Cancelled),
         status => Err(io::Error::other(format!(
             "progressive recognition ended without a match ({status:?}) after {} ms of audio",
             session.sample_ms()
@@ -2076,9 +2226,10 @@ fn service_windows_progressive(
     sender: &mpsc::Sender<WindowsRecognitionCompletion>,
     receiver: &mpsc::Receiver<WindowsRecognitionCompletion>,
     cancelled: &Arc<AtomicBool>,
-    active_workers: &mut BTreeSet<u64>,
+    active_workers: &mut BTreeMap<u64, JoinHandle<()>>,
     saw_match_event: &mut bool,
     saw_no_match_event: &mut bool,
+    backend_events: &Option<(SessionId, RecognitionMode, EventEmitter)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut post_stop_job = None;
     let mut deferred_manual_ui_event = None;
@@ -2094,7 +2245,11 @@ fn service_windows_progressive(
                 .into());
             }
         };
-        active_workers.remove(&completion.attempt);
+        if let Some(worker) = active_workers.remove(&completion.attempt) {
+            worker
+                .join()
+                .map_err(|_| io::Error::other("recognition HTTP worker panicked"))?;
+        }
         if let Some(status) = completion.status {
             progressive_log(
                 jsonl_output,
@@ -2110,6 +2265,21 @@ fn service_windows_progressive(
         let tracked = session.in_flight_attempts().contains(&completion.attempt);
         let was_terminal = session.is_terminal();
         if tracked {
+            let recognition_error_kind = completion.error.map(|_| match &completion.outcome {
+                RecognitionOutcome::TransportFailure => RecognitionErrorKind::Transport,
+                RecognitionOutcome::MatcherFailure { .. } | RecognitionOutcome::InvalidResponse => {
+                    RecognitionErrorKind::Internal
+                }
+                RecognitionOutcome::Match { .. } | RecognitionOutcome::NoMatch { .. } => {
+                    RecognitionErrorKind::Internal
+                }
+            });
+            let retry = match completion.outcome {
+                RecognitionOutcome::Match { retry }
+                | RecognitionOutcome::NoMatch { retry }
+                | RecognitionOutcome::MatcherFailure { retry } => retry,
+                RecognitionOutcome::InvalidResponse | RecognitionOutcome::TransportFailure => None,
+            };
             let delivery = shazam_http_lab::apply_progressive_response_at_ns(
                 session,
                 completion.attempt,
@@ -2132,6 +2302,39 @@ fn service_windows_progressive(
             let has_newly_stopped_retry = newly_stopped_retry.is_some();
             post_stop_job = newly_stopped_retry.or(post_stop_job);
             if !was_terminal && delivery.delivered_to_matcher {
+                if let (Some(kind), Some(message)) = (recognition_error_kind, completion.error) {
+                    emit_backend_event(
+                        backend_events,
+                        Some(completion.attempt),
+                        RecognitionEventKind::RecognitionError {
+                            kind,
+                            message: message.to_owned(),
+                        },
+                    );
+                }
+                if let Some(retry) = retry {
+                    emit_backend_event(
+                        backend_events,
+                        Some(completion.attempt),
+                        RecognitionEventKind::RetryScheduled {
+                            attempt_id: completion.attempt,
+                            retry_duration_ms: retry.retry_duration_ms,
+                            interval_ms: retry.interval_ms,
+                        },
+                    );
+                }
+                if let Some(candidate) = delivery.candidates.first() {
+                    emit_backend_event(
+                        backend_events,
+                        Some(completion.attempt),
+                        RecognitionEventKind::MatchFound {
+                            attempt_id: completion.attempt,
+                            title: Some(candidate.title.clone()),
+                            artist: Some(candidate.artist.clone()),
+                            track_id: candidate.track_id.clone(),
+                        },
+                    );
+                }
                 if let Some(event) = delivery.native_manual_ui_event() {
                     match &event {
                         shazam_http_lab::NativeManualUiEvent::Result(_) => {
@@ -2145,12 +2348,18 @@ fn service_windows_progressive(
                     if has_newly_stopped_retry
                         && matches!(event, shazam_http_lab::NativeManualUiEvent::NoMatch)
                     {
-                        deferred_manual_ui_event = Some(event);
+                        deferred_manual_ui_event = Some((event, completion.attempt));
                     } else {
+                        emit_backend_manual_event(backend_events, completion.attempt, &event);
                         emit_manual_ui_event(&event, jsonl_output, config_generation);
                     }
                 } else if let Some(event) = delivery.native_auto_ui_event() {
                     *saw_match_event = true;
+                    emit_backend_event(
+                        backend_events,
+                        Some(completion.attempt),
+                        RecognitionEventKind::AutoUiEvent(event.clone()),
+                    );
                     emit_auto_ui_event(&event, jsonl_output, config_generation);
                 } else if !delivery.candidates.is_empty() {
                     *saw_match_event = true;
@@ -2180,6 +2389,16 @@ fn service_windows_progressive(
     for job in jobs {
         let attempt = job.attempt;
         let sample_ms = job.sample_ms;
+        let signature_bytes = job.signature.len();
+        emit_backend_event(
+            backend_events,
+            Some(attempt),
+            RecognitionEventKind::SignatureReady {
+                attempt_id: attempt,
+                sample_ms,
+                signature_bytes,
+            },
+        );
         let configuration = configuration.clone();
         let worker_cancelled = if detached_post_stop_job {
             Arc::new(AtomicBool::new(false))
@@ -2194,9 +2413,15 @@ fn service_windows_progressive(
         };
         let sender = sender.clone();
         let context_state_for_worker = context_state.clone();
+        let backend_events_for_worker = backend_events.clone();
         let spawn_result = thread::Builder::new()
             .name(format!("openshazam-recognition-{attempt}"))
             .spawn(move || {
+                let mut completion_guard = WindowsCompletionGuard {
+                    sender,
+                    attempt,
+                    sent: false,
+                };
                 let request_context = context_state_for_worker.current();
                 let mut transport_started = false;
                 let result = if let Some(dispatch_ack_sender) = &dispatch_ack_sender {
@@ -2211,6 +2436,13 @@ fn service_windows_progressive(
                         &worker_cancelled,
                         || {
                             transport_started = true;
+                            emit_backend_event(
+                                &backend_events_for_worker,
+                                Some(attempt),
+                                RecognitionEventKind::RequestStarted {
+                                    attempt_id: attempt,
+                                },
+                            );
                             let _ = dispatch_ack_sender.send(true);
                         },
                     )
@@ -2224,7 +2456,15 @@ fn service_windows_progressive(
                         job.signature_timestamp_ms,
                         Duration::from_millis(timeout_ms),
                         &worker_cancelled,
-                        || {},
+                        || {
+                            emit_backend_event(
+                                &backend_events_for_worker,
+                                Some(attempt),
+                                RecognitionEventKind::RequestStarted {
+                                    attempt_id: attempt,
+                                },
+                            );
+                        },
                     )
                 };
                 if let Some(dispatch_ack_sender) = &dispatch_ack_sender {
@@ -2313,16 +2553,20 @@ fn service_windows_progressive(
                         }
                     }
                 };
-                let _ = sender.send(completion);
+                completion_guard.send(completion);
             });
-        if let Err(error) = spawn_result {
-            if detached_post_stop_job {
-                if let Some(event) = deferred_manual_ui_event.take() {
-                    emit_manual_ui_event(&event, jsonl_output, config_generation);
+        let worker = match spawn_result {
+            Ok(worker) => worker,
+            Err(error) => {
+                if detached_post_stop_job {
+                    if let Some((event, attempt_id)) = deferred_manual_ui_event.take() {
+                        emit_backend_manual_event(backend_events, attempt_id, &event);
+                        emit_manual_ui_event(&event, jsonl_output, config_generation);
+                    }
                 }
+                return Err(error.into());
             }
-            return Err(error.into());
-        }
+        };
         if detached_post_stop_job {
             let dispatch_ack_receiver = dispatch_ack_receiver
                 .expect("detached Retry has a dispatch acknowledgement receiver");
@@ -2340,13 +2584,14 @@ fn service_windows_progressive(
                     }
                 },
                 || {
-                    if let Some(event) = deferred_manual_ui_event.take() {
+                    if let Some((event, attempt_id)) = deferred_manual_ui_event.take() {
+                        emit_backend_manual_event(backend_events, attempt_id, &event);
                         emit_manual_ui_event(&event, jsonl_output, config_generation);
                     }
                 },
             )?;
         }
-        active_workers.insert(attempt);
+        active_workers.insert(attempt, worker);
         if detached_post_stop_job {
             session.finish_post_stop_retry_submission();
         }
@@ -2366,6 +2611,36 @@ struct WindowsRecognitionCompletion {
     outcome: RecognitionOutcome,
     candidates: Vec<shazam_http_lab::TrackCandidate>,
     error: Option<&'static str>,
+}
+
+#[cfg(windows)]
+struct WindowsCompletionGuard {
+    sender: mpsc::Sender<WindowsRecognitionCompletion>,
+    attempt: u64,
+    sent: bool,
+}
+
+#[cfg(windows)]
+impl WindowsCompletionGuard {
+    fn send(&mut self, completion: WindowsRecognitionCompletion) {
+        self.sent = true;
+        let _ = self.sender.send(completion);
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsCompletionGuard {
+    fn drop(&mut self) {
+        if !self.sent {
+            let _ = self.sender.send(WindowsRecognitionCompletion {
+                attempt: self.attempt,
+                status: None,
+                outcome: RecognitionOutcome::InvalidResponse,
+                candidates: Vec::new(),
+                error: Some("recognition HTTP worker panicked"),
+            });
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

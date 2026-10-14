@@ -604,6 +604,14 @@ pub struct EventEmitter {
 }
 
 impl EventEmitter {
+    /// Returns a session-scoped emitter that tags subsequent events with the
+    /// generation resolved asynchronously by the backend.
+    pub fn with_config_generation(&self, generation: u64) -> Self {
+        let mut scoped = self.clone();
+        scoped.config_generation = Some(generation);
+        scoped
+    }
+
     fn for_session(
         &self,
         session_id: SessionId,
@@ -776,6 +784,9 @@ fn update_snapshot(snapshot: &Mutex<ControllerSnapshot>, event: &RecognitionEven
     });
     match &event.kind {
         RecognitionEventKind::SessionStarted => {}
+        RecognitionEventKind::UiConfigSnapshot(config) => {
+            active.config = Some(config.clone());
+        }
         RecognitionEventKind::ManualUiEvent(result) => {
             active.last_result = Some(UiRecognitionEvent::Manual(result.clone()));
         }
@@ -2350,6 +2361,36 @@ mod tests {
                 event: UiRecognitionEvent::Manual(event)
             })
         );
+        assert_eq!(
+            controller.events.snapshot().active_session.unwrap().config,
+            Some(config)
+        );
+        assert!(controller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn backend_config_snapshot_sets_session_generation_after_start() {
+        let backend = MockBackend::default();
+        let emitters = Arc::clone(&backend.session_events);
+        let controller = ApplicationController::spawn(backend, 8, 8).unwrap();
+        let session = controller.commands.start_manual().unwrap().session_id;
+        next_event(&controller);
+
+        let config = UiConfigSnapshot {
+            generation: 77,
+            web_track_url_template: Some("https://example.test/track/{track_key}".into()),
+        };
+        session_emitter(&emitters, session)
+            .with_config_generation(config.generation)
+            .emit(
+                Some(session),
+                Some(RecognitionMode::Manual),
+                RecognitionEventKind::UiConfigSnapshot(config.clone()),
+            )
+            .unwrap();
+        let event = next_event(&controller);
+
+        assert_eq!(event.config_generation, Some(77));
         assert_eq!(
             controller.events.snapshot().active_session.unwrap().config,
             Some(config)

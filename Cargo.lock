@@ -563,6 +563,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "ctrlc",
+ "openshazam-controller",
  "shazam-http-lab",
  "shazam-progressive",
  "sigx-core",

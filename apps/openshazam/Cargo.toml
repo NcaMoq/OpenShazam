@@ -9,6 +9,7 @@ rust-version.workspace = true
 sigx-core = { path = "../../crates/sigx-core" }
 shazam-http-lab = { path = "../../crates/shazam-http-lab" }
 shazam-progressive = { path = "../../crates/shazam-progressive" }
+openshazam-controller = { path = "../../crates/openshazam-controller" }
 
 [dev-dependencies]
 sigx-format = { path = "../../crates/sigx-format" }
