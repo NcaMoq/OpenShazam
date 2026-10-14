@@ -1,0 +1,17 @@
+<Window
+    x:Class="OpenShazam.Settings.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="OpenShazam Settings">
+    <Grid x:Name="Root" MinWidth="480" Padding="24">
+        <StackPanel Spacing="18">
+            <TextBlock x:Name="PageTitle" Style="{StaticResource TitleTextBlockStyle}" />
+            <TextBlock x:Name="PageDescription" TextWrapping="WrapWholeWords" />
+            <StackPanel Spacing="4">
+                <ToggleSwitch x:Name="StartupToggle" IsEnabled="False" Toggled="OnStartupToggled" />
+                <TextBlock x:Name="StartupDescription" Margin="48,0,0,0" TextWrapping="WrapWholeWords" />
+            </StackPanel>
+            <InfoBar x:Name="StatusInfo" IsOpen="False" IsClosable="False" />
+        </StackPanel>
+    </Grid>
+</Window>

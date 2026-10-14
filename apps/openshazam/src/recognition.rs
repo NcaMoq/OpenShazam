@@ -575,15 +575,8 @@ impl CaptureAccumulator {
         bytes: &[u8],
         packet_frames: usize,
         silent: bool,
-        data_discontinuity: bool,
+        _data_discontinuity: bool,
     ) -> io::Result<()> {
-        if data_discontinuity {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "capture packet reports a data discontinuity",
-            ));
-        }
-
         let frames_to_use = packet_frames.min(self.remaining_frames());
         if frames_to_use == 0 {
             return Ok(());
@@ -981,7 +974,6 @@ pub(crate) fn recognize_loopback_progressive_controlled(
     );
     let mut saw_match_event = false;
     let mut saw_no_match_event = false;
-    let mut received_audio_packet = false;
     let maximum_prerecord_frames = if mode.tagging_type.uses_pre_recorded_audio() {
         frames_for_ms(sample_rate, 60_000)?
     } else {
@@ -1058,7 +1050,6 @@ pub(crate) fn recognize_loopback_progressive_controlled(
                 &mut preroll_start_timestamp_ms,
                 &mut timestamp_anchor,
                 audio_clock.as_ref(),
-                &mut received_audio_packet,
                 &mut packet_scratch,
             )?;
         }
@@ -1219,7 +1210,6 @@ pub(crate) fn recognize_loopback_progressive_controlled(
             &mut preroll_start_timestamp_ms,
             &mut timestamp_anchor,
             audio_clock.as_ref(),
-            &mut received_audio_packet,
             &mut packet_scratch,
         )
         .map(|_| None);
@@ -1255,7 +1245,6 @@ pub(crate) fn recognize_loopback_progressive_controlled(
             audio_clock.as_ref(),
             &cancelled,
             &control.stop_requested,
-            &mut received_audio_packet,
             &mut packet_scratch,
         ) {
             Ok(PreRecordEnd::Triggered(samples)) => Some(samples),
@@ -1376,6 +1365,13 @@ pub(crate) fn recognize_loopback_progressive_controlled(
                 &mut saw_no_match_event,
                 &control.events,
             )?;
+            // A network completion may become terminal while the capture
+            // thread is waiting on the WASAPI event. Do not consume another
+            // packet after processing that completion; the session no longer
+            // accepts PCM once a match/no-match terminal event has arrived.
+            if session.is_terminal() {
+                break 'capture;
+            }
             loop {
                 let Some(packet_frames) = capture.get_next_packet_size()? else {
                     return Err(io::Error::new(
@@ -1394,24 +1390,20 @@ pub(crate) fn recognize_loopback_progressive_controlled(
                     })?;
                 packet_scratch.bytes.resize(byte_count, 0);
                 let (read_frames, info) = capture.read_from_device(&mut packet_scratch.bytes)?;
-                if info.flags.data_discontinuity && received_audio_packet {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "WASAPI reported a capture discontinuity; retry after playback is stable",
-                    )
-                    .into());
-                }
                 if read_frames == 0 {
                     continue;
                 }
-                received_audio_packet = true;
                 let frame_count = read_frames as usize;
                 if frame_count != 0 {
-                    let source_timestamp_ms = capture_timestamp_ms(
+                    // A discontinuity marks a glitch in the device timeline,
+                    // not a stopped capture stream. Keep available PCM so one
+                    // recoverable endpoint glitch cannot abort recognition.
+                    let source_timestamp_ms = wasapi_packet_timestamp_ms(
                         &mut timestamp_anchor,
                         audio_clock.as_ref(),
                         info.timestamp,
                         info.flags.timestamp_error,
+                        info.flags.data_discontinuity,
                     );
                     if info.flags.silent {
                         fill_silent_samples(&mut packet_scratch.mono, frame_count);
@@ -1476,7 +1468,7 @@ pub(crate) fn recognize_loopback_progressive_controlled(
                     &control.events,
                 )?;
                 if session.is_terminal() {
-                    break;
+                    break 'capture;
                 }
             }
 
@@ -1619,6 +1611,22 @@ fn capture_timestamp_ms(
 }
 
 #[cfg(windows)]
+fn wasapi_packet_timestamp_ms(
+    anchor: &mut CaptureTimestampAnchor,
+    audio_clock: Option<&wasapi::AudioClock>,
+    qpc_timestamp_100ns: u64,
+    timestamp_error: bool,
+    data_discontinuity: bool,
+) -> Option<u64> {
+    capture_timestamp_ms(
+        anchor,
+        audio_clock,
+        qpc_timestamp_100ns,
+        timestamp_error || data_discontinuity,
+    )
+}
+
+#[cfg(windows)]
 fn advance_timestamp_ms(timestamp_ms: u64, frames: usize, sample_rate: u32) -> Option<u64> {
     if sample_rate == 0 {
         return None;
@@ -1627,6 +1635,17 @@ fn advance_timestamp_ms(timestamp_ms: u64, frames: usize, sample_rate: u32) -> O
         .checked_mul(1_000)?
         .checked_div(u128::from(sample_rate))?;
     timestamp_ms.checked_add(u64::try_from(elapsed_ms).ok()?)
+}
+
+#[cfg(windows)]
+fn retreat_timestamp_ms(timestamp_ms: u64, frames: usize, sample_rate: u32) -> Option<u64> {
+    if sample_rate == 0 {
+        return None;
+    }
+    let elapsed_ms = (frames as u128)
+        .checked_mul(1_000)?
+        .checked_div(u128::from(sample_rate))?;
+    timestamp_ms.checked_sub(u64::try_from(elapsed_ms).ok()?)
 }
 
 #[cfg(windows)]
@@ -1646,12 +1665,21 @@ fn push_timed_preroll(
         if discarded_frames > 0 {
             *start_timestamp_ms = advance_timestamp_ms(start_ms, discarded_frames, sample_rate);
         }
-    } else if old_frames == 0 && !samples.is_empty() {
+    } else if !samples.is_empty() {
+        // If the initial packet had a timeline glitch, a later packet can
+        // anchor the rolling buffer by backing up over the retained samples.
+        let retained_from_packet = samples.len().min(ring.frames());
+        let retained_frames_before_packet = ring.frames().saturating_sub(retained_from_packet);
+        let packet_frames_discarded = samples.len().saturating_sub(retained_from_packet);
         *start_timestamp_ms = packet_timestamp_ms.and_then(|packet_start| {
-            advance_timestamp_ms(
-                packet_start,
-                samples.len().saturating_sub(ring.frames()),
-                sample_rate,
+            advance_timestamp_ms(packet_start, packet_frames_discarded, sample_rate).and_then(
+                |retained_packet_start| {
+                    retreat_timestamp_ms(
+                        retained_packet_start,
+                        retained_frames_before_packet,
+                        sample_rate,
+                    )
+                },
             )
         });
     }
@@ -1724,7 +1752,6 @@ fn capture_wasapi_prerecord(
     audio_clock: Option<&wasapi::AudioClock>,
     cancelled: &AtomicBool,
     stop_requested: &AtomicBool,
-    received_audio_packet: &mut bool,
     packet_scratch: &mut WasapiPacketScratch,
 ) -> Result<PreRecordEnd, Box<dyn std::error::Error>> {
     loop {
@@ -1758,7 +1785,6 @@ fn capture_wasapi_prerecord(
             preroll_start_timestamp_ms,
             timestamp_anchor,
             audio_clock,
-            received_audio_packet,
             packet_scratch,
         )?;
 
@@ -1783,7 +1809,6 @@ fn append_wasapi_packets(
     preroll_start_timestamp_ms: &mut Option<u64>,
     timestamp_anchor: &mut CaptureTimestampAnchor,
     audio_clock: Option<&wasapi::AudioClock>,
-    received_audio_packet: &mut bool,
     packet_scratch: &mut WasapiPacketScratch,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut packet_available = false;
@@ -1804,23 +1829,18 @@ fn append_wasapi_packets(
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "packet too large"))?;
         packet_scratch.bytes.resize(byte_count, 0);
         let (read_frames, info) = capture.read_from_device(&mut packet_scratch.bytes)?;
-        if info.flags.data_discontinuity && *received_audio_packet {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "WASAPI reported a capture discontinuity while buffering pre-record audio",
-            )
-            .into());
-        }
         if read_frames == 0 {
             continue;
         }
-        let source_timestamp_ms = capture_timestamp_ms(
+        // Preserve the packet after a timeline glitch; only discard its source
+        // timestamp so pre-recorded audio does not inherit an untrusted origin.
+        let source_timestamp_ms = wasapi_packet_timestamp_ms(
             timestamp_anchor,
             audio_clock,
             info.timestamp,
             info.flags.timestamp_error,
+            info.flags.data_discontinuity,
         );
-        *received_audio_packet = true;
         let frame_count = read_frames as usize;
         if info.flags.silent {
             fill_silent_samples(&mut packet_scratch.mono, frame_count);
@@ -2631,7 +2651,6 @@ fn capture_loopback_frames(
     packet_scratch: &mut WasapiPacketScratch,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut empty_wakeups = 0usize;
-    let mut received_audio_packet = false;
 
     while accumulator.remaining_frames() > 0 {
         event.wait_for_event(2_000)?;
@@ -2661,17 +2680,9 @@ fn capture_loopback_frames(
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "packet too large"))?;
             packet_scratch.bytes.resize(byte_count, 0);
             let (read_frames, info) = capture.read_from_device(&mut packet_scratch.bytes)?;
-            if info.flags.data_discontinuity && received_audio_packet {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "WASAPI reported a playback-capture discontinuity; retry after playback is stable",
-                )
-                .into());
-            }
             if read_frames == 0 {
                 break;
             }
-            received_audio_packet = true;
 
             let frame_count = (read_frames as usize).min(accumulator.remaining_frames());
             if info.flags.silent {
@@ -2715,8 +2726,12 @@ mod tests {
         ignore_expected_timeout, milliseconds_for_frames, qpc_timestamp_to_unix_ms,
         CaptureAccumulator, ManualTriggerPoll, ManualTriggerSignal, CAPTURE_RATE,
     };
+    #[cfg(windows)]
+    use super::{push_timed_preroll, wasapi_packet_timestamp_ms, CaptureTimestampAnchor};
     #[cfg(any(windows, target_os = "macos"))]
     use shazam_http_lab::NativeTaggingRequestContext;
+    #[cfg(windows)]
+    use shazam_progressive::RollingPcmBuffer;
     use sigx_core::{Config, SigX};
     use sigx_format::Signature;
     #[cfg(any(windows, target_os = "macos"))]
@@ -2746,6 +2761,39 @@ mod tests {
             }),
             Err(WaitError::DeviceFailure)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discontinuity_keeps_pcm_and_reanchors_preroll_on_next_valid_timestamp() {
+        let mut timestamp_anchor = CaptureTimestampAnchor::default();
+        assert_eq!(
+            wasapi_packet_timestamp_ms(&mut timestamp_anchor, None, 500_000, false, true),
+            None
+        );
+        assert_eq!(timestamp_anchor.first_qpc_timestamp_100ns, None);
+
+        let mut preroll = RollingPcmBuffer::new(4_800);
+        let mut preroll_start_timestamp_ms = None;
+        push_timed_preroll(
+            &mut preroll,
+            &mut preroll_start_timestamp_ms,
+            &[0.25; 480],
+            None,
+            48_000,
+        );
+        assert_eq!(preroll.frames(), 480);
+        assert_eq!(preroll_start_timestamp_ms, None);
+
+        push_timed_preroll(
+            &mut preroll,
+            &mut preroll_start_timestamp_ms,
+            &[0.5; 480],
+            Some(10_000),
+            48_000,
+        );
+        assert_eq!(preroll.frames(), 960);
+        assert_eq!(preroll_start_timestamp_ms, Some(9_990));
     }
 
     #[test]
@@ -3018,10 +3066,14 @@ mod tests {
     }
 
     #[test]
-    fn capture_rejects_discontinuities_and_incomplete_streams() {
-        let mut accumulator = CaptureAccumulator::new(16_000).unwrap();
-        assert!(accumulator.push_packet(&[], 16, true, true).is_err());
-        assert!(accumulator.finish().is_err());
+    fn capture_keeps_audio_after_discontinuities_and_rejects_incomplete_streams() {
+        let mut accumulator = CaptureAccumulator::new(16).unwrap();
+        accumulator.push_packet(&[], 16, true, true).unwrap();
+        assert_eq!(accumulator.frames_seen(), 16);
+        assert!(accumulator.finish().is_ok());
+
+        let incomplete = CaptureAccumulator::new(16_000).unwrap();
+        assert!(incomplete.finish().is_err());
     }
 
     #[test]

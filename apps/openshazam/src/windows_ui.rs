@@ -125,13 +125,14 @@ use windows::{
     UI::{
         Color,
         Composition::{
-            AnimationIterationBehavior, CompositionBorderMode, CompositionColorBrush,
-            CompositionDrawingSurface, CompositionEllipseGeometry, CompositionGeometricClip,
-            CompositionGraphicsDevice, CompositionPath, CompositionPathGeometry,
-            CompositionSpriteShape, CompositionStretch, CompositionSurfaceBrush,
-            CompositionVisualSurface, Compositor, ContainerVisual, CubicBezierEasingFunction,
-            Desktop::DesktopWindowTarget, DropShadow, ScalarKeyFrameAnimation, ShapeVisual,
-            SpriteVisual, Vector2KeyFrameAnimation, Vector3KeyFrameAnimation,
+            AnimationController, AnimationIterationBehavior, CompositionBorderMode,
+            CompositionColorBrush, CompositionDrawingSurface, CompositionEllipseGeometry,
+            CompositionGeometricClip, CompositionGraphicsDevice, CompositionPath,
+            CompositionPathGeometry, CompositionSpriteShape, CompositionStretch,
+            CompositionSurfaceBrush, CompositionVisualSurface, Compositor, ContainerVisual,
+            CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow,
+            ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual, Vector2KeyFrameAnimation,
+            Vector3KeyFrameAnimation,
         },
     },
 };
@@ -525,6 +526,16 @@ impl StatusTextAlternator {
     }
 }
 
+fn status_text_progress(started_at: Instant, now: Instant) -> f32 {
+    ui_model::ease_in_out(status_text_linear_progress(started_at, now) as f64) as f32
+}
+
+fn status_text_linear_progress(started_at: Instant, now: Instant) -> f32 {
+    (now.saturating_duration_since(started_at).as_secs_f64()
+        / STATUS_TEXT_TRANSITION_DURATION.as_secs_f64())
+    .clamp(0.0, 1.0) as f32
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CaptureMode {
     Manual,
@@ -711,6 +722,7 @@ struct AppState {
     popup_activation_grace_until: Option<Instant>,
     phase_timer_active: bool,
     animation_timer_active: bool,
+    status_text_composition_ready: bool,
     startup_animation_pending: bool,
     startup_logo_consumed: bool,
     settings_visible: bool,
@@ -856,6 +868,7 @@ struct Renderer {
     dpi: u32,
     theme_generation: u64,
     composition: Option<CompositionScene>,
+    status_text_composition_enabled: bool,
     popup_layer: Option<ID2D1Layer>,
     artwork_layer: Option<ID2D1Layer>,
     artwork_geometries: [(u32, ID2D1Geometry); 2],
@@ -2427,6 +2440,7 @@ struct CompositionScene {
     root: ContainerVisual,
     tagging_root: ContainerVisual,
     result_overlay: CompositionResultOverlay,
+    status_text: CompositionStatusText,
     auto_shadow_root: ContainerVisual,
     auto_shadow_mask: CompositionGeometricClip,
     auto_shadow_brush: CompositionColorBrush,
@@ -2466,8 +2480,10 @@ struct CompositionScene {
 struct AnimationSnapshot {
     mode: TaggingMode,
     elapsed: f64,
+    now: Instant,
     theme: Theme,
     body_top: f32,
+    status_text: StatusTextSnapshot,
     show_button: bool,
     show_ripples: bool,
     levels: UiLevels,
@@ -2476,6 +2492,82 @@ struct AnimationSnapshot {
     success_elapsed: Option<f64>,
     success_track_id: Option<u64>,
     success_wave_frame: Option<ui_model::WaveFrame>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusTextLabel {
+    Ready,
+    AutoStart,
+    AutoOn,
+    AutoTurnOff,
+    Listening,
+}
+
+impl StatusTextLabel {
+    fn text(self, language: UiLanguage) -> &'static str {
+        let key = match self {
+            Self::Ready => UiTextKey::Ready,
+            Self::AutoStart => UiTextKey::AutoStartStatus,
+            Self::AutoOn => UiTextKey::AutoOn,
+            Self::AutoTurnOff => UiTextKey::AutoTurnOff,
+            Self::Listening => UiTextKey::Listening,
+        };
+        localized_ui_text(key, language)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StatusTextSnapshot {
+    current: Option<StatusTextLabel>,
+    previous: Option<StatusTextLabel>,
+    transition_started_at: Option<Instant>,
+}
+
+fn status_text_snapshot(
+    phase: &MainPhase,
+    alternator: Option<StatusTextAlternator>,
+) -> StatusTextSnapshot {
+    let cycle = match phase {
+        MainPhase::Ready | MainPhase::Error { .. } | MainPhase::Matched { .. } => {
+            Some(StatusCycle::Ready)
+        }
+        MainPhase::Listening {
+            mode: CaptureMode::Auto,
+            ..
+        } => Some(StatusCycle::Auto),
+        MainPhase::Listening {
+            mode: CaptureMode::Manual,
+            ..
+        } => {
+            return StatusTextSnapshot {
+                current: Some(StatusTextLabel::Listening),
+                previous: None,
+                transition_started_at: None,
+            };
+        }
+        MainPhase::Starting { .. }
+        | MainPhase::Cancelling { .. }
+        | MainPhase::NoMatch { .. }
+        | MainPhase::Offline { .. }
+        | MainPhase::Timeout { .. } => None,
+    };
+    let Some(cycle) = cycle else {
+        return StatusTextSnapshot::default();
+    };
+    let status = alternator.filter(|status| status.cycle == cycle);
+    let first = status.is_none_or(|status| status.first);
+    let (first_label, second_label) = match cycle {
+        StatusCycle::Ready => (StatusTextLabel::Ready, StatusTextLabel::AutoStart),
+        StatusCycle::Auto => (StatusTextLabel::AutoOn, StatusTextLabel::AutoTurnOff),
+    };
+    let current = if first { first_label } else { second_label };
+    let transition_started_at = status.and_then(|status| status.transition_started_at);
+    let previous = transition_started_at.map(|_| if first { second_label } else { first_label });
+    StatusTextSnapshot {
+        current: Some(current),
+        previous,
+        transition_started_at,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2510,6 +2602,329 @@ fn composition_scene_layer_order() -> [CompositionSceneLayer; 2] {
     ]
 }
 
+const STATUS_TEXT_TOP: f32 = 141.0;
+const STATUS_TEXT_HEIGHT: f32 = 19.0;
+const STATUS_TEXT_TRANSITION_DURATION: Duration = Duration::from_millis(400);
+
+struct CompositionStatusLabel {
+    _surface: CompositionDrawingSurface,
+    interop: ICompositionDrawingSurfaceInterop,
+    _brush: CompositionSurfaceBrush,
+    visual: SpriteVisual,
+    size: D2D_SIZE_U,
+    text: Option<String>,
+}
+
+impl CompositionStatusLabel {
+    unsafe fn new(
+        compositor: &Compositor,
+        graphics_device: &CompositionGraphicsDevice,
+        dpi: u32,
+    ) -> windows::core::Result<Self> {
+        let size = status_text_surface_size(dpi);
+        let surface = graphics_device.CreateDrawingSurface(
+            windows::Foundation::Size {
+                Width: size.width as f32,
+                Height: size.height as f32,
+            },
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            DirectXAlphaMode::Premultiplied,
+        )?;
+        let interop: ICompositionDrawingSurfaceInterop = surface.cast()?;
+        let brush = compositor.CreateSurfaceBrushWithSurface(&surface)?;
+        brush.SetStretch(CompositionStretch::Fill)?;
+        let visual = compositor.CreateSpriteVisual()?;
+        visual.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: STATUS_TEXT_HEIGHT,
+        })?;
+        visual.SetBrush(&brush)?;
+        visual.SetOpacity(0.0)?;
+        Ok(Self {
+            _surface: surface,
+            interop,
+            _brush: brush,
+            visual,
+            size,
+            text: None,
+        })
+    }
+
+    unsafe fn resize(&mut self, dpi: u32) -> windows::core::Result<()> {
+        let size = status_text_surface_size(dpi);
+        if size == self.size {
+            return Ok(());
+        }
+        self.interop.Resize(SIZE {
+            cx: size.width as i32,
+            cy: size.height as i32,
+        })?;
+        self.size = size;
+        self.text = None;
+        Ok(())
+    }
+
+    unsafe fn set_text(
+        &mut self,
+        value: &str,
+        format: &IDWriteTextFormat,
+        dpi: u32,
+    ) -> windows::core::Result<()> {
+        if self.text.as_deref() == Some(value) {
+            return Ok(());
+        }
+        let mut offset = POINT::default();
+        let context = self
+            .interop
+            .BeginDraw::<ID2D1DeviceContext>(None, &mut offset)?;
+        let draw_result = (|| -> windows::core::Result<()> {
+            context.SetDpi(96.0, 96.0);
+            context.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            context.SetTransform(&Matrix3x2 {
+                M11: 1.0,
+                M22: 1.0,
+                M31: offset.x as f32,
+                M32: offset.y as f32,
+                ..Default::default()
+            });
+            let transparent = d2d_color(0, 0, 0, 0.0);
+            context.Clear(Some(&transparent));
+            let white = d2d_color(255, 255, 255, 1.0);
+            let brush = context.CreateSolidColorBrush(&white, None)?;
+            let scale = composition_scale_for_dpi(dpi);
+            let area = rect(
+                8.0 * scale,
+                0.0,
+                (CONTENT_WIDTH as f32 - 8.0) * scale,
+                STATUS_TEXT_HEIGHT * scale,
+            );
+            let content: Vec<u16> = value.encode_utf16().collect();
+            context.DrawText(
+                &content,
+                format,
+                &area,
+                &brush,
+                windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+            Ok(())
+        })();
+        let end_result = self.interop.EndDraw();
+        draw_result?;
+        end_result?;
+        self.text = Some(value.to_owned());
+        Ok(())
+    }
+}
+
+fn status_text_surface_size(dpi: u32) -> D2D_SIZE_U {
+    let scale = composition_scale_for_dpi(dpi.max(96));
+    D2D_SIZE_U {
+        width: (CONTENT_WIDTH as f32 * scale).ceil() as u32,
+        height: (STATUS_TEXT_HEIGHT * scale).ceil() as u32,
+    }
+}
+
+struct CompositionStatusText {
+    compositor: Compositor,
+    root: ContainerVisual,
+    labels: [CompositionStatusLabel; 2],
+    write_factory: IDWriteFactory,
+    format: IDWriteTextFormat,
+    easing: CubicBezierEasingFunction,
+    controllers: [Option<AnimationController>; 2],
+    dpi: u32,
+    language: UiLanguage,
+    body_top: f32,
+    last_state: Option<StatusTextSnapshot>,
+}
+
+impl CompositionStatusText {
+    unsafe fn new(
+        compositor: &Compositor,
+        graphics_device: &CompositionGraphicsDevice,
+        write_factory: IDWriteFactory,
+        dpi: u32,
+        body_top: f32,
+    ) -> windows::core::Result<Self> {
+        let dpi = dpi.max(96);
+        let language = ui_language();
+        let format = status_text_format(&write_factory, dpi, language)?;
+        let labels = [
+            CompositionStatusLabel::new(compositor, graphics_device, dpi)?,
+            CompositionStatusLabel::new(compositor, graphics_device, dpi)?,
+        ];
+        let root = compositor.CreateContainerVisual()?;
+        root.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: STATUS_TEXT_HEIGHT,
+        })?;
+        root.SetOffset(Vector3 {
+            X: 0.0,
+            Y: body_top + STATUS_TEXT_TOP,
+            Z: 0.0,
+        })?;
+        // The two labels travel through this viewport during the push. A
+        // Composition container does not clip its children to its own bounds
+        // by default, so keep the outgoing label from painting above the line.
+        let clip = compositor.CreateInsetClipWithInsets(0.0, 0.0, 0.0, 0.0)?;
+        root.SetClip(&clip)?;
+        root.SetOpacity(0.0)?;
+        let children = root.Children()?;
+        children.InsertAtTop(&labels[0].visual)?;
+        children.InsertAtTop(&labels[1].visual)?;
+        let easing = compositor.CreateCubicBezierEasingFunction(
+            Vector2 { X: 0.42, Y: 0.0 },
+            Vector2 { X: 0.58, Y: 1.0 },
+        )?;
+        Ok(Self {
+            compositor: compositor.clone(),
+            root,
+            labels,
+            write_factory,
+            format,
+            easing,
+            controllers: [None, None],
+            dpi,
+            language,
+            body_top,
+            last_state: None,
+        })
+    }
+
+    unsafe fn update(
+        &mut self,
+        state: StatusTextSnapshot,
+        now: Instant,
+        body_top: f32,
+        dpi: u32,
+    ) -> windows::core::Result<()> {
+        let dpi = dpi.max(96);
+        let language = ui_language();
+        let dpi_changed = self.dpi != dpi;
+        let language_changed = self.language != language;
+        let configuration_changed = dpi_changed || language_changed;
+        if dpi_changed {
+            for label in &mut self.labels {
+                label.resize(dpi)?;
+            }
+            self.dpi = dpi;
+        }
+        if configuration_changed {
+            self.format = status_text_format(&self.write_factory, dpi, language)?;
+            for label in &mut self.labels {
+                label.text = None;
+            }
+        }
+        self.language = language;
+        if self.body_top != body_top {
+            self.body_top = body_top;
+            self.root.SetOffset(Vector3 {
+                X: 0.0,
+                Y: body_top + STATUS_TEXT_TOP,
+                Z: 0.0,
+            })?;
+        }
+        if !configuration_changed && self.last_state == Some(state) {
+            return Ok(());
+        }
+        for label in &self.labels {
+            label.visual.StopAnimation(&HSTRING::from("Offset.Y"))?;
+        }
+        self.controllers = [None, None];
+
+        let Some(current) = state.current else {
+            self.root.SetOpacity(0.0)?;
+            self.labels[0].visual.SetOpacity(0.0)?;
+            self.labels[1].visual.SetOpacity(0.0)?;
+            self.labels[0].visual.SetOffset(Vector3::default())?;
+            self.labels[1].visual.SetOffset(Vector3::default())?;
+            self.last_state = Some(state);
+            return Ok(());
+        };
+
+        let transition =
+            state
+                .previous
+                .zip(state.transition_started_at)
+                .filter(|(previous, started_at)| {
+                    *previous != current
+                        && now.saturating_duration_since(*started_at)
+                            < STATUS_TEXT_TRANSITION_DURATION
+                });
+        if let Some((previous, started_at)) = transition {
+            self.labels[0].set_text(previous.text(language), &self.format, dpi)?;
+            self.labels[1].set_text(current.text(language), &self.format, dpi)?;
+            self.labels[0].visual.SetOpacity(1.0)?;
+            self.labels[1].visual.SetOpacity(1.0)?;
+            self.labels[0].visual.SetOffset(Vector3::default())?;
+            self.labels[1].visual.SetOffset(Vector3 {
+                X: 0.0,
+                Y: STATUS_TEXT_HEIGHT,
+                Z: 0.0,
+            })?;
+            let progress = status_text_linear_progress(started_at, now);
+            self.controllers = [
+                Some(self.start_vertical_animation(0, 0.0, -STATUS_TEXT_HEIGHT, progress)?),
+                Some(self.start_vertical_animation(1, STATUS_TEXT_HEIGHT, 0.0, progress)?),
+            ];
+        } else {
+            self.labels[0].set_text(current.text(language), &self.format, dpi)?;
+            self.labels[0].visual.SetOpacity(1.0)?;
+            self.labels[1].visual.SetOpacity(0.0)?;
+            self.labels[0].visual.SetOffset(Vector3::default())?;
+            self.labels[1].visual.SetOffset(Vector3::default())?;
+        }
+        self.root.SetOpacity(1.0)?;
+        self.last_state = Some(state);
+        Ok(())
+    }
+
+    fn start_vertical_animation(
+        &self,
+        label_index: usize,
+        from: f32,
+        to: f32,
+        progress: f32,
+    ) -> windows::core::Result<AnimationController> {
+        let animation = self.compositor.CreateScalarKeyFrameAnimation()?;
+        animation.SetDuration(TimeSpan {
+            Duration: STATUS_TEXT_TRANSITION_DURATION.as_nanos() as i64 / 100,
+        })?;
+        animation.InsertKeyFrameWithEasingFunction(0.0, from, &self.easing)?;
+        animation.InsertKeyFrameWithEasingFunction(1.0, to, &self.easing)?;
+        let controller = self.compositor.CreateAnimationController()?;
+        self.labels[label_index]
+            .visual
+            .StartAnimationWithController(&HSTRING::from("Offset.Y"), &animation, &controller)?;
+        controller.SetProgress(progress)?;
+        Ok(controller)
+    }
+
+    unsafe fn resize(&mut self, dpi: u32) -> windows::core::Result<()> {
+        for label in &mut self.labels {
+            label.resize(dpi)?;
+        }
+        self.last_state = None;
+        Ok(())
+    }
+}
+
+fn status_text_format(
+    factory: &IDWriteFactory,
+    dpi: u32,
+    language: UiLanguage,
+) -> windows::core::Result<IDWriteTextFormat> {
+    let scale = composition_scale_for_dpi(dpi.max(96));
+    create_text_format_with_locale(
+        factory,
+        16.0 * scale,
+        DWRITE_FONT_WEIGHT_BOLD,
+        DWRITE_TEXT_ALIGNMENT_CENTER,
+        directwrite_locale(language),
+    )
+}
+
 fn result_overlay_occludes_shazam_button(panel_top: Option<f32>, body_top: f32) -> bool {
     let Some(panel_top) = panel_top else {
         return false;
@@ -2528,6 +2943,7 @@ impl CompositionScene {
     fn new(
         hwnd: HWND,
         d2d_factory: &ID2D1Factory,
+        write_factory: &IDWriteFactory,
         compositor: &Compositor,
         theme: Theme,
         arrow_edge: ArrowEdge,
@@ -3091,6 +3507,16 @@ impl CompositionScene {
         }
 
         let result_overlay = unsafe { CompositionResultOverlay::new(compositor, dpi, body_top)? };
+        let status_text = unsafe {
+            CompositionStatusText::new(
+                compositor,
+                &result_overlay._graphics_device,
+                write_factory.clone(),
+                dpi,
+                body_top,
+            )?
+        };
+        tagging_root.Children()?.InsertAtTop(&status_text.root)?;
         let root_children = root.Children()?;
         for layer in composition_scene_layer_order() {
             match layer {
@@ -3171,6 +3597,7 @@ impl CompositionScene {
             root,
             tagging_root,
             result_overlay,
+            status_text,
             auto_shadow_root,
             auto_shadow_mask,
             auto_shadow_brush,
@@ -3223,7 +3650,8 @@ impl CompositionScene {
             .SetOffset(composition_button_pixel_snap_offset(dpi, self.body_top))?;
         unsafe {
             self.result_overlay.resize(dpi)?;
-            self.result_overlay.set_viewport(dpi, self.body_top)
+            self.result_overlay.set_viewport(dpi, self.body_top)?;
+            self.status_text.resize(dpi)
         }
     }
 
@@ -3642,6 +4070,14 @@ impl CompositionScene {
                 snapshot.auto_spring,
             );
             self.last_button_scale = frame.button_child_scale as f32;
+        }
+        unsafe {
+            self.status_text.update(
+                snapshot.status_text,
+                snapshot.now,
+                snapshot.body_top,
+                self.dpi,
+            )?;
         }
         Ok(())
     }
@@ -4494,6 +4930,7 @@ impl Renderer {
             Some(CompositionScene::new(
                 hwnd,
                 &factory,
+                &write_factory,
                 &compositor,
                 theme,
                 ArrowEdge::Top,
@@ -4550,6 +4987,7 @@ impl Renderer {
             dpi,
             theme_generation,
             composition,
+            status_text_composition_enabled: false,
             popup_layer,
             artwork_layer: Some(artwork_layer),
             artwork_geometries,
@@ -4852,7 +5290,15 @@ impl Renderer {
 
     fn update_composition(&mut self, snapshot: AnimationSnapshot) -> windows::core::Result<()> {
         if let Some(scene) = self.composition.as_mut() {
-            scene.update(snapshot)?;
+            match scene.update(snapshot) {
+                Ok(()) => self.status_text_composition_enabled = true,
+                Err(error) => {
+                    self.status_text_composition_enabled = false;
+                    return Err(error);
+                }
+            }
+        } else {
+            self.status_text_composition_enabled = false;
         }
         Ok(())
     }
@@ -5380,6 +5826,9 @@ impl Renderer {
     }
 
     unsafe fn draw_status_text(&self, app: &AppState, body_top: f32) {
+        if self.status_text_composition_enabled {
+            return;
+        }
         let area = rect(
             8.0,
             body_top + 141.0,
@@ -5416,13 +5865,7 @@ impl Renderer {
             );
             return;
         };
-        let progress = ui_model::ease_in_out(
-            (Instant::now()
-                .saturating_duration_since(started_at)
-                .as_secs_f64()
-                / 0.4)
-                .clamp(0.0, 1.0),
-        ) as f32;
+        let progress = status_text_progress(started_at, Instant::now());
         let previous = if status.first { second } else { first };
         let line_height = area.bottom - area.top;
         self.target.PushAxisAlignedClip(
@@ -5457,6 +5900,9 @@ impl Renderer {
     unsafe fn draw_listening_status(&self, app: &AppState, body_top: f32, mode: CaptureMode) {
         if mode == CaptureMode::Auto {
             self.draw_status_text(app, body_top);
+            return;
+        }
+        if self.status_text_composition_enabled {
             return;
         }
         self.text(
@@ -8245,6 +8691,7 @@ unsafe fn update_visible_windows(app: &mut AppState) {
 }
 
 fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
+    let now = Instant::now();
     let (mode, show_button, show_ripples) = match app.phase {
         MainPhase::Listening {
             mode: CaptureMode::Manual,
@@ -8265,12 +8712,14 @@ fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
     AnimationSnapshot {
         mode,
         elapsed: phase_elapsed(&app.phase),
+        now,
         theme: app.theme,
         body_top: if app.arrow_edge == ArrowEdge::Top {
             POPUP_ARROW_HEIGHT as f32
         } else {
             0.0
         },
+        status_text: status_text_snapshot(&app.phase, app.status_alternator),
         show_button,
         show_ripples,
         levels: app.ui_levels,
@@ -8311,9 +8760,10 @@ unsafe fn sync_main_timers(app: &mut AppState) {
         }
         let animate = app.popup_transition.is_some()
             || animation_needs_frame(&app.phase, app.startup_animation_pending)
-            || app
-                .status_alternator
-                .is_some_and(|status| status.animating(Instant::now()))
+            || (!app.status_text_composition_ready
+                && app
+                    .status_alternator
+                    .is_some_and(|status| status.animating(Instant::now())))
             || app.history_transition.is_some_and(|transition| {
                 Instant::now().saturating_duration_since(transition.started_at)
                     < HISTORY_INSERT_TRANSITION
@@ -8676,6 +9126,18 @@ fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> 
     startup_animation_pending || phase_needs_frame(phase)
 }
 
+fn animation_needs_d2d_redraw(
+    phase: &MainPhase,
+    status_text_animating: bool,
+    status_text_composition_ready: bool,
+) -> bool {
+    (status_text_animating && !status_text_composition_ready)
+        || matches!(
+            phase,
+            MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
+        )
+}
+
 unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
     refresh_os_theme(app);
     let now = Instant::now();
@@ -8715,8 +9177,14 @@ unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
     // body origin before showing the HWND so Composition never presents the
     // initial 10-DIP placeholder position for a bottom-anchored popup.
     if let Some(renderer) = renderer {
-        if let Err(error) = renderer.update_composition(animation_snapshot(app)) {
-            app.message = Some(format!("Composition初期配置に失敗: {error}"));
+        match renderer.update_composition(animation_snapshot(app)) {
+            Ok(()) => {
+                app.status_text_composition_ready = renderer.status_text_composition_enabled;
+            }
+            Err(error) => {
+                app.status_text_composition_ready = false;
+                app.message = Some(format!("Composition初期配置に失敗: {error}"));
+            }
         }
     }
     // The main HWND is created hidden so only the tray icon is visible during
@@ -8936,8 +9404,16 @@ unsafe extern "system" fn window_proc(
             let _ = BeginPaint(hwnd, &mut paint);
             if let Some(renderer) = data.renderer.as_mut() {
                 if data.kind == WindowKind::Main {
-                    if let Err(error) = renderer.update_composition(animation_snapshot(app)) {
-                        app.message = Some(format!("Windows Composition update failed: {error}"));
+                    match renderer.update_composition(animation_snapshot(app)) {
+                        Ok(()) => {
+                            app.status_text_composition_ready =
+                                renderer.status_text_composition_enabled;
+                        }
+                        Err(error) => {
+                            app.status_text_composition_ready = false;
+                            app.message =
+                                Some(format!("Windows Composition update failed: {error}"));
+                        }
                     }
                 }
                 if let Err(error) = renderer.draw(app, data.kind) {
@@ -9086,22 +9562,32 @@ unsafe extern "system" fn window_proc(
                 }
                 if app.visible {
                     if let Some(renderer) = data.renderer.as_mut() {
-                        if let Err(error) = renderer.update_composition(animation_snapshot(app)) {
-                            app.message =
-                                Some(format!("Windows Composition update failed: {error}"));
-                            app.startup_animation_pending = false;
-                        } else if app.startup_animation_pending {
-                            app.startup_animation_pending = renderer
-                                .composition
-                                .as_ref()
-                                .is_some_and(|scene| !scene.startup_logo_complete());
+                        match renderer.update_composition(animation_snapshot(app)) {
+                            Ok(()) => {
+                                app.status_text_composition_ready =
+                                    renderer.status_text_composition_enabled;
+                                if app.startup_animation_pending {
+                                    app.startup_animation_pending = renderer
+                                        .composition
+                                        .as_ref()
+                                        .is_some_and(|scene| !scene.startup_logo_complete());
+                                }
+                            }
+                            Err(error) => {
+                                app.status_text_composition_ready = false;
+                                app.message =
+                                    Some(format!("Windows Composition update failed: {error}"));
+                                app.startup_animation_pending = false;
+                            }
                         }
                     }
-                    if matches!(
-                        app.phase,
-                        MainPhase::Matched { .. }
-                            | MainPhase::NoMatch { .. }
-                            | MainPhase::Offline { .. }
+                    let status_text_animating = app
+                        .status_alternator
+                        .is_some_and(|status| status.animating(now));
+                    if animation_needs_d2d_redraw(
+                        &app.phase,
+                        status_text_animating,
+                        app.status_text_composition_ready,
                     ) {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -9409,6 +9895,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             popup_activation_grace_until: None,
             phase_timer_active: false,
             animation_timer_active: false,
+            status_text_composition_ready: false,
             startup_animation_pending: false,
             startup_logo_consumed: false,
             settings_visible: false,
@@ -9777,6 +10264,47 @@ mod tests {
         auto.advance(start + Duration::from_secs(6));
         assert!(auto.first);
         assert_eq!(auto.next_at, start + Duration::from_secs(9));
+    }
+
+    #[test]
+    fn ui200_composition_status_snapshot_keeps_current_and_previous_text_identity() {
+        let start = Instant::now();
+        let mut auto = StatusTextAlternator::auto(start);
+        auto.advance(start + Duration::from_secs(3));
+        let listening_auto = MainPhase::Listening {
+            mode: CaptureMode::Auto,
+            started_at: start,
+        };
+        assert_eq!(
+            super::status_text_snapshot(&listening_auto, Some(auto)),
+            super::StatusTextSnapshot {
+                current: Some(super::StatusTextLabel::AutoTurnOff),
+                previous: Some(super::StatusTextLabel::AutoOn),
+                transition_started_at: Some(start + Duration::from_secs(3)),
+            }
+        );
+
+        let listening_manual = MainPhase::Listening {
+            mode: CaptureMode::Manual,
+            started_at: start,
+        };
+        assert_eq!(
+            super::status_text_snapshot(&listening_manual, Some(auto)),
+            super::StatusTextSnapshot {
+                current: Some(super::StatusTextLabel::Listening),
+                previous: None,
+                transition_started_at: None,
+            }
+        );
+
+        let no_match = MainPhase::NoMatch {
+            entered_at: start,
+            returned_to_ready_at: None,
+        };
+        assert_eq!(
+            super::status_text_snapshot(&no_match, Some(auto)),
+            super::StatusTextSnapshot::default()
+        );
     }
 
     #[test]
@@ -10443,6 +10971,49 @@ mod tests {
     }
 
     #[test]
+    fn ui222_page_link_failure_identifies_missing_or_invalid_inputs_without_logging_values() {
+        let configs = std::collections::HashMap::from([(
+            10,
+            UiConfigSnapshot {
+                generation: 10,
+                web_track_url_template: None,
+            },
+        )]);
+
+        assert_eq!(
+            resolve_page_link_for_generation(None, &configs, Some("key-1")),
+            Err(PageLinkFailure::MissingConfigGeneration)
+        );
+        assert_eq!(
+            resolve_page_link_for_generation(Some(11), &configs, Some("key-1")),
+            Err(PageLinkFailure::MissingConfigSnapshot)
+        );
+        assert_eq!(
+            resolve_page_link_for_generation(Some(10), &configs, Some("key-1")),
+            Err(PageLinkFailure::MissingTemplate)
+        );
+        assert_eq!(
+            resolve_page_link_checked(
+                Some("https://www.shazam.com/track/{trackid}/{trackid}"),
+                Some("key-1")
+            ),
+            Err(PageLinkFailure::InvalidTemplate)
+        );
+        assert_eq!(
+            resolve_page_link_checked(Some("https://www.shazam.com/track/{trackid}"), None),
+            Err(PageLinkFailure::MissingTrackKey)
+        );
+        assert_eq!(
+            resolve_page_link_checked(Some("https://www.shazam.com/track/{trackid}"), Some("")),
+            Err(PageLinkFailure::InvalidTrackKey)
+        );
+        assert_eq!(
+            PageLinkFailure::MissingTemplate.as_str(),
+            "missing_webtrackurl"
+        );
+    }
+
+    #[test]
     fn ui222_result_and_history_page_lookup_uses_the_clicked_track_identity() {
         let recognized_at = Instant::now();
         let make_track = |display_id, url: &str| Track {
@@ -11020,6 +11591,99 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a Windows Composition dispatcher and graphics device; run explicitly on Windows"]
+    fn composition_status_text_renders_transitions_and_resizes_at_fractional_dpi() {
+        use super::{
+            CompositionResultOverlay, CompositionStatusText, StatusTextLabel, StatusTextSnapshot,
+            DWRITE_FACTORY_TYPE_SHARED,
+        };
+
+        unsafe {
+            super::CoInitializeEx(None, super::COINIT_APARTMENTTHREADED).unwrap();
+            let dispatcher =
+                super::CreateDispatcherQueueController(super::DispatcherQueueOptions {
+                    dwSize: std::mem::size_of::<super::DispatcherQueueOptions>() as u32,
+                    threadType: super::DQTYPE_THREAD_CURRENT,
+                    apartmentType: super::DQTAT_COM_STA,
+                })
+                .unwrap();
+            let result = (|| -> windows::core::Result<()> {
+                let compositor = super::Compositor::new()?;
+                let overlay = CompositionResultOverlay::new(&compositor, 96, 10.0)?;
+                let write_factory: super::IDWriteFactory =
+                    super::DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+                let mut status = CompositionStatusText::new(
+                    &compositor,
+                    &overlay._graphics_device,
+                    write_factory,
+                    96,
+                    10.0,
+                )?;
+                let started_at = super::Instant::now();
+                status.update(
+                    StatusTextSnapshot {
+                        current: Some(StatusTextLabel::Ready),
+                        previous: None,
+                        transition_started_at: None,
+                    },
+                    started_at,
+                    10.0,
+                    96,
+                )?;
+                assert_eq!(
+                    status.labels[0].text.as_deref(),
+                    Some(StatusTextLabel::Ready.text(status.language))
+                );
+                assert!(status.controllers.iter().all(Option::is_none));
+
+                let transition_started_at = started_at + super::Duration::from_secs(3);
+                status.update(
+                    StatusTextSnapshot {
+                        current: Some(StatusTextLabel::AutoTurnOff),
+                        previous: Some(StatusTextLabel::AutoOn),
+                        transition_started_at: Some(transition_started_at),
+                    },
+                    transition_started_at + super::Duration::from_millis(200),
+                    10.0,
+                    96,
+                )?;
+                assert_eq!(
+                    status.labels[0].text.as_deref(),
+                    Some(StatusTextLabel::AutoOn.text(status.language))
+                );
+                assert_eq!(
+                    status.labels[1].text.as_deref(),
+                    Some(StatusTextLabel::AutoTurnOff.text(status.language))
+                );
+                assert!(status.controllers.iter().all(Option::is_some));
+
+                status.update(
+                    StatusTextSnapshot {
+                        current: Some(StatusTextLabel::AutoTurnOff),
+                        previous: None,
+                        transition_started_at: None,
+                    },
+                    transition_started_at + super::Duration::from_millis(500),
+                    10.0,
+                    120,
+                )?;
+                assert_eq!(
+                    status.labels[0].text.as_deref(),
+                    Some(StatusTextLabel::AutoTurnOff.text(status.language))
+                );
+                assert!(status.controllers.iter().all(Option::is_none));
+                assert_eq!(status.labels[0].size.width, 475);
+                assert_eq!(status.labels[0].size.height, 24);
+                assert_eq!(status.dpi, 120);
+                Ok(())
+            })();
+            drop(dispatcher);
+            super::CoUninitialize();
+            result.unwrap();
+        }
+    }
+
+    #[test]
     fn button_keeps_its_specified_absolute_position() {
         for body_top in [0.0, POPUP_ARROW_HEIGHT as f32] {
             let button_left = BUTTON_X as f32;
@@ -11461,6 +12125,45 @@ mod tests {
             started_at: std::time::Instant::now(),
         };
         assert!(!animation_needs_frame(&listening, false));
+    }
+
+    #[test]
+    fn status_text_push_uses_composition_and_keeps_d2d_fallback_deterministic() {
+        let start = std::time::Instant::now();
+        let ready = MainPhase::Ready;
+        assert!(!super::animation_needs_d2d_redraw(&ready, false, false));
+        assert!(super::animation_needs_d2d_redraw(&ready, true, false));
+        assert!(!super::animation_needs_d2d_redraw(&ready, true, true));
+        assert_eq!(super::status_text_progress(start, start), 0.0);
+        assert_eq!(super::status_text_linear_progress(start, start), 0.0);
+        assert!(
+            (super::status_text_progress(start, start + std::time::Duration::from_millis(200))
+                - 0.5)
+                .abs()
+                < 0.001
+        );
+        assert_eq!(
+            super::status_text_linear_progress(
+                start,
+                start + std::time::Duration::from_millis(200)
+            ),
+            0.5
+        );
+        assert_eq!(
+            super::status_text_linear_progress(
+                start,
+                start + std::time::Duration::from_millis(400)
+            ),
+            1.0
+        );
+        assert_eq!(
+            super::status_text_progress(start, start + std::time::Duration::from_millis(400)),
+            1.0
+        );
+        assert_eq!(
+            super::status_text_progress(start, start - std::time::Duration::from_millis(1)),
+            0.0
+        );
     }
 
     #[test]
