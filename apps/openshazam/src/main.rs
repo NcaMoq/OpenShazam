@@ -1461,7 +1461,7 @@ fn recognize_loopback_progressive(
                         info.flags.timestamp_error,
                     );
                     if info.flags.silent {
-                        packet_scratch.mono.resize(frame_count, 0.0);
+                        fill_silent_samples(&mut packet_scratch.mono, frame_count);
                     } else {
                         let byte_count = frame_count
                             .checked_mul(format.get_blockalign() as usize)
@@ -1685,6 +1685,12 @@ struct WasapiPacketScratch {
     mono: Vec<f32>,
 }
 
+#[cfg(any(windows, test))]
+fn fill_silent_samples(output: &mut Vec<f32>, sample_count: usize) {
+    output.resize(sample_count, 0.0);
+    output.fill(0.0);
+}
+
 #[cfg(windows)]
 impl WasapiPacketScratch {
     fn with_capacity(
@@ -1816,7 +1822,7 @@ fn append_wasapi_packets(
         *received_audio_packet = true;
         let frame_count = read_frames as usize;
         if info.flags.silent {
-            packet_scratch.mono.resize(frame_count, 0.0);
+            fill_silent_samples(&mut packet_scratch.mono, frame_count);
         } else {
             let byte_count = frame_count
                 .checked_mul(format.get_blockalign() as usize)
@@ -2527,7 +2533,7 @@ fn capture_loopback_frames(
                 let sample_count = frame_count.checked_mul(channels).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "capture packet too large")
                 })?;
-                packet_scratch.interleaved.resize(sample_count, 0.0);
+                fill_silent_samples(&mut packet_scratch.interleaved, sample_count);
                 accumulator.push_interleaved_f32(&packet_scratch.interleaved, channels)?;
                 continue;
             }
@@ -2558,10 +2564,10 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     use super::notify_after_retry_dispatch_ack;
     use super::{
-        classify_manual_trigger_poll, decode_mono_f32le, ignore_expected_timeout,
-        manual_completion_is_normal, milliseconds_for_frames, parse_capture_seconds,
-        qpc_timestamp_to_unix_ms, read_manual_trigger, CaptureAccumulator, ManualTriggerPoll,
-        ManualTriggerRead, ManualTriggerSignal, CAPTURE_RATE,
+        classify_manual_trigger_poll, decode_mono_f32le, fill_silent_samples,
+        ignore_expected_timeout, manual_completion_is_normal, milliseconds_for_frames,
+        parse_capture_seconds, qpc_timestamp_to_unix_ms, read_manual_trigger, CaptureAccumulator,
+        ManualTriggerPoll, ManualTriggerRead, ManualTriggerSignal, CAPTURE_RATE,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use super::{parse_progressive_capture_options, NativeContextState, ProgressiveCaptureMode};
@@ -2823,6 +2829,29 @@ mod tests {
             .flat_map(|sample| sample.to_le_bytes())
             .collect();
         assert_eq!(decode_mono_f32le(&bytes).unwrap(), samples);
+    }
+
+    #[test]
+    fn silent_wasapi_packets_clear_reused_buffers_at_same_smaller_and_larger_lengths() {
+        let mut mono = vec![0.75, -0.5, 0.25, -1.0];
+        let mono_ptr = mono.as_ptr();
+        let mono_capacity = mono.capacity();
+        fill_silent_samples(&mut mono, 4);
+        assert_eq!(mono, [0.0; 4]);
+
+        mono.fill(0.5);
+        fill_silent_samples(&mut mono, 2);
+        assert_eq!(mono, [0.0; 2]);
+
+        mono.fill(-0.25);
+        fill_silent_samples(&mut mono, 4);
+        assert_eq!(mono, [0.0; 4]);
+        assert_eq!(mono.as_ptr(), mono_ptr);
+        assert_eq!(mono.capacity(), mono_capacity);
+
+        let mut interleaved = vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6];
+        fill_silent_samples(&mut interleaved, 6);
+        assert_eq!(interleaved, [0.0; 6]);
     }
 
     #[cfg(any(windows, target_os = "macos"))]
