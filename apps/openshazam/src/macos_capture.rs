@@ -1649,6 +1649,12 @@ mod progressive_event_tests {
         let queue_overflow = AtomicBool::new(false);
         let callback_fault = AtomicU8::new(CallbackFault::None as u8);
         let stream_stopping = AtomicBool::new(false);
+        let supported = SupportedBufferSize::Range { min: 1, max: 16 };
+        let (recycle_sender, recycle_receiver) = make_audio_buffer_pool(&supported, 1).unwrap();
+        let mut buffer = recycle_receiver.try_recv().unwrap();
+        buffer.extend_from_slice(&[0.5, -0.25]);
+        let allocation = buffer.as_ptr();
+        let capacity = buffer.capacity();
 
         enqueue_audio_event(
             &sender,
@@ -1656,13 +1662,197 @@ mod progressive_event_tests {
             &queue_overflow,
             &callback_fault,
             &stream_stopping,
-            AudioBuffer::owned(vec![0.5]),
+            AudioBuffer::pooled(buffer, recycle_sender.clone()),
             Some(42),
         );
 
         assert!(queue_overflow.load(Ordering::Relaxed));
         assert_eq!(pending_audio_packets.load(Ordering::Acquire), 0);
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            callback_fault.load(Ordering::Acquire),
+            CallbackFault::None as u8
+        );
+        let recycled: Vec<_> = (0..PACKET_QUEUE_CAPACITY)
+            .map(|_| recycle_receiver.try_recv().unwrap())
+            .collect();
+        assert!(recycled.iter().all(Vec::is_empty));
+        assert!(recycled.iter().all(|buffer| buffer.capacity() == capacity));
+        assert!(recycled.iter().any(|buffer| buffer.as_ptr() == allocation));
+    }
+
+    #[test]
+    fn stopped_callback_drops_event_and_recycles_its_audio_buffer() {
+        let (sender, receiver) = mpsc::sync_channel(PROGRESSIVE_EVENT_QUEUE_CAPACITY);
+        let pending_audio_packets = AtomicUsize::new(0);
+        let queue_overflow = AtomicBool::new(false);
+        let callback_fault = AtomicU8::new(CallbackFault::None as u8);
+        let stream_stopping = AtomicBool::new(true);
+        let supported = SupportedBufferSize::Range { min: 1, max: 16 };
+        let (recycle_sender, recycle_receiver) = make_audio_buffer_pool(&supported, 1).unwrap();
+        let buffer = recycle_receiver.try_recv().unwrap();
+        let allocation = buffer.as_ptr();
+
+        enqueue_audio_event(
+            &sender,
+            &pending_audio_packets,
+            &queue_overflow,
+            &callback_fault,
+            &stream_stopping,
+            AudioBuffer::pooled(buffer, recycle_sender.clone()),
+            Some(43),
+        );
+
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(pending_audio_packets.load(Ordering::Acquire), 0);
+        assert!(!queue_overflow.load(Ordering::Relaxed));
+        assert_eq!(
+            callback_fault.load(Ordering::Acquire),
+            CallbackFault::None as u8
+        );
+        let recycled: Vec<_> = (0..PACKET_QUEUE_CAPACITY)
+            .map(|_| recycle_receiver.try_recv().unwrap())
+            .collect();
+        assert!(recycled.iter().all(Vec::is_empty));
+        assert!(recycled.iter().any(|buffer| buffer.as_ptr() == allocation));
+    }
+
+    #[test]
+    fn disconnected_event_queue_faults_without_leaking_pooled_audio_buffer() {
+        let (sender, receiver) = mpsc::sync_channel(PROGRESSIVE_EVENT_QUEUE_CAPACITY);
+        drop(receiver);
+        let pending_audio_packets = AtomicUsize::new(0);
+        let queue_overflow = AtomicBool::new(false);
+        let callback_fault = AtomicU8::new(CallbackFault::None as u8);
+        let stream_stopping = AtomicBool::new(false);
+        let supported = SupportedBufferSize::Range { min: 1, max: 16 };
+        let (recycle_sender, recycle_receiver) = make_audio_buffer_pool(&supported, 1).unwrap();
+        let buffer = recycle_receiver.try_recv().unwrap();
+        let allocation = buffer.as_ptr();
+
+        enqueue_audio_event(
+            &sender,
+            &pending_audio_packets,
+            &queue_overflow,
+            &callback_fault,
+            &stream_stopping,
+            AudioBuffer::pooled(buffer, recycle_sender.clone()),
+            Some(44),
+        );
+
+        assert_eq!(pending_audio_packets.load(Ordering::Acquire), 0);
+        assert!(!queue_overflow.load(Ordering::Relaxed));
+        assert_eq!(
+            callback_fault.load(Ordering::Acquire),
+            CallbackFault::EventQueueClosed as u8
+        );
+        let recycled: Vec<_> = (0..PACKET_QUEUE_CAPACITY)
+            .map(|_| recycle_receiver.try_recv().unwrap())
+            .collect();
+        assert!(recycled.iter().all(Vec::is_empty));
+        assert!(recycled.iter().any(|buffer| buffer.as_ptr() == allocation));
+    }
+
+    #[test]
+    fn concurrent_audio_and_completion_producers_keep_audio_fifo_and_accounting() {
+        const AUDIO_PACKETS: u64 = 2_048;
+        const COMPLETIONS: usize = 128;
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let pending_audio_packets = Arc::new(AtomicUsize::new(0));
+        let queue_overflow = Arc::new(AtomicBool::new(false));
+        let callback_fault = Arc::new(AtomicU8::new(CallbackFault::None as u8));
+        let stream_stopping = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(std::sync::Barrier::new(3));
+
+        let audio_sender = sender.clone();
+        let audio_pending = Arc::clone(&pending_audio_packets);
+        let audio_overflow = Arc::clone(&queue_overflow);
+        let audio_fault = Arc::clone(&callback_fault);
+        let audio_stopping = Arc::clone(&stream_stopping);
+        let audio_start = Arc::clone(&start);
+
+        let completion_sender = sender.clone();
+        let completion_start = Arc::clone(&start);
+        drop(sender);
+
+        thread::scope(|scope| {
+            let audio = scope.spawn(move || {
+                audio_start.wait();
+                for sequence in 0..AUDIO_PACKETS {
+                    enqueue_audio_event(
+                        &audio_sender,
+                        &audio_pending,
+                        &audio_overflow,
+                        &audio_fault,
+                        &audio_stopping,
+                        AudioBuffer::owned(vec![sequence as f32]),
+                        Some(sequence),
+                    );
+                }
+            });
+            let completions = scope.spawn(move || {
+                completion_start.wait();
+                for attempt in 0..COMPLETIONS {
+                    completion_sender
+                        .send(ProgressiveEvent::Completion(ProgressiveCompletion {
+                            attempt: attempt as u64,
+                            status: None,
+                            outcome: RecognitionOutcome::InvalidResponse,
+                            candidates: Vec::new(),
+                        }))
+                        .unwrap();
+                }
+            });
+
+            start.wait();
+            let mut previous_audio_sequence = None;
+            let mut delivered_audio_packets = 0usize;
+            let mut audio_payloads_match = true;
+            let mut audio_fifo_preserved = true;
+            let mut completion_payloads_match = true;
+            let mut duplicate_or_invalid_completion = false;
+            let mut seen_completions = vec![false; COMPLETIONS];
+            while let Ok(event) = receiver.recv() {
+                match event {
+                    ProgressiveEvent::Audio {
+                        samples,
+                        source_timestamp_ms,
+                    } => {
+                        let sequence = source_timestamp_ms.unwrap();
+                        audio_payloads_match &= samples.samples.as_slice() == [sequence as f32];
+                        audio_fifo_preserved &=
+                            previous_audio_sequence.is_none_or(|previous| previous < sequence);
+                        previous_audio_sequence = Some(sequence);
+                        delivered_audio_packets += 1;
+                        release_audio_packet(&pending_audio_packets);
+                    }
+                    ProgressiveEvent::Completion(completion) => {
+                        completion_payloads_match &=
+                            completion.outcome == RecognitionOutcome::InvalidResponse;
+                        if let Some(seen) = seen_completions.get_mut(completion.attempt as usize) {
+                            duplicate_or_invalid_completion |= *seen;
+                            *seen = true;
+                        } else {
+                            duplicate_or_invalid_completion = true;
+                        }
+                    }
+                }
+            }
+            audio.join().unwrap();
+            completions.join().unwrap();
+
+            assert!(delivered_audio_packets <= AUDIO_PACKETS as usize);
+            assert!(audio_payloads_match);
+            assert!(audio_fifo_preserved);
+            assert!(completion_payloads_match);
+            assert!(!duplicate_or_invalid_completion);
+            if delivered_audio_packets < AUDIO_PACKETS as usize {
+                assert!(queue_overflow.load(Ordering::Relaxed));
+            }
+            assert!(seen_completions.into_iter().all(|seen| seen));
+        });
+
+        assert_eq!(pending_audio_packets.load(Ordering::Acquire), 0);
         assert_eq!(
             callback_fault.load(Ordering::Acquire),
             CallbackFault::None as u8
