@@ -38,7 +38,7 @@ enum CallbackFault {
     EventQueueClosed = 3,
 }
 
-pub(super) fn capture_signature(
+pub(crate) fn capture_signature(
     output: &Path,
     capture_seconds: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -174,7 +174,7 @@ pub(super) fn capture_signature(
     Ok(())
 }
 
-pub(super) fn recognize_progressive(
+pub(crate) fn recognize_progressive(
     tagging_type: NativeTaggingType,
     context_state: super::NativeContextState,
     jsonl_output: bool,

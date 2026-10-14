@@ -5,6 +5,15 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+dev-cli = ["dep:ctrlc"]
+
+[[bin]]
+name = "openshazam"
+path = "src/main.rs"
+required-features = ["dev-cli"]
+
 [dependencies]
 sigx-core = { path = "../../crates/sigx-core" }
 shazam-http-lab = { path = "../../crates/shazam-http-lab" }
@@ -18,7 +27,7 @@ sigx-format = { path = "../../crates/sigx-format" }
 wasapi = "0.25.0"
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-ctrlc = "3.4"
+ctrlc = { version = "3.4", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cpal = "0.18.2"

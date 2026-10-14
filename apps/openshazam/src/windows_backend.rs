@@ -1,10 +1,12 @@
-use crate::cli::{self, NativeContextState, ProgressiveCaptureMode, WindowsProgressiveControl};
+use crate::recognition::{
+    self, NativeContextState, ProgressiveCaptureMode, WindowsProgressiveControl,
+};
 use openshazam_controller::{
     EventEmitter, RecognitionBackend, RecognitionContext, RecognitionErrorKind,
     RecognitionEventKind, RecognitionMode, SessionEndReason, SessionId,
 };
 use shazam_http_lab::NativeTaggingRequestContext;
-use shazam_progressive::NativeTaggingType;
+use shazam_progressive::{NativeTaggingType, SessionStatus};
 use std::{
     collections::HashMap,
     sync::{
@@ -50,6 +52,7 @@ struct SessionWorker {
 pub struct WindowsRecognitionBackend {
     device_id: Option<String>,
     sessions: HashMap<SessionId, SessionWorker>,
+    faulted: Arc<AtomicBool>,
 }
 
 impl WindowsRecognitionBackend {
@@ -58,6 +61,7 @@ impl WindowsRecognitionBackend {
         Self {
             device_id: None,
             sessions: HashMap::new(),
+            faulted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -66,16 +70,21 @@ impl WindowsRecognitionBackend {
         Self {
             device_id: Some(device_id.into()),
             sessions: HashMap::new(),
+            faulted: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn reap_prior_sessions(&mut self) -> Result<(), String> {
         let prior = std::mem::take(&mut self.sessions);
+        let mut panicked = false;
         for (_, session) in prior {
-            session
-                .worker
-                .join()
-                .map_err(|_| "previous Windows recognition worker panicked".to_owned())?;
+            if session.worker.join().is_err() {
+                panicked = true;
+            }
+        }
+        if panicked {
+            self.faulted.store(true, Ordering::Release);
+            return Err("previous Windows recognition worker panicked; backend is faulted".into());
         }
         Ok(())
     }
@@ -96,6 +105,11 @@ impl RecognitionBackend for WindowsRecognitionBackend {
         events: EventEmitter,
     ) -> Result<(), String> {
         self.reap_prior_sessions()?;
+        if self.faulted.load(Ordering::Acquire) {
+            return Err(
+                "Windows recognition backend is faulted after an incomplete worker cleanup".into(),
+            );
+        }
         let request_context = match (mode, context) {
             (RecognitionMode::Manual, _) => None,
             (RecognitionMode::Auto, Some(RecognitionContext::Foreground)) => {
@@ -118,11 +132,14 @@ impl RecognitionBackend for WindowsRecognitionBackend {
         let shutting_down = Arc::new(AtomicBool::new(false));
         let config_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let config_fetching = Arc::new(AtomicBool::new(false));
+        let cleanup_failed = Arc::new(AtomicBool::new(false));
         let run_cancelled = Arc::clone(&cancelled);
         let run_stop_requested = Arc::clone(&stop_requested);
         let run_shutting_down = Arc::clone(&shutting_down);
         let run_config_generation = Arc::clone(&config_generation);
         let run_config_fetching = Arc::clone(&config_fetching);
+        let run_cleanup_failed = Arc::clone(&cleanup_failed);
+        let run_faulted = Arc::clone(&self.faulted);
         let run_context = context_state.clone();
         let device_id = self.device_id.clone();
         let worker_events = events.clone();
@@ -134,45 +151,82 @@ impl RecognitionBackend for WindowsRecognitionBackend {
                     stop_requested: run_stop_requested.clone(),
                     config_generation: run_config_generation.clone(),
                     config_fetching: run_config_fetching.clone(),
-                    manual_trigger_immediately: mode == RecognitionMode::Manual,
+                    shutdown_requested: run_shutting_down.clone(),
+                    cleanup_failed: run_cleanup_failed.clone(),
+                    manual_trigger_receiver: if mode == RecognitionMode::Manual {
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        let _ = sender.send(recognition::ManualTriggerSignal::Enter);
+                        Some(receiver)
+                    } else {
+                        None
+                    },
                     events: Some((session_id, mode, worker_events.clone())),
                 };
-                let run = cli::recognize_loopback_progressive_controlled(
-                    device_id.as_deref(),
-                    ProgressiveCaptureMode {
-                        tagging_type,
-                        request_context,
-                    },
-                    run_context,
-                    false,
-                    control,
-                );
-                let reason = if run_shutting_down.load(Ordering::Acquire) {
-                    SessionEndReason::Shutdown
-                } else {
-                    match run {
-                        Ok(reason) => reason,
-                        Err(_) if run_cancelled.load(Ordering::Acquire) => {
-                            SessionEndReason::Cancelled
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    recognition::recognize_loopback_progressive_controlled(
+                        device_id.as_deref(),
+                        ProgressiveCaptureMode {
+                            tagging_type,
+                            request_context,
+                        },
+                        run_context,
+                        false,
+                        control,
+                    )
+                }));
+                let reason = match run {
+                    Ok(Ok(reason)) => reason,
+                    Ok(Err(error)) => {
+                        if run_cleanup_failed.load(Ordering::Acquire) {
+                            run_faulted.store(true, Ordering::Release);
                         }
-                        Err(_) if run_stop_requested.load(Ordering::Acquire) => {
-                            SessionEndReason::Stopped
-                        }
-                        Err(error) => {
-                            let _ = worker_events.emit(
-                                Some(session_id),
-                                Some(mode),
-                                RecognitionEventKind::RecognitionError {
-                                    kind: if run_config_fetching.load(Ordering::Acquire) {
-                                        RecognitionErrorKind::Configuration
-                                    } else {
-                                        RecognitionErrorKind::Capture
-                                    },
-                                    message: error.to_string(),
+                        let message = if run_cleanup_failed.load(Ordering::Acquire) {
+                            format!("{error}; recognition worker cleanup was incomplete")
+                        } else {
+                            error.to_string()
+                        };
+                        let _ = worker_events.emit(
+                            Some(session_id),
+                            Some(mode),
+                            RecognitionEventKind::RecognitionError {
+                                kind: if run_config_fetching.load(Ordering::Acquire) {
+                                    RecognitionErrorKind::Configuration
+                                } else {
+                                    RecognitionErrorKind::Capture
                                 },
-                            );
-                            SessionEndReason::Failed
-                        }
+                                message,
+                            },
+                        );
+                        crate::session_end::resolve_session_end(
+                            SessionStatus::Capturing,
+                            false,
+                            false,
+                            run_stop_requested.load(Ordering::Acquire),
+                            run_cancelled.load(Ordering::Acquire),
+                            run_shutting_down.load(Ordering::Acquire),
+                        )
+                    }
+                    Err(payload) => {
+                        run_faulted.store(true, Ordering::Release);
+                        let panic_message = payload
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("recognition worker panicked");
+                        let cleanup_note = if run_cleanup_failed.load(Ordering::Acquire) {
+                            "; an HTTP worker also failed during cleanup"
+                        } else {
+                            "; capture resources unwound on their owner thread"
+                        };
+                        let _ = worker_events.emit(
+                            Some(session_id),
+                            Some(mode),
+                            RecognitionEventKind::RecognitionError {
+                                kind: RecognitionErrorKind::Internal,
+                                message: format!("{panic_message}{cleanup_note}"),
+                            },
+                        );
+                        SessionEndReason::Failed
                     }
                 };
                 let generation = run_config_generation.load(Ordering::Acquire);
@@ -239,11 +293,17 @@ impl RecognitionBackend for WindowsRecognitionBackend {
             session.shutting_down.store(true, Ordering::Release);
             session.cancelled.store(true, Ordering::Release);
         }
+        let mut panicked = false;
         for (_, session) in sessions {
-            session
-                .worker
-                .join()
-                .map_err(|_| "Windows recognition worker panicked during shutdown".to_owned())?;
+            if session.worker.join().is_err() {
+                panicked = true;
+            }
+        }
+        if panicked {
+            self.faulted.store(true, Ordering::Release);
+            return Err(
+                "Windows recognition worker panicked during shutdown; backend is faulted".into(),
+            );
         }
         Ok(())
     }

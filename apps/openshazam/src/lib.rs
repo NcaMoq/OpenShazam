@@ -1,9 +1,12 @@
 //! Platform recognition backends reusable by native UI hosts.
 
-#[cfg(windows)]
-#[path = "main.rs"]
-#[allow(dead_code)]
-mod cli;
+pub mod recognition;
+pub mod session_end;
+#[cfg(any(windows, test))]
+mod worker_lifecycle;
+
+#[cfg(feature = "dev-cli")]
+pub mod cli;
 
 #[cfg(windows)]
 mod windows_backend;
