@@ -4060,12 +4060,22 @@ impl Renderer {
                 _ => None,
             };
             if let Some(scene) = self.composition.as_mut() {
-                scene.update_result_overlay(
+                if let Err(error) = scene.update_result_overlay(
                     self.layered_surface.as_ref(),
                     panel_top,
                     body_top,
                     self.dpi,
-                )?;
+                ) {
+                    // The result card has already been rendered into the
+                    // layered D2D surface. A failed optional Composition copy
+                    // must not skip UpdateLayeredWindow and leave the whole
+                    // card invisible; hide any stale overlay and present the
+                    // D2D frame as a fallback.
+                    let _ = scene.result_overlay.hide();
+                    eprintln!(
+                        "Windows UI result overlay update failed; using D2D fallback: {error}"
+                    );
+                }
             }
         }
         if let Some(surface) = self.layered_surface.as_ref() {
