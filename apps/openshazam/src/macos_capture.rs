@@ -451,7 +451,7 @@ pub(super) fn recognize_progressive(
             sample_rate,
         );
     }
-    super::emit_progressive_ui_config(
+    let config_generation = super::emit_progressive_ui_config(
         &configuration,
         super::ProgressiveUiConfigInputs {
             tagging_type,
@@ -706,6 +706,7 @@ pub(super) fn recognize_progressive(
                 capture_started,
                 trace_enabled,
                 jsonl_output,
+                config_generation,
             )?;
 
             let first_event = match progressive_receiver
@@ -741,6 +742,7 @@ pub(super) fn recognize_progressive(
                 capture_started,
                 trace_enabled,
                 jsonl_output,
+                config_generation,
             )?;
         }
         Ok(())
@@ -961,6 +963,7 @@ fn service_progressive(
     capture_started: Instant,
     trace_enabled: bool,
     jsonl_output: bool,
+    config_generation: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut deferred_post_stop_job = None;
     let mut deferred_manual_ui_event = None;
@@ -1107,11 +1110,11 @@ fn service_progressive(
                         {
                             deferred_manual_ui_event = Some(event.clone());
                         } else {
-                            super::emit_manual_ui_event(event, jsonl_output);
+                            super::emit_manual_ui_event(event, jsonl_output, config_generation);
                         }
                     } else if let Some(event) = auto_ui_event.as_ref() {
                         *matched = true;
-                        super::emit_auto_ui_event(event, jsonl_output);
+                        super::emit_auto_ui_event(event, jsonl_output, config_generation);
                     } else if !delivered_candidates.is_empty() {
                         *matched = true;
                         super::progressive_log(
@@ -1278,7 +1281,7 @@ fn service_progressive(
         if let Err(error) = spawn_result {
             if detached_post_stop_job {
                 if let Some(event) = deferred_manual_ui_event.take() {
-                    super::emit_manual_ui_event(&event, jsonl_output);
+                    super::emit_manual_ui_event(&event, jsonl_output, config_generation);
                 }
             }
             return Err(error.into());
@@ -1301,7 +1304,7 @@ fn service_progressive(
                 },
                 || {
                     if let Some(event) = deferred_manual_ui_event.take() {
-                        super::emit_manual_ui_event(&event, jsonl_output);
+                        super::emit_manual_ui_event(&event, jsonl_output, config_generation);
                     }
                 },
             )?;

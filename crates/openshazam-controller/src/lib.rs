@@ -8,7 +8,7 @@
 use std::{
     io,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
         Arc, Mutex,
     },
@@ -16,6 +16,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub use shazam_http_lab::{
+    NativeAutoResultEvent, NativeAutoUiEvent, NativeManualResultEvent, NativeManualResultStage,
+    NativeManualUiEvent, NativeTrackUiMetadata, TrackCandidate, TrackCandidateOrigin,
+    UiConfigSnapshot, UiRecognitionEvent, UiRecognitionInput,
+};
 pub use shazam_progressive::{RecognitionOutcome, RetryDirective};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,6 +46,15 @@ pub enum RecognitionCommand {
     StartAutoRecognition {
         session_id: SessionId,
         context: RecognitionContext,
+    },
+    StartManualRecognitionWithConfig {
+        session_id: SessionId,
+        config: UiConfigSnapshot,
+    },
+    StartAutoRecognitionWithConfig {
+        session_id: SessionId,
+        context: RecognitionContext,
+        config: UiConfigSnapshot,
     },
     StopRecognition {
         session_id: SessionId,
@@ -87,6 +101,13 @@ pub enum RecognitionEventKind {
         artist: Option<String>,
         track_id: Option<String>,
     },
+    /// Existing Manual callback-stage data, including Track Key and artwork.
+    ManualUiEvent(NativeManualUiEvent),
+    /// Auto's callback candidate; this does not claim Native duplicate filtering.
+    AutoUiEvent(NativeAutoUiEvent),
+    /// Session-scoped Config for UI PageLinkResolver use. URL resolution stays
+    /// in the UI layer.
+    UiConfigSnapshot(UiConfigSnapshot),
     NoMatch {
         attempt_id: u64,
     },
@@ -109,6 +130,8 @@ pub enum SessionEndReason {
     Stopped,
     Cancelled,
     Matched,
+    NoMatch,
+    TimedOut,
     Exhausted,
     Failed,
     Shutdown,
@@ -119,10 +142,29 @@ pub struct RecognitionEvent {
     pub sequence: u64,
     pub session_id: Option<SessionId>,
     pub mode: Option<RecognitionMode>,
+    /// Copied from the immutable Config attached to this session at Start.
+    pub config_generation: Option<u64>,
     /// Monotonic time since this controller started. This is event creation
     /// time, not the later time at which the UI dequeues the event.
     pub elapsed: Duration,
     pub kind: RecognitionEventKind,
+}
+
+impl RecognitionEvent {
+    /// Returns the existing typed UI result paired with the generation carried
+    /// by this session event. Session identity remains on this envelope.
+    pub fn ui_recognition_input(&self) -> Option<UiRecognitionInput> {
+        let config_generation = self.config_generation?;
+        let event = match &self.kind {
+            RecognitionEventKind::ManualUiEvent(event) => UiRecognitionEvent::Manual(event.clone()),
+            RecognitionEventKind::AutoUiEvent(event) => UiRecognitionEvent::Auto(event.clone()),
+            _ => return None,
+        };
+        Some(UiRecognitionInput {
+            config_generation,
+            event,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,12 +179,51 @@ pub enum EventError {
     ControllerStopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPhase {
+    Starting,
+    Running,
+    Stopping,
+    Cancelling,
+    Faulted,
+    Ended(SessionEndReason),
+}
+
+/// Authoritative bounded state retained independently of the UI notification
+/// queue. UI hosts poll this after a sequence gap or QueueFull report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecognitionSessionSnapshot {
+    pub session_id: SessionId,
+    pub mode: RecognitionMode,
+    pub context: Option<RecognitionContext>,
+    pub config: Option<UiConfigSnapshot>,
+    pub phase: SessionPhase,
+    pub last_result: Option<UiRecognitionEvent>,
+    pub last_event: Option<RecognitionEvent>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControllerSnapshot {
+    /// Increments for every event attempt, including a notification dropped
+    /// because the bounded UI queue was full.
+    pub last_sequence: u64,
+    pub dropped_notifications: u64,
+    pub active_session: Option<RecognitionSessionSnapshot>,
+    /// Most recent ended session, retained until another one ends.
+    pub last_ended_session: Option<RecognitionSessionSnapshot>,
+}
+
+const SESSION_OPEN: u8 = 0;
+const SESSION_CLOSING: u8 = 1;
+const SESSION_ENDED: u8 = 2;
+
 /// Platform adapter contract. Implementations own WASAPI/CoreAudio and network
-/// workers. `stop` stops capture and drains in-flight requests before returning;
-/// `cancel` invalidates the session and aborts requests where supported.
-/// Every method runs on the controller worker, so implementations should start
-/// long-running work on dedicated workers and reserve blocking waits for stop
-/// or shutdown.
+/// workers. `finish` must be emitted only after the capture and request workers
+/// for that session have released their resources. Never call `EventEmitter`
+/// from a real-time audio callback; forward events from the backend worker.
+/// `stop` drains requests, while `cancel` invalidates the session and aborts
+/// requests where supported. Methods run on the controller worker, so start
+/// long-running work on dedicated workers and reserve waits for stop/shutdown.
 pub trait RecognitionBackend: Send + 'static {
     fn start(
         &mut self,
@@ -188,6 +269,35 @@ impl CommandHandle {
         Ok(id)
     }
 
+    /// Starts a session bound to the caller-owned Config generation. The
+    /// snapshot value is immutable for this session even when another Config
+    /// is fetched later.
+    pub fn start_manual_with_config(
+        &self,
+        config: UiConfigSnapshot,
+    ) -> Result<SessionId, SubmitError> {
+        let id = self.allocate_session_id();
+        self.submit(RecognitionCommand::StartManualRecognitionWithConfig {
+            session_id: id,
+            config,
+        })?;
+        Ok(id)
+    }
+
+    pub fn start_auto_with_config(
+        &self,
+        context: RecognitionContext,
+        config: UiConfigSnapshot,
+    ) -> Result<SessionId, SubmitError> {
+        let id = self.allocate_session_id();
+        self.submit(RecognitionCommand::StartAutoRecognitionWithConfig {
+            session_id: id,
+            context,
+            config,
+        })?;
+        Ok(id)
+    }
+
     pub fn submit(&self, command: RecognitionCommand) -> Result<(), SubmitError> {
         if self.shutdown_requested.load(Ordering::Acquire) {
             return Err(SubmitError::ControllerStopped);
@@ -219,7 +329,9 @@ pub struct EventEmitter {
     sequence: Arc<AtomicU64>,
     origin: Instant,
     order_lock: Arc<Mutex<()>>,
-    session_gate: Option<(SessionId, RecognitionMode, Arc<AtomicBool>)>,
+    snapshot: Arc<Mutex<ControllerSnapshot>>,
+    session_gate: Option<(SessionId, RecognitionMode, Arc<AtomicU8>)>,
+    config_generation: Option<u64>,
 }
 
 impl EventEmitter {
@@ -227,11 +339,36 @@ impl EventEmitter {
         &self,
         session_id: SessionId,
         mode: RecognitionMode,
-        gate: Arc<AtomicBool>,
+        gate: Arc<AtomicU8>,
+        config_generation: Option<u64>,
     ) -> Self {
         let mut scoped = self.clone();
         scoped.session_gate = Some((session_id, mode, gate));
+        scoped.config_generation = config_generation;
         scoped
+    }
+
+    fn for_lifecycle(&self, config_generation: Option<u64>) -> Self {
+        let mut scoped = self.clone();
+        scoped.session_gate = None;
+        scoped.config_generation = config_generation;
+        // Lifecycle emitters are used only by the controller worker after the
+        // backend gate has been closed or after backend cleanup has completed.
+        scoped
+    }
+
+    /// Completes a session after the backend has stopped capture and released
+    /// its session resources. Calling this twice or after Stop/Cancel is safe:
+    /// only the first terminal transition can be published.
+    pub fn finish(&self, reason: SessionEndReason) -> Result<(), EventError> {
+        let Some((session_id, mode, _)) = &self.session_gate else {
+            return Err(EventError::ControllerStopped);
+        };
+        self.emit(
+            Some(*session_id),
+            Some(*mode),
+            RecognitionEventKind::SessionEnded { reason },
+        )
     }
 
     pub fn emit(
@@ -241,7 +378,7 @@ impl EventEmitter {
         kind: RecognitionEventKind,
     ) -> Result<(), EventError> {
         if let Some((allowed_session, allowed_mode, gate)) = &self.session_gate {
-            if !gate.load(Ordering::Acquire)
+            if gate.load(Ordering::Acquire) != SESSION_OPEN
                 || session_id != Some(*allowed_session)
                 || mode != Some(*allowed_mode)
             {
@@ -252,22 +389,66 @@ impl EventEmitter {
         if self
             .session_gate
             .as_ref()
-            .is_some_and(|(_, _, gate)| !gate.load(Ordering::Acquire))
+            .is_some_and(|(_, _, gate)| gate.load(Ordering::Acquire) != SESSION_OPEN)
         {
             return Err(EventError::ControllerStopped);
+        }
+        if matches!(kind, RecognitionEventKind::SessionEnded { .. }) {
+            if let Some((_, _, gate)) = &self.session_gate {
+                gate.compare_exchange(
+                    SESSION_OPEN,
+                    SESSION_ENDED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| EventError::ControllerStopped)?;
+            }
         }
         let event = RecognitionEvent {
             sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
             session_id,
             mode,
+            config_generation: self.config_generation,
             elapsed: self.origin.elapsed(),
             kind,
         };
+        update_snapshot(&self.snapshot, &event);
         match self.sender.try_send(event) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(EventError::QueueFull),
+            Err(TrySendError::Full(_)) => {
+                let mut snapshot = self.snapshot.lock().expect("snapshot lock poisoned");
+                snapshot.dropped_notifications = snapshot.dropped_notifications.saturating_add(1);
+                Err(EventError::QueueFull)
+            }
             Err(TrySendError::Disconnected(_)) => Err(EventError::ControllerStopped),
         }
+    }
+}
+
+fn update_snapshot(snapshot: &Mutex<ControllerSnapshot>, event: &RecognitionEvent) {
+    let mut snapshot = snapshot.lock().expect("snapshot lock poisoned");
+    snapshot.last_sequence = event.sequence;
+    let Some(active) = snapshot.active_session.as_mut() else {
+        return;
+    };
+    if Some(active.session_id) != event.session_id {
+        return;
+    }
+    active.last_event = Some(event.clone());
+    match &event.kind {
+        RecognitionEventKind::SessionStarted => active.phase = SessionPhase::Running,
+        RecognitionEventKind::ManualUiEvent(result) => {
+            active.last_result = Some(UiRecognitionEvent::Manual(result.clone()));
+        }
+        RecognitionEventKind::AutoUiEvent(result) => {
+            active.last_result = Some(UiRecognitionEvent::Auto(result.clone()));
+        }
+        RecognitionEventKind::MatchFound { .. } => {}
+        RecognitionEventKind::SessionEnded { reason } => {
+            active.phase = SessionPhase::Ended(*reason);
+            snapshot.last_ended_session = snapshot.active_session.take();
+        }
+        _ => {}
     }
 }
 
@@ -277,12 +458,19 @@ pub struct ApplicationController {
     worker: Option<JoinHandle<Result<(), String>>>,
 }
 
-pub struct EventReceiver(Receiver<RecognitionEvent>);
+pub struct EventReceiver(Receiver<RecognitionEvent>, Arc<Mutex<ControllerSnapshot>>);
 
 impl EventReceiver {
     /// Polls without blocking the UI thread.
     pub fn try_recv(&self) -> Result<RecognitionEvent, TryRecvError> {
         self.0.try_recv()
+    }
+
+    /// Returns the authoritative bounded session state. Use this to recover
+    /// after a sequence gap or `EventError::QueueFull`; it does not consume
+    /// notifications.
+    pub fn snapshot(&self) -> ControllerSnapshot {
+        self.1.lock().expect("snapshot lock poisoned").clone()
     }
 }
 
@@ -301,6 +489,7 @@ impl ApplicationController {
         let (command_sender, command_receiver) = mpsc::sync_channel(command_capacity);
         let (event_sender, event_receiver) = mpsc::sync_channel(event_capacity);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let snapshot = Arc::new(Mutex::new(ControllerSnapshot::default()));
         let commands = CommandHandle {
             sender: command_sender,
             next_session_id: Arc::new(AtomicU64::new(1)),
@@ -311,19 +500,30 @@ impl ApplicationController {
             sequence: Arc::new(AtomicU64::new(1)),
             origin: Instant::now(),
             order_lock: Arc::new(Mutex::new(())),
+            snapshot: Arc::clone(&snapshot),
             session_gate: None,
+            config_generation: None,
         };
+        let worker_snapshot = Arc::clone(&snapshot);
         let worker = thread::Builder::new()
             .name("openshazam-controller".into())
             .spawn(move || {
-                let result =
-                    run_controller(&mut backend, command_receiver, events, shutdown_requested);
+                let result = run_controller(
+                    &mut backend,
+                    command_receiver,
+                    events.clone(),
+                    shutdown_requested,
+                    Arc::clone(&worker_snapshot),
+                );
                 let shutdown_result = backend.shutdown();
+                if shutdown_result.is_ok() {
+                    finish_after_shutdown(&events, &worker_snapshot);
+                }
                 result.and(shutdown_result)
             })?;
         Ok(Self {
             commands,
-            events: EventReceiver(event_receiver),
+            events: EventReceiver(event_receiver, snapshot),
             worker: Some(worker),
         })
     }
@@ -335,19 +535,30 @@ impl ApplicationController {
     }
 }
 
+struct ActiveSession {
+    id: SessionId,
+    mode: RecognitionMode,
+    context: Option<RecognitionContext>,
+    config: Option<UiConfigSnapshot>,
+    gate: Arc<AtomicU8>,
+}
+
 fn run_controller<B: RecognitionBackend>(
     backend: &mut B,
     commands: Receiver<WorkerMessage>,
     events: EventEmitter,
     shutdown_requested: Arc<AtomicBool>,
+    snapshot: Arc<Mutex<ControllerSnapshot>>,
 ) -> Result<(), String> {
-    let mut active: Option<(
-        SessionId,
-        RecognitionMode,
-        Option<RecognitionContext>,
-        Arc<AtomicBool>,
-    )> = None;
+    let mut active: Option<ActiveSession> = None;
+    let mut shutdown_error = None;
     loop {
+        if active
+            .as_ref()
+            .is_some_and(|session| session.gate.load(Ordering::Acquire) == SESSION_ENDED)
+        {
+            active = None;
+        }
         if shutdown_requested.load(Ordering::Acquire) {
             break;
         }
@@ -356,133 +567,258 @@ fn run_controller<B: RecognitionBackend>(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        match command {
-            RecognitionCommand::StartManualRecognition { session_id }
-            | RecognitionCommand::StartAutoRecognition { session_id, .. } => {
-                let (mode, context) = match command {
-                    RecognitionCommand::StartManualRecognition { .. } => {
-                        (RecognitionMode::Manual, None)
-                    }
-                    RecognitionCommand::StartAutoRecognition { context, .. } => {
-                        (RecognitionMode::Auto, Some(context))
-                    }
-                    _ => unreachable!(),
-                };
-                if let Some((active_id, _, _, _)) = &active {
-                    events
-                        .emit(
-                            Some(session_id),
-                            Some(mode),
-                            RecognitionEventKind::CommandRejected {
-                                reason: format!("session {active_id:?} is already active"),
-                            },
-                        )
-                        .map_err(|error| format!("event queue failed: {error:?}"))?;
-                    continue;
-                }
-                let session_gate = Arc::new(AtomicBool::new(true));
-                active = Some((session_id, mode, context, Arc::clone(&session_gate)));
-                events
-                    .emit(
-                        Some(session_id),
-                        Some(mode),
-                        RecognitionEventKind::SessionStarted,
-                    )
-                    .map_err(|error| format!("event queue failed: {error:?}"))?;
-                if let Err(message) = backend.start(
+        // A backend can finish while `recv_timeout` is blocked. Reconcile the
+        // gate again after receiving so a queued next Start is not rejected
+        // merely because the worker woke for that command before its timer.
+        if active
+            .as_ref()
+            .is_some_and(|session| session.gate.load(Ordering::Acquire) == SESSION_ENDED)
+        {
+            active = None;
+        }
+
+        let start = match &command {
+            RecognitionCommand::StartManualRecognition { session_id } => {
+                Some((*session_id, RecognitionMode::Manual, None, None))
+            }
+            RecognitionCommand::StartAutoRecognition {
+                session_id,
+                context,
+            } => Some((*session_id, RecognitionMode::Auto, Some(*context), None)),
+            RecognitionCommand::StartManualRecognitionWithConfig { session_id, config } => Some((
+                *session_id,
+                RecognitionMode::Manual,
+                None,
+                Some(config.clone()),
+            )),
+            RecognitionCommand::StartAutoRecognitionWithConfig {
+                session_id,
+                context,
+                config,
+            } => Some((
+                *session_id,
+                RecognitionMode::Auto,
+                Some(*context),
+                Some(config.clone()),
+            )),
+            _ => None,
+        };
+
+        if let Some((session_id, mode, context, config)) = start {
+            let config_generation = config.as_ref().map(|config| config.generation);
+            if let Some(existing) = active.as_ref() {
+                emit_nonfatal(
+                    &events.for_lifecycle(config_generation),
+                    Some(session_id),
+                    Some(mode),
+                    RecognitionEventKind::CommandRejected {
+                        reason: format!("session {:?} is already active", existing.id),
+                    },
+                );
+                continue;
+            }
+            let gate = Arc::new(AtomicU8::new(SESSION_OPEN));
+            let session_events =
+                events.for_session(session_id, mode, Arc::clone(&gate), config_generation);
+            {
+                let mut state = snapshot.lock().expect("snapshot lock poisoned");
+                state.active_session = Some(RecognitionSessionSnapshot {
                     session_id,
                     mode,
                     context,
-                    events.for_session(session_id, mode, session_gate.clone()),
-                ) {
-                    session_gate.store(false, Ordering::Release);
-                    let _ = backend.cancel(session_id);
-                    events
-                        .emit(
+                    config: config.clone(),
+                    phase: SessionPhase::Starting,
+                    last_result: None,
+                    last_event: None,
+                });
+            }
+            active = Some(ActiveSession {
+                id: session_id,
+                mode,
+                context,
+                config: config.clone(),
+                gate: Arc::clone(&gate),
+            });
+            emit_nonfatal(
+                &session_events,
+                Some(session_id),
+                Some(mode),
+                RecognitionEventKind::SessionStarted,
+            );
+            if let Some(config) = &config {
+                emit_nonfatal(
+                    &session_events,
+                    Some(session_id),
+                    Some(mode),
+                    RecognitionEventKind::UiConfigSnapshot(config.clone()),
+                );
+            }
+            match backend.start(session_id, mode, context, session_events) {
+                Ok(()) => {}
+                Err(message) => {
+                    if gate
+                        .compare_exchange(
+                            SESSION_OPEN,
+                            SESSION_CLOSING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        let cancel_error = backend.cancel(session_id).err();
+                        let error_message = match cancel_error.as_deref() {
+                            Some(cleanup) => format!("{message}; cleanup failed: {cleanup}"),
+                            None => message,
+                        };
+                        let lifecycle = events.for_lifecycle(config_generation);
+                        emit_nonfatal(
+                            &lifecycle,
                             Some(session_id),
                             Some(mode),
                             RecognitionEventKind::RecognitionError {
                                 kind: RecognitionErrorKind::Internal,
-                                message,
+                                message: error_message,
                             },
-                        )
-                        .and_then(|()| {
-                            events.emit(
-                                Some(session_id),
-                                Some(mode),
-                                RecognitionEventKind::SessionEnded {
-                                    reason: SessionEndReason::Failed,
-                                },
-                            )
-                        })
-                        .map_err(|error| format!("event queue failed: {error:?}"))?;
-                    active = None;
+                        );
+                        if cancel_error.is_none() {
+                            end_session(
+                                &events,
+                                &snapshot,
+                                session_id,
+                                mode,
+                                config_generation,
+                                SessionEndReason::Failed,
+                            );
+                            active = None;
+                        } else {
+                            set_session_phase(&snapshot, session_id, SessionPhase::Faulted);
+                        }
+                    }
                 }
             }
+            continue;
+        }
+
+        match command {
             RecognitionCommand::StopRecognition { session_id } => {
-                if let Some((active_id, mode, _, session_gate)) = active.as_ref() {
-                    if session_id == *active_id {
-                        let mode = *mode;
-                        if let Err(message) = backend.stop(session_id) {
-                            events
-                                .emit(
+                if let Some(session) = active.as_mut().filter(|session| session.id == session_id) {
+                    let config_generation = session.config.as_ref().map(|config| config.generation);
+                    if session
+                        .gate
+                        .compare_exchange(
+                            SESSION_OPEN,
+                            SESSION_CLOSING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                        || session.gate.load(Ordering::Acquire) == SESSION_CLOSING
+                    {
+                        set_session_phase(&snapshot, session_id, SessionPhase::Stopping);
+                        match backend.stop(session_id) {
+                            Ok(()) => {
+                                end_session(
+                                    &events,
+                                    &snapshot,
+                                    session_id,
+                                    session.mode,
+                                    config_generation,
+                                    SessionEndReason::Stopped,
+                                );
+                                active = None;
+                            }
+                            Err(message) => {
+                                emit_nonfatal(
+                                    &events.for_lifecycle(config_generation),
                                     Some(session_id),
-                                    Some(mode),
+                                    Some(session.mode),
                                     RecognitionEventKind::RecognitionError {
                                         kind: RecognitionErrorKind::Internal,
-                                        message,
+                                        message: message.clone(),
                                     },
-                                )
-                                .map_err(|error| format!("event queue failed: {error:?}"))?;
+                                );
+                                match backend.cancel(session_id) {
+                                    Ok(()) => {
+                                        end_session(
+                                            &events,
+                                            &snapshot,
+                                            session_id,
+                                            session.mode,
+                                            config_generation,
+                                            SessionEndReason::Failed,
+                                        );
+                                        active = None;
+                                    }
+                                    Err(cleanup) => {
+                                        set_session_phase(
+                                            &snapshot,
+                                            session_id,
+                                            SessionPhase::Faulted,
+                                        );
+                                        shutdown_error.get_or_insert_with(|| {
+                                            format!(
+                                                "stop failed: {message}; cancel failed: {cleanup}"
+                                            )
+                                        });
+                                    }
+                                }
+                            }
                         }
-                        session_gate.store(false, Ordering::Release);
-                        events
-                            .emit(
-                                Some(session_id),
-                                Some(mode),
-                                RecognitionEventKind::SessionEnded {
-                                    reason: SessionEndReason::Stopped,
-                                },
-                            )
-                            .map_err(|error| format!("event queue failed: {error:?}"))?;
-                        active = None;
                     }
                 }
             }
             RecognitionCommand::CancelRecognition { session_id } => {
-                if let Some((active_id, mode, _, session_gate)) = active.as_ref() {
-                    if session_id == *active_id {
-                        let mode = *mode;
-                        session_gate.store(false, Ordering::Release);
-                        if let Err(message) = backend.cancel(session_id) {
-                            events
-                                .emit(
-                                    Some(session_id),
-                                    Some(mode),
-                                    RecognitionEventKind::RecognitionError {
-                                        kind: RecognitionErrorKind::Internal,
-                                        message,
-                                    },
-                                )
-                                .map_err(|error| format!("event queue failed: {error:?}"))?;
+                if let Some(session) = active.as_mut().filter(|session| session.id == session_id) {
+                    let config_generation = session.config.as_ref().map(|config| config.generation);
+                    match session.gate.compare_exchange(
+                        SESSION_OPEN,
+                        SESSION_CLOSING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Err(SESSION_ENDED) => {
+                            active = None;
+                            continue;
                         }
-                        events
-                            .emit(
-                                Some(session_id),
-                                Some(mode),
-                                RecognitionEventKind::SessionCancelled,
-                            )
-                            .and_then(|()| {
-                                events.emit(
-                                    Some(session_id),
-                                    Some(mode),
-                                    RecognitionEventKind::SessionEnded {
-                                        reason: SessionEndReason::Cancelled,
-                                    },
-                                )
-                            })
-                            .map_err(|error| format!("event queue failed: {error:?}"))?;
+                        Ok(_) | Err(SESSION_CLOSING) => {}
+                        Err(_) => unreachable!("unknown session gate state"),
+                    }
+                    if session.gate.load(Ordering::Acquire) == SESSION_ENDED {
                         active = None;
+                        continue;
+                    }
+                    set_session_phase(&snapshot, session_id, SessionPhase::Cancelling);
+                    match backend.cancel(session_id) {
+                        Ok(()) => {
+                            emit_nonfatal(
+                                &events.for_lifecycle(config_generation),
+                                Some(session_id),
+                                Some(session.mode),
+                                RecognitionEventKind::SessionCancelled,
+                            );
+                            end_session(
+                                &events,
+                                &snapshot,
+                                session_id,
+                                session.mode,
+                                config_generation,
+                                SessionEndReason::Cancelled,
+                            );
+                            active = None;
+                        }
+                        Err(message) => {
+                            emit_nonfatal(
+                                &events.for_lifecycle(config_generation),
+                                Some(session_id),
+                                Some(session.mode),
+                                RecognitionEventKind::RecognitionError {
+                                    kind: RecognitionErrorKind::Internal,
+                                    message: message.clone(),
+                                },
+                            );
+                            set_session_phase(&snapshot, session_id, SessionPhase::Faulted);
+                            shutdown_error.get_or_insert(message);
+                        }
                     }
                 }
             }
@@ -490,59 +826,171 @@ fn run_controller<B: RecognitionBackend>(
                 session_id,
                 context,
             } => {
-                if let Some((active_id, mode, _, session_gate)) = active.as_ref() {
-                    if session_id == *active_id && *mode == RecognitionMode::Auto {
-                        let session_gate = Arc::clone(session_gate);
-                        if let Err(message) = backend.set_context(session_id, context) {
-                            events
-                                .emit(
-                                    Some(session_id),
-                                    Some(*mode),
-                                    RecognitionEventKind::RecognitionError {
-                                        kind: RecognitionErrorKind::Internal,
-                                        message,
-                                    },
-                                )
-                                .map_err(|error| format!("event queue failed: {error:?}"))?;
-                        } else {
-                            active = Some((
-                                session_id,
-                                RecognitionMode::Auto,
-                                Some(context),
-                                session_gate,
-                            ));
+                if let Some(session) = active.as_mut().filter(|session| {
+                    session.id == session_id && session.mode == RecognitionMode::Auto
+                }) {
+                    if session.gate.load(Ordering::Acquire) == SESSION_OPEN {
+                        let config_generation =
+                            session.config.as_ref().map(|config| config.generation);
+                        match backend.set_context(session_id, context) {
+                            Ok(()) => {
+                                session.context = Some(context);
+                                if let Some(state) = snapshot
+                                    .lock()
+                                    .expect("snapshot lock poisoned")
+                                    .active_session
+                                    .as_mut()
+                                {
+                                    if state.session_id == session_id {
+                                        state.context = Some(context);
+                                    }
+                                }
+                            }
+                            Err(message) => emit_nonfatal(
+                                &events.for_lifecycle(config_generation),
+                                Some(session_id),
+                                Some(session.mode),
+                                RecognitionEventKind::RecognitionError {
+                                    kind: RecognitionErrorKind::Internal,
+                                    message,
+                                },
+                            ),
                         }
                     }
                 }
             }
             RecognitionCommand::Shutdown => break,
+            RecognitionCommand::StartManualRecognition { .. }
+            | RecognitionCommand::StartAutoRecognition { .. }
+            | RecognitionCommand::StartManualRecognitionWithConfig { .. }
+            | RecognitionCommand::StartAutoRecognitionWithConfig { .. } => unreachable!(),
         }
     }
-    if let Some((session_id, _, _, session_gate)) = active {
-        session_gate.store(false, Ordering::Release);
-        backend.cancel(session_id)?;
-        events
-            .emit(
-                Some(session_id),
-                None,
-                RecognitionEventKind::SessionEnded {
-                    reason: SessionEndReason::Shutdown,
-                },
-            )
-            .map_err(|error| format!("event queue failed: {error:?}"))?;
+
+    if let Some(session) = active {
+        match session.gate.compare_exchange(
+            SESSION_OPEN,
+            SESSION_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Err(SESSION_ENDED) => return shutdown_error.map_or(Ok(()), Err),
+            Ok(_) | Err(SESSION_CLOSING) => {}
+            Err(_) => unreachable!("unknown session gate state"),
+        }
+        set_session_phase(&snapshot, session.id, SessionPhase::Cancelling);
+        match backend.cancel(session.id) {
+            Ok(()) => end_session(
+                &events,
+                &snapshot,
+                session.id,
+                session.mode,
+                session.config.as_ref().map(|config| config.generation),
+                SessionEndReason::Shutdown,
+            ),
+            Err(message) => {
+                set_session_phase(&snapshot, session.id, SessionPhase::Faulted);
+                emit_nonfatal(
+                    &events.for_lifecycle(session.config.as_ref().map(|config| config.generation)),
+                    Some(session.id),
+                    Some(session.mode),
+                    RecognitionEventKind::RecognitionError {
+                        kind: RecognitionErrorKind::Internal,
+                        message: message.clone(),
+                    },
+                );
+                shutdown_error.get_or_insert(message);
+            }
+        }
     }
-    Ok(())
+    shutdown_error.map_or(Ok(()), Err)
+}
+
+fn emit_nonfatal(
+    events: &EventEmitter,
+    session_id: Option<SessionId>,
+    mode: Option<RecognitionMode>,
+    kind: RecognitionEventKind,
+) {
+    // QueueFull means the event is represented by the authoritative snapshot
+    // and the incremented sequence/dropped counter. It is not a controller
+    // failure. A stale session gate is also an expected race outcome.
+    let _ = events.emit(session_id, mode, kind);
+}
+
+fn set_session_phase(
+    snapshot: &Mutex<ControllerSnapshot>,
+    session_id: SessionId,
+    phase: SessionPhase,
+) {
+    if let Some(session) = snapshot
+        .lock()
+        .expect("snapshot lock poisoned")
+        .active_session
+        .as_mut()
+        .filter(|session| session.session_id == session_id)
+    {
+        session.phase = phase;
+    }
+}
+
+fn end_session(
+    events: &EventEmitter,
+    snapshot: &Mutex<ControllerSnapshot>,
+    session_id: SessionId,
+    mode: RecognitionMode,
+    config_generation: Option<u64>,
+    reason: SessionEndReason,
+) {
+    emit_nonfatal(
+        &events.for_lifecycle(config_generation),
+        Some(session_id),
+        Some(mode),
+        RecognitionEventKind::SessionEnded { reason },
+    );
+    // `update_snapshot` moves the active state to `last_ended_session` before
+    // enqueueing; if a duplicate/stale lifecycle notification was rejected,
+    // avoid manufacturing a second terminal state here.
+    let mut state = snapshot.lock().expect("snapshot lock poisoned");
+    if state
+        .active_session
+        .as_ref()
+        .is_some_and(|session| session.session_id == session_id)
+    {
+        if let Some(mut ended) = state.active_session.take() {
+            ended.phase = SessionPhase::Ended(reason);
+            state.last_ended_session = Some(ended);
+        }
+    }
+}
+
+fn finish_after_shutdown(events: &EventEmitter, snapshot: &Mutex<ControllerSnapshot>) {
+    let active = snapshot
+        .lock()
+        .expect("snapshot lock poisoned")
+        .active_session
+        .clone();
+    if let Some(session) = active {
+        end_session(
+            events,
+            snapshot,
+            session.session_id,
+            session.mode,
+            session.config.as_ref().map(|config| config.generation),
+            SessionEndReason::Shutdown,
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::{collections::HashMap, sync::Mutex};
 
     #[derive(Clone, Default)]
     struct MockBackend {
         calls: Arc<Mutex<Vec<String>>>,
-        session_events: Arc<Mutex<Option<EventEmitter>>>,
+        session_events: Arc<Mutex<HashMap<SessionId, EventEmitter>>>,
     }
 
     impl RecognitionBackend for MockBackend {
@@ -553,7 +1001,10 @@ mod tests {
             _context: Option<RecognitionContext>,
             events: EventEmitter,
         ) -> Result<(), String> {
-            *self.session_events.lock().unwrap() = Some(events);
+            self.session_events
+                .lock()
+                .unwrap()
+                .insert(session_id, events);
             self.calls
                 .lock()
                 .unwrap()
@@ -601,6 +1052,42 @@ mod tests {
             .0
             .recv_timeout(Duration::from_secs(1))
             .expect("controller event should arrive")
+    }
+
+    fn candidate() -> TrackCandidate {
+        TrackCandidate {
+            track_id: Some("opaque-id".into()),
+            title: "Title".into(),
+            artist: "Artist".into(),
+            ui_metadata: Some(NativeTrackUiMetadata {
+                track_key: Some("track-key".into()),
+                album_adam_id: None,
+                isrc: None,
+                date: None,
+                artwork_url: Some("artwork".into()),
+                hq_artwork_url: None,
+                background_image_url: None,
+            }),
+            alternative_track: None,
+            origin: TrackCandidateOrigin::Synthetic,
+        }
+    }
+
+    fn session_emitter(
+        emitters: &Arc<Mutex<HashMap<SessionId, EventEmitter>>>,
+        session_id: SessionId,
+    ) -> EventEmitter {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(emitter) = emitters.lock().unwrap().get(&session_id).cloned() {
+                return emitter;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "backend did not start the session"
+            );
+            thread::yield_now();
+        }
     }
 
     #[test]
@@ -667,7 +1154,7 @@ mod tests {
             }
         );
         assert_eq!(
-            session_events.lock().unwrap().as_ref().unwrap().emit(
+            session_events.lock().unwrap()[&automatic].emit(
                 Some(automatic),
                 Some(RecognitionMode::Auto),
                 RecognitionEventKind::MatchFound {
@@ -689,26 +1176,267 @@ mod tests {
     }
 
     #[test]
-    fn event_emitter_is_bounded_and_sequences_successful_events() {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let emitter = EventEmitter {
-            sender,
-            sequence: Arc::new(AtomicU64::new(1)),
-            origin: Instant::now(),
-            order_lock: Arc::new(Mutex::new(())),
-            session_gate: None,
-        };
-        emitter
-            .emit(None, None, RecognitionEventKind::SessionStarted)
+    fn natural_terminal_event_releases_controller_for_a_new_mode() {
+        let backend = MockBackend::default();
+        let emitters = Arc::clone(&backend.session_events);
+        let controller = ApplicationController::spawn(backend, 8, 8).unwrap();
+        let manual = controller.commands.start_manual().unwrap();
+        assert_eq!(
+            next_event(&controller).kind,
+            RecognitionEventKind::SessionStarted
+        );
+        session_emitter(&emitters, manual)
+            .finish(SessionEndReason::NoMatch)
             .unwrap();
         assert_eq!(
-            emitter.emit(None, None, RecognitionEventKind::CaptureStarted),
-            Err(EventError::QueueFull)
+            next_event(&controller).kind,
+            RecognitionEventKind::SessionEnded {
+                reason: SessionEndReason::NoMatch
+            }
         );
-        assert_eq!(receiver.recv().unwrap().sequence, 1);
-        assert!(emitter
-            .emit(None, None, RecognitionEventKind::CaptureStarted)
-            .is_ok());
-        assert_eq!(receiver.recv().unwrap().sequence, 3);
+        let auto = controller
+            .commands
+            .start_auto(RecognitionContext::Foreground)
+            .unwrap();
+        assert_eq!(next_event(&controller).session_id, Some(auto));
+        assert!(controller.events.snapshot().active_session.is_some());
+        assert!(controller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn matched_and_timed_out_manual_sessions_can_be_restarted() {
+        let backend = MockBackend::default();
+        let emitters = Arc::clone(&backend.session_events);
+        let controller = ApplicationController::spawn(backend, 8, 16).unwrap();
+        let matched = controller.commands.start_manual().unwrap();
+        next_event(&controller);
+        let old = session_emitter(&emitters, matched);
+        old.finish(SessionEndReason::Matched).unwrap();
+        assert_eq!(
+            next_event(&controller).kind,
+            RecognitionEventKind::SessionEnded {
+                reason: SessionEndReason::Matched
+            }
+        );
+        let timed = controller.commands.start_manual().unwrap();
+        assert_eq!(next_event(&controller).session_id, Some(timed));
+        session_emitter(&emitters, timed)
+            .finish(SessionEndReason::TimedOut)
+            .unwrap();
+        assert_eq!(
+            next_event(&controller).kind,
+            RecognitionEventKind::SessionEnded {
+                reason: SessionEndReason::TimedOut
+            }
+        );
+        let next = controller.commands.start_manual().unwrap();
+        assert_eq!(next_event(&controller).session_id, Some(next));
+        assert_eq!(
+            old.finish(SessionEndReason::Failed),
+            Err(EventError::ControllerStopped)
+        );
+        assert_eq!(
+            controller
+                .events
+                .snapshot()
+                .active_session
+                .as_ref()
+                .unwrap()
+                .session_id,
+            next
+        );
+        assert!(controller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn auto_ui_match_is_nonterminal_and_explicit_stop_ends_once() {
+        let backend = MockBackend::default();
+        let emitters = Arc::clone(&backend.session_events);
+        let controller = ApplicationController::spawn(backend, 8, 8).unwrap();
+        let auto = controller
+            .commands
+            .start_auto(RecognitionContext::Background)
+            .unwrap();
+        next_event(&controller);
+        let emitter = session_emitter(&emitters, auto);
+        emitter
+            .emit(
+                Some(auto),
+                Some(RecognitionMode::Auto),
+                RecognitionEventKind::AutoUiEvent(NativeAutoUiEvent::ContinuousMatchCandidate(
+                    NativeAutoResultEvent {
+                        primary_track: candidate(),
+                        alternative_track: None,
+                    },
+                )),
+            )
+            .unwrap();
+        assert!(matches!(
+            next_event(&controller).kind,
+            RecognitionEventKind::AutoUiEvent(_)
+        ));
+        assert_eq!(
+            controller
+                .events
+                .snapshot()
+                .active_session
+                .as_ref()
+                .unwrap()
+                .session_id,
+            auto
+        );
+        controller
+            .commands
+            .submit(RecognitionCommand::StopRecognition { session_id: auto })
+            .unwrap();
+        assert_eq!(
+            next_event(&controller).kind,
+            RecognitionEventKind::SessionEnded {
+                reason: SessionEndReason::Stopped
+            }
+        );
+        assert_eq!(
+            emitter.finish(SessionEndReason::Matched),
+            Err(EventError::ControllerStopped)
+        );
+        let manual = controller.commands.start_manual().unwrap();
+        assert_eq!(next_event(&controller).session_id, Some(manual));
+        assert!(controller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn queue_full_does_not_kill_controller_and_snapshot_recovers_terminal_result() {
+        let backend = MockBackend::default();
+        let emitters = Arc::clone(&backend.session_events);
+        let controller = ApplicationController::spawn(backend, 8, 1).unwrap();
+        let session = controller
+            .commands
+            .start_manual_with_config(UiConfigSnapshot {
+                generation: 9,
+                web_track_url_template: Some("https://example.test/{track_key}".into()),
+            })
+            .unwrap();
+        let emitter = session_emitter(&emitters, session);
+        // Do not drain the one-slot queue: backend notifications are nonfatal
+        // and the authoritative snapshot retains the latest result and finish.
+        let result = NativeManualUiEvent::NoMatch;
+        let _ = emitter.emit(
+            Some(session),
+            Some(RecognitionMode::Manual),
+            RecognitionEventKind::ManualUiEvent(result),
+        );
+        let _ = emitter.finish(SessionEndReason::NoMatch);
+        let snapshot = controller.events.snapshot();
+        assert!(snapshot.dropped_notifications >= 1);
+        assert_eq!(
+            snapshot.last_ended_session.as_ref().unwrap().session_id,
+            session
+        );
+        assert_eq!(
+            snapshot.last_ended_session.as_ref().unwrap().phase,
+            SessionPhase::Ended(SessionEndReason::NoMatch)
+        );
+        assert_eq!(
+            snapshot.last_ended_session.as_ref().unwrap().last_result,
+            Some(UiRecognitionEvent::Manual(NativeManualUiEvent::NoMatch))
+        );
+        assert!(controller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn session_config_generation_and_track_metadata_are_bound_to_event() {
+        let backend = MockBackend::default();
+        let emitters = Arc::clone(&backend.session_events);
+        let controller = ApplicationController::spawn(backend, 8, 8).unwrap();
+        let config = UiConfigSnapshot {
+            generation: 44,
+            web_track_url_template: Some("https://example.test/{track_key}".into()),
+        };
+        let session = controller
+            .commands
+            .start_manual_with_config(config.clone())
+            .unwrap();
+        next_event(&controller);
+        next_event(&controller);
+        let event = NativeManualUiEvent::Result(NativeManualResultEvent {
+            stage: NativeManualResultStage::TaggingDidFinish,
+            primary_track: candidate(),
+            alternative_track: None,
+        });
+        session_emitter(&emitters, session)
+            .emit(
+                Some(session),
+                Some(RecognitionMode::Manual),
+                RecognitionEventKind::ManualUiEvent(event.clone()),
+            )
+            .unwrap();
+        let result = next_event(&controller);
+        assert_eq!(result.config_generation, Some(44));
+        assert_eq!(
+            result.ui_recognition_input(),
+            Some(UiRecognitionInput {
+                config_generation: 44,
+                event: UiRecognitionEvent::Manual(event)
+            })
+        );
+        assert_eq!(
+            controller.events.snapshot().active_session.unwrap().config,
+            Some(config)
+        );
+        assert!(controller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn backend_failure_and_shutdown_have_terminal_snapshot_state() {
+        let backend = MockBackend::default();
+        let emitters = Arc::clone(&backend.session_events);
+        let controller = ApplicationController::spawn(backend, 8, 8).unwrap();
+        let snapshot_handle = Arc::clone(&controller.events.1);
+        let session = controller
+            .commands
+            .start_auto(RecognitionContext::Foreground)
+            .unwrap();
+        next_event(&controller);
+        let events = session_emitter(&emitters, session);
+        events
+            .emit(
+                Some(session),
+                Some(RecognitionMode::Auto),
+                RecognitionEventKind::RecognitionError {
+                    kind: RecognitionErrorKind::Transport,
+                    message: "offline".into(),
+                },
+            )
+            .unwrap();
+        next_event(&controller);
+        events.finish(SessionEndReason::Failed).unwrap();
+        assert_eq!(
+            next_event(&controller).kind,
+            RecognitionEventKind::SessionEnded {
+                reason: SessionEndReason::Failed
+            }
+        );
+        let active = controller.commands.start_manual().unwrap();
+        next_event(&controller);
+        assert_eq!(
+            controller
+                .events
+                .snapshot()
+                .active_session
+                .as_ref()
+                .unwrap()
+                .session_id,
+            active
+        );
+        assert!(controller.join().unwrap().is_ok());
+        let snapshot = snapshot_handle.lock().unwrap().clone();
+        assert_eq!(
+            snapshot.last_ended_session.as_ref().unwrap().session_id,
+            active
+        );
+        assert_eq!(
+            snapshot.last_ended_session.as_ref().unwrap().phase,
+            SessionPhase::Ended(SessionEndReason::Shutdown)
+        );
     }
 }

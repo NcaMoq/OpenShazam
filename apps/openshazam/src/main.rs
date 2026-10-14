@@ -22,8 +22,6 @@ use std::{
 
 #[cfg(any(windows, target_os = "macos"))]
 static NEXT_UI_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(1);
-#[cfg(any(windows, target_os = "macos"))]
-static ACTIVE_UI_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -296,14 +294,18 @@ fn elapsed_ns(started: Instant) -> u64 {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn emit_manual_ui_event(event: &shazam_http_lab::NativeManualUiEvent, jsonl_output: bool) {
+fn emit_manual_ui_event(
+    event: &shazam_http_lab::NativeManualUiEvent,
+    jsonl_output: bool,
+    config_generation: u64,
+) {
     if jsonl_output {
         println!("{}", shazam_http_lab::native_manual_ui_event_to_json(event));
         if ui_config_snapshot_jsonl_enabled() {
             println!(
                 "{}",
                 shazam_http_lab::UiRecognitionInput {
-                    config_generation: ACTIVE_UI_CONFIG_GENERATION.load(Ordering::Acquire),
+                    config_generation,
                     event: shazam_http_lab::UiRecognitionEvent::Manual(event.clone()),
                 }
                 .to_json()
@@ -333,14 +335,18 @@ fn emit_manual_ui_event(event: &shazam_http_lab::NativeManualUiEvent, jsonl_outp
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn emit_auto_ui_event(event: &shazam_http_lab::NativeAutoUiEvent, jsonl_output: bool) {
+fn emit_auto_ui_event(
+    event: &shazam_http_lab::NativeAutoUiEvent,
+    jsonl_output: bool,
+    config_generation: u64,
+) {
     if jsonl_output {
         println!("{}", shazam_http_lab::native_auto_ui_event_to_json(event));
         if ui_config_snapshot_jsonl_enabled() {
             println!(
                 "{}",
                 shazam_http_lab::UiRecognitionInput {
-                    config_generation: ACTIVE_UI_CONFIG_GENERATION.load(Ordering::Acquire),
+                    config_generation,
                     event: shazam_http_lab::UiRecognitionEvent::Auto(event.clone()),
                 }
                 .to_json()
@@ -398,12 +404,11 @@ struct ProgressiveUiConfigInputs {
 fn emit_progressive_ui_config(
     configuration: &shazam_http_lab::ShazamConfiguration,
     inputs: ProgressiveUiConfigInputs,
-) -> Result<(), io::Error> {
-    if !inputs.jsonl_output {
-        return Ok(());
-    }
+) -> Result<u64, io::Error> {
     let generation = NEXT_UI_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel);
-    ACTIVE_UI_CONFIG_GENERATION.store(generation, Ordering::Release);
+    if !inputs.jsonl_output {
+        return Ok(generation);
+    }
     let record = match inputs.tagging_type {
         NativeTaggingType::Manual => configuration.native_manual_ui_config_json(
             inputs.sample_rate_hz,
@@ -427,7 +432,7 @@ fn emit_progressive_ui_config(
     if ui_config_snapshot_jsonl_enabled() {
         println!("{}", configuration.ui_config_snapshot(generation).to_json());
     }
-    Ok(())
+    Ok(generation)
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -1315,7 +1320,7 @@ fn recognize_loopback_progressive(
             sample_rate,
         );
     }
-    emit_progressive_ui_config(
+    let config_generation = emit_progressive_ui_config(
         &configuration,
         ProgressiveUiConfigInputs {
             tagging_type: mode.tagging_type,
@@ -1437,6 +1442,7 @@ fn recognize_loopback_progressive(
                 context_state.clone(),
                 started,
                 jsonl_output,
+                config_generation,
                 timing.request_timeout_ms,
                 &completion_sender,
                 &completion_receiver,
@@ -1458,6 +1464,7 @@ fn recognize_loopback_progressive(
                 context_state.clone(),
                 started,
                 jsonl_output,
+                config_generation,
                 timing.request_timeout_ms,
                 &completion_sender,
                 &completion_receiver,
@@ -1546,6 +1553,7 @@ fn recognize_loopback_progressive(
                     context_state.clone(),
                     started,
                     jsonl_output,
+                    config_generation,
                     timing.request_timeout_ms,
                     &completion_sender,
                     &completion_receiver,
@@ -1569,6 +1577,7 @@ fn recognize_loopback_progressive(
                 context_state.clone(),
                 started,
                 jsonl_output,
+                config_generation,
                 timing.request_timeout_ms,
                 &completion_sender,
                 &completion_receiver,
@@ -1597,6 +1606,7 @@ fn recognize_loopback_progressive(
             context_state.clone(),
             started,
             jsonl_output,
+            config_generation,
             timing.request_timeout_ms,
             &completion_sender,
             &completion_receiver,
@@ -2061,6 +2071,7 @@ fn service_windows_progressive(
     context_state: NativeContextState,
     started: Instant,
     jsonl_output: bool,
+    config_generation: u64,
     timeout_ms: u64,
     sender: &mpsc::Sender<WindowsRecognitionCompletion>,
     receiver: &mpsc::Receiver<WindowsRecognitionCompletion>,
@@ -2136,11 +2147,11 @@ fn service_windows_progressive(
                     {
                         deferred_manual_ui_event = Some(event);
                     } else {
-                        emit_manual_ui_event(&event, jsonl_output);
+                        emit_manual_ui_event(&event, jsonl_output, config_generation);
                     }
                 } else if let Some(event) = delivery.native_auto_ui_event() {
                     *saw_match_event = true;
-                    emit_auto_ui_event(&event, jsonl_output);
+                    emit_auto_ui_event(&event, jsonl_output, config_generation);
                 } else if !delivery.candidates.is_empty() {
                     *saw_match_event = true;
                     progressive_log(
@@ -2307,7 +2318,7 @@ fn service_windows_progressive(
         if let Err(error) = spawn_result {
             if detached_post_stop_job {
                 if let Some(event) = deferred_manual_ui_event.take() {
-                    emit_manual_ui_event(&event, jsonl_output);
+                    emit_manual_ui_event(&event, jsonl_output, config_generation);
                 }
             }
             return Err(error.into());
@@ -2330,7 +2341,7 @@ fn service_windows_progressive(
                 },
                 || {
                     if let Some(event) = deferred_manual_ui_event.take() {
-                        emit_manual_ui_event(&event, jsonl_output);
+                        emit_manual_ui_event(&event, jsonl_output, config_generation);
                     }
                 },
             )?;

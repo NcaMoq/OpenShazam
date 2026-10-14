@@ -6,4 +6,5 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+shazam-http-lab = { path = "../shazam-http-lab" }
 shazam-progressive = { path = "../shazam-progressive" }
