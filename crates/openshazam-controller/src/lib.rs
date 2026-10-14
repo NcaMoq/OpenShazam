@@ -261,6 +261,7 @@ pub enum UiRecognitionEventRef<'a> {
 pub enum SubmitError {
     QueueFull,
     ControllerStopped,
+    CommandIdExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +342,11 @@ pub struct ControllerSnapshot {
 
 impl ControllerSnapshot {
     pub fn command_result(&self, command_id: CommandId) -> CommandResultLookup {
+        // Zero is reserved for the controller's untracked shutdown wakeup and
+        // can never represent a successfully submitted user command.
+        if command_id.0 == 0 {
+            return CommandResultLookup::Unknown;
+        }
         if let Some(result) = self
             .command_results
             .iter()
@@ -528,7 +534,14 @@ impl CommandHandle {
         if self.shutdown_requested.load(Ordering::Acquire) {
             return Err(SubmitError::ControllerStopped);
         }
-        let command_id = CommandId(self.next_command_id.fetch_add(1, Ordering::Relaxed));
+        // All CommandHandle clones share this Snapshot mutex, so keeping the
+        // candidate uncommitted until try_send succeeds gives concurrent
+        // submitters unique IDs without consuming IDs for QueueFull failures.
+        let raw_command_id = self.next_command_id.load(Ordering::Relaxed);
+        if raw_command_id == 0 {
+            return Err(SubmitError::CommandIdExhausted);
+        }
+        let command_id = CommandId(raw_command_id);
         match self.sender.try_send(WorkerMessage::Command {
             command_id,
             command,
@@ -541,6 +554,10 @@ impl CommandHandle {
                         session_id,
                         status: CommandStatus::Submitted,
                     },
+                );
+                self.next_command_id.store(
+                    raw_command_id.checked_add(1).unwrap_or(0),
+                    Ordering::Relaxed,
                 );
                 Ok(command_id)
             }
@@ -558,6 +575,10 @@ impl CommandHandle {
 
     /// Requests shutdown without waiting for the worker or active devices.
     pub fn request_shutdown(&self) {
+        // Serialize shutdown with submissions using the same short-lived lock:
+        // a command either enters the queue before shutdown and gets drained,
+        // or observes the shutdown flag and is not accepted.
+        let _snapshot = self.snapshot.lock().expect("snapshot lock poisoned");
         if !self.shutdown_requested.swap(true, Ordering::AcqRel) {
             let _ = self.sender.try_send(WorkerMessage::Command {
                 command_id: CommandId(0),
@@ -802,7 +823,7 @@ fn set_command_status(
     snapshot: &Mutex<ControllerSnapshot>,
     command_id: CommandId,
     status: CommandStatus,
-) -> Option<SessionId> {
+) -> bool {
     let status = match status {
         CommandStatus::Rejected { reason } => CommandStatus::Rejected {
             reason: bounded_reason(reason),
@@ -816,14 +837,25 @@ fn set_command_status(
         status => status,
     };
     let mut snapshot = snapshot.lock().expect("snapshot lock poisoned");
-    let result = snapshot
+    let Some(result) = snapshot
         .command_results
         .iter_mut()
-        .find(|result| result.command_id == command_id)?;
+        .find(|result| result.command_id == command_id)
+    else {
+        return false;
+    };
+    if matches!(
+        &result.status,
+        CommandStatus::Completed
+            | CommandStatus::Rejected { .. }
+            | CommandStatus::StartFailed { .. }
+            | CommandStatus::Failed { .. }
+    ) {
+        return false;
+    }
     result.status = status;
-    let session_id = result.session_id;
     snapshot.command_results_revision = snapshot.command_results_revision.saturating_add(1);
-    session_id
+    true
 }
 
 fn update_command_status(
@@ -832,7 +864,7 @@ fn update_command_status(
     command_id: CommandId,
     status: CommandStatus,
 ) {
-    if set_command_status(snapshot, command_id, status).is_some() {
+    if set_command_status(snapshot, command_id, status) {
         emit_nonfatal(
             events,
             None,
@@ -873,6 +905,23 @@ fn complete_ended_session(
             complete_command_if_pending(events, snapshot, command_id);
         }
     }
+}
+
+fn reject_cancel_after_session_end(
+    active: &mut Option<ActiveSession>,
+    events: &EventEmitter,
+    snapshot: &Mutex<ControllerSnapshot>,
+    command_id: CommandId,
+) {
+    update_command_status(
+        events,
+        snapshot,
+        command_id,
+        CommandStatus::Rejected {
+            reason: "session ended before Cancel was dispatched".into(),
+        },
+    );
+    complete_ended_session(active, events, snapshot);
 }
 
 fn complete_snapshot_session_commands(
@@ -1390,7 +1439,12 @@ fn run_controller<B: RecognitionBackend>(
                         Ordering::Acquire,
                     ) {
                         Err(SESSION_ENDED) => {
-                            complete_ended_session(&mut active, &events, &snapshot);
+                            reject_cancel_after_session_end(
+                                &mut active,
+                                &events,
+                                &snapshot,
+                                command_id,
+                            );
                             continue;
                         }
                         Ok(_) => {}
@@ -1408,15 +1462,12 @@ fn run_controller<B: RecognitionBackend>(
                         Err(_) => unreachable!("unknown session gate state"),
                     }
                     if session.gate.load(Ordering::Acquire) == SESSION_ENDED {
-                        update_command_status(
+                        reject_cancel_after_session_end(
+                            &mut active,
                             &events,
                             &snapshot,
                             command_id,
-                            CommandStatus::Rejected {
-                                reason: "session ended before Cancel was dispatched".into(),
-                            },
                         );
-                        complete_ended_session(&mut active, &events, &snapshot);
                         continue;
                     }
                     set_session_phase(&snapshot, session_id, SessionPhase::Cancelling);
@@ -1661,7 +1712,7 @@ mod tests {
     use super::*;
     use std::{
         collections::HashMap,
-        sync::{mpsc::SyncSender, Condvar, Mutex},
+        sync::{mpsc::SyncSender, Barrier, Condvar, Mutex},
     };
 
     #[derive(Clone, Default)]
@@ -1785,6 +1836,64 @@ mod tests {
                 return event;
             }
         }
+    }
+
+    fn standalone_emitter(
+        snapshot: Arc<Mutex<ControllerSnapshot>>,
+    ) -> (EventEmitter, Receiver<RecognitionEvent>) {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        (
+            EventEmitter {
+                sender,
+                sequence: Arc::new(AtomicU64::new(1)),
+                origin: Instant::now(),
+                order_lock: Arc::new(Mutex::new(())),
+                snapshot,
+                session_gate: None,
+                config_generation: None,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn ended_cancel_helper_terminates_ticket_and_terminal_status_cannot_regress() {
+        let command_id = CommandId(19);
+        let mut initial = ControllerSnapshot {
+            command_results_capacity: 4,
+            ..ControllerSnapshot::default()
+        };
+        retain_command_result(
+            &mut initial,
+            CommandResult {
+                command_id,
+                session_id: Some(SessionId(5)),
+                status: CommandStatus::Submitted,
+            },
+        );
+        let snapshot = Arc::new(Mutex::new(initial));
+        let (events, _receiver) = standalone_emitter(Arc::clone(&snapshot));
+        let mut active = None;
+        reject_cancel_after_session_end(&mut active, &events, &snapshot, command_id);
+        assert!(matches!(
+            snapshot.lock().unwrap().command_result(command_id),
+            CommandResultLookup::Retained(CommandResult {
+                status: CommandStatus::Rejected { .. },
+                ..
+            })
+        ));
+        assert!(!set_command_status(
+            &snapshot,
+            command_id,
+            CommandStatus::Accepted
+        ));
+        assert!(matches!(
+            snapshot.lock().unwrap().command_result(command_id),
+            CommandResultLookup::Retained(CommandResult {
+                status: CommandStatus::Rejected { .. },
+                ..
+            })
+        ));
     }
 
     fn candidate() -> TrackCandidate {
@@ -1970,6 +2079,50 @@ mod tests {
             .session_id;
         assert_eq!(next_event(&controller).session_id, Some(auto));
         assert!(controller.events.snapshot().active_session.is_some());
+        assert!(controller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn cancel_submitted_after_natural_end_is_rejected_and_new_session_is_untouched() {
+        let backend = MockBackend::default();
+        let emitters = Arc::clone(&backend.session_events);
+        let controller = ApplicationController::spawn(backend, 8, 16).unwrap();
+        let old = controller.commands.start_manual().unwrap();
+        wait_for_command_status(&controller, old.command_id, |status| {
+            *status == CommandStatus::Running
+        });
+        session_emitter(&emitters, old.session_id)
+            .finish(SessionEndReason::TimedOut)
+            .unwrap();
+        let cancel = controller
+            .commands
+            .submit_tracked(RecognitionCommand::CancelRecognition {
+                session_id: old.session_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_for_command_status(&controller, cancel, |status| {
+                matches!(status, CommandStatus::Rejected { .. })
+            })
+            .status,
+            CommandStatus::Rejected { .. }
+        ));
+
+        let new = controller.commands.start_manual().unwrap();
+        assert_eq!(new.session_id, SessionId(old.session_id.0 + 1));
+        wait_for_command_status(&controller, new.command_id, |status| {
+            *status == CommandStatus::Running
+        });
+        assert_eq!(
+            controller
+                .events
+                .snapshot()
+                .active_session
+                .unwrap()
+                .session_id,
+            new.session_id
+        );
+        controller.commands.request_shutdown();
         assert!(controller.join().unwrap().is_ok());
     }
 
@@ -2357,6 +2510,198 @@ mod tests {
     }
 
     #[test]
+    fn reserved_command_id_zero_stays_unknown_beyond_eviction_watermark() {
+        let snapshot = ControllerSnapshot {
+            command_results_evicted_through: Some(CommandId(u64::MAX)),
+            ..ControllerSnapshot::default()
+        };
+        assert_eq!(
+            snapshot.command_result(CommandId(0)),
+            CommandResultLookup::Unknown
+        );
+        assert_eq!(
+            snapshot.command_result(CommandId(u64::MAX)),
+            CommandResultLookup::Expired {
+                evicted_through: CommandId(u64::MAX)
+            }
+        );
+    }
+
+    #[test]
+    fn queue_full_does_not_consume_command_id_or_make_unknown_ids_expired() {
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let backend = MockBackend {
+            start_entered: Some(entered_sender),
+            start_gate: Some(Arc::clone(&gate)),
+            ..MockBackend::default()
+        };
+        let controller = ApplicationController::spawn(backend, 1, 32).unwrap();
+        let start = controller.commands.start_manual().unwrap();
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("backend start should be in progress");
+        let queued_stop = controller
+            .commands
+            .submit_tracked(RecognitionCommand::StopRecognition {
+                session_id: start.session_id,
+            })
+            .unwrap();
+        assert_eq!(queued_stop, CommandId(2));
+        assert_eq!(
+            controller
+                .commands
+                .start_auto_tracked(RecognitionContext::Foreground),
+            Err(SubmitError::QueueFull)
+        );
+        {
+            let (released, ready) = &*gate;
+            *released.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        assert_eq!(
+            wait_for_command_status(&controller, queued_stop, |status| {
+                *status == CommandStatus::Completed
+            })
+            .status,
+            CommandStatus::Completed
+        );
+
+        let next = controller
+            .commands
+            .submit_tracked(RecognitionCommand::StopRecognition {
+                session_id: start.session_id,
+            })
+            .unwrap();
+        assert_eq!(next, CommandId(3));
+        assert!(matches!(
+            wait_for_command_status(&controller, next, |status| {
+                matches!(status, CommandStatus::Rejected { .. })
+            })
+            .status,
+            CommandStatus::Rejected { .. }
+        ));
+        assert_eq!(
+            controller.commands.command_result(CommandId(4)),
+            CommandResultLookup::Unknown
+        );
+        controller.commands.request_shutdown();
+        assert!(controller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn concurrent_handles_allocate_unique_monotonic_command_ids() {
+        let controller = ApplicationController::spawn(MockBackend::default(), 128, 8).unwrap();
+        let mut submitters = Vec::new();
+        for worker in 0..8 {
+            let commands = controller.commands.clone();
+            submitters.push(thread::spawn(move || {
+                (0..8)
+                    .map(|index| {
+                        commands
+                            .submit_tracked(RecognitionCommand::StopRecognition {
+                                session_id: SessionId(10_000 + worker * 8 + index),
+                            })
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut ids = submitters
+            .into_iter()
+            .flat_map(|submitter| submitter.join().unwrap())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=64).map(CommandId).collect::<Vec<_>>());
+        controller.commands.request_shutdown();
+        assert!(controller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn command_id_zero_remains_reserved_when_counter_exhausts() {
+        let controller = ApplicationController::spawn(MockBackend::default(), 4, 4).unwrap();
+        controller
+            .commands
+            .next_command_id
+            .store(u64::MAX, Ordering::Relaxed);
+        let last = controller
+            .commands
+            .submit_tracked(RecognitionCommand::StopRecognition {
+                session_id: SessionId(123),
+            })
+            .unwrap();
+        assert_eq!(last, CommandId(u64::MAX));
+        assert_eq!(
+            controller
+                .commands
+                .submit_tracked(RecognitionCommand::StopRecognition {
+                    session_id: SessionId(124),
+                }),
+            Err(SubmitError::CommandIdExhausted)
+        );
+        assert_eq!(
+            controller.commands.command_result(CommandId(0)),
+            CommandResultLookup::Unknown
+        );
+        controller.commands.request_shutdown();
+        assert!(controller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn concurrent_shutdown_and_submit_never_leave_an_accepted_ticket_pending() {
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let backend = MockBackend {
+            start_entered: Some(entered_sender),
+            start_gate: Some(Arc::clone(&gate)),
+            ..MockBackend::default()
+        };
+        let controller = ApplicationController::spawn(backend, 4, 8).unwrap();
+        let start = controller.commands.start_manual().unwrap();
+        let result_commands = controller.commands.clone();
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("backend start should be in progress");
+
+        let barrier = Arc::new(Barrier::new(3));
+        let submit_commands = controller.commands.clone();
+        let submit_barrier = Arc::clone(&barrier);
+        let submitter = thread::spawn(move || {
+            submit_barrier.wait();
+            submit_commands.submit_tracked(RecognitionCommand::CancelRecognition {
+                session_id: start.session_id,
+            })
+        });
+        let shutdown_commands = controller.commands.clone();
+        let shutdown_barrier = Arc::clone(&barrier);
+        let shutdown = thread::spawn(move || {
+            shutdown_barrier.wait();
+            shutdown_commands.request_shutdown();
+        });
+        barrier.wait();
+        let submitted = submitter.join().unwrap();
+        shutdown.join().unwrap();
+        {
+            let (released, ready) = &*gate;
+            *released.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        assert!(controller.join().unwrap().is_ok());
+
+        match submitted {
+            Ok(command_id) => assert!(matches!(
+                result_commands.command_result(command_id),
+                CommandResultLookup::Retained(CommandResult {
+                    status: CommandStatus::Rejected { .. },
+                    ..
+                })
+            )),
+            Err(SubmitError::ControllerStopped) => {}
+            other => panic!("unexpected submit result: {other:?}"),
+        }
+    }
+
+    #[test]
     fn lost_rejection_notification_is_recoverable_from_command_result_snapshot() {
         let backend = MockBackend::default();
         let controller = ApplicationController::spawn(backend, 4, 1).unwrap();
@@ -2529,6 +2874,64 @@ mod tests {
             *status == CommandStatus::Completed
         });
         assert_eq!(cancel_result.status, CommandStatus::Completed);
+        assert!(controller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn duplicate_cancel_commands_complete_once_and_reject_the_stale_request() {
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let backend = MockBackend {
+            start_entered: Some(entered_sender),
+            start_gate: Some(Arc::clone(&gate)),
+            ..MockBackend::default()
+        };
+        let observed = Arc::clone(&backend.calls);
+        let controller = ApplicationController::spawn(backend, 4, 16).unwrap();
+        let start = controller.commands.start_manual().unwrap();
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("backend start should be in progress");
+        let first = controller
+            .commands
+            .submit_tracked(RecognitionCommand::CancelRecognition {
+                session_id: start.session_id,
+            })
+            .unwrap();
+        let duplicate = controller
+            .commands
+            .submit_tracked(RecognitionCommand::CancelRecognition {
+                session_id: start.session_id,
+            })
+            .unwrap();
+        {
+            let (released, ready) = &*gate;
+            *released.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        assert_eq!(
+            wait_for_command_status(&controller, first, |status| {
+                *status == CommandStatus::Completed
+            })
+            .status,
+            CommandStatus::Completed
+        );
+        assert!(matches!(
+            wait_for_command_status(&controller, duplicate, |status| {
+                matches!(status, CommandStatus::Rejected { .. })
+            })
+            .status,
+            CommandStatus::Rejected { .. }
+        ));
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("cancel:"))
+                .count(),
+            1
+        );
         assert!(controller.join().unwrap().is_ok());
     }
 
