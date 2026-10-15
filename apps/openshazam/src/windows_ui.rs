@@ -391,15 +391,13 @@ fn result_panel_draw_top(
     composition_cache_ready: bool,
     composition_cache_hit: bool,
 ) -> Option<f32> {
-    panel_top
-        .map(|top| {
-            if composition_cache_ready {
-                (!composition_cache_hit).then_some(body_top)
-            } else {
-                Some(top)
-            }
-        })
-        .flatten()
+    panel_top.and_then(|top| {
+        if composition_cache_ready {
+            (!composition_cache_hit).then_some(body_top)
+        } else {
+            Some(top)
+        }
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -658,6 +656,9 @@ const SUCCESS_SETTLE_TOTAL: Duration = Duration::from_secs(1);
 // implementation value replaceable rather than presenting it as native data.
 const HISTORY_INSERT_TRANSITION: Duration = Duration::from_millis(250);
 
+// Keeping Track inline avoids a heap allocation on the recognition-to-popup
+// fast path; this state machine is not copied on every animation frame.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum MainPhase {
     Ready,
@@ -2954,6 +2955,9 @@ fn should_start_startup_logo(kind: WindowKind, already_started: bool) -> bool {
 }
 
 impl CompositionScene {
+    // Parameters mirror the existing native graphics context and popup
+    // lifecycle; grouping them would obscure resource ownership.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         hwnd: HWND,
         d2d_factory: &ID2D1Factory,
@@ -3669,6 +3673,9 @@ impl CompositionScene {
         }
     }
 
+    // Explicit source/capture/motion parameters keep the GPU overlay
+    // updates independent of audio workers and view state.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn update_result_overlay(
         &mut self,
         source: Option<&LayeredSurface>,
@@ -7054,7 +7061,6 @@ unsafe fn anchor_popup(app: &mut AppState) {
         hWnd: hwnd,
         uID: TRAY_ICON_ID,
         guidItem: TRAY_ICON_GUID,
-        ..Default::default()
     };
     let tray = Shell_NotifyIconGetRect(&identifier).ok();
     let dpi = GetDpiForWindow(hwnd).max(96);
@@ -7485,7 +7491,6 @@ fn cancel_capture(app: &mut AppState) {
                 app.message = Some(format!("Cancel request was not accepted: {error:?}"));
             }
         }
-        return;
     }
 }
 
@@ -7754,14 +7759,12 @@ fn reconcile_session_snapshot(app: &mut AppState, session: &RecognitionSessionSn
                         | RecognitionEventCategory::AutoUiEvent
                 )
             });
-            if capture_is_live && matches!(app.phase, MainPhase::Starting { .. }) {
-                enter_listening(app, ui_session.mode, Instant::now());
-                changed = true;
-            } else if capture_is_live
-                && matches!(app.phase, MainPhase::Cancelling { .. })
-                && app
-                    .recognition_session
-                    .is_some_and(|current| current.cancel_command_id.is_none())
+            if capture_is_live
+                && (matches!(app.phase, MainPhase::Starting { .. })
+                    || (matches!(app.phase, MainPhase::Cancelling { .. })
+                        && app
+                            .recognition_session
+                            .is_some_and(|current| current.cancel_command_id.is_none())))
             {
                 enter_listening(app, ui_session.mode, Instant::now());
                 changed = true;
@@ -8161,9 +8164,8 @@ fn curl_artwork_request(
 ) -> Result<CurlArtworkResponse, String> {
     let timeout = format!("{:.3}", remaining.as_secs_f64().max(0.1));
     let max_bytes = MAX_ARTWORK_BYTES.to_string();
-    let write_out = format!(
-        "\nOPEN SHAZAM IMAGE RESPONSE:%{{http_code}}\n%{{redirect_url}}\n%{{content_type}}\n%{{remote_ip}}"
-    );
+    let write_out =
+        "\nOPEN SHAZAM IMAGE RESPONSE:%{http_code}\n%{redirect_url}\n%{content_type}\n%{remote_ip}".to_string();
     let mut command = Command::new("curl.exe");
     command.args([
         "--disable",
