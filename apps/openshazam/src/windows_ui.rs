@@ -351,7 +351,10 @@ fn resolve_history_timestamp(
 ) -> (SystemTime, HistoryTimestampSource) {
     match event_time_utc {
         Some(when) => (when, HistoryTimestampSource::ControllerEvent),
-        None => (received_at_utc, HistoryTimestampSource::HostReceivedFallback),
+        None => (
+            received_at_utc,
+            HistoryTimestampSource::HostReceivedFallback,
+        ),
     }
 }
 
