@@ -325,7 +325,7 @@ fn qpc_timestamp_to_unix_ms(
     current_unix_ms.checked_sub(elapsed_ms)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, all(target_os = "macos", feature = "dev-cli")))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ManualTriggerSignal {
     Enter,
@@ -333,6 +333,23 @@ pub(crate) enum ManualTriggerSignal {
     EndOfInput,
     #[cfg(any(test, feature = "dev-cli"))]
     InputError(String),
+}
+
+#[cfg(all(target_os = "macos", feature = "dev-cli"))]
+fn spawn_manual_trigger_receiver() -> std::sync::mpsc::Receiver<ManualTriggerSignal> {
+    // Keep blocking stdin reads off the CoreAudio capture thread. The queue
+    // contains at most one terminal trigger and never stores microphone audio.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let signal = match io::stdin().read_line(&mut line) {
+            Ok(0) => ManualTriggerSignal::EndOfInput,
+            Ok(_) => ManualTriggerSignal::Enter,
+            Err(error) => ManualTriggerSignal::InputError(error.to_string()),
+        };
+        let _ = sender.send(signal);
+    });
+    receiver
 }
 
 #[cfg(any(windows, test))]
