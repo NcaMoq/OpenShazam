@@ -64,6 +64,14 @@ jobs:
       - name: Build WinUI 3 desktop and Rust sidecar
         shell: pwsh
         run: ./tools/build-winui.ps1
+      - name: Smoke-test recognition bridge startup and shutdown
+        shell: pwsh
+        run: |
+          $reply = '{"command":"shutdown"}' | & ".\dist\win-x64\openshazam-ui-bridge.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Rust bridge failed to exit cleanly" }
+          if (-not ($reply | Select-String -SimpleMatch 'openshazam.bridge.v1')) {
+            throw "Rust bridge did not emit the expected protocol handshake"
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: OpenShazam-WinUI3-win-x64-unsigned
