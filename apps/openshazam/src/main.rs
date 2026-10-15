@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 
 #[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
 mod ui_model;
 #[cfg(windows)]
 mod windows_ui;
