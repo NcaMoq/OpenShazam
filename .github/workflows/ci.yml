@@ -60,3 +60,23 @@ jobs:
           dotnet-version: '8.0.x'
       - name: Build WinUI 3 settings
         run: dotnet build apps/openshazam/settings-ui/OpenShazam.Settings.csproj --configuration Release -p:Platform=x64
+
+  winui-settings-host:
+    name: In-process WinUI 3 C++ Settings host (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: Restore native Windows App SDK and C++/WinRT packages
+        shell: pwsh
+        run: |
+          nuget restore apps/openshazam/settings-host/packages.config -PackagesDirectory apps/openshazam/settings-host/packages -NonInteractive
+      - name: Build same-process WinUI 3 settings island DLL
+        shell: pwsh
+        run: |
+          msbuild apps/openshazam/settings-host/SettingsHost.vcxproj /p:Configuration=Release /p:Platform=x64 /m
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenShazam-WinUI3-SettingsHost-x64
+          path: apps/openshazam/settings-host/bin/x64/Release/
+          if-no-files-found: error
