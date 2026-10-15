@@ -63,7 +63,7 @@ mod host {
     }
 
     fn send(out: &mut impl Write, message: Value) -> io::Result<()> {
-        serde_json::to_writer(&mut *out, &message)?;
+        serde_json::to_writer(&mut *out, &message).map_err(io::Error::other)?;
         out.write_all(b"\n")?;
         out.flush()
     }
