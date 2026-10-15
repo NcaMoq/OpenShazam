@@ -65,7 +65,7 @@ public sealed partial class MainWindow : Window
 
             _observedXamlRoot = xamlRoot;
             xamlRoot.Changed += OnXamlRootChanged;
-            OnXamlRootChanged(xamlRoot, null!);
+            ApplyRasterizationScale(xamlRoot.RasterizationScale);
         }
 
         await RefreshStartupStateAsync();
@@ -73,7 +73,11 @@ public sealed partial class MainWindow : Window
 
     private void OnXamlRootChanged(XamlRoot sender, XamlRootChangedEventArgs args)
     {
-        var scale = sender.RasterizationScale;
+        ApplyRasterizationScale(sender.RasterizationScale);
+    }
+
+    private void ApplyRasterizationScale(double scale)
+    {
         if (double.IsFinite(scale) && scale > 0 && Math.Abs(scale - _lastRasterizationScale) > 0.001)
         {
             _lastRasterizationScale = scale;
