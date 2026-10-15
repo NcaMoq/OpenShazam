@@ -14,11 +14,13 @@ internal sealed class RecognitionBridge : IAsyncDisposable
     private readonly Task _readerTask;
     private readonly Task _errorTask;
 
-    public event Action<JsonElement>? EventReceived;
-    public event Action<string>? Disconnected;
+    private readonly Action<JsonElement> _onEvent;
+    private readonly Action<string> _onDisconnected;
 
-    public RecognitionBridge()
+    public RecognitionBridge(Action<JsonElement> onEvent, Action<string> onDisconnected)
     {
+        _onEvent = onEvent;
+        _onDisconnected = onDisconnected;
         var executable = Path.Combine(AppContext.BaseDirectory, "openshazam-ui-bridge.exe");
         if (!File.Exists(executable))
         {
@@ -62,13 +64,13 @@ internal sealed class RecognitionBridge : IAsyncDisposable
                 using var document = JsonDocument.Parse(line);
                 var value = document.RootElement;
                 if (value.ValueKind == JsonValueKind.Object)
-                    EventReceived?.Invoke(value.Clone());
+                    _onEvent(value.Clone());
             }
-            Disconnected?.Invoke("Recognition service has exited.");
+            _onDisconnected("Recognition service has exited.");
         }
         catch (Exception error) when (error is IOException or JsonException or InvalidDataException)
         {
-            Disconnected?.Invoke($"Recognition connection closed: {error.Message}");
+            _onDisconnected($"Recognition connection closed: {error.Message}");
         }
     }
 
