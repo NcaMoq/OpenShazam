@@ -31,6 +31,8 @@ jobs:
           toolchain: '1.85.0'
           components: rustfmt, clippy
       - run: cargo test --workspace --all-targets --locked
+      - name: Check production libraries without developer CLI feature
+        run: cargo check --workspace --all-targets --locked --no-default-features
       - name: Verify Windows packet-to-SigX golden fixture
         if: runner.os == 'Windows'
         run: cargo test -p openshazam --locked packetized_capture_matches_single_packet_and_is_repeatable
