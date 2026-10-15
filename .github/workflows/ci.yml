@@ -19,6 +19,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          # Match rust-toolchain.toml; installing stable components does not
+          # install them for the repository's pinned Rust 1.85.0 toolchain.
+          toolchain: '1.85.0'
           components: rustfmt, clippy
       - run: cargo test --workspace --all-targets --locked
       - name: Verify Windows packet-to-SigX golden fixture
@@ -34,5 +37,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: '1.85.0'
           targets: x86_64-pc-windows-gnu
       - run: cargo check --workspace --all-targets --locked --target x86_64-pc-windows-gnu
