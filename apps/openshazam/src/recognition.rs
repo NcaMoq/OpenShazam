@@ -801,7 +801,6 @@ pub fn capture_loopback_signature(
 }
 
 #[cfg(windows)]
-#[cfg(windows)]
 pub(crate) struct WindowsProgressiveControl {
     pub(crate) cancelled: Arc<AtomicBool>,
     pub(crate) stop_requested: Arc<AtomicBool>,
