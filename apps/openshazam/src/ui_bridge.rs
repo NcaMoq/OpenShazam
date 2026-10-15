@@ -5,9 +5,9 @@
 mod host {
     use openshazam::{page_link, WindowsRecognitionBackend};
     use openshazam_controller::{
-        ApplicationController, RecognitionCommand, RecognitionContext, RecognitionEvent,
-        RecognitionEventKind, RecognitionMode, SessionId, NativeAutoUiEvent,
-        NativeManualResultStage, NativeManualUiEvent, UiConfigSnapshot,
+        ApplicationController, NativeAutoUiEvent, NativeManualResultStage, NativeManualUiEvent,
+        RecognitionCommand, RecognitionContext, RecognitionEvent, RecognitionEventKind,
+        RecognitionMode, SessionId, UiConfigSnapshot,
     };
     use serde_json::{json, Value};
     use std::{
@@ -69,7 +69,8 @@ mod host {
     }
 
     fn millis(value: SystemTime) -> u64 {
-        value.duration_since(UNIX_EPOCH)
+        value
+            .duration_since(UNIX_EPOCH)
             .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0)
     }
@@ -123,38 +124,49 @@ mod host {
             {
                 let track = result.primary_track;
                 let metadata = track.ui_metadata.as_ref();
-                send(out, match_message(
-                    &track.title,
-                    &track.artist,
-                    metadata.and_then(|v| v.artwork_url.as_deref()),
-                    metadata.and_then(|v| v.track_key.as_deref()),
-                    generation.and_then(|v| configs.get(&v)),
-                    occurred,
-                    "manual",
-                ))?;
+                send(
+                    out,
+                    match_message(
+                        &track.title,
+                        &track.artist,
+                        metadata.and_then(|v| v.artwork_url.as_deref()),
+                        metadata.and_then(|v| v.track_key.as_deref()),
+                        generation.and_then(|v| configs.get(&v)),
+                        occurred,
+                        "manual",
+                    ),
+                )?;
             }
-            RecognitionEventKind::AutoUiEvent(NativeAutoUiEvent::ContinuousMatchCandidate(result)) => {
+            RecognitionEventKind::AutoUiEvent(NativeAutoUiEvent::ContinuousMatchCandidate(
+                result,
+            )) => {
                 let track = result.primary_track;
                 let metadata = track.ui_metadata.as_ref();
-                send(out, match_message(
-                    &track.title,
-                    &track.artist,
-                    metadata.and_then(|v| v.artwork_url.as_deref()),
-                    metadata.and_then(|v| v.track_key.as_deref()),
-                    generation.and_then(|v| configs.get(&v)),
-                    occurred,
-                    "auto",
-                ))?;
+                send(
+                    out,
+                    match_message(
+                        &track.title,
+                        &track.artist,
+                        metadata.and_then(|v| v.artwork_url.as_deref()),
+                        metadata.and_then(|v| v.track_key.as_deref()),
+                        generation.and_then(|v| configs.get(&v)),
+                        occurred,
+                        "auto",
+                    ),
+                )?;
             }
-            RecognitionEventKind::NoMatch { .. } |
-            RecognitionEventKind::ManualUiEvent(NativeManualUiEvent::NoMatch) => {
+            RecognitionEventKind::NoMatch { .. }
+            | RecognitionEventKind::ManualUiEvent(NativeManualUiEvent::NoMatch) => {
                 send(out, json!({"kind":"status", "value":"no_match"}))?;
             }
             RecognitionEventKind::SessionTimedOut => {
                 send(out, json!({"kind":"status", "value":"timeout"}))?;
             }
             RecognitionEventKind::RecognitionError { kind, message } => {
-                send(out, json!({"kind":"error", "code":format!("{kind:?}"), "message":message}))?;
+                send(
+                    out,
+                    json!({"kind":"error", "code":format!("{kind:?}"), "message":message}),
+                )?;
             }
             RecognitionEventKind::SessionEnded { reason } => {
                 send(out, json!({"kind":"ended", "reason":format!("{reason:?}")}))?;
@@ -165,9 +177,7 @@ mod host {
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-        let controller = ApplicationController::spawn(
-            WindowsRecognitionBackend::new(), 16, 64,
-        )?;
+        let controller = ApplicationController::spawn(WindowsRecognitionBackend::new(), 16, 64)?;
         let input = command_reader();
         let stdout = io::stdout();
         let mut out = stdout.lock();
@@ -180,47 +190,66 @@ mod host {
                     Ok(Ok(Command::Quit)) | Err(TryRecvError::Disconnected) => break 'main,
                     Ok(Ok(command)) => {
                         let outcome = match command {
-                            Command::StartManual if active.is_none() => controller.commands
-                                .start_manual().map(|ticket| {
+                            Command::StartManual if active.is_none() => {
+                                controller.commands.start_manual().map(|ticket| {
                                     active = Some(ticket.session_id);
                                     ("manual", ticket.session_id.0)
-                                }),
-                            Command::StartAuto if active.is_none() => controller.commands
-                                .start_auto(RecognitionContext::Foreground).map(|ticket| {
+                                })
+                            }
+                            Command::StartAuto if active.is_none() => controller
+                                .commands
+                                .start_auto(RecognitionContext::Foreground)
+                                .map(|ticket| {
                                     active = Some(ticket.session_id);
                                     ("auto", ticket.session_id.0)
                                 }),
                             Command::Stop if active.is_some() => {
                                 let id = active.expect("checked active session");
-                                controller.commands.submit(RecognitionCommand::StopRecognition {
-                                    session_id: id,
-                                }).map(|_| ("stopping", id.0))
+                                controller
+                                    .commands
+                                    .submit(RecognitionCommand::StopRecognition { session_id: id })
+                                    .map(|_| ("stopping", id.0))
                             }
                             Command::Cancel if active.is_some() => {
                                 let id = active.expect("checked active session");
-                                controller.commands.submit(RecognitionCommand::CancelRecognition {
-                                    session_id: id,
-                                }).map(|_| ("cancelling", id.0))
+                                controller
+                                    .commands
+                                    .submit(RecognitionCommand::CancelRecognition {
+                                        session_id: id,
+                                    })
+                                    .map(|_| ("cancelling", id.0))
                             }
                             _ => {
-                                send(&mut out, json!({"kind":"error", "code":"invalid_state",
-                                    "message":"command does not match active session state"}))?;
+                                send(
+                                    &mut out,
+                                    json!({"kind":"error", "code":"invalid_state",
+                                    "message":"command does not match active session state"}),
+                                )?;
                                 continue;
                             }
                         };
                         match outcome {
-                            Ok((mode, session)) => send(&mut out, json!({
-                                "kind":"status", "value": mode, "session":session
-                            }))?,
-                            Err(error) => send(&mut out, json!({
-                                "kind":"error", "code":"command_rejected",
-                                "message":format!("{error:?}")
-                            }))?,
+                            Ok((mode, session)) => send(
+                                &mut out,
+                                json!({
+                                    "kind":"status", "value": mode, "session":session
+                                }),
+                            )?,
+                            Err(error) => send(
+                                &mut out,
+                                json!({
+                                    "kind":"error", "code":"command_rejected",
+                                    "message":format!("{error:?}")
+                                }),
+                            )?,
                         }
                     }
-                    Ok(Err(error)) => send(&mut out, json!({
-                        "kind":"error", "code":"bad_command", "message":error
-                    }))?,
+                    Ok(Err(error)) => send(
+                        &mut out,
+                        json!({
+                            "kind":"error", "code":"bad_command", "message":error
+                        }),
+                    )?,
                     Err(TryRecvError::Empty) => break,
                 }
             }
