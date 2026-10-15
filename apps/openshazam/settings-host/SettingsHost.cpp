@@ -150,6 +150,9 @@ namespace
         RefreshStartup(weak);
     }
 
+    struct SettingsHost;
+    SettingsHost* g_active{};
+
     struct SettingsHost
     {
         HWND hwnd{};
@@ -290,7 +293,6 @@ namespace
 
         static LRESULT CALLBACK WindowProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         {
-            extern SettingsHost* g_active;
             auto* host = g_active;
             switch (msg)
             {
@@ -316,7 +318,6 @@ namespace
             }
         }
     };
-    SettingsHost* g_active{};
     std::unique_ptr<SettingsHost> g_settings;
 }
 
