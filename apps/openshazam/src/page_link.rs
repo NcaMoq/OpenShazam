@@ -26,7 +26,7 @@ pub fn resolve(template: Option<&str>, track_key: Option<&str>) -> Option<String
 pub fn valid_page_url(value: &str) -> bool {
     if value.len() > 4096 || !value.starts_with("https://") ||
        value.chars().any(char::is_control) ||
-       value.contains(['#', '@', '\\']) {
+       value.contains('#') || value.contains('@') || value.contains('\\') {
         return false;
     }
     let authority = value[8..].split(['/', '?', '#']).next().unwrap_or_default();
