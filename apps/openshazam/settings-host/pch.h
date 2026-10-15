@@ -1,0 +1,16 @@
+#pragma once
+#include <unknwn.h>
+#include <windows.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Microsoft.UI.h>
+#include <winrt/Microsoft.UI.Dispatching.h>
+#include <winrt/Microsoft.UI.Xaml.h>
+#include <winrt/Microsoft.UI.Xaml.Controls.h>
+#include <winrt/Microsoft.UI.Xaml.Hosting.h>
+#include <winrt/Microsoft.UI.Xaml.Media.h>
+#include <microsoft.ui.interop.h>
+#include <Microsoft.UI.Dispatching.Interop.h>
+#include <string>
+#include <memory>
+#include <algorithm>
