@@ -7,7 +7,7 @@ mod host {
     use openshazam_controller::{
         ApplicationController, NativeAutoUiEvent, NativeManualResultStage, NativeManualUiEvent,
         RecognitionCommand, RecognitionContext, RecognitionEvent, RecognitionEventKind,
-        RecognitionMode, SessionId, UiConfigSnapshot,
+        SessionId, UiConfigSnapshot,
     };
     use serde_json::{json, Value};
     use std::{
