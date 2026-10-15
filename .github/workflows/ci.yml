@@ -1,11 +1,18 @@
-name: Rust CI
+name: OpenShazam CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
+
+# A PR push already runs this workflow; cancel superseded revisions instead of
+# consuming runners for commits which can no longer be merged.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rust:
@@ -40,3 +47,14 @@ jobs:
           toolchain: '1.85.0'
           targets: x86_64-pc-windows-gnu
       - run: cargo check --workspace --all-targets --locked --target x86_64-pc-windows-gnu
+
+  winui-settings:
+    name: WinUI 3 settings build (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build WinUI 3 settings
+        run: dotnet build apps/openshazam/settings-ui/OpenShazam.Settings.csproj --configuration Release -p:Platform=x64
