@@ -796,7 +796,6 @@ struct TextStyles {
     result_title: IDWriteTextFormat,
     result_artist: IDWriteTextFormat,
     button: IDWriteTextFormat,
-    settings: IDWriteTextFormat,
     centered_body: IDWriteTextFormat,
     centered_title: IDWriteTextFormat,
     centered_heavy: IDWriteTextFormat,
@@ -6665,12 +6664,6 @@ unsafe fn create_text_styles(factory: &IDWriteFactory) -> windows::core::Result<
             DWRITE_FONT_WEIGHT_BOLD,
             DWRITE_TEXT_ALIGNMENT_CENTER,
         )?,
-        settings: create_text_format(
-            factory,
-            13.0,
-            DWRITE_FONT_WEIGHT_BOLD,
-            DWRITE_TEXT_ALIGNMENT_LEADING,
-        )?,
         centered_body: create_text_format(
             factory,
             12.0,
@@ -7175,6 +7168,9 @@ unsafe fn open_settings(app: &mut AppState) {
     }
 }
 
+// Legacy About panel is retained for source compatibility until the
+// About entry moves into the WinUI 3 Settings host.
+#[allow(dead_code)]
 unsafe fn open_about(app: &mut AppState) {
     if app.about_hwnd.0.is_null() {
         let dpi = GetDpiForWindow(app.main_hwnd).max(96);
@@ -7198,6 +7194,7 @@ unsafe fn open_about(app: &mut AppState) {
     }
 }
 
+#[allow(dead_code)]
 unsafe fn open_microphone_info(app: &mut AppState) {
     if app.microphone_hwnd.0.is_null() {
         let dpi = GetDpiForWindow(app.main_hwnd).max(96);
@@ -9843,6 +9840,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if message.message == windows::Win32::UI::WindowsAndMessaging::WM_QUIT {
                     running = false;
                     break;
+                }
+                if (*app_ptr)
+                    .settings_host
+                    .as_ref()
+                    .is_some_and(|host| host.pre_translate(&mut message))
+                {
+                    continue;
                 }
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
