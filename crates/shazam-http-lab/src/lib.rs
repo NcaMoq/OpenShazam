@@ -1303,7 +1303,11 @@ pub fn parse_shazam_config(body: &[u8]) -> Result<ShazamConfiguration, Error> {
     let web_track_url_template = root
         .get("settings")
         .and_then(|settings| settings.get("webtrackurl"))
-        .and_then(|entry| entry.as_str().or_else(|| entry.get("href").and_then(Value::as_str)))
+        .and_then(|entry| {
+            entry
+                .as_str()
+                .or_else(|| entry.get("href").and_then(Value::as_str))
+        })
         .filter(|value| !value.is_empty() && value.len() <= MAX_WEB_TRACK_URL_TEMPLATE_BYTES)
         .map(str::to_owned);
     Ok(ShazamConfiguration {
@@ -3875,7 +3879,10 @@ mod tests {
         let wrapped = parse(Some(json!({"href": href_template})));
         assert_eq!(wrapped.web_track_url_template(), Some(href_template));
         assert_eq!(
-            wrapped.ui_config_snapshot(19).web_track_url_template.as_deref(),
+            wrapped
+                .ui_config_snapshot(19)
+                .web_track_url_template
+                .as_deref(),
             Some(href_template)
         );
         for invalid in [
