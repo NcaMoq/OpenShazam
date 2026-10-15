@@ -14,7 +14,12 @@ name = "openshazam"
 path = "src/main.rs"
 required-features = ["dev-cli"]
 
+[[bin]]
+name = "openshazam-ui-bridge"
+path = "src/ui_bridge.rs"
+
 [dependencies]
+serde_json = "1.0"
 sigx-core = { path = "../../crates/sigx-core" }
 shazam-http-lab = { path = "../../crates/shazam-http-lab" }
 shazam-progressive = { path = "../../crates/shazam-progressive" }
