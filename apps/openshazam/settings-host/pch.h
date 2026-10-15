@@ -1,6 +1,9 @@
 #pragma once
 #include <unknwn.h>
 #include <windows.h>
+#ifdef GetCurrentTime
+#undef GetCurrentTime
+#endif
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.UI.Text.h>
@@ -10,7 +13,7 @@
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
 #include <winrt/Microsoft.UI.Xaml.Hosting.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
-#include <microsoft.ui.interop.h>
+#include <winrt/Microsoft.UI.Interop.h>
 #include <Microsoft.UI.Dispatching.Interop.h>
 #include <string>
 #include <memory>
