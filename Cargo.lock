@@ -564,6 +564,7 @@ dependencies = [
  "cpal",
  "ctrlc",
  "openshazam-controller",
+ "serde_json",
  "shazam-http-lab",
  "shazam-progressive",
  "sigx-core",
