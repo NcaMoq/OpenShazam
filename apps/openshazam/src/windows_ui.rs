@@ -341,7 +341,18 @@ struct Track {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HistoryTimestampSource {
+    ControllerEvent,
     HostReceivedFallback,
+}
+
+fn resolve_history_timestamp(
+    event_time_utc: Option<SystemTime>,
+    received_at_utc: SystemTime,
+) -> (SystemTime, HistoryTimestampSource) {
+    match event_time_utc {
+        Some(when) => (when, HistoryTimestampSource::ControllerEvent),
+        None => (received_at_utc, HistoryTimestampSource::HostReceivedFallback),
+    }
 }
 
 const WINDOWS_EPOCH_OFFSET_100NS: i64 = 116_444_736_000_000_000;
@@ -7578,6 +7589,7 @@ fn poll_recognition_events(app: &mut AppState) -> bool {
 }
 
 fn apply_recognition_event(app: &mut AppState, event: RecognitionEvent, mode: CaptureMode) -> bool {
+    let event_time_utc = event.emitted_at_utc;
     let config_generation = event.config_generation;
     let session_id = event.session_id;
     match event.kind {
@@ -7616,7 +7628,13 @@ fn apply_recognition_event(app: &mut AppState, event: RecognitionEvent, mode: Ca
             if let Some(session) = app.recognition_session.as_mut() {
                 session.result_presented = true;
             }
-            show_controller_match(app, result.primary_track, mode, config_generation);
+            show_controller_match(
+                app,
+                result.primary_track,
+                mode,
+                config_generation,
+                Some(event_time_utc),
+            );
             true
         }
         RecognitionEventKind::ManualUiEvent(NativeManualUiEvent::NoMatch)
@@ -7713,6 +7731,7 @@ fn reconcile_session_snapshot(app: &mut AppState, session: &RecognitionSessionSn
                     result.primary_track.clone(),
                     ui_session.mode,
                     session.config.as_ref().map(|config| config.generation),
+                    session.last_result_at_utc,
                 );
                 changed = true;
             }
@@ -7795,6 +7814,7 @@ fn show_controller_match(
     candidate: TrackCandidate,
     mode: CaptureMode,
     config_generation: Option<u64>,
+    event_time_utc: Option<SystemTime>,
 ) {
     let metadata = candidate.ui_metadata.as_ref();
     let display_id = app.next_display_id;
@@ -7814,7 +7834,8 @@ fn show_controller_match(
             reason.as_str(),
         );
     }
-    let recognized_at_utc = SystemTime::now();
+    let (recognized_at_utc, timestamp_source) =
+        resolve_history_timestamp(event_time_utc, SystemTime::now());
     let track = Track {
         display_id,
         title: candidate.title,
@@ -7822,7 +7843,7 @@ fn show_controller_match(
         recognized_at: Instant::now(),
         recognized_at_utc,
         recognized_date_label: format_history_date_label(recognized_at_utc),
-        timestamp_source: HistoryTimestampSource::HostReceivedFallback,
+        timestamp_source,
         artwork_url: metadata.and_then(|metadata| metadata.artwork_url.clone()),
         hq_artwork_url: metadata.and_then(|metadata| metadata.hq_artwork_url.clone()),
         background_artwork_url: metadata.and_then(|metadata| metadata.background_image_url.clone()),
@@ -10144,6 +10165,20 @@ mod tests {
         WHITE_CLOSE_ICON_PIXELS,
     };
     use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    #[test]
+    fn ui229_history_keeps_controller_event_time_when_ui_delivery_is_delayed() {
+        let emitted = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let received = emitted + Duration::from_secs(3_600);
+        assert_eq!(
+            super::resolve_history_timestamp(Some(emitted), received),
+            (emitted, HistoryTimestampSource::ControllerEvent)
+        );
+        assert_eq!(
+            super::resolve_history_timestamp(None, received),
+            (received, HistoryTimestampSource::HostReceivedFallback)
+        );
+    }
 
     #[test]
     fn ui229_history_date_uses_absolute_utc_timestamp_and_localized_formatter() {
