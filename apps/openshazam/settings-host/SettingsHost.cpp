@@ -1,7 +1,6 @@
 // WinUI 3 Settings XAML Island hosted IN the native Rust/Win32 process.
 // No second recognition controller, process, webview, or legacy Win32 settings UI.
 #include "pch.h"
-#include "App.xaml.h"
 #include <winrt/Windows.Foundation.Collections.h>
 
 namespace x = winrt::Microsoft::UI::Xaml;
@@ -9,9 +8,36 @@ namespace controls = winrt::Microsoft::UI::Xaml::Controls;
 namespace hosting = winrt::Microsoft::UI::Xaml::Hosting;
 namespace dispatch = winrt::Microsoft::UI::Dispatching;
 namespace appmodel = winrt::Windows::ApplicationModel;
+namespace markup = winrt::Microsoft::UI::Xaml::Markup;
+namespace typeinfo = winrt::Microsoft::UI::Xaml::XamlTypeInfo;
 
 namespace
 {
+    // No App.xaml, XAML compiler-generated ABI or a second app process is
+    // needed. ApplicationT provides the metadata interface required by the
+    // built-in Fluent WinUI 3 controls.
+    struct SettingsApplication : x::ApplicationT<SettingsApplication, markup::IXamlMetadataProvider>
+    {
+        markup::IXamlType GetXamlType(
+            winrt::Windows::UI::Xaml::Interop::TypeName const& name)
+        {
+            return provider.GetXamlType(name);
+        }
+
+        markup::IXamlType GetXamlType(winrt::hstring const& name)
+        {
+            return provider.GetXamlType(name);
+        }
+
+        winrt::com_array<markup::XmlnsDefinition> GetXmlnsDefinitions()
+        {
+            return provider.GetXmlnsDefinitions();
+        }
+
+    private:
+        typeinfo::XamlControlsXamlMetaDataProvider provider;
+    };
+
     constexpr wchar_t kSettingsClass[] = L"OpenShazamWinUI3Preferences";
     constexpr wchar_t kStartupTask[] = L"OpenShazamStartup";
     constexpr int kWidthDips = 520;
@@ -131,7 +157,7 @@ namespace
         hosting::DesktopWindowXamlSource island{ nullptr };
         dispatch::DispatcherQueueController queue{ nullptr };
         bool ownsQueue{};
-        winrt::OpenShazam::SettingsHost::App app{ nullptr };
+        x::Application app{ nullptr };
         std::shared_ptr<SettingsState> state;
 
         void Initialize(HWND parent)
@@ -145,7 +171,7 @@ namespace
                 queue = dispatch::DispatcherQueueController::CreateOnCurrentThread();
                 ownsQueue = true;
             }
-            app = winrt::make<winrt::OpenShazam::SettingsHost::implementation::App>();
+            app = winrt::make<SettingsApplication>();
             auto instance = ::GetModuleHandleW(nullptr);
             WNDCLASSW wc{};
             wc.lpfnWndProc = &WindowProc;
@@ -164,8 +190,9 @@ namespace
                 parent, nullptr, instance, nullptr);
             if (!hwnd) winrt::throw_last_error();
             island = hosting::DesktopWindowXamlSource{};
-            island.Initialize(winrt::GetWindowIdFromWindow(hwnd));
-            auto child = winrt::GetWindowFromWindowId(island.SiteBridge().WindowId());
+            island.Initialize(winrt::Microsoft::UI::GetWindowIdFromWindow(hwnd));
+            app.Resources().MergedDictionaries().Append(controls::XamlControlsResources{});
+            auto child = winrt::Microsoft::UI::GetWindowFromWindowId(island.SiteBridge().WindowId());
             auto style = ::GetWindowLongPtrW(child, GWL_STYLE);
             ::SetWindowLongPtrW(child, GWL_STYLE, style | WS_TABSTOP | WS_VISIBLE);
             state = std::make_shared<SettingsState>();
@@ -238,7 +265,7 @@ namespace
             if (!hwnd) return;
             ::ShowWindow(hwnd, SW_SHOWNORMAL);
             ::SetForegroundWindow(hwnd);
-            ::SetFocus(winrt::GetWindowFromWindowId(island.SiteBridge().WindowId()));
+            ::SetFocus(winrt::Microsoft::UI::GetWindowFromWindowId(island.SiteBridge().WindowId()));
             if (state) RefreshStartup(state);
         }
 

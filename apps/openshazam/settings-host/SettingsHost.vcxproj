@@ -57,12 +57,8 @@
   <ItemGroup>
     <Reference Include="packages\Microsoft.Web.WebView2.1.0.3179.45\lib\Microsoft.Web.WebView2.Core.winmd" />
     <ClInclude Include="pch.h" />
-    <ClInclude Include="App.xaml.h"><DependentUpon>App.xaml</DependentUpon></ClInclude>
     <ClCompile Include="pch.cpp"><PrecompiledHeader>Create</PrecompiledHeader></ClCompile>
-    <ClCompile Include="App.xaml.cpp"><DependentUpon>App.xaml</DependentUpon></ClCompile>
     <ClCompile Include="SettingsHost.cpp" />
-    <ApplicationDefinition Include="App.xaml" />
-    <Midl Include="App.idl"><DependentUpon>App.xaml</DependentUpon></Midl>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
