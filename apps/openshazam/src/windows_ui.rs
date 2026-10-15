@@ -180,8 +180,6 @@ const PHASE_TICK_MS: u32 = 100;
 const ANIMATION_TICK_MS: u32 = 8;
 const MAIN_WINDOW_WIDTH: f64 = CONTENT_WIDTH;
 const MAIN_WINDOW_HEIGHT: f64 = CONTENT_HEIGHT + POPUP_ARROW_HEIGHT;
-const SETTINGS_WIDTH: f64 = 550.0;
-const SETTINGS_HEIGHT: f64 = 400.0;
 const ABOUT_WIDTH: f64 = 600.0;
 const ABOUT_HEIGHT: f64 = 320.0;
 const MIC_INFO_WIDTH: f64 = CONTENT_WIDTH;
@@ -285,7 +283,6 @@ fn visible_history_row_hit(y: f32, row_top: f32, history_top: f32, history_botto
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowKind {
     Main,
-    Settings,
     About,
     MicrophoneInfo,
 }
@@ -708,7 +705,7 @@ struct RecognitionSessionUi {
 struct AppState {
     main_hwnd: HWND,
     taskbar_created_message: u32,
-    settings_hwnd: HWND,
+    settings_host: Option<crate::windows_settings::SettingsHost>,
     about_hwnd: HWND,
     microphone_hwnd: HWND,
     d2d_factory: ID2D1Factory,
@@ -740,7 +737,6 @@ struct AppState {
     status_text_composition_ready: bool,
     startup_animation_pending: bool,
     startup_logo_consumed: bool,
-    settings_visible: bool,
     about_visible: bool,
     microphone_visible: bool,
     arrow_edge: ArrowEdge,
@@ -801,7 +797,6 @@ struct TextStyles {
     result_artist: IDWriteTextFormat,
     button: IDWriteTextFormat,
     settings: IDWriteTextFormat,
-    settings_small: IDWriteTextFormat,
     centered_body: IDWriteTextFormat,
     centered_title: IDWriteTextFormat,
     centered_heavy: IDWriteTextFormat,
@@ -5179,7 +5174,6 @@ impl Renderer {
         }
         let draw_result = match kind {
             WindowKind::Main => self.draw_main(app, result_panel_draw_top),
-            WindowKind::Settings => self.draw_settings(app),
             WindowKind::About => self.draw_about(app),
             WindowKind::MicrophoneInfo => self.draw_microphone_info(app),
         };
@@ -6378,126 +6372,6 @@ impl Renderer {
         );
     }
 
-    unsafe fn draw_settings(&self, app: &AppState) -> windows::core::Result<()> {
-        let background = if app.theme == Theme::Light {
-            &self.palette.white
-        } else {
-            &self.palette.black
-        };
-        let outer = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
-            rect: rect(0.0, 0.0, SETTINGS_WIDTH as f32, SETTINGS_HEIGHT as f32),
-            radiusX: 12.0,
-            radiusY: 12.0,
-        };
-        self.target.FillRoundedRectangle(&outer, background);
-        self.text(
-            "設定",
-            rect(28.0, 12.0, 510.0, 52.0),
-            &self.text.centered_title,
-            &self.palette.title,
-        );
-        let rows = [122.0f32, 64.0, 37.0, 64.0];
-        let mut top = 58.0;
-        for (index, height) in rows.into_iter().enumerate() {
-            let row = rect(38.0, top, 512.0, top + height);
-            self.fill_rect(
-                row,
-                if index % 2 == 0 {
-                    &self.palette.skeleton
-                } else {
-                    background
-                },
-            );
-            match index {
-                0 => {
-                    self.text(
-                        "表示",
-                        rect(56.0, top + 12.0, 470.0, top + 40.0),
-                        &self.text.title,
-                        &self.palette.title,
-                    );
-                    self.text(
-                        "テーマ",
-                        rect(56.0, top + 56.0, 300.0, top + 90.0),
-                        &self.text.settings,
-                        &self.palette.subtitle,
-                    );
-                    self.text(
-                        if app.theme == Theme::Light {
-                            "ライト"
-                        } else {
-                            "ダーク"
-                        },
-                        rect(355.0, top + 56.0, 490.0, top + 90.0),
-                        &self.text.trailing_small,
-                        &self.palette.accent,
-                    );
-                }
-                1 => {
-                    self.text(
-                        "\u{8a8d}\u{8b58}\u{5165}\u{529b}",
-                        rect(56.0, top + 6.0, 300.0, top + 30.0),
-                        &self.text.settings,
-                        &self.palette.title,
-                    );
-                    self.text(
-                        "WASAPI loopback",
-                        rect(310.0, top + 6.0, 490.0, top + 30.0),
-                        &self.text.trailing_small,
-                        &self.palette.subtitle,
-                    );
-                    self.text(
-                        "\u{30b7}\u{30b9}\u{30c6}\u{30e0}\u{518d}\u{751f}\u{97f3}\u{3092}\u{8a8d}\u{8b58}\u{3057}\u{307e}\u{3059}",
-                        rect(56.0, top + 31.0, 490.0, top + 59.0),
-                        &self.text.settings_small,
-                        &self.palette.subtitle,
-                    );
-                }
-                2 => {
-                    self.text(
-                        "マイク入力",
-                        rect(56.0, top + 2.0, 300.0, top + 35.0),
-                        &self.text.settings,
-                        &self.palette.title,
-                    );
-                    self.text(
-                        "未対応",
-                        rect(355.0, top + 2.0, 490.0, top + 35.0),
-                        &self.text.trailing_small,
-                        &self.palette.subtitle,
-                    );
-                }
-                _ => {
-                    self.text(
-                        "このアプリについて",
-                        rect(56.0, top + 8.0, 470.0, top + 33.0),
-                        &self.text.settings,
-                        &self.palette.title,
-                    );
-                    self.text(
-                        "OpenShazam",
-                        rect(56.0, top + 34.0, 470.0, top + 58.0),
-                        &self.text.settings_small,
-                        &self.palette.subtitle,
-                    );
-                }
-            }
-            top += height;
-        }
-        self.text(
-            "Escで閉じる",
-            rect(
-                30.0,
-                SETTINGS_HEIGHT as f32 - 30.0,
-                520.0,
-                SETTINGS_HEIGHT as f32 - 6.0,
-            ),
-            &self.text.date,
-            &self.palette.subtitle,
-        );
-        Ok(())
-    }
-
     unsafe fn draw_about(&self, app: &AppState) -> windows::core::Result<()> {
         let background = if app.theme == Theme::Light {
             &self.palette.white
@@ -6795,12 +6669,6 @@ unsafe fn create_text_styles(factory: &IDWriteFactory) -> windows::core::Result<
             factory,
             13.0,
             DWRITE_FONT_WEIGHT_BOLD,
-            DWRITE_TEXT_ALIGNMENT_LEADING,
-        )?,
-        settings_small: create_text_format(
-            factory,
-            12.0,
-            DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_TEXT_ALIGNMENT_LEADING,
         )?,
         centered_body: create_text_format(
@@ -7288,25 +7156,22 @@ enum MainHit {
 }
 
 unsafe fn open_settings(app: &mut AppState) {
-    if app.settings_hwnd.0.is_null() {
-        let dpi = GetDpiForWindow(app.main_hwnd).max(96);
-        let factor = f64::from(dpi) / 96.0;
-        if let Ok(hwnd) = create_window(
-            app as *mut AppState,
-            WindowKind::Settings,
-            "OpenShazam Preferences",
-            (SETTINGS_WIDTH * factor).round() as i32,
-            (SETTINGS_HEIGHT * factor).round() as i32,
-            false,
-        ) {
-            app.settings_hwnd = hwnd;
+    // Settings is WinUI 3 only. Lazy-loading the native C++/WinRT island
+    // keeps XAML out of the permanent audio/GPU hot path and never starts a
+    // second recognition process. No fallback Win32 Settings UI exists.
+    if app.settings_host.is_none() {
+        match crate::windows_settings::SettingsHost::load() {
+            Ok(host) => app.settings_host = Some(host),
+            Err(error) => {
+                app.message = Some(error);
+                return;
+            }
         }
     }
-    if !app.settings_hwnd.0.is_null() {
-        app.settings_visible = true;
-        let _ = ShowWindow(app.settings_hwnd, SW_SHOWNORMAL);
-        let _ = SetForegroundWindow(app.settings_hwnd);
-        let _ = InvalidateRect(Some(app.settings_hwnd), None, false);
+    if let Some(host) = app.settings_host.as_ref() {
+        if let Err(error) = host.show(app.main_hwnd) {
+            app.message = Some(error);
+        }
     }
 }
 
@@ -8706,9 +8571,6 @@ unsafe fn update_visible_windows(app: &mut AppState) {
     if app.visible || app.popup_transition.is_some() {
         let _ = InvalidateRect(Some(app.main_hwnd), None, false);
     }
-    if app.settings_visible {
-        let _ = InvalidateRect(Some(app.settings_hwnd), None, false);
-    }
     if app.about_visible {
         let _ = InvalidateRect(Some(app.about_hwnd), None, false);
     }
@@ -9686,10 +9548,6 @@ unsafe extern "system" fn window_proc(
             if wparam.0 == VK_ESCAPE.0 as usize {
                 match data.kind {
                     WindowKind::Main => hide_main(app),
-                    WindowKind::Settings => {
-                        app.settings_visible = false;
-                        let _ = ShowWindow(hwnd, SW_HIDE);
-                    }
                     WindowKind::About => {
                         app.about_visible = false;
                         let _ = ShowWindow(hwnd, SW_HIDE);
@@ -9725,16 +9583,6 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
-        WM_LBUTTONUP if data.kind == WindowKind::Settings => {
-            let x = low_word(lparam.0) as f32 * 96.0 / GetDpiForWindow(hwnd).max(96) as f32;
-            let y = high_word(lparam.0) as f32 * 96.0 / GetDpiForWindow(hwnd).max(96) as f32;
-            if (55.0..=500.0).contains(&x) && (244.0..=310.0).contains(&y) {
-                open_microphone_info(app);
-            } else if (55.0..=500.0).contains(&x) && y >= 310.0 {
-                open_about(app);
-            }
-            LRESULT(0)
-        }
         WM_LBUTTONUP if data.kind == WindowKind::About => {
             app.about_visible = false;
             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -9748,10 +9596,6 @@ unsafe extern "system" fn window_proc(
         WM_CLOSE => {
             match data.kind {
                 WindowKind::Main => hide_main(app),
-                WindowKind::Settings => {
-                    app.settings_visible = false;
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                }
                 WindowKind::About => {
                     app.about_visible = false;
                     let _ = ShowWindow(hwnd, SW_HIDE);
@@ -9789,7 +9633,6 @@ unsafe extern "system" fn window_proc(
                 let data = Box::from_raw(pointer);
                 match data.kind {
                     WindowKind::Main => app.main_hwnd = HWND::default(),
-                    WindowKind::Settings => app.settings_hwnd = HWND::default(),
                     WindowKind::About => app.about_hwnd = HWND::default(),
                     WindowKind::MicrophoneInfo => app.microphone_hwnd = HWND::default(),
                 }
@@ -9820,7 +9663,9 @@ fn high_word(value: isize) -> u16 {
 }
 
 fn no_auxiliary_window_visible(app: &AppState) -> bool {
-    !app.settings_visible && !app.about_visible && !app.microphone_visible
+    !app.settings_host.as_ref().is_some_and(|host| host.visible())
+        && !app.about_visible
+        && !app.microphone_visible
 }
 
 fn should_hide_main_after_deactivation(app: &AppState, now: Instant) -> bool {
@@ -9896,7 +9741,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let app = Box::new(AppState {
             main_hwnd: HWND::default(),
             taskbar_created_message,
-            settings_hwnd: HWND::default(),
+            settings_host: None,
             about_hwnd: HWND::default(),
             microphone_hwnd: HWND::default(),
             d2d_factory,
@@ -9925,7 +9770,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             status_text_composition_ready: false,
             startup_animation_pending: false,
             startup_logo_consumed: false,
-            settings_visible: false,
             about_visible: false,
             microphone_visible: false,
             arrow_edge: ArrowEdge::Top,
@@ -10011,9 +9855,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(token) = (*app_ptr).theme_changed_token.take() {
             let _ = (*app_ptr).theme_settings.RemoveColorValuesChanged(token);
         }
-        if !(*app_ptr).settings_hwnd.0.is_null() {
-            let _ = DestroyWindow((*app_ptr).settings_hwnd);
-        }
+        // Shutdown WinUI XAML before releasing the STA and compositor.
+        (*app_ptr).settings_host.take();
         if !(*app_ptr).about_hwnd.0.is_null() {
             let _ = DestroyWindow((*app_ptr).about_hwnd);
         }
@@ -11785,7 +11628,7 @@ mod tests {
     fn logo_startup_animation_runs_once_for_the_main_scene_only() {
         assert!(should_start_startup_logo(WindowKind::Main, false));
         assert!(!should_start_startup_logo(WindowKind::Main, true));
-        assert!(!should_start_startup_logo(WindowKind::Settings, false));
+        assert!(!should_start_startup_logo(WindowKind::About, false));
     }
 
     #[test]
