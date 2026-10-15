@@ -14,7 +14,7 @@ use std::{
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub use shazam_http_lab::{
@@ -209,6 +209,9 @@ pub struct RecognitionEvent {
     /// Monotonic time since this controller started. This is event creation
     /// time, not the later time at which the UI dequeues the event.
     pub elapsed: Duration,
+    /// Wall-clock time when the recognition event was emitted. Do not replace
+    /// this with the time a UI dequeues the event (which can be delayed).
+    pub emitted_at_utc: SystemTime,
     pub kind: RecognitionEventKind,
 }
 
@@ -320,6 +323,8 @@ pub struct RecognitionSessionSnapshot {
     pub config: Option<UiConfigSnapshot>,
     pub phase: SessionPhase,
     pub last_result: Option<UiRecognitionEvent>,
+    /// Emission time of last_result, preserved even if UI notifications drop.
+    pub last_result_at_utc: Option<SystemTime>,
     pub last_event: Option<RecognitionEventSummary>,
 }
 
@@ -672,6 +677,7 @@ impl EventEmitter {
             config_generation: self.config_generation,
             attempt_id,
             elapsed: self.origin.elapsed(),
+            emitted_at_utc: SystemTime::now(),
             kind,
         };
         update_snapshot(&self.snapshot, &event);
@@ -789,9 +795,11 @@ fn update_snapshot(snapshot: &Mutex<ControllerSnapshot>, event: &RecognitionEven
         }
         RecognitionEventKind::ManualUiEvent(result) => {
             active.last_result = Some(UiRecognitionEvent::Manual(result.clone()));
+            active.last_result_at_utc = Some(event.emitted_at_utc);
         }
         RecognitionEventKind::AutoUiEvent(result) => {
             active.last_result = Some(UiRecognitionEvent::Auto(result.clone()));
+            active.last_result_at_utc = Some(event.emitted_at_utc);
         }
         RecognitionEventKind::MatchFound { .. } => {}
         RecognitionEventKind::SessionEnded { reason } => {
@@ -1241,6 +1249,7 @@ fn run_controller<B: RecognitionBackend>(
                     config: config.clone(),
                     phase: SessionPhase::Starting,
                     last_result: None,
+                    last_result_at_utc: None,
                     last_event: None,
                 });
             }
