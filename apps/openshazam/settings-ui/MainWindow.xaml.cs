@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.InteropServices;
 using Microsoft.UI;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
@@ -12,6 +13,9 @@ public sealed partial class MainWindow : Window
 {
     internal const string WindowTitle = "OpenShazam Settings";
     private const string StartupTaskId = "OpenShazamStartup";
+    private const double SettingsWidthDips = 520;
+    private const double SettingsHeightDips = 300;
+    private const double DipsPerInch = 96;
     private StartupTask? _startupTask;
     private bool _isLoading;
     private readonly bool _isJapanese;
@@ -37,7 +41,13 @@ public sealed partial class MainWindow : Window
 
         var hwnd = WindowNative.GetWindowHandle(this);
         var windowId = Win32Interop.GetWindowIdFromWindow(hwnd);
-        AppWindow.GetFromWindowId(windowId).Resize(new Windows.Graphics.SizeInt32(520, 300));
+        // AppWindow.Resize takes physical pixels; XAML layout dimensions are DIPs.
+        // Size from the actual window monitor to avoid clipping at high DPI.
+        var windowDpi = NativeMethods.GetDpiForWindow(hwnd);
+        var scale = (windowDpi == 0 ? DipsPerInch : windowDpi) / DipsPerInch;
+        AppWindow.GetFromWindowId(windowId).Resize(new Windows.Graphics.SizeInt32(
+            (int)Math.Ceiling(SettingsWidthDips * scale),
+            (int)Math.Ceiling(SettingsHeightDips * scale)));
     }
 
     private async void OnLoaded(object sender, RoutedEventArgs args)
@@ -122,6 +132,12 @@ public sealed partial class MainWindow : Window
         {
             _isLoading = false;
         }
+    }
+
+    private static class NativeMethods
+    {
+        [DllImport("user32.dll")]
+        internal static extern uint GetDpiForWindow(IntPtr hwnd);
     }
 
     private string Text(string english, string japanese) => _isJapanese ? japanese : english;
