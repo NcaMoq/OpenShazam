@@ -130,6 +130,7 @@ namespace
         HWND owner{};
         hosting::DesktopWindowXamlSource island{ nullptr };
         dispatch::DispatcherQueueController queue{ nullptr };
+        bool ownsQueue{};
         winrt::OpenShazam::SettingsHost::App app{ nullptr };
         std::shared_ptr<SettingsState> state;
 
@@ -138,7 +139,12 @@ namespace
             owner = parent;
             // The native application has an STA COM apartment and a USER32
             // message pump. This is only created on the first Settings request.
-            queue = dispatch::DispatcherQueueController::CreateOnCurrentThread();
+            // Reuse a Microsoft.UI queue if another in-process host initialized it.
+            if (!dispatch::DispatcherQueue::GetForCurrentThread())
+            {
+                queue = dispatch::DispatcherQueueController::CreateOnCurrentThread();
+                ownsQueue = true;
+            }
             app = winrt::make<winrt::OpenShazam::SettingsHost::implementation::App>();
             auto instance = ::GetModuleHandleW(nullptr);
             WNDCLASSW wc{};
@@ -245,6 +251,12 @@ namespace
                 island = nullptr;
                 if (hwnd) { auto w = hwnd; hwnd = nullptr; ::DestroyWindow(w); }
                 state.reset();
+                app = nullptr;
+                if (queue && ownsQueue)
+                {
+                    queue.ShutdownQueue();
+                    queue = nullptr;
+                }
             }
             catch (...) { }
         }

@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.UI.Text.h>
 #include <winrt/Microsoft.UI.h>
 #include <winrt/Microsoft.UI.Dispatching.h>
 #include <winrt/Microsoft.UI.Xaml.h>
