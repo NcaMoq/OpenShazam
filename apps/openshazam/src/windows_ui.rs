@@ -8165,7 +8165,8 @@ fn curl_artwork_request(
     let timeout = format!("{:.3}", remaining.as_secs_f64().max(0.1));
     let max_bytes = MAX_ARTWORK_BYTES.to_string();
     let write_out =
-        "\nOPEN SHAZAM IMAGE RESPONSE:%{http_code}\n%{redirect_url}\n%{content_type}\n%{remote_ip}".to_string();
+        "\nOPEN SHAZAM IMAGE RESPONSE:%{http_code}\n%{redirect_url}\n%{content_type}\n%{remote_ip}"
+            .to_string();
     let mut command = Command::new("curl.exe");
     command.args([
         "--disable",
