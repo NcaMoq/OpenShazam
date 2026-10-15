@@ -50,13 +50,22 @@ jobs:
           targets: x86_64-pc-windows-gnu
       - run: cargo check --workspace --all-targets --locked --target x86_64-pc-windows-gnu
 
-  winui-settings:
-    name: WinUI 3 settings build (Windows x64)
+  winui:
+    name: WinUI 3 desktop and Rust recognition bundle (Windows x64)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.85.0'
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - name: Build WinUI 3 settings
-        run: dotnet build apps/openshazam/settings-ui/OpenShazam.Settings.csproj --configuration Release -p:Platform=x64
+      - name: Build WinUI 3 desktop and Rust sidecar
+        shell: pwsh
+        run: ./tools/build-winui.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenShazam-WinUI3-win-x64-unsigned
+          path: dist/win-x64/
+          if-no-files-found: error
