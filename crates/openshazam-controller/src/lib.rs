@@ -2326,6 +2326,15 @@ mod tests {
             snapshot.last_ended_session.as_ref().unwrap().last_result,
             Some(UiRecognitionEvent::Manual(NativeManualUiEvent::NoMatch))
         );
+        assert!(
+            snapshot
+                .last_ended_session
+                .as_ref()
+                .unwrap()
+                .last_result_at_utc
+                .is_some(),
+            "the result timestamp must survive a full UI notification queue"
+        );
         assert!(controller.join().unwrap().is_ok());
     }
 
@@ -2363,6 +2372,17 @@ mod tests {
         let result = next_event(&controller);
         assert_eq!(result.config_generation, Some(44));
         assert_eq!(result.attempt_id, Some(7));
+        assert_eq!(
+            controller
+                .events
+                .snapshot()
+                .active_session
+                .as_ref()
+                .unwrap()
+                .last_result_at_utc,
+            Some(result.emitted_at_utc),
+            "snapshot and queued result must agree on the event time"
+        );
         assert_eq!(
             result.ui_recognition_input(),
             Some(UiRecognitionInput {
