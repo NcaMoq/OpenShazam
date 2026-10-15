@@ -5,6 +5,8 @@ use std::process::ExitCode;
 mod ui_model;
 #[cfg(windows)]
 mod windows_ui;
+#[cfg(windows)]
+mod windows_settings;
 
 fn main() -> ExitCode {
     #[cfg(windows)]
