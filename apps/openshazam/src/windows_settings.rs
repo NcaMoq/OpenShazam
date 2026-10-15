@@ -1,6 +1,6 @@
 //! Lazy, same-process C ABI to the C++/WinRT WinUI 3 Settings island.
- //! The DLL is loaded by its absolute path next to the product executable.
- //! Neither the recognition controller nor audio buffers ever cross this ABI.
+//! The DLL is loaded by its absolute path next to the product executable.
+//! Neither the recognition controller nor audio buffers ever cross this ABI.
 use std::{
     ffi::{c_char, c_void, OsStr},
     os::windows::ffi::OsStrExt,
@@ -70,18 +70,16 @@ impl SettingsHost {
             };
             Ok(Self {
                 library: module,
-                show: std::mem::transmute::<*mut c_void, Show>(
-                    get(b"OpenShazamSettingsShow\0")?
-                ),
-                pre_translate: std::mem::transmute::<*mut c_void, Translate>(
-                    get(b"OpenShazamSettingsPreTranslate\0")?
-                ),
-                is_visible: std::mem::transmute::<*mut c_void, IsVisible>(
-                    get(b"OpenShazamSettingsIsVisible\0")?
-                ),
-                shutdown: std::mem::transmute::<*mut c_void, Shutdown>(
-                    get(b"OpenShazamSettingsShutdown\0")?
-                ),
+                show: std::mem::transmute::<*mut c_void, Show>(get(b"OpenShazamSettingsShow\0")?),
+                pre_translate: std::mem::transmute::<*mut c_void, Translate>(get(
+                    b"OpenShazamSettingsPreTranslate\0",
+                )?),
+                is_visible: std::mem::transmute::<*mut c_void, IsVisible>(get(
+                    b"OpenShazamSettingsIsVisible\0",
+                )?),
+                shutdown: std::mem::transmute::<*mut c_void, Shutdown>(get(
+                    b"OpenShazamSettingsShutdown\0",
+                )?),
             })
         };
         if result.is_err() {
@@ -94,7 +92,10 @@ impl SettingsHost {
         // SAFETY: Called by the Win32 UI thread on its own HWND.
         let hr = unsafe { (self.show)(parent.0) };
         if hr < 0 {
-            Err(format!("WinUI 3 Settings failed to open (HRESULT 0x{:08X})", hr as u32))
+            Err(format!(
+                "WinUI 3 Settings failed to open (HRESULT 0x{:08X})",
+                hr as u32
+            ))
         } else {
             Ok(())
         }
@@ -104,7 +105,10 @@ impl SettingsHost {
         unsafe { (self.is_visible)() != 0 }
     }
 
-    pub fn pre_translate(&self, message: &mut windows::Win32::UI::WindowsAndMessaging::MSG) -> bool {
+    pub fn pre_translate(
+        &self,
+        message: &mut windows::Win32::UI::WindowsAndMessaging::MSG,
+    ) -> bool {
         // WinUI focus navigation must be processed before TranslateMessage.
         unsafe { (self.pre_translate)(message as *mut _ as *mut c_void) != 0 }
     }

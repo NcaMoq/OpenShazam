@@ -4,9 +4,9 @@ use std::process::ExitCode;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod ui_model;
 #[cfg(windows)]
-mod windows_ui;
-#[cfg(windows)]
 mod windows_settings;
+#[cfg(windows)]
+mod windows_ui;
 
 fn main() -> ExitCode {
     #[cfg(windows)]

@@ -9660,7 +9660,9 @@ fn high_word(value: isize) -> u16 {
 }
 
 fn no_auxiliary_window_visible(app: &AppState) -> bool {
-    !app.settings_host.as_ref().is_some_and(|host| host.visible())
+    !app.settings_host
+        .as_ref()
+        .is_some_and(|host| host.visible())
         && !app.about_visible
         && !app.microphone_visible
 }
