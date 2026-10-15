@@ -53,8 +53,8 @@ public sealed partial class MainWindow : Window
         StartupToggle.OffContent = Text("Off", "オフ");
         StartupToggle.OnContent = Text("On", "オン");
         StartupDescription.Text = Text(
-            "OpenShazam starts in the notification area. Music recognition will not start automatically.",
-            "OpenShazamは通知領域で起動します。楽曲認識は自動で開始しません。");
+            "OpenShazam will start without automatically listening for music.",
+            "OpenShazamの起動時に楽曲認識は自動開始されません。");
         HistoryList.ItemsSource = _history;
         LoadHistory();
         Closed += OnWindowClosed;
@@ -62,15 +62,13 @@ public sealed partial class MainWindow : Window
 
         try
         {
-            _bridge = new RecognitionBridge();
-            _bridge.EventReceived += message =>
-                DispatcherQueue.TryEnqueue(() => HandleBridgeEvent(message));
-            _bridge.Disconnected += message =>
-                DispatcherQueue.TryEnqueue(() =>
+            _bridge = new RecognitionBridge(
+                message => DispatcherQueue.TryEnqueue(() => HandleBridgeEvent(message)),
+                message => DispatcherQueue.TryEnqueue(() =>
                 {
                     SetRunning(false);
                     ShowInfo(message, InfoBarSeverity.Error);
-                });
+                }));
         }
         catch (Exception error) when (error is IOException or InvalidOperationException)
         {
@@ -128,9 +126,14 @@ public sealed partial class MainWindow : Window
     private void ResizeForRasterizationScale(double scale)
     {
         // AppWindow uses physical pixels; the XAML panel uses effective pixels.
-        // Match the same 520×300 logical window footprint at every monitor DPI.
-        var width = (int)Math.Ceiling(SettingsWidthDips * scale);
-        var height = (int)Math.Ceiling(SettingsHeightDips * scale);
+        // Keep the intended logical size when there is room, but never
+        // exceed the active monitor's work area (including taskbar bounds).
+        // The XAML content is scrollable on compact and portrait displays.
+        var workArea = DisplayArea.GetFromWindowId(_appWindow.Id, DisplayAreaFallback.Nearest).WorkArea;
+        var desiredWidth = (int)Math.Ceiling(SettingsWidthDips * scale);
+        var desiredHeight = (int)Math.Ceiling(SettingsHeightDips * scale);
+        var width = workArea.Width > 0 ? Math.Min(desiredWidth, workArea.Width) : desiredWidth;
+        var height = workArea.Height > 0 ? Math.Min(desiredHeight, workArea.Height) : desiredHeight;
         if (_appWindow.Size.Width != width || _appWindow.Size.Height != height)
         {
             _appWindow.Resize(new Windows.Graphics.SizeInt32(width, height));
