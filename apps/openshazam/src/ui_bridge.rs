@@ -6,8 +6,8 @@ mod host {
     use openshazam::{page_link, WindowsRecognitionBackend};
     use openshazam_controller::{
         ApplicationController, NativeAutoUiEvent, NativeManualResultStage, NativeManualUiEvent,
-        RecognitionCommand, RecognitionContext, RecognitionEvent, RecognitionEventKind,
-        SessionId, UiConfigSnapshot,
+        RecognitionCommand, RecognitionContext, RecognitionEvent, RecognitionEventKind, SessionId,
+        UiConfigSnapshot,
     };
     use serde_json::{json, Value};
     use std::{
