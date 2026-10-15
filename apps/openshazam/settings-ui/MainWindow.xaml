@@ -2,102 +2,16 @@
     x:Class="OpenShazam.Settings.MainWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="OpenShazam">
-    <Grid x:Name="Root" Padding="24" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
-        <ScrollViewer VerticalScrollBarVisibility="Auto" VerticalScrollMode="Enabled">
-            <StackPanel Spacing="20">
-                <Grid ColumnSpacing="12">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <StackPanel Spacing="3">
-                        <TextBlock Text="OpenShazam" FontSize="29" FontWeight="SemiBold" />
-                        <TextBlock x:Name="PageDescription"
-                                   TextWrapping="WrapWholeWords"
-                                   Opacity="0.7" />
-                    </StackPanel>
-                    <TextBlock Grid.Column="1" Text="♪" FontSize="36"
-                               VerticalAlignment="Center" />
-                </Grid>
-
-                <Border CornerRadius="18" Padding="22"
-                        BorderThickness="1"
-                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
-                    <StackPanel Spacing="16" HorizontalAlignment="Stretch">
-                        <ProgressRing x:Name="ListeningRing" Width="74" Height="74"
-                                      IsActive="False" HorizontalAlignment="Center" />
-                        <TextBlock x:Name="StatusText" Text="Ready to recognize"
-                                   FontSize="18" FontWeight="SemiBold"
-                                   TextAlignment="Center" TextWrapping="Wrap" />
-                        <Button x:Name="RecognizeButton" Content="Recognize music"
-                                HorizontalAlignment="Stretch" Click="OnRecognizeClicked"
-                                Style="{StaticResource AccentButtonStyle}" />
-                        <ToggleSwitch x:Name="AutoModeToggle"
-                                      Header="Continuous recognition"
-                                      HorizontalAlignment="Center"
-                                      Toggled="OnAutoToggled" />
-                    </StackPanel>
-                </Border>
-
-                <Border x:Name="ResultCard" Visibility="Collapsed"
-                        Padding="18" CornerRadius="14"
-                        BorderThickness="1"
-                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
-                    <StackPanel Spacing="7">
-                        <TextBlock x:Name="ResultHeader" Text="Recognized"
-                                   FontSize="13" Opacity="0.7" />
-                        <TextBlock x:Name="ResultTitle" FontSize="23"
-                                   FontWeight="SemiBold" TextWrapping="Wrap" />
-                        <TextBlock x:Name="ResultArtist" FontSize="16"
-                                   TextWrapping="Wrap" />
-                        <Button x:Name="OpenSongButton" Content="Open on Shazam"
-                                HorizontalAlignment="Left" IsEnabled="False"
-                                Click="OnOpenSongClicked" />
-                    </StackPanel>
-                </Border>
-
-                <StackPanel Spacing="10">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock x:Name="HistoryTitle" Text="History"
-                                   FontSize="20" FontWeight="SemiBold" />
-                        <TextBlock x:Name="HistoryCount" Grid.Column="1"
-                                   Opacity="0.65" VerticalAlignment="Center" />
-                    </Grid>
-                    <ListView x:Name="HistoryList" MinHeight="110" MaxHeight="260"
-                              IsItemClickEnabled="True" ItemClick="OnHistoryItemClick">
-                        <ListView.ItemTemplate>
-                            <DataTemplate>
-                                <StackPanel Padding="4" Spacing="2">
-                                    <TextBlock Text="{Binding Title}" FontWeight="SemiBold"
-                                               FontSize="15" TextTrimming="CharacterEllipsis" />
-                                    <TextBlock Text="{Binding Artist}" Opacity="0.75"
-                                               TextTrimming="CharacterEllipsis" />
-                                    <TextBlock Text="{Binding RecognizedAtLabel}" FontSize="12"
-                                               Opacity="0.65" />
-                                </StackPanel>
-                            </DataTemplate>
-                        </ListView.ItemTemplate>
-                    </ListView>
-                </StackPanel>
-
-                <Expander x:Name="SettingsExpander" Header="Settings">
-                    <StackPanel Spacing="12" Padding="8,14,8,14">
-                        <TextBlock x:Name="SettingsDescription" TextWrapping="Wrap" />
-                        <ToggleSwitch x:Name="StartupToggle" IsEnabled="False"
-                                      Toggled="OnStartupToggled" />
-                        <TextBlock x:Name="StartupDescription" Margin="44,0,0,0"
-                                   TextWrapping="WrapWholeWords" />
-                    </StackPanel>
-                </Expander>
-                <InfoBar x:Name="StatusInfo" IsOpen="False" IsClosable="True" />
+    Title="OpenShazam Settings">
+    <Grid x:Name="Root" MinWidth="480" Padding="24">
+        <StackPanel Spacing="18">
+            <TextBlock x:Name="PageTitle" Style="{StaticResource TitleTextBlockStyle}" />
+            <TextBlock x:Name="PageDescription" TextWrapping="WrapWholeWords" />
+            <StackPanel Spacing="4">
+                <ToggleSwitch x:Name="StartupToggle" IsEnabled="False" Toggled="OnStartupToggled" />
+                <TextBlock x:Name="StartupDescription" Margin="48,0,0,0" TextWrapping="WrapWholeWords" />
             </StackPanel>
-        </ScrollViewer>
+            <InfoBar x:Name="StatusInfo" IsOpen="False" IsClosable="False" />
+        </StackPanel>
     </Grid>
 </Window>

@@ -1,68 +1,69 @@
 # OpenShazam
 
-OpenShazam is an unofficial Windows music-recognition desktop application.
-The native recognition engine (WASAPI loopback, Progressive recognition,
-Pure Rust SigX, and network transport) remains in Rust. The desktop shell is
-built with WinUI 3 and Windows App SDK. Development command-line tools remain
-available separately on supported platforms.
+An unofficial Rust command-line music recognition prototype.
 
-## Windows desktop build (x64)
+## Requirements
 
-Prerequisites: Windows, Rust 1.85.0, .NET 8 SDK, Windows App SDK runtime, and
-`curl` for the current recognition network path.
+- Rust 1.85 or newer
+- `ffmpeg` and `ffprobe` for audio-file input
+- `curl` for live recognition requests
 
-Run from the repository root in PowerShell:
-
-```powershell
-./tools/build-winui.ps1
-./dist/win-x64/OpenShazam.exe
-```
-
-The build assembles these files side by side:
-
-- `OpenShazam.exe`: primary WinUI 3 desktop UI
-- `openshazam-ui-bridge.exe`: native Rust recognition controller used by the UI
-- the managed and WinUI runtime dependencies published by the .NET SDK
-
-The UI starts the bridge as a local child process and exchanges bounded JSONL
-commands and recognition events over redirected stdin/stdout. Audio buffers,
-fingerprints, and the Shazam Config's request credentials do not cross this UI
-boundary. The Rust worker remains responsible for capture and recognition.
-The UI runs without elevation. History (up to 40 entries) is stored under the
-current user's LocalAppData/OpenShazam directory. History timestamps are
-recorded in UTC milliseconds and shown in the local time zone.
-
-**This is an unsigned development bundle, not an MSIX installer.** Code
-signing, ARM64 packaging, notification-area lifecycle, and real-device/
-multi-monitor visual testing are still pending. The Windows App SDK runtime
-must be present for this unpackaged build.
-
-The old Win32/Direct2D/Windows Composition desktop renderer was removed;
-do not use the historical `cargo run -p openshazam -- ui` command.
-
-## Developer recognition tools
-
-Requirements: Rust 1.85.0 or newer. File-input experiments use `ffmpeg`
-and `ffprobe`; live requests use `curl`.
+## Build
 
 ```sh
 cargo build --workspace --locked
+```
+
+## Run
+
+Check configuration:
+
+```sh
 cargo run --locked -p shazam-http-lab -- config-check
+```
+
+Recognize an audio file:
+
+```sh
+cargo run --locked -p shazam-http-lab -- audio-live <audio-file> <seconds>
 cargo run --locked -p shazam-http-lab -- audio-progressive-live <audio-file> <seconds>
 ```
 
-On Windows, use `cargo run --locked -p openshazam -- list-devices` and
-`cargo run --locked -p openshazam -- recognize-loopback`.
-On macOS, use `cargo run --locked -p openshazam -- recognize-microphone-progressive`.
+Capture from a microphone on macOS:
 
-## Music page links
+```sh
+cargo run --locked -p openshazam -- recognize-microphone-progressive
+```
 
-The Rust bridge uses only the current Shazam Config's
-`settings.webtrackurl.href` (or plain-text legacy template), combined
-with the recognized track's real `track_key`. Links must resolve to
-validated HTTPS `shazam.com` URLs. A result without both inputs has no
-page link; no hard-coded track-page fallback is used.
+Capture system audio on Windows:
 
-The optional developer-CLI JSONL diagnostic controls are unchanged:
-`OPENSHZAM_UI_CONFIG_SNAPSHOT_JSONL=1` with `--events-jsonl` emits
-Config snapshot and typed UI event records for testing.
+```sh
+cargo run --locked -p openshazam -- list-devices
+cargo run --locked -p openshazam -- recognize-loopback [device-id]
+```
+
+Launch the Windows tray UI:
+
+```sh
+cargo build --locked -p shazam-http-lab -p openshazam
+cargo run --locked -p openshazam -- ui
+```
+
+### Windows UI page links
+
+The Windows tray UI resolves `UiConfigSnapshot.web_track_url_template` with a
+result's `track_key`, validates the resulting Shazam HTTPS URL, and opens it in
+the default browser. The link stays disabled if either input is unavailable;
+the UI does not guess a URL. Config snapshots omit recognition endpoints,
+installation IDs, and other Config values.
+
+For CLI hosts, set `OPENSHZAM_UI_CONFIG_SNAPSHOT_JSONL=1` together with
+`--events-jsonl`. This opts into independent `openshazam.ui-config-snapshot.v1`
+and `openshazam.ui-recognition-input.v1` records. Each result wrapper names the
+generation of the Config snapshot used by that recognition session. Without
+the environment variable, the pre-existing JSONL records remain unchanged.
+
+```sh
+OPENSHZAM_UI_CONFIG_SNAPSHOT_JSONL=1 cargo run --locked -p openshazam -- \
+  recognize-microphone-progressive --events-jsonl
+```

@@ -1,6 +1,5 @@
 //! Platform recognition backends reusable by native UI hosts.
 
-pub mod page_link;
 pub mod recognition;
 pub mod session_end;
 #[cfg(any(windows, test))]
