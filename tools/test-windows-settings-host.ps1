@@ -23,6 +23,7 @@ using System.Threading;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Windows.Automation;
+using Microsoft.Win32;
 
 public static class OpenShazamSettingsHostSmoke
 {
@@ -86,6 +87,8 @@ public static class OpenShazamSettingsHostSmoke
     private static extern bool GetWindowRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool PrintWindow(IntPtr window, IntPtr deviceContext, uint flags);
+    [DllImport("dwmapi.dll", SetLastError = true)]
+    private static extern int DwmGetWindowAttribute(IntPtr window, int attribute, out int value, uint size);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyWindow(IntPtr window);
     [DllImport("user32.dll", SetLastError = true)]
@@ -201,6 +204,23 @@ public static class OpenShazamSettingsHostSmoke
                 IntPtr settingsWindow = FindWindowW("OpenShazamWinUI3Preferences", null);
                 if (settingsWindow == IntPtr.Zero || !IsWindowVisible(settingsWindow))
                     throw new InvalidOperationException("Settings top-level window was not visible.");
+                stage = "verify native caption follows Windows appearance";
+                int appsUseLightTheme = (int)(Registry.GetValue(
+                    @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                    "AppsUseLightTheme", 1) ?? 1);
+                int expectedDarkCaption = appsUseLightTheme == 0 ? 1 : 0;
+                int actualDarkCaption;
+                int captionResult = DwmGetWindowAttribute(settingsWindow, 20,
+                    out actualDarkCaption, sizeof(int));
+                if (captionResult < 0)
+                    captionResult = DwmGetWindowAttribute(settingsWindow, 19,
+                        out actualDarkCaption, sizeof(int));
+                if (captionResult < 0 || actualDarkCaption != expectedDarkCaption)
+                    throw new InvalidOperationException(
+                        "Native caption theme did not follow AppsUseLightTheme. " +
+                        "HRESULT=0x" + captionResult.ToString("X8") +
+                        "; expectedDark=" + expectedDarkCaption +
+                        "; actualDark=" + actualDarkCaption);
                 IntPtr islandWindow = FindWindowExW(settingsWindow, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
                 if (islandWindow == IntPtr.Zero || !IsWindowVisible(islandWindow))
                     throw new InvalidOperationException("WinUI island child window was not visible.");
@@ -221,6 +241,7 @@ public static class OpenShazamSettingsHostSmoke
                 AutomationElementCollection descendants = islandRoot.FindAll(
                     TreeScope.Descendants, Condition.TrueCondition);
                 bool startupToggleFound = false;
+                bool extraVisibleSettingsTextFound = false;
                 StringBuilder names = new StringBuilder();
                 for (int i = 0; i < descendants.Count; i++)
                 {
@@ -232,14 +253,19 @@ public static class OpenShazamSettingsHostSmoke
                             .Append(descendants[i].Current.ControlType.ProgrammaticName)
                             .Append("]");
                     }
-                    if ((name.StartsWith("Windows", StringComparison.Ordinal) ||
-                         name.StartsWith("Launch OpenShazam when", StringComparison.Ordinal)) &&
+                    if ((name == "Startup" || name == "\u81EA\u52D5\u8D77\u52D5") &&
                         descendants[i].Current.ControlType == ControlType.Button)
                         startupToggleFound = true;
+                    if (name == "Settings" || name == "\u8A2D\u5B9A" ||
+                        name == "General" ||
+                        name == "\u5168\u822C" || name == "Audio input" ||
+                        name == "\u97F3\u58F0\u5165\u529B" ||
+                        name.Contains("MSIX"))
+                        extraVisibleSettingsTextFound = true;
                 }
-                if (!startupToggleFound)
+                if (!startupToggleFound || extraVisibleSettingsTextFound)
                     throw new InvalidOperationException(
-                        "Startup ToggleSwitch was not exposed by the WinUI accessibility tree. " +
+                        "Settings should expose only the startup toggle. " +
                         "Descendant count=" + descendants.Count + "; names=" + names);
 
                 stage = "verify rendered WinUI island pixels";

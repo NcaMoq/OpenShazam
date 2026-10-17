@@ -13,6 +13,7 @@ namespace automation = winrt::Microsoft::UI::Xaml::Automation;
 namespace markup = winrt::Microsoft::UI::Xaml::Markup;
 namespace typeinfo = winrt::Microsoft::UI::Xaml::XamlTypeInfo;
 namespace appmodel = winrt::Windows::ApplicationModel;
+namespace viewmanagement = winrt::Windows::UI::ViewManagement;
 
 namespace
 {
@@ -52,6 +53,37 @@ namespace
     constexpr int kWidthDips = 520;
     constexpr int kHeightDips = 380;
 
+    void ApplySystemTitleBarTheme(HWND window) noexcept
+    {
+        if (!window) return;
+        try
+        {
+            // WinUI's XAML theme does not style the native non-client caption.
+            // Ask DWM for the matching immersive caption using the current
+            // system foreground palette (light text implies the dark palette).
+            viewmanagement::UISettings settings;
+            auto foreground = settings.GetColorValue(viewmanagement::UIColorType::Foreground);
+            const float luminance = 0.2126f * foreground.R +
+                                    0.7152f * foreground.G +
+                                    0.0722f * foreground.B;
+            BOOL useDarkMode = luminance >= 0.5f ? TRUE : FALSE;
+            auto setAttribute = [&](DWORD attribute) {
+                return SUCCEEDED(::DwmSetWindowAttribute(
+                    window,
+                    static_cast<DWMWINDOWATTRIBUTE>(attribute),
+                    &useDarkMode,
+                    sizeof(useDarkMode)));
+            };
+            // Attribute 20 is the documented Windows 11 value. Windows 10
+            // 1903 used value 19 before the public SDK constant was added.
+            if (!setAttribute(20)) setAttribute(19);
+        }
+        catch (...)
+        {
+            // Keep the OS default caption if UISettings is unavailable.
+        }
+    }
+
     bool IsJapanese() noexcept
     {
         return PRIMARYLANGID(::GetUserDefaultUILanguage()) == LANG_JAPANESE;
@@ -65,32 +97,11 @@ namespace
     struct SettingsState
     {
         controls::ToggleSwitch toggle{ nullptr };
-        controls::InfoBar info{ nullptr };
         bool loading{ true };
         bool alive{ true };
-
-        void Status(winrt::hstring const& message, controls::InfoBarSeverity level)
-        {
-            if (!alive) return;
-            info.Title(Localized(L"Startup setting", L"自動起動"));
-            info.Severity(level);
-            info.Message(message);
-            info.IsOpen(true);
-        }
     };
 
-    bool IsPackagedApp() noexcept
-    {
-        UINT32 packageNameLength = 0;
-        const auto result = ::GetCurrentPackageFullName(&packageNameLength, nullptr);
-        return result != APPMODEL_ERROR_NO_PACKAGE;
-    }
-
-    void ShowStartupFailureNoThrow(
-        std::shared_ptr<SettingsState> const& state,
-        winrt::hstring const& message = {},
-        controls::InfoBarSeverity severity = controls::InfoBarSeverity::Error,
-        bool unexpectedFailure = false) noexcept
+    void DisableStartupControlNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
     {
         if (!state || !state->alive) return;
         state->loading = false;
@@ -98,24 +109,6 @@ namespace
         {
             state->toggle.IsOn(false);
             state->toggle.IsEnabled(false);
-            if (!message.empty())
-            {
-                state->Status(message, severity);
-            }
-            else if (!unexpectedFailure && !IsPackagedApp())
-            {
-                state->Status(Localized(
-                    L"Automatic startup is available in the packaged MSIX version.",
-                    L"自動起動はMSIXパッケージ版で利用できます。"),
-                    controls::InfoBarSeverity::Informational);
-            }
-            else
-            {
-                state->Status(Localized(
-                    L"Windows could not read or update the startup setting.",
-                    L"Windowsで自動起動の設定を読み込めませんでした。"),
-                    controls::InfoBarSeverity::Error);
-            }
         }
         catch (...)
         {
@@ -124,10 +117,7 @@ namespace
         }
     }
 
-    winrt::fire_and_forget RefreshStartup(
-        std::weak_ptr<SettingsState> weak,
-        winrt::hstring failureMessage = {},
-        controls::InfoBarSeverity failureSeverity = controls::InfoBarSeverity::Error)
+    winrt::fire_and_forget RefreshStartup(std::weak_ptr<SettingsState> weak)
     {
         auto state = weak.lock();
         if (!state || !state->alive) co_return;
@@ -142,38 +132,15 @@ namespace
                                current == appmodel::StartupTaskState::EnabledByPolicy);
             state->toggle.IsEnabled(current == appmodel::StartupTaskState::Disabled ||
                                     current == appmodel::StartupTaskState::Enabled);
-            switch (current)
-            {
-            case appmodel::StartupTaskState::DisabledByUser:
-                state->Status(Localized(L"Startup was disabled in Windows. Re-enable it in Windows Settings.",
-                    L"Windows側で自動起動が無効です。Windowsの設定で有効にしてください。"),
-                    controls::InfoBarSeverity::Informational);
-                break;
-            case appmodel::StartupTaskState::DisabledByPolicy:
-                state->Status(Localized(L"Startup is restricted by organization policy.",
-                    L"組織のポリシーにより自動起動が制限されています。"),
-                    controls::InfoBarSeverity::Informational);
-                break;
-            case appmodel::StartupTaskState::EnabledByPolicy:
-                state->Status(Localized(L"Startup is enabled by organization policy.",
-                    L"組織のポリシーにより自動起動が有効です。"),
-                    controls::InfoBarSeverity::Informational);
-                break;
-            default:
-                state->info.IsOpen(false);
-                break;
-            }
-            if (!failureMessage.empty())
-                state->Status(failureMessage, failureSeverity);
             state->loading = false;
         }
         catch (winrt::hresult_error const&)
         {
-            ShowStartupFailureNoThrow(state, failureMessage, failureSeverity);
+            DisableStartupControlNoThrow(state);
         }
         catch (...)
         {
-            ShowStartupFailureNoThrow(state, failureMessage, failureSeverity, true);
+            DisableStartupControlNoThrow(state);
         }
     }
 
@@ -200,21 +167,11 @@ namespace
         }
         catch (winrt::hresult_error const&)
         {
-            try
-            {
-                ShowStartupFailureNoThrow(state, Localized(
-                    L"Windows could not update the startup setting.",
-                    L"Windowsで自動起動の設定を変更できませんでした。"),
-                    controls::InfoBarSeverity::Error);
-            }
-            catch (...)
-            {
-                ShowStartupFailureNoThrow(state);
-            }
+            DisableStartupControlNoThrow(state);
         }
         catch (...)
         {
-            ShowStartupFailureNoThrow(state, {}, controls::InfoBarSeverity::Error, true);
+            DisableStartupControlNoThrow(state);
         }
     }
 
@@ -265,6 +222,7 @@ namespace
                 ::MulDiv(kWidthDips, dpi, 96), ::MulDiv(kHeightDips, dpi, 96),
                 parent, nullptr, instance, nullptr);
             if (!hwnd) winrt::throw_last_error();
+            ApplySystemTitleBarTheme(hwnd);
             island = hosting::DesktopWindowXamlSource{};
             island.Initialize(winrt::Microsoft::UI::GetWindowIdFromWindow(hwnd));
             islandHwnd = winrt::Microsoft::UI::GetWindowFromWindowId(island.SiteBridge().WindowId());
@@ -290,50 +248,13 @@ namespace
         x::UIElement BuildContent()
         {
             controls::StackPanel stack;
-            stack.Spacing(20);
+            stack.Spacing(0);
             stack.Padding(x::ThicknessHelper::FromUniformLength(24));
 
-            controls::TextBlock title;
-            title.Text(Localized(L"Settings", L"設定"));
-            title.FontSize(28);
-            title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
-            stack.Children().Append(title);
-
-            controls::TextBlock description;
-            description.Text(Localized(L"Choose how OpenShazam starts.",
-                L"OpenShazamの起動方法を設定します。"));
-            description.TextWrapping(x::TextWrapping::Wrap);
-            stack.Children().Append(description);
-
-            controls::TextBlock generalHeader;
-            generalHeader.Text(Localized(L"General", L"全般"));
-            generalHeader.FontSize(20);
-            generalHeader.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
-            stack.Children().Append(generalHeader);
-
             state->toggle = controls::ToggleSwitch{};
-            controls::StackPanel startupHeader;
-            startupHeader.Spacing(4);
-            auto startupName = Localized(
-                L"Launch OpenShazam when I sign in",
-                L"Windowsへのサインイン時にOpenShazamを起動");
-            auto startupHelp = Localized(
-                L"Start in the notification area. Music recognition will not start automatically.",
-                L"サインイン時に通知領域へ起動します。楽曲認識は自動で開始しません。");
-            controls::TextBlock startupTitle;
-            startupTitle.Text(startupName);
-            startupTitle.TextWrapping(x::TextWrapping::Wrap);
-            startupTitle.FontSize(16);
-            startupTitle.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
-            startupHeader.Children().Append(startupTitle);
-
-            controls::TextBlock startupDescription;
-            startupDescription.Text(startupHelp);
-            startupDescription.TextWrapping(x::TextWrapping::Wrap);
-            startupHeader.Children().Append(startupDescription);
-            state->toggle.Header(startupHeader);
+            auto startupName = Localized(L"Startup", L"自動起動");
+            state->toggle.Header(winrt::box_value(startupName));
             automation::AutomationProperties::SetName(state->toggle, startupName);
-            automation::AutomationProperties::SetHelpText(state->toggle, startupHelp);
             state->toggle.OnContent(winrt::box_value(Localized(L"On", L"オン")));
             state->toggle.OffContent(winrt::box_value(Localized(L"Off", L"オフ")));
             state->toggle.IsEnabled(false);
@@ -343,24 +264,6 @@ namespace
                     ChangeStartup(weak, state->toggle.IsOn());
             });
             stack.Children().Append(state->toggle);
-
-            controls::TextBlock inputHeader;
-            inputHeader.Text(Localized(L"Audio input", L"音声入力"));
-            inputHeader.FontSize(20);
-            inputHeader.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
-            stack.Children().Append(inputHeader);
-
-            controls::TextBlock inputDescription;
-            inputDescription.Text(Localized(
-                L"Recognition uses system audio that is currently playing on this PC.",
-                L"このPCで現在再生中のシステム音声を認識します。"));
-            inputDescription.TextWrapping(x::TextWrapping::Wrap);
-            stack.Children().Append(inputDescription);
-
-            state->info = controls::InfoBar{};
-            state->info.IsOpen(false);
-            state->info.IsClosable(false);
-            stack.Children().Append(state->info);
 
             // Keep the background as a XAML ThemeResource expression rather
             // than copying the current brush instance. That lets the root
@@ -384,6 +287,7 @@ namespace
         void Show()
         {
             if (!hwnd) return;
+            ApplySystemTitleBarTheme(hwnd);
             ::ShowWindow(hwnd, SW_SHOWNORMAL);
             // The island is initially measured while its host HWND is hidden.
             // Reapply its native site bounds after the parent becomes visible.
@@ -443,6 +347,10 @@ namespace
                         SWP_NOZORDER | SWP_NOACTIVATE);
                 }
                 return 0;
+            case WM_SETTINGCHANGE:
+            case WM_THEMECHANGED:
+                ApplySystemTitleBarTheme(h);
+                return ::DefWindowProcW(h, msg, wp, lp);
             case WM_CLOSE:
                 ::ShowWindow(h, SW_HIDE);
                 return 0;
