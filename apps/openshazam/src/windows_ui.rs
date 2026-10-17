@@ -136,10 +136,10 @@ use windows::{
     UI::{
         Color,
         Composition::{
-            AnimationController, AnimationIterationBehavior, CompositionBorderMode,
-            CompositionColorBrush, CompositionDrawingSurface, CompositionEllipseGeometry,
-            CompositionGeometricClip, CompositionGraphicsDevice, CompositionPath,
-            CompositionPathGeometry, CompositionSpriteShape, CompositionStretch,
+            AnimationController, AnimationIterationBehavior, CompositionBitmapInterpolationMode,
+            CompositionBorderMode, CompositionColorBrush, CompositionDrawingSurface,
+            CompositionEllipseGeometry, CompositionGeometricClip, CompositionGraphicsDevice,
+            CompositionPath, CompositionPathGeometry, CompositionSpriteShape, CompositionStretch,
             CompositionSurfaceBrush, CompositionVisualSurface, Compositor, ContainerVisual,
             CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow,
             ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual, Vector2KeyFrameAnimation,
@@ -2833,6 +2833,48 @@ unsafe fn make_inverse_circle_clip_at(
     compositor.CreateGeometricClipWithGeometry(&geometry)
 }
 
+unsafe fn make_auto_shadow_surface(
+    compositor: &Compositor,
+    bounds: f32,
+    brush: &CompositionColorBrush,
+) -> windows::core::Result<(
+    ShapeVisual,
+    CompositionVisualSurface,
+    CompositionSurfaceBrush,
+)> {
+    let raster_bounds = bounds * AUTO_SHADOW_RASTER_SCALE;
+    let source = compositor.CreateShapeVisual()?;
+    source.SetBorderMode(CompositionBorderMode::Soft)?;
+    source.SetSize(Vector2 {
+        X: raster_bounds,
+        Y: raster_bounds,
+    })?;
+    let geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
+    geometry.SetCenter(Vector2 {
+        X: raster_bounds * 0.5,
+        Y: raster_bounds * 0.5,
+    })?;
+    geometry.SetRadius(Vector2 {
+        X: raster_bounds * 0.5,
+        Y: raster_bounds * 0.5,
+    })?;
+    let shape = compositor.CreateSpriteShapeWithGeometry(&geometry)?;
+    shape.SetFillBrush(brush)?;
+    source.Shapes()?.Append(&shape)?;
+
+    let surface = compositor.CreateVisualSurface()?;
+    surface.SetSourceVisual(&source)?;
+    surface.SetSourceOffset(Vector2 { X: 0.0, Y: 0.0 })?;
+    surface.SetSourceSize(Vector2 {
+        X: raster_bounds,
+        Y: raster_bounds,
+    })?;
+    let surface_brush = compositor.CreateSurfaceBrushWithSurface(&surface)?;
+    surface_brush.SetStretch(CompositionStretch::Fill)?;
+    surface_brush.SetBitmapInterpolationMode(CompositionBitmapInterpolationMode::Linear)?;
+    Ok((source, surface, surface_brush))
+}
+
 struct CompositionScene {
     compositor: Compositor,
     _target: DesktopWindowTarget,
@@ -3452,36 +3494,9 @@ impl CompositionScene {
         auto_shadow_root.SetClip(&auto_shadow_mask)?;
         let auto_shadow_brush =
             compositor.CreateColorBrushWithColor(composition_auto_shadow_color(theme))?;
-        let auto_shadow_raster_bounds = auto_shadow_bounds * AUTO_SHADOW_RASTER_SCALE;
-        let auto_shadow_source = compositor.CreateShapeVisual()?;
-        auto_shadow_source.SetBorderMode(CompositionBorderMode::Soft)?;
-        auto_shadow_source.SetSize(Vector2 {
-            X: auto_shadow_raster_bounds,
-            Y: auto_shadow_raster_bounds,
-        })?;
-        let auto_shadow_geometry: CompositionEllipseGeometry =
-            compositor.CreateEllipseGeometry()?;
-        auto_shadow_geometry.SetCenter(Vector2 {
-            X: auto_shadow_raster_bounds * 0.5,
-            Y: auto_shadow_raster_bounds * 0.5,
-        })?;
-        auto_shadow_geometry.SetRadius(Vector2 {
-            X: auto_shadow_raster_bounds * 0.5,
-            Y: auto_shadow_raster_bounds * 0.5,
-        })?;
-        let auto_shadow_shape = compositor.CreateSpriteShapeWithGeometry(&auto_shadow_geometry)?;
-        auto_shadow_shape.SetFillBrush(&auto_shadow_brush)?;
-        auto_shadow_source.Shapes()?.Append(&auto_shadow_shape)?;
-        let auto_shadow_surface = compositor.CreateVisualSurface()?;
-        auto_shadow_surface.SetSourceVisual(&auto_shadow_source)?;
-        auto_shadow_surface.SetSourceOffset(Vector2 { X: 0.0, Y: 0.0 })?;
-        auto_shadow_surface.SetSourceSize(Vector2 {
-            X: auto_shadow_raster_bounds,
-            Y: auto_shadow_raster_bounds,
-        })?;
-        let auto_shadow_surface_brush =
-            compositor.CreateSurfaceBrushWithSurface(&auto_shadow_surface)?;
-        auto_shadow_surface_brush.SetStretch(CompositionStretch::Fill)?;
+        let (auto_shadow_source, auto_shadow_surface, auto_shadow_surface_brush) = unsafe {
+            make_auto_shadow_surface(compositor, auto_shadow_bounds, &auto_shadow_brush)?
+        };
         let auto_shadow = compositor.CreateDropShadow()?;
         auto_shadow.SetBlurRadius(3.0)?;
         auto_shadow.SetOffset(Vector3::default())?;
@@ -14743,6 +14758,7 @@ mod tests {
                     X: AUTO_SHADOW_DISPLAY_BOUNDS,
                     Y: AUTO_SHADOW_DISPLAY_BOUNDS,
                 })?;
+                host.SetBorderMode(CompositionBorderMode::Soft)?;
                 host.SetCenterPoint(Vector3 {
                     X: AUTO_SHADOW_DISPLAY_BOUNDS * 0.5,
                     Y: AUTO_SHADOW_DISPLAY_BOUNDS * 0.5,
@@ -14750,27 +14766,36 @@ mod tests {
                 })?;
                 host.SetClip(&clip)?;
 
-                let geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
-                geometry.SetCenter(auto_shadow_host_center())?;
-                geometry.SetRadius(Vector2 {
-                    X: AUTO_SHADOW_DISPLAY_BOUNDS * 0.5,
-                    Y: AUTO_SHADOW_DISPLAY_BOUNDS * 0.5,
-                })?;
-                let shape = compositor.CreateSpriteShapeWithGeometry(&geometry)?;
-                shape.SetFillBrush(
-                    &compositor.CreateColorBrushWithColor(composition_color(255, 9, 9, 9))?,
+                let color_brush =
+                    compositor.CreateColorBrushWithColor(composition_color(255, 9, 9, 9))?;
+                let (source, surface, surface_brush) = make_auto_shadow_surface(
+                    &compositor,
+                    AUTO_SHADOW_DISPLAY_BOUNDS,
+                    &color_brush,
                 )?;
-                let visual = compositor.CreateShapeVisual()?;
-                visual.SetSize(Vector2 {
+                let sprite = compositor.CreateSpriteVisual()?;
+                sprite.SetSize(Vector2 {
                     X: AUTO_SHADOW_DISPLAY_BOUNDS,
                     Y: AUTO_SHADOW_DISPLAY_BOUNDS,
                 })?;
-                visual.Shapes()?.Append(&shape)?;
-                host.Children()?.InsertAtTop(&visual)?;
+                sprite.SetBorderMode(CompositionBorderMode::Soft)?;
+                sprite.SetBrush(&surface_brush)?;
+                host.Children()?.InsertAtTop(&sprite)?;
 
                 assert_eq!(host.Size()?, Vector2 { X: 96.0, Y: 96.0 });
+                assert_eq!(source.Size()?, Vector2 { X: 384.0, Y: 384.0 });
+                assert_eq!(surface.SourceSize()?, Vector2 { X: 384.0, Y: 384.0 });
+                assert_eq!(source.BorderMode()?, CompositionBorderMode::Soft);
+                assert_eq!(surface_brush.Stretch()?, CompositionStretch::Fill);
+                assert_eq!(
+                    surface_brush.BitmapInterpolationMode()?,
+                    CompositionBitmapInterpolationMode::Linear
+                );
+                assert_eq!(sprite.Size()?, Vector2 { X: 96.0, Y: 96.0 });
+                assert_eq!(sprite.BorderMode()?, CompositionBorderMode::Soft);
                 assert_eq!(clip.CenterPoint()?, auto_shadow_host_center());
                 assert_eq!(clip.Scale()?, Vector2 { X: 0.85, Y: 0.85 });
+                drop(color_brush);
                 Ok(())
             })();
             drop(dispatcher);
