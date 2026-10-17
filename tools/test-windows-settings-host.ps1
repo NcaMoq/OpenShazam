@@ -284,6 +284,17 @@ public static class OpenShazamSettingsHostSmoke
                 var startupLabelRect = startupLabel.Current.BoundingRectangle;
                 var startupToggleRect = startupToggle.Current.BoundingRectangle;
                 var appearanceSelectorRect = appearanceSelector.Current.BoundingRectangle;
+                var startupAncestry = new StringBuilder();
+                AutomationElement startupAncestor = startupToggle;
+                for (int depth = 0; depth < 8 && startupAncestor != null; depth++)
+                {
+                    var current = startupAncestor.Current;
+                    if (startupAncestry.Length > 0) startupAncestry.Append(" <- ");
+                    startupAncestry.Append(current.Name).Append(" [")
+                        .Append(current.ControlType.ProgrammaticName).Append("] ")
+                        .Append(current.BoundingRectangle);
+                    startupAncestor = TreeWalker.RawViewWalker.GetParent(startupAncestor);
+                }
                 if (startupLabelRect.Right <= startupLabelRect.Left ||
                     startupLabelRect.Bottom <= startupLabelRect.Top ||
                     startupToggleRect.Right <= startupToggleRect.Left ||
@@ -295,7 +306,8 @@ public static class OpenShazamSettingsHostSmoke
                     throw new InvalidOperationException(
                         "Settings controls should be right-aligned while labels remain left-aligned. " +
                         "Startup label=" + startupLabelRect + "; startup toggle=" + startupToggleRect +
-                        "; appearance selector=" + appearanceSelectorRect + "; controls=" + names);
+                        "; appearance selector=" + appearanceSelectorRect + "; controls=" + names +
+                        "; startup ancestry=" + startupAncestry);
 
                 stage = "verify the appearance selector options";
                 var expandCollapse = (ExpandCollapsePattern)appearanceSelector.GetCurrentPattern(
@@ -312,13 +324,13 @@ public static class OpenShazamSettingsHostSmoke
                     string name = expandedElements[i].Current.Name;
                     if (name == "Light" || name == "\u30E9\u30A4\u30C8") lightOptionFound = true;
                     if (name == "Dark" || name == "\u30C0\u30FC\u30AF") darkOptionFound = true;
-                    if (name == "Use system setting" || name == "\u30B7\u30B9\u30C6\u30E0\u8A2D\u5B9A\u306B\u5408\u308F\u305B\u308B")
+                    if (name == "System" || name == "\u30B7\u30B9\u30C6\u30E0")
                         systemOptionFound = true;
                 }
                 expandCollapse.Collapse();
                 if (!lightOptionFound || !darkOptionFound || !systemOptionFound)
                     throw new InvalidOperationException(
-                        "Appearance selector did not expose Light, Dark and Use system setting. " +
+                        "Appearance selector did not expose Light, Dark and System. " +
                         "Light=" + lightOptionFound + "; Dark=" + darkOptionFound +
                         "; System=" + systemOptionFound + "; names=" + expandedElements.Count);
 

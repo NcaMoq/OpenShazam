@@ -15,6 +15,7 @@
 
 namespace x = winrt::Microsoft::UI::Xaml;
 namespace controls = winrt::Microsoft::UI::Xaml::Controls;
+namespace media = winrt::Microsoft::UI::Xaml::Media;
 namespace hosting = winrt::Microsoft::UI::Xaml::Hosting;
 namespace dispatch = winrt::Microsoft::UI::Dispatching;
 namespace automation = winrt::Microsoft::UI::Xaml::Automation;
@@ -62,6 +63,7 @@ namespace
     constexpr uint32_t kAppearanceSystem = 0;
     constexpr uint32_t kAppearanceLight = 1;
     constexpr uint32_t kAppearanceDark = 2;
+    constexpr double kSettingsControlLaneWidthDips = 208.0;
     constexpr int kWidthDips = 520;
     constexpr int kHeightDips = 380;
     constexpr int kMinimumWidthDips = 460;
@@ -486,11 +488,11 @@ namespace
             auto startupLabelColumn = controls::ColumnDefinition{};
             startupLabelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
             auto startupToggleColumn = controls::ColumnDefinition{};
-            // Let the switch define a fixed-width trailing lane. The label
-            // consumes the remaining space, pinning the whole control to the
-            // card's right edge at every window width.
+            // Share the same trailing lane width as the appearance selector
+            // so both settings controls align to one right edge.
             startupToggleColumn.Width(
-                x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Auto));
+                x::GridLengthHelper::FromValueAndType(
+                    kSettingsControlLaneWidthDips, x::GridUnitType::Pixel));
             startupRow.ColumnDefinitions().Append(startupLabelColumn);
             startupRow.ColumnDefinitions().Append(startupToggleColumn);
 
@@ -511,7 +513,12 @@ namespace
             state->toggle.OffContent(winrt::box_value(Localized(L"Off", L"オフ")));
             state->toggle.VerticalAlignment(x::VerticalAlignment::Center);
             state->toggle.HorizontalAlignment(x::HorizontalAlignment::Right);
-            state->toggle.Width(124.0);
+            state->toggle.HorizontalContentAlignment(x::HorizontalAlignment::Right);
+            // ToggleSwitch reserves a wider internal layout slot than its
+            // switch/content peer. Align that peer with the selector lane.
+            auto switchAlignment = media::TranslateTransform{};
+            switchAlignment.X(80.0);
+            state->toggle.RenderTransform(switchAlignment);
             state->toggle.IsEnabled(false);
             std::weak_ptr<SettingsState> weak = state;
             state->toggle.Toggled([weak](auto const&, auto const&) {
@@ -536,7 +543,8 @@ namespace
             auto labelColumn = controls::ColumnDefinition{};
             labelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
             auto selectorColumn = controls::ColumnDefinition{};
-            selectorColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Auto));
+            selectorColumn.Width(x::GridLengthHelper::FromValueAndType(
+                kSettingsControlLaneWidthDips, x::GridUnitType::Pixel));
             appearanceRow.ColumnDefinitions().Append(iconColumn);
             appearanceRow.ColumnDefinitions().Append(labelColumn);
             appearanceRow.ColumnDefinitions().Append(selectorColumn);
@@ -576,8 +584,8 @@ namespace
             state->appearance.Items().Append(winrt::box_value(Localized(L"Light", L"ライト")));
             state->appearance.Items().Append(winrt::box_value(Localized(L"Dark", L"ダーク")));
             state->appearance.Items().Append(winrt::box_value(Localized(
-                L"Use system setting", L"システム設定に合わせる")));
-            state->appearance.Width(208.0);
+                L"System", L"システム")));
+            state->appearance.Width(kSettingsControlLaneWidthDips);
             state->appearance.HorizontalAlignment(x::HorizontalAlignment::Right);
             state->appearance.VerticalAlignment(x::VerticalAlignment::Center);
             automation::AutomationProperties::SetName(state->appearance, appearanceName);
