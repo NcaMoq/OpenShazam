@@ -5,7 +5,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::c_void,
     io::Read,
     mem::size_of,
@@ -176,6 +176,7 @@ const WM_ARTWORK_READY: u32 = WM_APP + 0x45;
 const WM_ACTIVATE_MAIN_POPUP: u32 = WM_APP + 0x46;
 const WM_OPEN_SETTINGS: u32 = WM_APP + 0x47;
 const WM_APPEARANCE_CHANGED: u32 = WM_APP + 0x48;
+const WM_ARTWORK_LOAD_FINISHED: u32 = WM_APP + 0x49;
 const TRAY_ICON_ID: u32 = 1;
 const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
     data1: 0x6a3d77b1,
@@ -607,11 +608,46 @@ struct CachedArtworkBitmap {
     bitmap: ID2D1Bitmap,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TrackIdentity {
+    display_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ArtworkRequestIdentity {
+    track: TrackIdentity,
+    generation: u64,
+    request_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArtworkRequest {
+    identity: ArtworkRequestIdentity,
+    standard_url: Option<String>,
+    high_quality_url: Option<String>,
+}
+
+fn artwork_request_is_current(
+    current: Option<&ArtworkRequest>,
+    incoming: ArtworkRequestIdentity,
+) -> bool {
+    current.is_some_and(|request| request.identity == incoming)
+}
+
+fn artwork_request_urls_match_track(
+    request_standard: Option<&str>,
+    request_high_quality: Option<&str>,
+    track_standard: Option<&str>,
+    track_high_quality: Option<&str>,
+) -> bool {
+    request_standard == track_standard && request_high_quality == track_high_quality
+}
+
 #[derive(Debug)]
 struct ArtworkReady {
-    display_id: u64,
+    identity: ArtworkRequestIdentity,
     source: ArtworkSource,
-    result: Result<ArtworkPixels, String>,
+    pixels: ArtworkPixels,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -896,6 +932,9 @@ struct AppState {
     status_alternator: Option<StatusTextAlternator>,
     success_wave_frame: Option<ui_model::WaveFrame>,
     next_display_id: u64,
+    next_artwork_request_id: u64,
+    artwork_generations: HashMap<TrackIdentity, u64>,
+    active_artwork_requests: HashMap<TrackIdentity, ArtworkRequest>,
     artwork_resources: HashMap<u64, (ArtworkSource, ArtworkPixels)>,
     ui_configs: HashMap<u64, UiConfigSnapshot>,
     message: Option<String>,
@@ -7954,6 +7993,7 @@ fn show_controller_match(
         config_generation,
         page_url,
     };
+    let artwork_request = register_artwork_request(app, &track);
     let previous_count = app.history.len();
     app.history.insert(0, track.clone());
     app.history_transition = Some(HistoryMutationTransition {
@@ -7964,14 +8004,15 @@ fn show_controller_match(
         },
     });
     app.history.truncate(40);
+    invalidate_orphaned_artwork_requests(app);
     app.status_alternator = Some(StatusTextAlternator::after_success(track.recognized_at));
-    start_artwork_load(
-        app.main_hwnd,
-        track.display_id,
-        track.artwork_url.clone(),
-        track.hq_artwork_url.clone(),
-        unsafe { GetDpiForWindow(app.main_hwnd) }.max(96),
-    );
+    if let Some(request) = artwork_request {
+        start_artwork_load(
+            app.main_hwnd,
+            request,
+            unsafe { GetDpiForWindow(app.main_hwnd) }.max(96),
+        );
+    }
     if app.visible {
         app.success_wave_frame = current_success_wave_frame(app);
         app.phase = MainPhase::Matched {
@@ -8004,38 +8045,93 @@ fn current_success_wave_frame(app: &AppState) -> Option<ui_model::WaveFrame> {
     ))
 }
 
-fn start_artwork_load(
-    hwnd: HWND,
-    display_id: u64,
-    standard_url: Option<String>,
-    high_quality_url: Option<String>,
-    dpi: u32,
-) {
-    if standard_url.is_none() && high_quality_url.is_none() {
-        return;
+fn register_artwork_request(app: &mut AppState, track: &Track) -> Option<ArtworkRequest> {
+    if track.artwork_url.is_none() && track.hq_artwork_url.is_none() {
+        return None;
     }
+    let identity = TrackIdentity {
+        display_id: track.display_id,
+    };
+    let generation = app
+        .artwork_generations
+        .get(&identity)
+        .copied()
+        .unwrap_or_default()
+        .wrapping_add(1)
+        .max(1);
+    app.artwork_generations.insert(identity, generation);
+    let request_id = app.next_artwork_request_id.max(1);
+    app.next_artwork_request_id = request_id.wrapping_add(1).max(1);
+    let request = ArtworkRequest {
+        identity: ArtworkRequestIdentity {
+            track: identity,
+            generation,
+            request_id,
+        },
+        standard_url: track.artwork_url.clone(),
+        high_quality_url: track.hq_artwork_url.clone(),
+    };
+    app.active_artwork_requests
+        .insert(identity, request.clone());
+    Some(request)
+}
+
+fn invalidate_orphaned_artwork_requests(app: &mut AppState) {
+    let live_tracks: HashSet<_> = app
+        .history
+        .iter()
+        .map(|track| TrackIdentity {
+            display_id: track.display_id,
+        })
+        .collect();
+    app.active_artwork_requests
+        .retain(|identity, _| live_tracks.contains(identity));
+    app.artwork_generations
+        .retain(|identity, _| live_tracks.contains(identity));
+    app.artwork_resources.retain(|display_id, _| {
+        live_tracks.contains(&TrackIdentity {
+            display_id: *display_id,
+        })
+    });
+}
+
+fn start_artwork_load(hwnd: HWND, request: ArtworkRequest, dpi: u32) {
     let hwnd_value = hwnd.0 as isize;
     let required_pixels = 150u32.saturating_mul(dpi.max(96)).saturating_add(95) / 96;
     thread::spawn(move || {
         let mut standard_size = None;
-        if let Some(url) = standard_url.filter(|url| valid_https_resource_url(url)) {
+        if let Some(url) = request
+            .standard_url
+            .as_deref()
+            .filter(|url| valid_https_resource_url(url))
+        {
             if let Ok(pixels) = fetch_and_decode_artwork(&url) {
                 standard_size = Some(pixels.width.min(pixels.height));
-                post_artwork_ready(hwnd_value, display_id, ArtworkSource::Standard, Ok(pixels));
+                post_artwork_ready(
+                    hwnd_value,
+                    request.identity,
+                    ArtworkSource::Standard,
+                    pixels,
+                );
             }
         }
         if standard_size.is_none_or(|size| size < required_pixels) {
-            if let Some(url) = high_quality_url.filter(|url| valid_https_resource_url(url)) {
+            if let Some(url) = request
+                .high_quality_url
+                .as_deref()
+                .filter(|url| valid_https_resource_url(url))
+            {
                 if let Ok(pixels) = fetch_and_decode_artwork(&url) {
                     post_artwork_ready(
                         hwnd_value,
-                        display_id,
+                        request.identity,
                         ArtworkSource::HighQuality,
-                        Ok(pixels),
+                        pixels,
                     );
                 }
             }
         }
+        post_artwork_load_finished(hwnd_value, request.identity);
     });
 }
 
@@ -8605,14 +8701,14 @@ fn decode_artwork_wic(encoded: &[u8]) -> Result<ArtworkPixels, String> {
 
 fn post_artwork_ready(
     hwnd: isize,
-    display_id: u64,
+    identity: ArtworkRequestIdentity,
     source: ArtworkSource,
-    result: Result<ArtworkPixels, String>,
+    pixels: ArtworkPixels,
 ) {
     let pointer = Box::into_raw(Box::new(ArtworkReady {
-        display_id,
+        identity,
         source,
-        result,
+        pixels,
     })) as isize;
     if unsafe {
         PostMessageW(
@@ -8625,6 +8721,22 @@ fn post_artwork_ready(
     .is_err()
     {
         unsafe { drop(Box::from_raw(pointer as *mut ArtworkReady)) };
+    }
+}
+
+fn post_artwork_load_finished(hwnd: isize, identity: ArtworkRequestIdentity) {
+    let pointer = Box::into_raw(Box::new(identity)) as isize;
+    if unsafe {
+        PostMessageW(
+            Some(HWND(hwnd as *mut c_void)),
+            WM_ARTWORK_LOAD_FINISHED,
+            WPARAM(0),
+            LPARAM(pointer),
+        )
+    }
+    .is_err()
+    {
+        unsafe { drop(Box::from_raw(pointer as *mut ArtworkRequestIdentity)) };
     }
 }
 
@@ -9455,26 +9567,41 @@ unsafe extern "system" fn window_proc(
             let pointer = lparam.0 as *mut ArtworkReady;
             if !pointer.is_null() {
                 let ready = Box::from_raw(pointer);
-                let is_current = matches!(
-                    &app.phase,
-                    MainPhase::Matched { track, .. } if track.display_id == ready.display_id
+                let identity = ready.identity;
+                let is_current_request = artwork_request_is_current(
+                    app.active_artwork_requests.get(&identity.track),
+                    identity,
                 );
-                let is_in_history = app
+                let is_bound_track = app
                     .history
                     .iter()
-                    .any(|track| track.display_id == ready.display_id);
-                if (is_current || is_in_history) && ready.result.is_ok() {
-                    let pixels = ready.result.expect("checked successful artwork result");
+                    .find(|track| track.display_id == identity.track.display_id)
+                    .is_some_and(|track| {
+                        let request = app.active_artwork_requests.get(&identity.track);
+                        request.is_some_and(|request| {
+                            artwork_request_urls_match_track(
+                                request.standard_url.as_deref(),
+                                request.high_quality_url.as_deref(),
+                                track.artwork_url.as_deref(),
+                                track.hq_artwork_url.as_deref(),
+                            )
+                        })
+                    });
+                if is_current_request && is_bound_track {
+                    let pixels = ready.pixels;
                     let existing_is_better = app
                         .artwork_resources
-                        .get(&ready.display_id)
-                        .is_some_and(|(source, _)| {
-                            *source == ArtworkSource::HighQuality
-                                && ready.source == ArtworkSource::Standard
+                        .get(&identity.track.display_id)
+                        .is_some_and(|(source, cached)| {
+                            !should_replace_cached_artwork(
+                                Some((*source, cached.fingerprint)),
+                                ready.source,
+                                pixels.fingerprint,
+                            )
                         });
                     if !existing_is_better {
                         app.artwork_resources
-                            .insert(ready.display_id, (ready.source, pixels));
+                            .insert(identity.track.display_id, (ready.source, pixels));
                         const ARTWORK_CACHE_LIMIT: usize = 24 * 1024 * 1024;
                         while app
                             .artwork_resources
@@ -9491,6 +9618,27 @@ unsafe extern "system" fn window_proc(
                         if app.visible {
                             let _ = InvalidateRect(Some(app.main_hwnd), None, false);
                         }
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_ARTWORK_LOAD_FINISHED if data.kind == WindowKind::Main => {
+            let pointer = lparam.0 as *mut ArtworkRequestIdentity;
+            if !pointer.is_null() {
+                let identity = *Box::from_raw(pointer);
+                if artwork_request_is_current(
+                    app.active_artwork_requests.get(&identity.track),
+                    identity,
+                ) {
+                    app.active_artwork_requests.remove(&identity.track);
+                    let track_is_retained = app
+                        .history
+                        .iter()
+                        .any(|track| track.display_id == identity.track.display_id);
+                    if !track_is_retained {
+                        app.artwork_generations.remove(&identity.track);
+                        app.artwork_resources.remove(&identity.track.display_id);
                     }
                 }
             }
@@ -10067,6 +10215,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             status_alternator: Some(StatusTextAlternator::ready(Instant::now())),
             success_wave_frame: None,
             next_display_id: 1,
+            next_artwork_request_id: 1,
+            artwork_generations: HashMap::new(),
+            active_artwork_requests: HashMap::new(),
             artwork_resources: HashMap::new(),
             ui_configs: HashMap::new(),
             message: None,
@@ -10274,13 +10425,13 @@ mod tests {
     use super::StatusTextAlternator;
     use super::{
         advance_result_card_stage, animation_needs_frame, artwork_pixel_fingerprint,
-        button_border_arc_points, composition_button_pixel_snap_offset,
-        composition_header_viewport_offset, composition_root_layer_order,
-        composition_scale_for_dpi, composition_scene_layer_order, copy_notification_text,
-        copy_panel_pixels_into, create_text_format_with_locale, d2d_color_from_system,
-        directwrite_locale, fallback_match_artwork_rect, gradient_origin_transform,
-        header_fill_scope, history_artwork_frame, history_row_top, history_text_rects,
-        history_title_color, inverse_circle_clip_radii, is_offline_failure,
+        artwork_request_is_current, artwork_request_urls_match_track, button_border_arc_points,
+        composition_button_pixel_snap_offset, composition_header_viewport_offset,
+        composition_root_layer_order, composition_scale_for_dpi, composition_scene_layer_order,
+        copy_notification_text, copy_panel_pixels_into, create_text_format_with_locale,
+        d2d_color_from_system, directwrite_locale, fallback_match_artwork_rect,
+        gradient_origin_transform, header_fill_scope, history_artwork_frame, history_row_top,
+        history_text_rects, history_title_color, inverse_circle_clip_radii, is_offline_failure,
         is_tray_activation_event, localized_ui_text, native_icon_layout, no_match_copy,
         no_match_icon_rect, page_url_for_display_id, phase_needs_timeout, point_in_rect,
         popup_base_color, resolve_page_link, resolve_page_link_checked,
@@ -10291,10 +10442,11 @@ mod tests {
         select_ui_language_from_multisz, should_hide_popup_on_deactivation,
         should_replace_cached_artwork, should_show_initial_popup, should_start_startup_logo,
         theme_from_foreground_rgb, timeout_copy, ui_model, valid_page_template,
-        visible_history_row_hit, ArrowEdge, ArtworkSource, CaptureMode, CompositionRootLayer,
-        CompositionSceneLayer, HeaderFillScope, HistoryMutationEvent, HistoryMutationTransition,
-        HistoryTimestampSource, MainPhase, NoMatchIconCommand, PageLinkFailure, ResultCardAdvance,
-        ResultCardStage, Theme, ThemePreference, Track, UiConfigSnapshot, UiLanguage, UiTextKey,
+        visible_history_row_hit, ArrowEdge, ArtworkRequest, ArtworkRequestIdentity, ArtworkSource,
+        CaptureMode, CompositionRootLayer, CompositionSceneLayer, HeaderFillScope,
+        HistoryMutationEvent, HistoryMutationTransition, HistoryTimestampSource, MainPhase,
+        NoMatchIconCommand, PageLinkFailure, ResultCardAdvance, ResultCardStage, Theme,
+        ThemePreference, Track, TrackIdentity, UiConfigSnapshot, UiLanguage, UiTextKey,
         ValidatedWebTrackUrl, WindowKind, BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X,
         FALLBACK_MATCH_DARK_PIXELS, FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE,
         HISTORY_HEIGHT, HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH,
@@ -11315,6 +11467,60 @@ mod tests {
             Some((ArtworkSource::HighQuality, refreshed)),
             ArtworkSource::Standard,
             first,
+        ));
+    }
+
+    #[test]
+    fn ui240_artwork_reuse_rejects_stale_request_generation_and_url_binding() {
+        let track = TrackIdentity { display_id: 41 };
+        let old = ArtworkRequest {
+            identity: ArtworkRequestIdentity {
+                track,
+                generation: 1,
+                request_id: 10,
+            },
+            standard_url: Some("https://cdn.example.test/a.jpg".to_owned()),
+            high_quality_url: None,
+        };
+        let current = ArtworkRequest {
+            identity: ArtworkRequestIdentity {
+                track,
+                generation: 2,
+                request_id: 11,
+            },
+            standard_url: Some("https://cdn.example.test/b.jpg".to_owned()),
+            high_quality_url: Some("https://cdn.example.test/b@2x.jpg".to_owned()),
+        };
+
+        assert!(artwork_request_is_current(Some(&current), current.identity));
+        assert!(!artwork_request_is_current(Some(&current), old.identity));
+        assert!(!artwork_request_is_current(
+            Some(&current),
+            ArtworkRequestIdentity {
+                track,
+                generation: current.identity.generation,
+                request_id: old.identity.request_id,
+            },
+        ));
+        assert!(!artwork_request_is_current(
+            Some(&current),
+            ArtworkRequestIdentity {
+                track,
+                generation: old.identity.generation,
+                request_id: current.identity.request_id,
+            },
+        ));
+        assert!(artwork_request_urls_match_track(
+            current.standard_url.as_deref(),
+            current.high_quality_url.as_deref(),
+            Some("https://cdn.example.test/b.jpg"),
+            Some("https://cdn.example.test/b@2x.jpg"),
+        ));
+        assert!(!artwork_request_urls_match_track(
+            old.standard_url.as_deref(),
+            old.high_quality_url.as_deref(),
+            Some("https://cdn.example.test/b.jpg"),
+            Some("https://cdn.example.test/b@2x.jpg"),
         ));
     }
 
