@@ -803,6 +803,54 @@ struct ResultOverlayContentKey {
     language: UiLanguage,
 }
 
+fn result_overlay_identity_matches_phase(
+    identity: &ResultOverlayIdentity,
+    phase: &MainPhase,
+    current_artwork: Option<(ArtworkSource, usize, u128)>,
+) -> bool {
+    match (identity, phase) {
+        (
+            ResultOverlayIdentity::Matched {
+                display_id,
+                title,
+                artist,
+                artwork_url,
+                hq_artwork_url,
+                artwork,
+            },
+            MainPhase::Matched { track, .. },
+        ) => {
+            track.display_id == *display_id
+                && track.title.as_str() == title
+                && track.artist.as_str() == artist
+                && track.artwork_url.as_deref() == artwork_url.as_deref()
+                && track.hq_artwork_url.as_deref() == hq_artwork_url.as_deref()
+                && current_artwork == *artwork
+        }
+        (
+            ResultOverlayIdentity::NoMatch {
+                entered_at,
+                offline,
+            },
+            MainPhase::NoMatch {
+                entered_at: current_entered_at,
+                ..
+            },
+        ) => !offline && entered_at == current_entered_at,
+        (
+            ResultOverlayIdentity::NoMatch {
+                entered_at,
+                offline,
+            },
+            MainPhase::Offline {
+                entered_at: current_entered_at,
+                ..
+            },
+        ) => *offline && entered_at == current_entered_at,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ResultOverlayMotionKey {
     MatchEnter {
@@ -5271,6 +5319,27 @@ impl Renderer {
         })
     }
 
+    fn result_overlay_matches_current(&self, app: &AppState) -> bool {
+        let Some(key) = self.result_overlay_content_key.as_ref() else {
+            return false;
+        };
+        if key.theme_generation != app.theme_generation
+            || key.dpi != self.dpi
+            || key.edge != app.arrow_edge
+            || key.language != ui_language()
+        {
+            return false;
+        }
+        let current_artwork = match &app.phase {
+            MainPhase::Matched { track, .. } => app
+                .artwork_resources
+                .get(&track.display_id)
+                .map(|(source, pixels)| (*source, pixels.bgra.len(), pixels.fingerprint)),
+            _ => None,
+        };
+        result_overlay_identity_matches_phase(&key.identity, &app.phase, current_artwork)
+    }
+
     unsafe fn on_size(&mut self, hwnd: HWND) {
         let mut client = RECT::default();
         if GetClientRect(hwnd, &mut client).is_ok() {
@@ -9397,12 +9466,14 @@ fn animation_needs_d2d_redraw(
     phase: &MainPhase,
     status_text_animating: bool,
     status_text_composition_ready: bool,
+    result_overlay_composition_ready: bool,
 ) -> bool {
     (status_text_animating && !status_text_composition_ready)
-        || matches!(
-            phase,
-            MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
-        )
+        || (!result_overlay_composition_ready
+            && matches!(
+                phase,
+                MainPhase::Matched { .. } | MainPhase::NoMatch { .. } | MainPhase::Offline { .. }
+            ))
 }
 
 unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
@@ -9872,9 +9943,11 @@ unsafe extern "system" fn window_proc(
                     }
                 }
                 if app.visible {
+                    let mut composition_update_succeeded = false;
                     if let Some(renderer) = data.renderer.as_mut() {
                         match renderer.update_composition(animation_snapshot(app)) {
                             Ok(()) => {
+                                composition_update_succeeded = true;
                                 app.status_text_composition_ready =
                                     renderer.status_text_composition_enabled;
                                 if app.startup_animation_pending {
@@ -9895,10 +9968,16 @@ unsafe extern "system" fn window_proc(
                     let status_text_animating = app
                         .status_alternator
                         .is_some_and(|status| status.animating(now));
+                    let result_overlay_composition_ready = composition_update_succeeded
+                        && data
+                            .renderer
+                            .as_ref()
+                            .is_some_and(|renderer| renderer.result_overlay_matches_current(app));
                     if animation_needs_d2d_redraw(
                         &app.phase,
                         status_text_animating,
                         app.status_text_composition_ready,
+                        result_overlay_composition_ready,
                     ) {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -12642,9 +12721,15 @@ mod tests {
     fn status_text_push_uses_composition_and_keeps_d2d_fallback_deterministic() {
         let start = std::time::Instant::now();
         let ready = MainPhase::Ready;
-        assert!(!super::animation_needs_d2d_redraw(&ready, false, false));
-        assert!(super::animation_needs_d2d_redraw(&ready, true, false));
-        assert!(!super::animation_needs_d2d_redraw(&ready, true, true));
+        assert!(!super::animation_needs_d2d_redraw(
+            &ready, false, false, false
+        ));
+        assert!(super::animation_needs_d2d_redraw(
+            &ready, true, false, false
+        ));
+        assert!(!super::animation_needs_d2d_redraw(
+            &ready, true, true, false
+        ));
         assert_eq!(super::status_text_progress(start, start), 0.0);
         assert_eq!(super::status_text_linear_progress(start, start), 0.0);
         assert!(
@@ -12675,6 +12760,116 @@ mod tests {
             super::status_text_progress(start, start - std::time::Duration::from_millis(1)),
             0.0
         );
+    }
+
+    #[test]
+    fn composition_result_overlay_suppresses_redundant_d2d_animation_redraws() {
+        let now = Instant::now();
+        let matched = MainPhase::Matched {
+            track: Track {
+                display_id: 1,
+                title: String::new(),
+                artist: String::new(),
+                recognized_at: now,
+                recognized_at_utc: SystemTime::UNIX_EPOCH,
+                recognized_date_label: String::new(),
+                timestamp_source: HistoryTimestampSource::ControllerEvent,
+                artwork_url: None,
+                hq_artwork_url: None,
+                background_artwork_url: None,
+                track_key: None,
+                config_generation: None,
+                page_url: None,
+            },
+            stage: ResultCardStage::Entering { started_at: now },
+        };
+        let no_match = MainPhase::NoMatch {
+            entered_at: now,
+            returned_to_ready_at: None,
+        };
+
+        assert!(super::animation_needs_d2d_redraw(
+            &matched, false, true, false
+        ));
+        assert!(!super::animation_needs_d2d_redraw(
+            &matched, false, true, true
+        ));
+        assert!(super::animation_needs_d2d_redraw(
+            &no_match, false, true, false
+        ));
+        assert!(!super::animation_needs_d2d_redraw(
+            &no_match, false, true, true
+        ));
+        // Composition failure must keep the D2D fallback repaint active.
+        assert!(super::animation_needs_d2d_redraw(
+            &matched, false, false, false
+        ));
+    }
+
+    #[test]
+    fn composition_overlay_readiness_is_bound_to_current_phase_and_artwork() {
+        let now = Instant::now();
+        let track = Track {
+            display_id: 5,
+            title: "Title".to_owned(),
+            artist: "Artist".to_owned(),
+            recognized_at: now,
+            recognized_at_utc: SystemTime::UNIX_EPOCH,
+            recognized_date_label: String::new(),
+            timestamp_source: HistoryTimestampSource::ControllerEvent,
+            artwork_url: Some("https://cdn.example.test/cover.jpg".to_owned()),
+            hq_artwork_url: None,
+            background_artwork_url: None,
+            track_key: None,
+            config_generation: None,
+            page_url: None,
+        };
+        let phase = MainPhase::Matched {
+            track: track.clone(),
+            stage: ResultCardStage::Holding { started_at: now },
+        };
+        let fingerprint = (ArtworkSource::Standard, 1024, 0xAABB_CCDD);
+        let identity = super::ResultOverlayIdentity::Matched {
+            display_id: track.display_id,
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            artwork_url: track.artwork_url.clone(),
+            hq_artwork_url: track.hq_artwork_url.clone(),
+            artwork: Some(fingerprint),
+        };
+        assert!(super::result_overlay_identity_matches_phase(
+            &identity,
+            &phase,
+            Some(fingerprint),
+        ));
+        assert!(!super::result_overlay_identity_matches_phase(
+            &identity,
+            &phase,
+            Some((ArtworkSource::Standard, 1024, 0x1122_3344)),
+        ));
+
+        let no_match = MainPhase::NoMatch {
+            entered_at: now,
+            returned_to_ready_at: None,
+        };
+        let no_match_identity = super::ResultOverlayIdentity::NoMatch {
+            entered_at: now,
+            offline: false,
+        };
+        assert!(super::result_overlay_identity_matches_phase(
+            &no_match_identity,
+            &no_match,
+            None,
+        ));
+        let offline = MainPhase::Offline {
+            entered_at: now,
+            returned_to_ready_at: None,
+        };
+        assert!(!super::result_overlay_identity_matches_phase(
+            &no_match_identity,
+            &offline,
+            None,
+        ));
     }
 
     #[test]
