@@ -11,6 +11,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $compositionTests = @(
     'composition_animates_ellipse_radius_and_sprite_stroke_without_a_window'
     'composition_builds_the_native_no_match_icon_path'
+    'composition_auto_shadow_uses_button_viewport_for_336pt_mask'
     'composition_inner_ripple_group_accepts_the_inverse_circle_clip'
     'composition_result_overlay_uploads_pixels_and_resizes_at_fractional_dpi'
     'composition_status_text_renders_transitions_and_resizes_at_fractional_dpi'

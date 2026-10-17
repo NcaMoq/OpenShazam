@@ -14660,4 +14660,72 @@ mod tests {
             result.unwrap();
         }
     }
+
+    #[test]
+    #[ignore = "requires a Windows Composition dispatcher; run explicitly to verify AutoShadow mask interop"]
+    fn composition_auto_shadow_uses_button_viewport_for_336pt_mask() {
+        use super::*;
+
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).unwrap();
+            let dispatcher = CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })
+            .unwrap();
+            let result = (|| -> windows::core::Result<()> {
+                let compositor = Compositor::new()?;
+                let d2d_factory: ID2D1Factory =
+                    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+                let clip = make_inverse_circle_clip_at(
+                    &compositor,
+                    &d2d_factory,
+                    INNER_MASK_BOUNDS,
+                    BUTTON_CLEAR_DIAMETER,
+                    auto_shadow_host_center(),
+                )?;
+                clip.SetCenterPoint(auto_shadow_host_center())?;
+                clip.SetScale(Vector2 { X: 0.85, Y: 0.85 })?;
+
+                let host = compositor.CreateContainerVisual()?;
+                host.SetSize(Vector2 {
+                    X: AUTO_SHADOW_DISPLAY_BOUNDS,
+                    Y: AUTO_SHADOW_DISPLAY_BOUNDS,
+                })?;
+                host.SetCenterPoint(Vector3 {
+                    X: AUTO_SHADOW_DISPLAY_BOUNDS * 0.5,
+                    Y: AUTO_SHADOW_DISPLAY_BOUNDS * 0.5,
+                    Z: 0.0,
+                })?;
+                host.SetClip(&clip)?;
+
+                let geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
+                geometry.SetCenter(auto_shadow_host_center())?;
+                geometry.SetRadius(Vector2 {
+                    X: AUTO_SHADOW_DISPLAY_BOUNDS * 0.5,
+                    Y: AUTO_SHADOW_DISPLAY_BOUNDS * 0.5,
+                })?;
+                let shape = compositor.CreateSpriteShapeWithGeometry(&geometry)?;
+                shape.SetFillBrush(
+                    &compositor.CreateColorBrushWithColor(composition_color(255, 9, 9, 9))?,
+                )?;
+                let visual = compositor.CreateShapeVisual()?;
+                visual.SetSize(Vector2 {
+                    X: AUTO_SHADOW_DISPLAY_BOUNDS,
+                    Y: AUTO_SHADOW_DISPLAY_BOUNDS,
+                })?;
+                visual.Shapes()?.Append(&shape)?;
+                host.Children()?.InsertAtTop(&visual)?;
+
+                assert_eq!(host.Size()?, Vector2 { X: 96.0, Y: 96.0 });
+                assert_eq!(clip.CenterPoint()?, auto_shadow_host_center());
+                assert_eq!(clip.Scale()?, Vector2 { X: 0.85, Y: 0.85 });
+                Ok(())
+            })();
+            drop(dispatcher);
+            CoUninitialize();
+            result.unwrap();
+        }
+    }
 }
