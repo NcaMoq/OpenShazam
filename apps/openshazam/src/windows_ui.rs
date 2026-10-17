@@ -3308,6 +3308,85 @@ fn make_auto_shadow_outline_mask(
     Ok((source, surface, mask_brush))
 }
 
+fn popup_outline_center(arrow_center: f32) -> f32 {
+    arrow_center.clamp(14.0, CONTENT_WIDTH as f32 - 14.0)
+}
+
+unsafe fn create_popup_arrow_geometry(
+    d2d_factory: &ID2D1Factory,
+    edge: ArrowEdge,
+    center: f32,
+) -> windows::core::Result<ID2D1Geometry> {
+    let half = 10.0f32;
+    let (tip_y, base_y) = if edge == ArrowEdge::Top {
+        (0.0, POPUP_ARROW_HEIGHT as f32)
+    } else {
+        (
+            CONTENT_HEIGHT as f32 + POPUP_ARROW_HEIGHT as f32,
+            CONTENT_HEIGHT as f32,
+        )
+    };
+    let arrow = d2d_factory.CreatePathGeometry()?;
+    let sink = arrow.Open()?;
+    sink.BeginFigure(
+        Vector2 {
+            X: center - half,
+            Y: base_y,
+        },
+        D2D1_FIGURE_BEGIN_FILLED,
+    );
+    sink.AddLine(Vector2 {
+        X: center,
+        Y: tip_y,
+    });
+    sink.AddLine(Vector2 {
+        X: center + half,
+        Y: base_y,
+    });
+    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+    sink.Close()?;
+    arrow.cast()
+}
+
+unsafe fn create_popup_outline_geometry(
+    d2d_factory: &ID2D1Factory,
+    edge: ArrowEdge,
+    center: f32,
+) -> windows::core::Result<ID2D1Geometry> {
+    let body_top = if edge == ArrowEdge::Top {
+        POPUP_ARROW_HEIGHT as f32
+    } else {
+        0.0
+    };
+    let body_bottom = body_top + CONTENT_HEIGHT as f32;
+    let rounded = d2d_factory.CreateRoundedRectangleGeometry(
+        &windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+            rect: rect(0.0, body_top, CONTENT_WIDTH as f32, body_bottom),
+            radiusX: POPUP_CORNER_RADIUS as f32,
+            radiusY: POPUP_CORNER_RADIUS as f32,
+        },
+    )?;
+    let arrow = create_popup_arrow_geometry(d2d_factory, edge, center)?;
+    let union = d2d_factory.CreatePathGeometry()?;
+    let sink = union.Open()?;
+    rounded.CombineWithGeometry(&arrow, D2D1_COMBINE_MODE_UNION, None, 0.25, &sink)?;
+    sink.Close()?;
+    union.cast()
+}
+
+unsafe fn create_composition_clip_from_d2d_geometry(
+    compositor: &Compositor,
+    geometry: &ID2D1Geometry,
+) -> windows::core::Result<CompositionGeometricClip> {
+    let source: IGeometrySource2D = D2DCompositionGeometrySource {
+        geometry: geometry.clone(),
+    }
+    .into();
+    let path = CompositionPath::Create(&source)?;
+    let path_geometry = compositor.CreatePathGeometryWithPath(&path)?;
+    compositor.CreateGeometricClipWithGeometry(&path_geometry)
+}
+
 struct AutoShadowCircleVisuals {
     clipped_layer: ContainerVisual,
     background: SpriteVisual,
@@ -3379,6 +3458,8 @@ struct CompositionScene {
     compositor: Compositor,
     _target: DesktopWindowTarget,
     root: ContainerVisual,
+    _popup_clip: CompositionGeometricClip,
+    popup_clip_key: (ArrowEdge, u32),
     tagging_root: ContainerVisual,
     history_overlay: CompositionHistoryOverlay,
     result_overlay: CompositionResultOverlay,
@@ -3917,6 +3998,7 @@ impl CompositionScene {
         compositor: &Compositor,
         theme: Theme,
         arrow_edge: ArrowEdge,
+        arrow_center: f32,
         dpi: u32,
         animate_startup_logo: bool,
     ) -> windows::core::Result<Self> {
@@ -3951,6 +4033,13 @@ impl CompositionScene {
             0.0
         };
         root.SetOffset(composition_button_pixel_snap_offset(dpi, body_top))?;
+        let arrow_center = popup_outline_center(arrow_center);
+        let popup_outline =
+            unsafe { create_popup_outline_geometry(d2d_factory, arrow_edge, arrow_center)? };
+        let popup_clip =
+            unsafe { create_composition_clip_from_d2d_geometry(compositor, &popup_outline)? };
+        root.SetClip(&popup_clip)?;
+        let popup_clip_key = (arrow_edge, arrow_center.to_bits());
         let clip_bottom = MAIN_WINDOW_HEIGHT as f32 - (body_top + TOP_HEIGHT as f32);
         let clip = compositor.CreateInsetClipWithInsets(0.0, 0.0, 0.0, clip_bottom.max(0.0))?;
         tagging_root.SetClip(&clip)?;
@@ -4585,6 +4674,8 @@ impl CompositionScene {
             compositor: compositor.clone(),
             _target: target,
             root,
+            _popup_clip: popup_clip,
+            popup_clip_key,
             tagging_root,
             history_overlay,
             result_overlay,
@@ -4629,6 +4720,24 @@ impl CompositionScene {
             no_match_active: false,
             no_match_restore_active: false,
         })
+    }
+
+    unsafe fn update_popup_clip(
+        &mut self,
+        outline: &ID2D1Geometry,
+        edge: ArrowEdge,
+        arrow_center: f32,
+    ) -> windows::core::Result<()> {
+        let center = popup_outline_center(arrow_center);
+        let key = (edge, center.to_bits());
+        if self.popup_clip_key == key {
+            return Ok(());
+        }
+        let clip = create_composition_clip_from_d2d_geometry(&self.compositor, outline)?;
+        self.root.SetClip(&clip)?;
+        self._popup_clip = clip;
+        self.popup_clip_key = key;
+        Ok(())
     }
 
     fn set_dpi(&mut self, dpi: u32) -> windows::core::Result<()> {
@@ -6320,6 +6429,8 @@ impl Renderer {
         write_factory: IDWriteFactory,
         compositor: Compositor,
         dpi: u32,
+        arrow_edge: ArrowEdge,
+        arrow_center: f32,
         theme_generation: u64,
         theme: Theme,
         system_foreground: Color,
@@ -6385,7 +6496,8 @@ impl Renderer {
                 &write_factory,
                 &compositor,
                 theme,
-                ArrowEdge::Top,
+                arrow_edge,
+                arrow_center,
                 dpi,
                 animate_startup_logo,
             )?)
@@ -6672,6 +6784,14 @@ impl Renderer {
         } else {
             0.0
         };
+        let popup_outline = if kind == WindowKind::Main {
+            Some(self.popup_outline(app)?)
+        } else {
+            None
+        };
+        if let (Some(scene), Some(outline)) = (self.composition.as_mut(), popup_outline.as_ref()) {
+            unsafe { scene.update_popup_clip(outline, app.arrow_edge, app.arrow_center)? };
+        }
         let history_composition_active = kind == WindowKind::Main
             && unsafe { self.prepare_history_overlay(app, body_top, Instant::now()) };
         let panel_top = if kind == WindowKind::Main {
@@ -6734,7 +6854,7 @@ impl Renderer {
         let popup_layer_parameters = if kind == WindowKind::Main {
             Some(windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS {
                 contentBounds: rect(0.0, 0.0, CONTENT_WIDTH as f32, MAIN_WINDOW_HEIGHT as f32),
-                geometricMask: std::mem::ManuallyDrop::new(Some(self.popup_outline(app)?)),
+                geometricMask: std::mem::ManuallyDrop::new(popup_outline.clone()),
                 maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                 maskTransform: windows_numerics::Matrix3x2 {
                     M11: 1.0,
@@ -7298,37 +7418,14 @@ impl Renderer {
     /// arrow. A single outer contour keeps the translucent DWM edge continuous
     /// and avoids independently rasterized edges where the arrow meets panel.
     unsafe fn popup_outline(&self, app: &AppState) -> windows::core::Result<ID2D1Geometry> {
-        let half = 10.0f32;
-        let center = app
-            .arrow_center
-            .clamp(half + 4.0, CONTENT_WIDTH as f32 - half - 4.0);
+        let center = popup_outline_center(app.arrow_center);
         let key = (app.arrow_edge, center.to_bits());
         if let Some((edge, center_bits, geometry)) = self.popup_outline.borrow().as_ref() {
             if *edge == key.0 && *center_bits == key.1 {
                 return Ok(geometry.clone());
             }
         }
-
-        let body_top = if app.arrow_edge == ArrowEdge::Top {
-            POPUP_ARROW_HEIGHT as f32
-        } else {
-            0.0
-        };
-        let body_bottom = body_top + CONTENT_HEIGHT as f32;
-        let rounded = self.factory.CreateRoundedRectangleGeometry(
-            &windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
-                rect: rect(0.0, body_top, CONTENT_WIDTH as f32, body_bottom),
-                radiusX: POPUP_CORNER_RADIUS as f32,
-                radiusY: POPUP_CORNER_RADIUS as f32,
-            },
-        )?;
-        let arrow = self.popup_arrow_geometry(app.arrow_edge, center)?;
-
-        let union = self.factory.CreatePathGeometry()?;
-        let union_sink = union.Open()?;
-        rounded.CombineWithGeometry(&arrow, D2D1_COMBINE_MODE_UNION, None, 0.25, &union_sink)?;
-        union_sink.Close()?;
-        let geometry: ID2D1Geometry = union.cast()?;
+        let geometry = create_popup_outline_geometry(&self.factory, app.arrow_edge, center)?;
         *self.popup_outline.borrow_mut() = Some((key.0, key.1, geometry.clone()));
         Ok(geometry)
     }
@@ -7392,35 +7489,7 @@ impl Renderer {
         edge: ArrowEdge,
         center: f32,
     ) -> windows::core::Result<ID2D1Geometry> {
-        let half = 10.0f32;
-        let (tip_y, base_y) = if edge == ArrowEdge::Top {
-            (0.0, POPUP_ARROW_HEIGHT as f32)
-        } else {
-            (
-                CONTENT_HEIGHT as f32 + POPUP_ARROW_HEIGHT as f32,
-                CONTENT_HEIGHT as f32,
-            )
-        };
-        let arrow = self.factory.CreatePathGeometry()?;
-        let sink = arrow.Open()?;
-        sink.BeginFigure(
-            Vector2 {
-                X: center - half,
-                Y: base_y,
-            },
-            D2D1_FIGURE_BEGIN_FILLED,
-        );
-        sink.AddLine(Vector2 {
-            X: center,
-            Y: tip_y,
-        });
-        sink.AddLine(Vector2 {
-            X: center + half,
-            Y: base_y,
-        });
-        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-        sink.Close()?;
-        arrow.cast()
+        create_popup_arrow_geometry(&self.factory, edge, center)
     }
 
     unsafe fn combine_geometry(
@@ -11801,6 +11870,8 @@ unsafe extern "system" fn window_proc(
                 app.dwrite_factory.clone(),
                 app.compositor.clone(),
                 dpi,
+                app.arrow_edge,
+                app.arrow_center,
                 app.theme_generation,
                 app.theme,
                 app.system_foreground,
