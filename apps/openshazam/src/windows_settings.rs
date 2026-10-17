@@ -19,12 +19,32 @@ type BootstrapShutdown = unsafe extern "system" fn();
 const WINDOWSAPPSDK_RELEASE_MAJORMINOR: u32 = 0x0001_0008;
 const WINDOWSAPPSDK_RUNTIME_MIN_VERSION: u64 = 0x1F40_0326_08CC_0000;
 const WINDOWSAPPSDK_RELEASE_VERSION_TAG: [u16; 1] = [0];
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const APPMODEL_ERROR_NO_PACKAGE: u32 = 15_700;
 
 #[link(name = "kernel32")]
 extern "system" {
     fn LoadLibraryW(name: *const u16) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
     fn FreeLibrary(module: *mut c_void) -> i32;
+    fn GetCurrentPackageFullName(
+        package_full_name_length: *mut u32,
+        package_full_name: *mut u16,
+    ) -> u32;
+}
+
+fn process_has_package_identity() -> Result<bool, String> {
+    let mut length = 0u32;
+    // A null output buffer intentionally asks the OS whether the current
+    // process has package identity without reading any package metadata.
+    let result = unsafe { GetCurrentPackageFullName(&mut length, std::ptr::null_mut()) };
+    match result {
+        0 | ERROR_INSUFFICIENT_BUFFER => Ok(true),
+        APPMODEL_ERROR_NO_PACKAGE => Ok(false),
+        code => Err(format!(
+            "Windows could not determine OpenShazam package identity (error {code})."
+        )),
+    }
 }
 
 pub struct SettingsHost {
@@ -34,7 +54,7 @@ pub struct SettingsHost {
     is_visible: IsVisible,
     shutdown: Shutdown,
     bootstrap_library: *mut c_void,
-    bootstrap_shutdown: BootstrapShutdown,
+    bootstrap_shutdown: Option<BootstrapShutdown>,
 }
 
 impl SettingsHost {
@@ -49,6 +69,7 @@ impl SettingsHost {
             .parent()
             .ok_or("Cannot locate OpenShazam's installation directory")?
             .join("Microsoft.WindowsAppRuntime.Bootstrap.dll");
+        let has_package_identity = process_has_package_identity()?;
         if !path.is_file() {
             return Err(format!(
                 "WinUI 3 Settings component is missing: {}. \
@@ -56,7 +77,7 @@ impl SettingsHost {
                 path.display()
             ));
         }
-        if !bootstrap_path.is_file() {
+        if !has_package_identity && !bootstrap_path.is_file() {
             return Err(format!(
                 "Windows App SDK bootstrapper is missing: {}. \
                  Build and bundle Microsoft.WindowsAppRuntime.Bootstrap.dll alongside openshazam.exe.",
@@ -64,54 +85,64 @@ impl SettingsHost {
             ));
         }
 
-        let mut bootstrap_name: Vec<u16> = OsStr::new(bootstrap_path.as_os_str())
-            .encode_wide()
-            .collect();
-        bootstrap_name.push(0);
-        // SAFETY: The absolute, NUL-terminated path points to the app-local
-        // Windows App SDK bootstrapper produced alongside the Settings host.
-        let bootstrap_library = unsafe { LoadLibraryW(bootstrap_name.as_ptr()) };
-        if bootstrap_library.is_null() {
-            return Err(format!(
-                "Windows could not load the Windows App SDK bootstrapper from {} (OS error {}).",
-                bootstrap_path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        // SAFETY: These exports are the documented C ABI of the app-local
-        // Windows App SDK bootstrapper. Initialize the framework package graph
-        // before loading SettingsHost, whose imports include WinUI runtime DLLs.
-        let bootstrap_functions = unsafe {
-            let initialize = GetProcAddress(
-                bootstrap_library,
-                b"MddBootstrapInitialize\0".as_ptr().cast(),
-            );
-            let shutdown =
-                GetProcAddress(bootstrap_library, b"MddBootstrapShutdown\0".as_ptr().cast());
-            if initialize.is_null() || shutdown.is_null() {
-                FreeLibrary(bootstrap_library);
-                return Err("Windows App SDK bootstrapper is missing a required export".to_owned());
+        let (bootstrap_library, bootstrap_shutdown) = if has_package_identity {
+            // A framework-dependent MSIX package receives the Windows App SDK
+            // framework through its manifest package dependency. The
+            // Bootstrapper API is for unpackaged/external-location processes.
+            (std::ptr::null_mut(), None)
+        } else {
+            let mut bootstrap_name: Vec<u16> = OsStr::new(bootstrap_path.as_os_str())
+                .encode_wide()
+                .collect();
+            bootstrap_name.push(0);
+            // SAFETY: The absolute, NUL-terminated path points to the app-local
+            // Windows App SDK bootstrapper produced alongside the Settings host.
+            let bootstrap_library = unsafe { LoadLibraryW(bootstrap_name.as_ptr()) };
+            if bootstrap_library.is_null() {
+                return Err(format!(
+                    "Windows could not load the Windows App SDK bootstrapper from {} (OS error {}).",
+                    bootstrap_path.display(),
+                    std::io::Error::last_os_error()
+                ));
             }
-            (
-                std::mem::transmute::<*mut c_void, BootstrapInitialize>(initialize),
-                std::mem::transmute::<*mut c_void, BootstrapShutdown>(shutdown),
-            )
+
+            // SAFETY: These exports are the documented C ABI of the app-local
+            // Windows App SDK bootstrapper. Initialize the framework package graph
+            // before loading SettingsHost, whose imports include WinUI runtime DLLs.
+            let bootstrap_functions = unsafe {
+                let initialize = GetProcAddress(
+                    bootstrap_library,
+                    b"MddBootstrapInitialize\0".as_ptr().cast(),
+                );
+                let shutdown =
+                    GetProcAddress(bootstrap_library, b"MddBootstrapShutdown\0".as_ptr().cast());
+                if initialize.is_null() || shutdown.is_null() {
+                    FreeLibrary(bootstrap_library);
+                    return Err(
+                        "Windows App SDK bootstrapper is missing a required export".to_owned()
+                    );
+                }
+                (
+                    std::mem::transmute::<*mut c_void, BootstrapInitialize>(initialize),
+                    std::mem::transmute::<*mut c_void, BootstrapShutdown>(shutdown),
+                )
+            };
+            let bootstrap_hr = unsafe {
+                (bootstrap_functions.0)(
+                    WINDOWSAPPSDK_RELEASE_MAJORMINOR,
+                    WINDOWSAPPSDK_RELEASE_VERSION_TAG.as_ptr(),
+                    WINDOWSAPPSDK_RUNTIME_MIN_VERSION,
+                )
+            };
+            if bootstrap_hr < 0 {
+                unsafe { FreeLibrary(bootstrap_library) };
+                return Err(format!(
+                    "Windows App SDK 1.8 initialization failed (HRESULT 0x{:08X}).",
+                    bootstrap_hr as u32
+                ));
+            }
+            (bootstrap_library, Some(bootstrap_functions.1))
         };
-        let bootstrap_hr = unsafe {
-            (bootstrap_functions.0)(
-                WINDOWSAPPSDK_RELEASE_MAJORMINOR,
-                WINDOWSAPPSDK_RELEASE_VERSION_TAG.as_ptr(),
-                WINDOWSAPPSDK_RUNTIME_MIN_VERSION,
-            )
-        };
-        if bootstrap_hr < 0 {
-            unsafe { FreeLibrary(bootstrap_library) };
-            return Err(format!(
-                "Windows App SDK 1.8 initialization failed (HRESULT 0x{:08X}).",
-                bootstrap_hr as u32
-            ));
-        }
 
         let mut name: Vec<u16> = OsStr::new(path.as_os_str()).encode_wide().collect();
         name.push(0);
@@ -120,9 +151,11 @@ impl SettingsHost {
         // The Windows App SDK framework dependency is active at this point.
         let module = unsafe { LoadLibraryW(name.as_ptr()) };
         if module.is_null() {
-            unsafe {
-                (bootstrap_functions.1)();
-                FreeLibrary(bootstrap_library);
+            if let Some(bootstrap_shutdown) = bootstrap_shutdown {
+                unsafe {
+                    bootstrap_shutdown();
+                    FreeLibrary(bootstrap_library);
+                }
             }
             return Err(format!(
                 "Windows could not load WinUI 3 Settings from {} (OS error {}). \
@@ -157,14 +190,16 @@ impl SettingsHost {
                     b"OpenShazamSettingsShutdown\0",
                 )?),
                 bootstrap_library,
-                bootstrap_shutdown: bootstrap_functions.1,
+                bootstrap_shutdown,
             })
         })();
         if result.is_err() {
             unsafe {
                 FreeLibrary(module);
-                (bootstrap_functions.1)();
-                FreeLibrary(bootstrap_library);
+                if let Some(bootstrap_shutdown) = bootstrap_shutdown {
+                    bootstrap_shutdown();
+                    FreeLibrary(bootstrap_library);
+                }
             }
         }
         result
@@ -196,8 +231,10 @@ impl Drop for SettingsHost {
         unsafe {
             (self.shutdown)();
             FreeLibrary(self.library);
-            (self.bootstrap_shutdown)();
-            FreeLibrary(self.bootstrap_library);
+            if let Some(bootstrap_shutdown) = self.bootstrap_shutdown {
+                bootstrap_shutdown();
+                FreeLibrary(self.bootstrap_library);
+            }
         }
     }
 }
