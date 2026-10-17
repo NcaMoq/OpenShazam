@@ -10459,20 +10459,25 @@ unsafe fn sync_main_timers(app: &mut AppState) {
             let _ = KillTimer(Some(hwnd), TIMER_PHASE);
             app.phase_timer_active = false;
         }
-        let animate = app.popup_transition.is_some()
-            || animation_needs_frame(&app.phase, app.startup_animation_pending)
-            || result_overlay_fallback_needs_frame(
-                &app.phase,
-                app.result_overlay_composition_ready,
-            )
-            || (!app.status_text_composition_ready
-                && app
-                    .status_alternator
-                    .is_some_and(|status| status.animating(Instant::now())))
-            || app.history_transition.is_some_and(|transition| {
-                Instant::now().saturating_duration_since(transition.started_at)
-                    < HISTORY_INSERT_TRANSITION
-            });
+        let content_animation_needs_frame =
+            animation_needs_frame(&app.phase, app.startup_animation_pending)
+                || result_overlay_fallback_needs_frame(
+                    &app.phase,
+                    app.result_overlay_composition_ready,
+                )
+                || (!app.status_text_composition_ready
+                    && app
+                        .status_alternator
+                        .is_some_and(|status| status.animating(Instant::now())))
+                || app.history_transition.is_some_and(|transition| {
+                    Instant::now().saturating_duration_since(transition.started_at)
+                        < HISTORY_INSERT_TRANSITION
+                });
+        let animate = animation_timer_needed(
+            app.visible,
+            app.popup_transition.is_some(),
+            content_animation_needs_frame,
+        );
         if animate && !app.animation_timer_active {
             let _ = SetTimer(Some(hwnd), TIMER_ANIMATION, ANIMATION_TICK_MS, None);
             app.animation_timer_active = true;
@@ -10841,6 +10846,14 @@ fn advance_result_card_stage(stage: ResultCardStage, now: Instant) -> ResultCard
 
 fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> bool {
     startup_animation_pending || phase_needs_frame(phase)
+}
+
+fn animation_timer_needed(
+    visible: bool,
+    popup_transition_active: bool,
+    content_animation_needs_frame: bool,
+) -> bool {
+    popup_transition_active || (visible && content_animation_needs_frame)
 }
 
 fn result_overlay_fallback_needs_frame(phase: &MainPhase, composition_ready: bool) -> bool {
@@ -12184,8 +12197,8 @@ unsafe fn hovered_history_row_for_cursor(app: &AppState) -> Option<usize> {
 mod tests {
     use super::StatusTextAlternator;
     use super::{
-        advance_result_card_stage, animation_needs_frame, artwork_pixel_fingerprint,
-        artwork_request_is_current, artwork_request_matches_track,
+        advance_result_card_stage, animation_needs_frame, animation_timer_needed,
+        artwork_pixel_fingerprint, artwork_request_is_current, artwork_request_matches_track,
         artwork_request_urls_match_track, auto_shadow_host_center, button_border_arc_points,
         capture_animation_start, capture_mode_in_progress, composition_button_pixel_snap_offset,
         composition_header_viewport_offset, composition_root_layer_order,
@@ -14731,6 +14744,14 @@ mod tests {
             &auto_listening,
             auto_started + Duration::from_millis(200)
         ));
+    }
+
+    #[test]
+    fn hidden_popup_skips_content_animation_ticks_but_finishes_popup_transition() {
+        assert!(!animation_timer_needed(false, false, true));
+        assert!(!animation_timer_needed(false, false, false));
+        assert!(animation_timer_needed(true, false, true));
+        assert!(animation_timer_needed(false, true, false));
     }
 
     #[test]
