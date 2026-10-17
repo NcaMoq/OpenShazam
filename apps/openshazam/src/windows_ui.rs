@@ -141,10 +141,10 @@ use windows_numerics::{Matrix3x2, Vector2, Vector3};
 
 use openshazam::WindowsRecognitionBackend;
 use openshazam_controller::{
-    ApplicationController, CommandId, CommandResultLookup, CommandStatus, NativeManualResultStage,
-    NativeManualUiEvent, RecognitionCommand, RecognitionContext, RecognitionEvent,
-    RecognitionEventCategory, RecognitionEventKind, RecognitionSessionSnapshot, SessionEndReason,
-    SessionPhase, TrackCandidate, UiConfigSnapshot, UiRecognitionEvent,
+    ApplicationController, CommandId, CommandResultLookup, CommandStatus, NativeAutoUiEvent,
+    NativeManualResultStage, NativeManualUiEvent, RecognitionCommand, RecognitionContext,
+    RecognitionEvent, RecognitionEventCategory, RecognitionEventKind, RecognitionSessionSnapshot,
+    SessionEndReason, SessionPhase, TrackCandidate, UiConfigSnapshot, UiRecognitionEvent,
 };
 
 use crate::ui_model::{
@@ -739,6 +739,8 @@ struct AppState {
     dropped_notifications: u64,
     status_alternator: Option<StatusTextAlternator>,
     success_wave_frame: Option<ui_model::WaveFrame>,
+    auto_listening_started_at: Option<Instant>,
+    last_auto_candidate_identity: Option<String>,
     next_display_id: u64,
     artwork_resources: HashMap<u64, (ArtworkSource, ArtworkPixels)>,
     ui_configs: HashMap<u64, UiConfigSnapshot>,
@@ -7426,6 +7428,8 @@ fn start_capture(app: &mut AppState, mode: CaptureMode) {
     };
     match ticket {
         Ok(ticket) => {
+            app.auto_listening_started_at = None;
+            app.last_auto_candidate_identity = None;
             app.recognition_session = Some(RecognitionSessionUi {
                 ticket,
                 mode,
@@ -7616,8 +7620,13 @@ fn apply_recognition_event(app: &mut AppState, event: RecognitionEvent, mode: Ca
             if let Some(session) = app.recognition_session.as_mut() {
                 session.result_presented = true;
             }
-            show_controller_match(app, result.primary_track, mode, config_generation);
+            show_controller_match(app, result.primary_track, config_generation);
             true
+        }
+        RecognitionEventKind::AutoUiEvent(NativeAutoUiEvent::ContinuousMatchCandidate(result))
+            if mode == CaptureMode::Auto =>
+        {
+            present_auto_match(app, result.primary_track, config_generation)
         }
         RecognitionEventKind::ManualUiEvent(NativeManualUiEvent::NoMatch)
         | RecognitionEventKind::NoMatch { .. } => {
@@ -7683,6 +7692,12 @@ fn reconcile_controller_snapshot(
 }
 
 fn enter_listening(app: &mut AppState, mode: CaptureMode, started_at: Instant) {
+    let started_at = if mode == CaptureMode::Auto {
+        *app.auto_listening_started_at.get_or_insert(started_at)
+    } else {
+        app.auto_listening_started_at = None;
+        started_at
+    };
     app.phase = MainPhase::Listening { mode, started_at };
     app.status_alternator =
         (mode == CaptureMode::Auto).then(|| StatusTextAlternator::auto(started_at));
@@ -7711,11 +7726,21 @@ fn reconcile_session_snapshot(app: &mut AppState, session: &RecognitionSessionSn
                 show_controller_match(
                     app,
                     result.primary_track.clone(),
-                    ui_session.mode,
                     session.config.as_ref().map(|config| config.generation),
                 );
                 changed = true;
             }
+        }
+    }
+    if ui_session.mode == CaptureMode::Auto {
+        if let Some(UiRecognitionEvent::Auto(NativeAutoUiEvent::ContinuousMatchCandidate(result))) =
+            session.last_result.as_ref()
+        {
+            changed |= present_auto_match(
+                app,
+                result.primary_track.clone(),
+                session.config.as_ref().map(|config| config.generation),
+            );
         }
     }
     match session.phase {
@@ -7756,6 +7781,8 @@ fn reconcile_session_snapshot(app: &mut AppState, session: &RecognitionSessionSn
         }
         SessionPhase::Faulted => {
             app.recognition_session = None;
+            app.auto_listening_started_at = None;
+            app.last_auto_candidate_identity = None;
             app.phase = MainPhase::Error {
                 message: "Recognition session failed and its resources may not have been released"
                     .to_owned(),
@@ -7765,6 +7792,8 @@ fn reconcile_session_snapshot(app: &mut AppState, session: &RecognitionSessionSn
         }
         SessionPhase::Ended(reason) => {
             app.recognition_session = None;
+            app.auto_listening_started_at = None;
+            app.last_auto_candidate_identity = None;
             if !matches!(
                 app.phase,
                 MainPhase::Matched { .. }
@@ -7793,7 +7822,6 @@ fn reconcile_session_snapshot(app: &mut AppState, session: &RecognitionSessionSn
 fn show_controller_match(
     app: &mut AppState,
     candidate: TrackCandidate,
-    mode: CaptureMode,
     config_generation: Option<u64>,
 ) {
     let metadata = candidate.ui_metadata.as_ref();
@@ -7859,10 +7887,40 @@ fn show_controller_match(
     } else {
         app.success_wave_frame = None;
         app.phase = MainPhase::Ready;
-        if mode == CaptureMode::Manual {
-            unsafe { notify_hidden_match(app.main_hwnd, &track) };
-        }
+        unsafe { notify_hidden_match(app.main_hwnd, &track) };
     }
+}
+
+fn present_auto_match(
+    app: &mut AppState,
+    candidate: TrackCandidate,
+    config_generation: Option<u64>,
+) -> bool {
+    let identity = auto_candidate_identity(&candidate);
+    if app.last_auto_candidate_identity.as_deref() == Some(identity.as_str()) {
+        return false;
+    }
+    app.last_auto_candidate_identity = Some(identity);
+    show_controller_match(app, candidate, config_generation);
+    true
+}
+
+fn auto_candidate_identity(candidate: &TrackCandidate) -> String {
+    if let Some(track_key) = candidate
+        .ui_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.track_key.as_deref())
+    {
+        return format!("key:{track_key}");
+    }
+    if let Some(track_id) = candidate.track_id.as_deref() {
+        return format!("id:{track_id}");
+    }
+    format!(
+        "name:{}\0{}",
+        candidate.title.trim().to_lowercase(),
+        candidate.artist.trim().to_lowercase()
+    )
 }
 
 fn current_success_wave_frame(app: &AppState) -> Option<ui_model::WaveFrame> {
@@ -9912,6 +9970,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             dropped_notifications: 0,
             status_alternator: Some(StatusTextAlternator::ready(Instant::now())),
             success_wave_frame: None,
+            auto_listening_started_at: None,
+            last_auto_candidate_identity: None,
             next_display_id: 1,
             artwork_resources: HashMap::new(),
             ui_configs: HashMap::new(),
@@ -10013,7 +10073,15 @@ fn update_phase_timers(app: &mut AppState) -> bool {
                 changed = true;
             }
             ResultCardAdvance::Ready => {
-                app.phase = MainPhase::Ready;
+                if app
+                    .recognition_session
+                    .is_some_and(|session| session.mode == CaptureMode::Auto)
+                {
+                    let started_at = app.auto_listening_started_at.unwrap_or(now);
+                    enter_listening(app, CaptureMode::Auto, started_at);
+                } else {
+                    app.phase = MainPhase::Ready;
+                }
                 changed = true;
             }
         },
