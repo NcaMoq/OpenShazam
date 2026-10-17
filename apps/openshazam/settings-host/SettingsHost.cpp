@@ -476,12 +476,13 @@ namespace
             stack.Padding(x::ThicknessHelper::FromUniformLength(24));
 
             state->startupCard = markup::XamlReader::Load(
-                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="14" />)"
+                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="16" />)"
             ).as<controls::Border>();
             state->startupCard.HorizontalAlignment(x::HorizontalAlignment::Stretch);
             state->startupRow = controls::Grid{};
             auto startupRow = state->startupRow;
             startupRow.HorizontalAlignment(x::HorizontalAlignment::Stretch);
+            startupRow.ColumnSpacing(12.0);
             auto startupLabelColumn = controls::ColumnDefinition{};
             startupLabelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
             auto startupToggleColumn = controls::ColumnDefinition{};
@@ -523,12 +524,13 @@ namespace
             stack.Children().Append(state->startupCard);
 
             state->appearanceCard = markup::XamlReader::Load(
-                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="14" />)"
+                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="16" />)"
             ).as<controls::Border>();
             state->appearanceCard.HorizontalAlignment(x::HorizontalAlignment::Stretch);
             state->appearanceRow = controls::Grid{};
             auto appearanceRow = state->appearanceRow;
             appearanceRow.HorizontalAlignment(x::HorizontalAlignment::Stretch);
+            appearanceRow.ColumnSpacing(12.0);
             auto iconColumn = controls::ColumnDefinition{};
             iconColumn.Width(x::GridLengthHelper::FromValueAndType(34.0, x::GridUnitType::Pixel));
             auto labelColumn = controls::ColumnDefinition{};
@@ -622,11 +624,11 @@ namespace
                 {
                     state->startupCard.Width(cardWidth);
                     state->appearanceCard.Width(cardWidth);
-                    // Border padding consumes 14 DIPs on each side. Pin each
+                    // Border padding consumes 16 DIPs on each side. Pin each
                     // row to the remaining content width so the trailing
                     // control stays at the card's right edge even when the
                     // island is measured before its host window is shown.
-                    const double rowWidth = cardWidth - 28.0;
+                    const double rowWidth = cardWidth - 32.0;
                     state->startupRow.Width(rowWidth);
                     state->appearanceRow.Width(rowWidth);
                 }
