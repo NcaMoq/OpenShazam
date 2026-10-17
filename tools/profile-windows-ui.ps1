@@ -16,10 +16,24 @@ param(
     [int]$ProcessId = 0,
     [ValidateRange(5, 600)]
     [int]$DurationSeconds = 30,
-    [string]$OutputDirectory = (Join-Path $env:TEMP 'OpenShazam-UI-Profile')
+    [string]$OutputDirectory = (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\windows-x64') 'profiles')
 )
 
 $ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $PSScriptRoot
+$distRoot = [IO.Path]::GetFullPath((Join-Path $root 'dist\windows-x64')).TrimEnd('\')
+$resolvedOutputDirectory = if ([IO.Path]::IsPathRooted($OutputDirectory)) {
+    [IO.Path]::GetFullPath($OutputDirectory)
+}
+else {
+    [IO.Path]::GetFullPath((Join-Path $distRoot $OutputDirectory))
+}
+$distPrefix = $distRoot + [IO.Path]::DirectorySeparatorChar
+if (-not $resolvedOutputDirectory.Equals($distRoot, [StringComparison]::OrdinalIgnoreCase) -and
+    -not $resolvedOutputDirectory.StartsWith($distPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Profile output is restricted to $distRoot"
+}
+$OutputDirectory = $resolvedOutputDirectory
 
 $source = @'
 using System;
@@ -86,6 +100,11 @@ if (-not [OpenShazamProfileWindowProbe]::HasVisibleMainWindow($ProcessId)) {
 $wpr = Get-Command 'wpr.exe' -ErrorAction SilentlyContinue
 if (-not $wpr) { throw 'Windows Performance Recorder (wpr.exe) is not installed.' }
 $null = New-Item -ItemType Directory -Path $OutputDirectory -Force
+$OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory -ErrorAction Stop).Path
+if (-not $OutputDirectory.Equals($distRoot, [StringComparison]::OrdinalIgnoreCase) -and
+    -not $OutputDirectory.StartsWith($distPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Resolved profile output escaped $distRoot"
+}
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $tracePath = Join-Path $OutputDirectory "openshazam-$stamp.etl"
 $csvPath = Join-Path $OutputDirectory "openshazam-$stamp-samples.csv"
