@@ -14505,6 +14505,11 @@ mod tests {
                 stroke.InsertKeyFrame(0.0, 0.0)?;
                 stroke.InsertKeyFrame(1.0, 4.0)?;
                 shape.StartAnimation(&HSTRING::from("StrokeThickness"), &stroke)?;
+                // Stop clocked animations before tearing down the dispatcher.
+                // Leaving them active can race COM/Composition cleanup when
+                // another native Composition test starts in the same process.
+                shape.StopAnimation(&HSTRING::from("StrokeThickness"))?;
+                geometry.StopAnimation(&HSTRING::from("Radius"))?;
                 Ok(())
             })();
             drop(dispatcher);
