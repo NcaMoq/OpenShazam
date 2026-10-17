@@ -101,7 +101,7 @@ use windows::{
         },
         UI::{
             HiDpi::{
-                GetDpiForWindow, SetProcessDpiAwarenessContext,
+                GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
             },
             Input::KeyboardAndMouse::{GetDoubleClickTime, ReleaseCapture, SetCapture, VK_ESCAPE},
@@ -115,8 +115,8 @@ use windows::{
             WindowsAndMessaging::{
                 AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
                 DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
-                GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-                KillTimer, LoadCursorW, LoadIconW, PeekMessageW, PostMessageW, PostQuitMessage,
+                GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer,
+                LoadCursorW, LoadIconW, PeekMessageW, PostMessageW, PostQuitMessage,
                 RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
                 SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu,
                 TranslateMessage, UpdateLayeredWindow, WaitMessage, CS_DBLCLKS, CW_USEDEFAULT,
@@ -7794,13 +7794,20 @@ fn queue_hidden_match_notification(app: &mut AppState, track: &Track) {
 
 unsafe fn notify_hidden_match(app: &mut AppState, track: &Track, artwork: Option<&ArtworkPixels>) {
     let body = format!("{} — {}", track.title, track.artist);
-    let balloon_icon = artwork.and_then(|pixels| match create_notification_icon(pixels) {
-        Ok(icon) => Some(icon),
-        Err(error) => {
-            eprintln!("OpenShazam could not create notification artwork icon: {error}");
-            None
-        }
-    });
+    let notification_dpi = GetDpiForWindow(app.main_hwnd).max(96);
+    let balloon_icon =
+        artwork.and_then(
+            |pixels| match create_notification_icon(pixels, notification_dpi) {
+                Ok(icon) => Some(icon),
+                Err(error) => {
+                    eprintln!("OpenShazam could not create notification artwork icon: {error}");
+                    None
+                }
+            },
+        );
+    if artwork.is_none() {
+        eprintln!("OpenShazam notification artwork unavailable; using the system information icon");
+    }
     let mut data = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: app.main_hwnd,
@@ -7890,12 +7897,14 @@ fn scale_notification_artwork_to_size(
 
 unsafe fn create_notification_icon(
     pixels: &ArtworkPixels,
+    dpi: u32,
 ) -> windows::core::Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
-    // NIIF_LARGE_ICON requires the custom hBalloonIcon to use the exact
-    // SM_CXICON x SM_CYICON dimensions. Using max(width, height) or clamping
-    // can make Explorer silently show its blue NIIF_INFO fallback instead.
-    let width = GetSystemMetrics(SM_CXICON);
-    let height = GetSystemMetrics(SM_CYICON);
+    // NIIF_LARGE_ICON requires hBalloonIcon to use the large system-icon size.
+    // This process is per-monitor DPI aware, so query the metrics for the
+    // notification window's current monitor instead of using the system-DPI
+    // values. A mismatched icon size can make Explorer silently use NIIF_INFO.
+    let width = GetSystemMetricsForDpi(SM_CXICON, dpi.max(96));
+    let height = GetSystemMetricsForDpi(SM_CYICON, dpi.max(96));
     if !(1..=512).contains(&width) || !(1..=512).contains(&height) {
         return Err(Error::new(
             windows::core::HRESULT(0x8007_0057u32 as i32),
@@ -12906,7 +12915,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_notification_artwork_creates_a_native_icon_handle() {
+    fn custom_notification_artwork_creates_native_icons_at_supported_dpi_values() {
         let pixels = ArtworkPixels {
             width: 1,
             height: 1,
@@ -12914,9 +12923,15 @@ mod tests {
             bgra: vec![40, 80, 120, 255],
         };
         unsafe {
-            let icon = super::create_notification_icon(&pixels).unwrap();
-            assert!(!icon.0.is_null());
-            let _ = super::DestroyIcon(icon);
+            for dpi in [96, 120, 144, 168, 192, 240, 288] {
+                let icon = super::create_notification_icon(&pixels, dpi)
+                    .unwrap_or_else(|error| panic!("failed to create icon at {dpi} DPI: {error}"));
+                assert!(
+                    !icon.0.is_null(),
+                    "icon handle at {dpi} DPI must be non-null"
+                );
+                let _ = super::DestroyIcon(icon);
+            }
         }
     }
 
