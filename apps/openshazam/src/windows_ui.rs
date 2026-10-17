@@ -9307,6 +9307,10 @@ unsafe fn open_settings_after_wndproc(app_ptr: *mut AppState) -> LRESULT {
             hr as u32
         ));
         let _ = InvalidateRect(Some(owner), None, false);
+    } else {
+        // Settings takes focus without going through the popup's ordinary
+        // deactivation path, so dismiss the main popup explicitly on success.
+        hide_main(&mut *app_ptr);
     }
     LRESULT(0)
 }
