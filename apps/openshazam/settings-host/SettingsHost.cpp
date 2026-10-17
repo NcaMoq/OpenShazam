@@ -483,11 +483,11 @@ namespace
             auto startupLabelColumn = controls::ColumnDefinition{};
             startupLabelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
             auto startupToggleColumn = controls::ColumnDefinition{};
-            // Keep a stable trailing lane. Auto sizing can collapse while the
-            // XAML island is first measured, visually grouping the switch
-            // with the label instead of anchoring it to the card's right edge.
+            // Let the switch define a fixed-width trailing lane. The label
+            // consumes the remaining space, pinning the whole control to the
+            // card's right edge at every window width.
             startupToggleColumn.Width(
-                x::GridLengthHelper::FromValueAndType(124.0, x::GridUnitType::Pixel));
+                x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Auto));
             startupRow.ColumnDefinitions().Append(startupLabelColumn);
             startupRow.ColumnDefinitions().Append(startupToggleColumn);
 
@@ -508,7 +508,7 @@ namespace
             state->toggle.OffContent(winrt::box_value(Localized(L"Off", L"オフ")));
             state->toggle.VerticalAlignment(x::VerticalAlignment::Center);
             state->toggle.HorizontalAlignment(x::HorizontalAlignment::Right);
-            state->toggle.MinWidth(100.0);
+            state->toggle.Width(124.0);
             state->toggle.IsEnabled(false);
             std::weak_ptr<SettingsState> weak = state;
             state->toggle.Toggled([weak](auto const&, auto const&) {
@@ -532,7 +532,7 @@ namespace
             auto labelColumn = controls::ColumnDefinition{};
             labelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
             auto selectorColumn = controls::ColumnDefinition{};
-            selectorColumn.Width(x::GridLengthHelper::FromValueAndType(208.0, x::GridUnitType::Pixel));
+            selectorColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Auto));
             appearanceRow.ColumnDefinitions().Append(iconColumn);
             appearanceRow.ColumnDefinitions().Append(labelColumn);
             appearanceRow.ColumnDefinitions().Append(selectorColumn);
