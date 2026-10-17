@@ -7,15 +7,22 @@ Open the OpenShazam popup before running this script. It records GPU and
 Desktop Composition events with WPR, plus CPU/memory/GPU process counters.
 CPU/GPU percentile values describe resource samples; frame interval p95/p99
 must be derived from the ETL in Windows Performance Analyzer (WPA).
+Use -ResourceOnly when WPR elevation is unavailable; this samples process
+resources without collecting ETW or frame timing.
 
 .EXAMPLE
 $app = Get-Process -Name openshazam | Select-Object -First 1
 .\tools\profile-windows-ui.ps1 -ProcessId $app.Id -DurationSeconds 30
+
+.EXAMPLE
+$app = Get-Process -Name openshazam | Select-Object -First 1
+.\tools\profile-windows-ui.ps1 -ProcessId $app.Id -DurationSeconds 30 -ResourceOnly
 #>
 param(
     [int]$ProcessId = 0,
     [ValidateRange(5, 600)]
     [int]$DurationSeconds = 30,
+    [switch]$ResourceOnly,
     [string]$OutputDirectory = (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\windows-x64') 'profiles')
 )
 
@@ -97,8 +104,11 @@ if (-not [OpenShazamProfileWindowProbe]::HasVisibleMainWindow($ProcessId)) {
     throw 'The OpenShazam popup is not visible. Open the popup before starting this profile.'
 }
 
-$wpr = Get-Command 'wpr.exe' -ErrorAction SilentlyContinue
-if (-not $wpr) { throw 'Windows Performance Recorder (wpr.exe) is not installed.' }
+$wpr = $null
+if (-not $ResourceOnly) {
+    $wpr = Get-Command 'wpr.exe' -ErrorAction SilentlyContinue
+    if (-not $wpr) { throw 'Windows Performance Recorder (wpr.exe) is not installed.' }
+}
 $null = New-Item -ItemType Directory -Path $OutputDirectory -Force
 $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory -ErrorAction Stop).Path
 if (-not $OutputDirectory.Equals($distRoot, [StringComparison]::OrdinalIgnoreCase) -and
@@ -133,11 +143,13 @@ function Get-TargetCounterValue($CounterSamples, [string]$SetName, [int]$TargetP
 }
 
 try {
-    & $wpr.Source -start GPU -start DesktopComposition -filemode
-    if ($LASTEXITCODE -ne 0) {
-        throw "WPR could not start GPU/DesktopComposition recording (exit $LASTEXITCODE). Run in an elevated PowerShell window if required."
+    if (-not $ResourceOnly) {
+        & $wpr.Source -start GPU -start DesktopComposition -filemode
+        if ($LASTEXITCODE -ne 0) {
+            throw "WPR could not start GPU/DesktopComposition recording (exit $LASTEXITCODE). Run in an elevated PowerShell window if required, or use -ResourceOnly for process counters."
+        }
+        $recordingStarted = $true
     }
-    $recordingStarted = $true
 
     $sampleIntervalSeconds = 1.0
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -190,9 +202,11 @@ try {
         }
     }
 
-    & $wpr.Source -stop $tracePath 'OpenShazam Windows UI GPU and Desktop Composition profile' -skipPdbGen -compress
-    if ($LASTEXITCODE -ne 0) { throw "WPR could not save the ETL trace (exit $LASTEXITCODE)." }
-    $recordingStopped = $true
+    if ($recordingStarted) {
+        & $wpr.Source -stop $tracePath 'OpenShazam Windows UI GPU and Desktop Composition profile' -skipPdbGen -compress
+        if ($LASTEXITCODE -ne 0) { throw "WPR could not save the ETL trace (exit $LASTEXITCODE)." }
+        $recordingStopped = $true
+    }
 
     $samples | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
     $cpuValues = [double[]]@($samples | ForEach-Object { $_.CpuPercentOfMachine })
@@ -219,11 +233,11 @@ try {
         PeakWorkingSetBytes = if ($workingSetValues.Count) { ($workingSetValues | Measure-Object -Maximum).Maximum } else { $null }
         PeakPrivateBytes = if ($privateValues.Count) { ($privateValues | Measure-Object -Maximum).Maximum } else { $null }
         PeakGpuProcessCommittedBytes = if ($gpuMemoryValues.Count) { ($gpuMemoryValues | Measure-Object -Maximum).Maximum } else { $null }
-        TracePath = $tracePath
+        TracePath = if ($ResourceOnly) { $null } else { $tracePath }
         SamplesPath = $csvPath
         CounterWarnings = @($counterWarnings)
-        ResourcePercentilesNote = 'CPU/GPU P95/P99 are percentiles over approximately one-second resource samples, not frame intervals. GPU values may be null when Windows exposes no matching counter instances for this PID.'
-        FrameIntervalPercentiles = 'Not derived automatically; use the ETL DesktopComposition/GPU events in WPA for frame-level analysis.'
+        ResourcePercentilesNote = if ($ResourceOnly) { 'Resource-only run: CPU/GPU P95/P99 are percentiles over approximately one-second process samples, not frame intervals. No ETW trace was collected. GPU values may be null when Windows exposes no matching counter instances for this PID.' } else { 'CPU/GPU P95/P99 are percentiles over approximately one-second resource samples, not frame intervals. GPU values may be null when Windows exposes no matching counter instances for this PID.' }
+        FrameIntervalPercentiles = if ($ResourceOnly) { 'Unavailable: ResourceOnly mode does not collect ETW frame events.' } else { 'Not derived automatically; use the ETL DesktopComposition/GPU events in WPA for frame-level analysis.' }
     }
     $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
     $summary
