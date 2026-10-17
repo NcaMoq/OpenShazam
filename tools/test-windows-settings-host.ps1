@@ -18,7 +18,9 @@ foreach ($name in @('openshazam.exe', 'OpenShazam.SettingsHost.dll', 'Microsoft.
 $source = @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
+using System.Windows.Automation;
 
 public static class OpenShazamSettingsHostSmoke
 {
@@ -197,6 +199,34 @@ public static class OpenShazamSettingsHostSmoke
                 if (!GetWindowRect(islandWindow, out islandRect) ||
                     islandRect.Right <= islandRect.Left || islandRect.Bottom <= islandRect.Top)
                     throw new InvalidOperationException("WinUI island child window had empty bounds.");
+
+                stage = "verify Settings controls in the accessibility tree";
+                AutomationElement islandRoot = AutomationElement.FromHandle(islandWindow);
+                if (islandRoot == null)
+                    throw new InvalidOperationException("WinUI island has no UI Automation root.");
+                AutomationElementCollection descendants = islandRoot.FindAll(
+                    TreeScope.Descendants, Condition.TrueCondition);
+                bool startupToggleFound = false;
+                StringBuilder names = new StringBuilder();
+                for (int i = 0; i < descendants.Count; i++)
+                {
+                    string name = descendants[i].Current.Name;
+                    if (!String.IsNullOrWhiteSpace(name))
+                    {
+                        if (names.Length > 0) names.Append(" | ");
+                        names.Append(name).Append(" [")
+                            .Append(descendants[i].Current.ControlType.ProgrammaticName)
+                            .Append("]");
+                    }
+                    if ((name.StartsWith("Windows", StringComparison.Ordinal) ||
+                         name.StartsWith("Launch OpenShazam when", StringComparison.Ordinal)) &&
+                        descendants[i].Current.ControlType == ControlType.Button)
+                        startupToggleFound = true;
+                }
+                if (!startupToggleFound)
+                    throw new InvalidOperationException(
+                        "Startup ToggleSwitch was not exposed by the WinUI accessibility tree. " +
+                        "Descendant count=" + descendants.Count + "; names=" + names);
                 stage = "shutdown XAML host";
             }
             catch (Exception exception)
@@ -244,7 +274,14 @@ public static class OpenShazamSettingsHostSmoke
 }
 '@
 
-Add-Type -TypeDefinition $source -Language CSharp
+$uiaClientAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationClient')
+$uiaTypesAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationTypes')
+if (-not $uiaClientAssembly -or -not $uiaTypesAssembly) {
+    throw 'Windows UI Automation assemblies are required for the Settings smoke test.'
+}
+$uiaClient = $uiaClientAssembly.Location
+$uiaTypes = $uiaTypesAssembly.Location
+Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @($uiaClient, $uiaTypes)
 $result = [OpenShazamSettingsHostSmoke]::Run($dist)
 if ($result -notlike 'Composition + WinUI Settings host initialized*') {
     throw $result
