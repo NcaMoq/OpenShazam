@@ -428,6 +428,79 @@ fn save_theme_preference(preference: ThemePreference) {
     }
 }
 
+fn load_auto_shazam_preference() -> bool {
+    let key_path = wide("Software\\OpenShazam");
+    let value_name = wide("AutoShazamEnabled");
+    let mut key = HKEY::default();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            None,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if opened.0 != 0 {
+        return false;
+    }
+
+    let mut value = 0u32;
+    let mut value_type = Default::default();
+    let mut byte_count = size_of::<u32>() as u32;
+    let queried = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut value_type),
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut byte_count),
+        )
+    };
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    queried.0 == 0 && value_type == REG_DWORD && byte_count == size_of::<u32>() as u32 && value != 0
+}
+
+fn save_auto_shazam_preference(enabled: bool) {
+    let key_path = wide("Software\\OpenShazam");
+    let value_name = wide("AutoShazamEnabled");
+    let mut key = HKEY::default();
+    let created = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            Some(0),
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+    };
+    if created.0 != 0 {
+        return;
+    }
+
+    let value = u32::from(enabled);
+    let bytes = unsafe {
+        std::slice::from_raw_parts((&value as *const u32).cast::<u8>(), size_of::<u32>())
+    };
+    unsafe {
+        let _ = RegSetValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            Some(0),
+            REG_DWORD,
+            Some(bytes),
+        );
+        let _ = RegCloseKey(key);
+    }
+}
+
 fn foreground_for_theme(theme: Theme) -> Color {
     match theme {
         Theme::Light => Color {
@@ -969,6 +1042,7 @@ enum MainPhase {
 struct RecognitionSessionUi {
     ticket: openshazam_controller::CommandTicket,
     mode: CaptureMode,
+    context: Option<RecognitionContext>,
     cancel_command_id: Option<CommandId>,
     last_sequence: u64,
     result_presented: bool,
@@ -8547,6 +8621,7 @@ fn hide_main(app: &mut AppState) {
     app.visible = false;
     app.main_activated = false;
     app.popup_activation_grace_until = None;
+    set_auto_recognition_context(app, RecognitionContext::Background);
     unsafe {
         sync_main_timers(app);
         if !app.main_hwnd.0.is_null() {
@@ -8607,14 +8682,22 @@ fn start_capture(app: &mut AppState, mode: CaptureMode) {
         .recognition_controller
         .as_ref()
         .expect("controller created");
+    let context = (mode == CaptureMode::Auto).then_some(if app.visible {
+        RecognitionContext::Foreground
+    } else {
+        RecognitionContext::Background
+    });
     let ticket = match mode {
         CaptureMode::Manual => controller.commands.start_manual(),
         CaptureMode::Auto => controller
             .commands
-            .start_auto(RecognitionContext::Foreground),
+            .start_auto(context.expect("Auto recognition has a foreground/background context")),
     };
     match ticket {
         Ok(ticket) => {
+            if mode == CaptureMode::Auto {
+                save_auto_shazam_preference(true);
+            }
             app.auto_spring =
                 (mode == CaptureMode::Auto).then(ui_model::auto_tagging_button_spring_profile);
             app.success_wave_frame = None;
@@ -8627,6 +8710,7 @@ fn start_capture(app: &mut AppState, mode: CaptureMode) {
             app.recognition_session = Some(RecognitionSessionUi {
                 ticket,
                 mode,
+                context,
                 cancel_command_id: None,
                 last_sequence: 0,
                 result_presented: false,
@@ -8654,6 +8738,9 @@ fn cancel_capture(app: &mut AppState) {
                 session_id: session.ticket.session_id,
             }) {
             Ok(command_id) => {
+                if session.mode == CaptureMode::Auto {
+                    save_auto_shazam_preference(false);
+                }
                 if let Some(active) = app.recognition_session.as_mut() {
                     active.cancel_command_id = Some(command_id);
                 }
@@ -8665,6 +8752,36 @@ fn cancel_capture(app: &mut AppState) {
             Err(error) => {
                 app.message = Some(format!("Cancel request was not accepted: {error:?}"));
             }
+        }
+    }
+}
+
+fn set_auto_recognition_context(app: &mut AppState, context: RecognitionContext) {
+    let Some(session) = app.recognition_session else {
+        return;
+    };
+    if session.mode != CaptureMode::Auto
+        || session.context == Some(context)
+        || session.cancel_command_id.is_some()
+    {
+        return;
+    }
+    let Some(controller) = app.recognition_controller.as_ref() else {
+        return;
+    };
+    match controller
+        .commands
+        .submit(RecognitionCommand::SetRecognitionContext {
+            session_id: session.ticket.session_id,
+            context,
+        }) {
+        Ok(_) => {
+            if let Some(active) = app.recognition_session.as_mut() {
+                active.context = Some(context);
+            }
+        }
+        Err(error) => {
+            eprintln!("OpenShazam could not update Auto Shazam context: {error:?}");
         }
     }
 }
@@ -10612,6 +10729,7 @@ unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
         hide_when_complete: false,
     });
     app.visible = true;
+    set_auto_recognition_context(app, RecognitionContext::Foreground);
     if let Some(renderer) = renderer.as_deref_mut() {
         if let Err(error) = renderer.set_popup_opacity(from) {
             app.message = Some(format!("Popup opacity setup failed: {error}"));
@@ -11644,6 +11762,12 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
         // launch; the tray icon remains available to hide/show it afterward.
         if should_show_initial_popup(silent_startup) {
             let _ = PostMessageW(Some(hwnd), WM_SHOW_INITIAL_POPUP, WPARAM(0), LPARAM(0));
+        }
+        // Mirror Shazam's persisted Auto Shazam state: once the user has
+        // enabled continuous recognition, launch it again with the popup
+        // hidden. Showing the popup later only changes its request context.
+        if load_auto_shazam_preference() {
+            start_capture(&mut *app_ptr, CaptureMode::Auto);
         }
         let mut message = MSG::default();
         let mut running = true;
