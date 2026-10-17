@@ -75,9 +75,11 @@ pub struct UiLevels {
 impl Default for UiLevels {
     fn default() -> Self {
         Self {
-            // Keep the unconnected UI at unit scale until a measured meter
-            // adapter supplies values. Bass=5/7 is the neutral point of the
-            // documented 0.75..1.10 button range; treble=0.5 is unit scale.
+            // Hold a stable placeholder until a measured meter adapter
+            // supplies values. Bass=5/7 keeps the separately-scaled button at
+            // unit scale; treble=0.5 keeps the outer-ring scale at unit scale.
+            // The native neutral Bass input is unresolved, so the inner fill
+            // is not claimed to be at unit scale here.
             bass: 5.0 / 7.0,
             treble: 0.5,
         }
