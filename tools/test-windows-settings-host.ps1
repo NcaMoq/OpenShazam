@@ -243,6 +243,8 @@ public static class OpenShazamSettingsHostSmoke
                 bool startupToggleFound = false;
                 bool appearanceSelectorFound = false;
                 bool appearanceLabelFound = false;
+                AutomationElement startupToggle = null;
+                AutomationElement startupLabel = null;
                 AutomationElement appearanceSelector = null;
                 StringBuilder names = new StringBuilder();
                 for (int i = 0; i < descendants.Count; i++)
@@ -253,11 +255,17 @@ public static class OpenShazamSettingsHostSmoke
                         if (names.Length > 0) names.Append(" | ");
                         names.Append(name).Append(" [")
                             .Append(descendants[i].Current.ControlType.ProgrammaticName)
-                            .Append("]");
+                            .Append("] ").Append(descendants[i].Current.BoundingRectangle);
                     }
                     if ((name == "Start on sign-in" || name == "\u81EA\u52D5\u8D77\u52D5") &&
                         descendants[i].Current.ControlType == ControlType.Button)
+                    {
                         startupToggleFound = true;
+                        startupToggle = descendants[i];
+                    }
+                    if ((name == "Start on sign-in" || name == "\u81EA\u52D5\u8D77\u52D5") &&
+                        descendants[i].Current.ControlType == ControlType.Text)
+                        startupLabel = descendants[i];
                     if (descendants[i].Current.ControlType == ControlType.ComboBox)
                     {
                         appearanceSelectorFound = true;
@@ -266,10 +274,28 @@ public static class OpenShazamSettingsHostSmoke
                     if (name == "Choose a mode" || name == "\u30E2\u30FC\u30C9\u3092\u9078\u3076")
                         appearanceLabelFound = true;
                 }
-                if (!startupToggleFound || !appearanceSelectorFound || !appearanceLabelFound)
+                if (!startupToggleFound || startupLabel == null ||
+                    !appearanceSelectorFound || !appearanceLabelFound)
                     throw new InvalidOperationException(
-                        "Settings should expose the startup toggle and appearance selector. " +
+                        "Settings should expose a startup label and right-side toggle, plus the appearance selector. " +
                         "Descendant count=" + descendants.Count + "; names=" + names);
+
+                stage = "verify Settings labels and controls are aligned in separate columns";
+                var startupLabelRect = startupLabel.Current.BoundingRectangle;
+                var startupToggleRect = startupToggle.Current.BoundingRectangle;
+                var appearanceSelectorRect = appearanceSelector.Current.BoundingRectangle;
+                if (startupLabelRect.Right <= startupLabelRect.Left ||
+                    startupLabelRect.Bottom <= startupLabelRect.Top ||
+                    startupToggleRect.Right <= startupToggleRect.Left ||
+                    startupToggleRect.Bottom <= startupToggleRect.Top ||
+                    appearanceSelectorRect.Right <= appearanceSelectorRect.Left ||
+                    appearanceSelectorRect.Bottom <= appearanceSelectorRect.Top ||
+                    startupLabelRect.Left >= startupToggleRect.Left ||
+                    Math.Abs(startupToggleRect.Right - appearanceSelectorRect.Right) > 24.0)
+                    throw new InvalidOperationException(
+                        "Settings controls should be right-aligned while labels remain left-aligned. " +
+                        "Startup label=" + startupLabelRect + "; startup toggle=" + startupToggleRect +
+                        "; appearance selector=" + appearanceSelectorRect + "; controls=" + names);
 
                 stage = "verify the appearance selector options";
                 var expandCollapse = (ExpandCollapsePattern)appearanceSelector.GetCurrentPattern(
@@ -375,13 +401,15 @@ public static class OpenShazamSettingsHostSmoke
 $uiaClientAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationClient')
 $uiaTypesAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationTypes')
 $drawingAssembly = [Reflection.Assembly]::LoadWithPartialName('System.Drawing')
-if (-not $uiaClientAssembly -or -not $uiaTypesAssembly -or -not $drawingAssembly) {
+$windowsBaseAssembly = [Reflection.Assembly]::LoadWithPartialName('WindowsBase')
+if (-not $uiaClientAssembly -or -not $uiaTypesAssembly -or -not $drawingAssembly -or -not $windowsBaseAssembly) {
     throw 'Windows UI Automation and System.Drawing assemblies are required for the Settings smoke test.'
 }
 $uiaClient = $uiaClientAssembly.Location
 $uiaTypes = $uiaTypesAssembly.Location
 $drawing = $drawingAssembly.Location
-Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @($uiaClient, $uiaTypes, $drawing)
+$windowsBase = $windowsBaseAssembly.Location
+Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @($uiaClient, $uiaTypes, $drawing, $windowsBase)
 $result = [OpenShazamSettingsHostSmoke]::Run($dist)
 if ($result -notlike 'Composition + WinUI Settings host initialized*') {
     throw $result

@@ -107,6 +107,10 @@ namespace
         controls::ToggleSwitch toggle{ nullptr };
         controls::ComboBox appearance{ nullptr };
         controls::ScrollViewer viewer{ nullptr };
+        controls::Border startupCard{ nullptr };
+        controls::Border appearanceCard{ nullptr };
+        controls::Grid startupRow{ nullptr };
+        controls::Grid appearanceRow{ nullptr };
         HWND owner{};
         HWND hwnd{};
         uint32_t appearanceMode{ kAppearanceSystem };
@@ -301,28 +305,51 @@ namespace
             stack.Spacing(8);
             stack.Padding(x::ThicknessHelper::FromUniformLength(24));
 
-            auto startupCard = markup::XamlReader::Load(
+            state->startupCard = markup::XamlReader::Load(
                 LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="14" />)"
             ).as<controls::Border>();
+            state->startupRow = controls::Grid{};
+            auto startupRow = state->startupRow;
+            startupRow.HorizontalAlignment(x::HorizontalAlignment::Stretch);
+            auto startupLabelColumn = controls::ColumnDefinition{};
+            startupLabelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
+            auto startupToggleColumn = controls::ColumnDefinition{};
+            startupToggleColumn.Width(x::GridLengthHelper::FromValueAndType(150.0, x::GridUnitType::Pixel));
+            startupRow.ColumnDefinitions().Append(startupLabelColumn);
+            startupRow.ColumnDefinitions().Append(startupToggleColumn);
+
+            controls::TextBlock startupLabel;
             state->toggle = controls::ToggleSwitch{};
             auto startupName = Localized(L"Start on sign-in", L"自動起動");
-            state->toggle.Header(winrt::box_value(startupName));
+            startupLabel.Text(startupName);
+            startupLabel.FontSize(14.0);
+            startupLabel.VerticalAlignment(x::VerticalAlignment::Center);
+            automation::AutomationProperties::SetName(startupLabel, startupName);
+            controls::Grid::SetColumn(startupLabel, 0);
+            startupRow.Children().Append(startupLabel);
+
             automation::AutomationProperties::SetName(state->toggle, startupName);
             state->toggle.OnContent(winrt::box_value(Localized(L"On", L"オン")));
             state->toggle.OffContent(winrt::box_value(Localized(L"Off", L"オフ")));
+            state->toggle.VerticalAlignment(x::VerticalAlignment::Center);
+            state->toggle.Margin(x::ThicknessHelper::FromLengths(64.0, 0.0, 0.0, 0.0));
             state->toggle.IsEnabled(false);
             std::weak_ptr<SettingsState> weak = state;
             state->toggle.Toggled([weak](auto const&, auto const&) {
                 if (auto state = weak.lock(); state && state->alive && !state->startupLoading)
                     ChangeStartup(weak, state->toggle.IsOn());
             });
-            startupCard.Child(state->toggle);
-            stack.Children().Append(startupCard);
+            controls::Grid::SetColumn(state->toggle, 1);
+            startupRow.Children().Append(state->toggle);
+            state->startupCard.Child(startupRow);
+            stack.Children().Append(state->startupCard);
 
-            auto appearanceCard = markup::XamlReader::Load(
+            state->appearanceCard = markup::XamlReader::Load(
                 LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="14" />)"
             ).as<controls::Border>();
-            controls::Grid appearanceRow;
+            state->appearanceRow = controls::Grid{};
+            auto appearanceRow = state->appearanceRow;
+            appearanceRow.HorizontalAlignment(x::HorizontalAlignment::Stretch);
             auto iconColumn = controls::ColumnDefinition{};
             iconColumn.Width(x::GridLengthHelper::FromValueAndType(34.0, x::GridUnitType::Pixel));
             auto labelColumn = controls::ColumnDefinition{};
@@ -378,8 +405,8 @@ namespace
             });
             controls::Grid::SetColumn(state->appearance, 2);
             appearanceRow.Children().Append(state->appearance);
-            appearanceCard.Child(appearanceRow);
-            stack.Children().Append(appearanceCard);
+            state->appearanceCard.Child(appearanceRow);
+            stack.Children().Append(state->appearanceCard);
 
             // Keep the background as a XAML ThemeResource expression rather
             // than copying the current brush instance. That lets the root
@@ -389,6 +416,7 @@ namespace
             ).as<controls::ScrollViewer>();
             state->viewer.Content(stack);
             state->viewer.VerticalScrollBarVisibility(controls::ScrollBarVisibility::Auto);
+            state->viewer.HorizontalScrollBarVisibility(controls::ScrollBarVisibility::Disabled);
             ApplyAppearanceToSettings(state, state->appearanceMode);
             return state->viewer;
         }
@@ -398,6 +426,18 @@ namespace
             if (!hwnd || !island) return;
             RECT rect{};
             ::GetClientRect(hwnd, &rect);
+            auto dpi = ::GetDpiForWindow(hwnd);
+            if (dpi < 96) dpi = 96;
+            if (state && state->startupCard && state->appearanceCard &&
+                state->startupRow && state->appearanceRow)
+            {
+                const double cardWidth = ::MulDiv(rect.right - rect.left, 96, dpi) - 48.0;
+                if (cardWidth > 28.0)
+                {
+                    state->startupCard.Width(cardWidth);
+                    state->appearanceCard.Width(cardWidth);
+                }
+            }
             island.SiteBridge().MoveAndResize({0, 0, rect.right - rect.left, rect.bottom - rect.top});
         }
 
