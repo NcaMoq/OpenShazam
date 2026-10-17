@@ -2988,6 +2988,18 @@ fn make_auto_shadow_circle_visuals(
     clipped_layer.SetClip(&circle_clip)?;
 
     shadow.SetMask(outer_mask)?;
+    let background = compositor.CreateSpriteVisual()?;
+    background.SetSize(Vector2 {
+        X: bounds,
+        Y: bounds,
+    })?;
+    background.SetBorderMode(CompositionBorderMode::Soft)?;
+    background.SetBrush(background_brush)?;
+    clipped_layer.Children()?.InsertAtTop(&background)?;
+
+    // The native outer shape is a sublayer of the background and therefore
+    // composes over its fill. Its SpriteVisual carries only the custom shadow
+    // mask, not a visible stroke.
     let shadow_visual = compositor.CreateSpriteVisual()?;
     shadow_visual.SetSize(Vector2 {
         X: bounds,
@@ -2997,15 +3009,6 @@ fn make_auto_shadow_circle_visuals(
     shadow_visual.SetBrush(shadow_brush)?;
     shadow_visual.SetShadow(shadow)?;
     clipped_layer.Children()?.InsertAtTop(&shadow_visual)?;
-
-    let background = compositor.CreateSpriteVisual()?;
-    background.SetSize(Vector2 {
-        X: bounds,
-        Y: bounds,
-    })?;
-    background.SetBorderMode(CompositionBorderMode::Soft)?;
-    background.SetBrush(background_brush)?;
-    clipped_layer.Children()?.InsertAtTop(&background)?;
 
     Ok(AutoShadowCircleVisuals {
         clipped_layer,
@@ -15105,6 +15108,7 @@ mod tests {
                 );
                 assert_eq!(layers.background.Size()?, Vector2 { X: 96.0, Y: 96.0 });
                 assert_eq!(layers.shadow.Size()?, Vector2 { X: 96.0, Y: 96.0 });
+                assert_eq!(layers.clipped_layer.Children()?.Count()?, 2);
                 let circle_clip: CompositionGeometricClip = layers.clipped_layer.Clip()?.cast()?;
                 let circle: CompositionEllipseGeometry = circle_clip.Geometry()?.cast()?;
                 assert_eq!(
