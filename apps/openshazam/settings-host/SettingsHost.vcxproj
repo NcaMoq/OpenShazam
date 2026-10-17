@@ -1,13 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <Import Project="packages\Microsoft.WindowsAppSDK.1.8.260317003\build\native\Microsoft.WindowsAppSDK.props" Condition="Exists('packages\Microsoft.WindowsAppSDK.1.8.260317003\build\native\Microsoft.WindowsAppSDK.props')" />
-  <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.230706.1\build\native\Microsoft.Windows.CppWinRT.props" Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.230706.1\build\native\Microsoft.Windows.CppWinRT.props')" />
-  <Import Project="packages\Microsoft.WindowsAppSDK.Base.1.8.251216001\build\native\Microsoft.WindowsAppSDK.Base.props" Condition="Exists('packages\Microsoft.WindowsAppSDK.Base.1.8.251216001\build\native\Microsoft.WindowsAppSDK.Base.props')" />
-  <Import Project="packages\Microsoft.WindowsAppSDK.Foundation.1.8.260222000\build\native\Microsoft.WindowsAppSDK.Foundation.props" Condition="Exists('packages\Microsoft.WindowsAppSDK.Foundation.1.8.260222000\build\native\Microsoft.WindowsAppSDK.Foundation.props')" />
-  <Import Project="packages\Microsoft.WindowsAppSDK.InteractiveExperiences.1.8.260125001\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.props" Condition="Exists('packages\Microsoft.WindowsAppSDK.InteractiveExperiences.1.8.260125001\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.props')" />
-  <Import Project="packages\Microsoft.WindowsAppSDK.WinUI.1.8.260224000\build\native\Microsoft.WindowsAppSDK.WinUI.props" Condition="Exists('packages\Microsoft.WindowsAppSDK.WinUI.1.8.260224000\build\native\Microsoft.WindowsAppSDK.WinUI.props')" />
-  <Import Project="packages\Microsoft.WindowsAppSDK.DWrite.1.8.25122902\build\native\Microsoft.WindowsAppSDK.DWrite.props" Condition="Exists('packages\Microsoft.WindowsAppSDK.DWrite.1.8.25122902\build\native\Microsoft.WindowsAppSDK.DWrite.props')" />
-  <Import Project="packages\Microsoft.WindowsAppSDK.Runtime.1.8.260317003\build\native\Microsoft.WindowsAppSDK.Runtime.props" Condition="Exists('packages\Microsoft.WindowsAppSDK.Runtime.1.8.260317003\build\native\Microsoft.WindowsAppSDK.Runtime.props')" />
+  <PropertyGroup>
+    <OpenShazamPackagesDir Condition="'$(OpenShazamPackagesDir)' == ''">$(MSBuildProjectDirectory)\packages\</OpenShazamPackagesDir>
+  </PropertyGroup>
+  <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.1.8.260317003\build\native\Microsoft.WindowsAppSDK.props" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.1.8.260317003\build\native\Microsoft.WindowsAppSDK.props')" />
+  <Import Project="$(OpenShazamPackagesDir)Microsoft.Windows.CppWinRT.2.0.230706.1\build\native\Microsoft.Windows.CppWinRT.props" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.Windows.CppWinRT.2.0.230706.1\build\native\Microsoft.Windows.CppWinRT.props')" />
+  <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Base.1.8.251216001\build\native\Microsoft.WindowsAppSDK.Base.props" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Base.1.8.251216001\build\native\Microsoft.WindowsAppSDK.Base.props')" />
+  <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Foundation.1.8.260222000\build\native\Microsoft.WindowsAppSDK.Foundation.props" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Foundation.1.8.260222000\build\native\Microsoft.WindowsAppSDK.Foundation.props')" />
+  <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.InteractiveExperiences.1.8.260125001\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.props" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.InteractiveExperiences.1.8.260125001\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.props')" />
+  <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.WinUI.1.8.260224000\build\native\Microsoft.WindowsAppSDK.WinUI.props" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.WinUI.1.8.260224000\build\native\Microsoft.WindowsAppSDK.WinUI.props')" />
+  <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.DWrite.1.8.25122902\build\native\Microsoft.WindowsAppSDK.DWrite.props" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.DWrite.1.8.25122902\build\native\Microsoft.WindowsAppSDK.DWrite.props')" />
+  <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Runtime.1.8.260317003\build\native\Microsoft.WindowsAppSDK.Runtime.props" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Runtime.1.8.260317003\build\native\Microsoft.WindowsAppSDK.Runtime.props')" />
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
     <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
@@ -55,20 +58,20 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <Reference Include="packages\Microsoft.Web.WebView2.1.0.3179.45\lib\Microsoft.Web.WebView2.Core.winmd" />
+    <Reference Include="$(OpenShazamPackagesDir)Microsoft.Web.WebView2.1.0.3179.45\lib\Microsoft.Web.WebView2.Core.winmd" />
     <ClInclude Include="pch.h" />
     <ClCompile Include="pch.cpp"><PrecompiledHeader>Create</PrecompiledHeader></ClCompile>
     <ClCompile Include="SettingsHost.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
-    <Import Project="packages\Microsoft.WindowsAppSDK.Base.1.8.251216001\build\native\Microsoft.WindowsAppSDK.Base.targets" Condition="Exists('packages\Microsoft.WindowsAppSDK.Base.1.8.251216001\build\native\Microsoft.WindowsAppSDK.Base.targets')" />
-    <Import Project="packages\Microsoft.WindowsAppSDK.Foundation.1.8.260222000\build\native\Microsoft.WindowsAppSDK.Foundation.targets" Condition="Exists('packages\Microsoft.WindowsAppSDK.Foundation.1.8.260222000\build\native\Microsoft.WindowsAppSDK.Foundation.targets')" />
-    <Import Project="packages\Microsoft.WindowsAppSDK.InteractiveExperiences.1.8.260125001\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.targets" Condition="Exists('packages\Microsoft.WindowsAppSDK.InteractiveExperiences.1.8.260125001\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.targets')" />
-    <Import Project="packages\Microsoft.WindowsAppSDK.WinUI.1.8.260224000\build\native\Microsoft.WindowsAppSDK.WinUI.targets" Condition="Exists('packages\Microsoft.WindowsAppSDK.WinUI.1.8.260224000\build\native\Microsoft.WindowsAppSDK.WinUI.targets')" />
-    <Import Project="packages\Microsoft.WindowsAppSDK.DWrite.1.8.25122902\build\native\Microsoft.WindowsAppSDK.DWrite.targets" Condition="Exists('packages\Microsoft.WindowsAppSDK.DWrite.1.8.25122902\build\native\Microsoft.WindowsAppSDK.DWrite.targets')" />
-    <Import Project="packages\Microsoft.WindowsAppSDK.Runtime.1.8.260317003\build\native\Microsoft.WindowsAppSDK.Runtime.targets" Condition="Exists('packages\Microsoft.WindowsAppSDK.Runtime.1.8.260317003\build\native\Microsoft.WindowsAppSDK.Runtime.targets')" />
-    <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.230706.1\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.230706.1\build\native\Microsoft.Windows.CppWinRT.targets')" />
-    <Import Project="packages\Microsoft.WindowsAppSDK.1.8.260317003\build\native\Microsoft.WindowsAppSDK.targets" Condition="Exists('packages\Microsoft.WindowsAppSDK.1.8.260317003\build\native\Microsoft.WindowsAppSDK.targets')" />
+    <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Base.1.8.251216001\build\native\Microsoft.WindowsAppSDK.Base.targets" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Base.1.8.251216001\build\native\Microsoft.WindowsAppSDK.Base.targets')" />
+    <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Foundation.1.8.260222000\build\native\Microsoft.WindowsAppSDK.Foundation.targets" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Foundation.1.8.260222000\build\native\Microsoft.WindowsAppSDK.Foundation.targets')" />
+    <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.InteractiveExperiences.1.8.260125001\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.targets" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.InteractiveExperiences.1.8.260125001\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.targets')" />
+    <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.WinUI.1.8.260224000\build\native\Microsoft.WindowsAppSDK.WinUI.targets" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.WinUI.1.8.260224000\build\native\Microsoft.WindowsAppSDK.WinUI.targets')" />
+    <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.DWrite.1.8.25122902\build\native\Microsoft.WindowsAppSDK.DWrite.targets" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.DWrite.1.8.25122902\build\native\Microsoft.WindowsAppSDK.DWrite.targets')" />
+    <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Runtime.1.8.260317003\build\native\Microsoft.WindowsAppSDK.Runtime.targets" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.Runtime.1.8.260317003\build\native\Microsoft.WindowsAppSDK.Runtime.targets')" />
+    <Import Project="$(OpenShazamPackagesDir)Microsoft.Windows.CppWinRT.2.0.230706.1\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.Windows.CppWinRT.2.0.230706.1\build\native\Microsoft.Windows.CppWinRT.targets')" />
+    <Import Project="$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.1.8.260317003\build\native\Microsoft.WindowsAppSDK.targets" Condition="Exists('$(OpenShazamPackagesDir)Microsoft.WindowsAppSDK.1.8.260317003\build\native\Microsoft.WindowsAppSDK.targets')" />
   </ImportGroup>
 </Project>

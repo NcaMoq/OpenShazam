@@ -2,8 +2,15 @@
 // No second recognition controller, process, webview, or legacy Win32 settings UI.
 #include "pch.h"
 #include <appmodel.h>
+#include <algorithm>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <vector>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
+
+#pragma comment(lib, "Advapi32.lib")
 
 namespace x = winrt::Microsoft::UI::Xaml;
 namespace controls = winrt::Microsoft::UI::Xaml::Controls;
@@ -56,6 +63,112 @@ namespace
     constexpr uint32_t kAppearanceDark = 2;
     constexpr int kWidthDips = 520;
     constexpr int kHeightDips = 380;
+    constexpr wchar_t kStartupRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    constexpr wchar_t kStartupRunValue[] = L"OpenShazam";
+
+    enum class PackageIdentityStatus
+    {
+        Packaged,
+        Unpackaged,
+        Unknown,
+    };
+
+    PackageIdentityStatus GetPackageIdentityStatus() noexcept
+    {
+        UINT32 length = 0;
+        const LONG result = ::GetCurrentPackageFullName(&length, nullptr);
+        if (result == ERROR_INSUFFICIENT_BUFFER || result == ERROR_SUCCESS)
+            return PackageIdentityStatus::Packaged;
+        if (result == 15700 /* APPMODEL_ERROR_NO_PACKAGE */)
+            return PackageIdentityStatus::Unpackaged;
+        return PackageIdentityStatus::Unknown;
+    }
+
+    [[noreturn]] void ThrowRegistryError(LSTATUS error, char const* operation)
+    {
+        throw std::system_error(static_cast<int>(error), std::system_category(), operation);
+    }
+
+    struct RunRegistryKey
+    {
+        HKEY value{};
+        ~RunRegistryKey() { if (value) ::RegCloseKey(value); }
+    };
+
+    std::wstring CurrentExecutablePath()
+    {
+        std::vector<wchar_t> buffer(512);
+        for (;;)
+        {
+            const DWORD length = ::GetModuleFileNameW(nullptr, buffer.data(),
+                static_cast<DWORD>(buffer.size()));
+            if (length == 0)
+                throw std::system_error(static_cast<int>(::GetLastError()),
+                    std::system_category(), "GetModuleFileNameW failed");
+            if (length < buffer.size())
+                return std::wstring(buffer.data(), length);
+            if (buffer.size() >= 32768)
+                throw std::length_error("OpenShazam executable path exceeds the Windows limit");
+            buffer.resize((std::min)(buffer.size() * 2, size_t{32768}));
+        }
+    }
+
+    std::wstring StartupCommand()
+    {
+        return L"\"" + CurrentExecutablePath() + L"\" ui --startup";
+    }
+
+    bool RunStartupEnabled()
+    {
+        RunRegistryKey key;
+        LSTATUS status = ::RegOpenKeyExW(HKEY_CURRENT_USER, kStartupRunKey, 0,
+            KEY_QUERY_VALUE, &key.value);
+        if (status == ERROR_FILE_NOT_FOUND) return false;
+        if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegOpenKeyExW failed");
+
+        DWORD type = 0;
+        DWORD byteCount = 0;
+        status = ::RegQueryValueExW(key.value, kStartupRunValue, nullptr, &type,
+            nullptr, &byteCount);
+        if (status == ERROR_FILE_NOT_FOUND) return false;
+        if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegQueryValueExW failed");
+        if (type != REG_SZ || byteCount < sizeof(wchar_t)) return false;
+
+        std::vector<wchar_t> value(byteCount / sizeof(wchar_t) + 1, L'\0');
+        status = ::RegQueryValueExW(key.value, kStartupRunValue, nullptr, &type,
+            reinterpret_cast<BYTE*>(value.data()), &byteCount);
+        if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegQueryValueExW failed");
+        const std::wstring actual(value.data());
+        const std::wstring expected = StartupCommand();
+        return ::CompareStringOrdinal(actual.c_str(), -1, expected.c_str(), -1, TRUE) == CSTR_EQUAL;
+    }
+
+    void SetRunStartupEnabled(bool enable)
+    {
+        RunRegistryKey key;
+        LSTATUS status = ERROR_SUCCESS;
+        if (enable)
+        {
+            DWORD disposition = 0;
+            status = ::RegCreateKeyExW(HKEY_CURRENT_USER, kStartupRunKey, 0, nullptr,
+                REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr, &key.value, &disposition);
+            if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegCreateKeyExW failed");
+            const std::wstring command = StartupCommand();
+            const DWORD byteCount = static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t));
+            status = ::RegSetValueExW(key.value, kStartupRunValue, 0, REG_SZ,
+                reinterpret_cast<BYTE const*>(command.c_str()), byteCount);
+            if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegSetValueExW failed");
+            return;
+        }
+
+        status = ::RegOpenKeyExW(HKEY_CURRENT_USER, kStartupRunKey, 0,
+            KEY_SET_VALUE, &key.value);
+        if (status == ERROR_FILE_NOT_FOUND) return;
+        if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegOpenKeyExW failed");
+        status = ::RegDeleteValueW(key.value, kStartupRunValue);
+        if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND)
+            ThrowRegistryError(status, "RegDeleteValueW failed");
+    }
 
     bool SystemUsesDarkAppearance() noexcept
     {
@@ -177,6 +290,19 @@ namespace
         {
             state->startupLoading = true;
             state->toggle.IsEnabled(false);
+            const auto packageStatus = GetPackageIdentityStatus();
+            if (packageStatus == PackageIdentityStatus::Unpackaged)
+            {
+                state->toggle.IsOn(RunStartupEnabled());
+                state->toggle.IsEnabled(true);
+                state->startupLoading = false;
+                co_return;
+            }
+            if (packageStatus != PackageIdentityStatus::Packaged)
+            {
+                DisableStartupControlNoThrow(state);
+                co_return;
+            }
             auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
             if (!state->alive) co_return;
             auto current = task.State();
@@ -204,6 +330,21 @@ namespace
         {
             state->startupLoading = true;
             state->toggle.IsEnabled(false);
+            const auto packageStatus = GetPackageIdentityStatus();
+            if (packageStatus == PackageIdentityStatus::Unpackaged)
+            {
+                SetRunStartupEnabled(enable);
+                if (!state->alive) co_return;
+                state->toggle.IsOn(enable);
+                state->toggle.IsEnabled(true);
+                state->startupLoading = false;
+                co_return;
+            }
+            if (packageStatus != PackageIdentityStatus::Packaged)
+            {
+                DisableStartupControlNoThrow(state);
+                co_return;
+            }
             auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
             if (!state->alive) co_return;
             if (enable)

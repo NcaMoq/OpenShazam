@@ -12,7 +12,6 @@ dev-cli = ["dep:ctrlc"]
 [[bin]]
 name = "openshazam"
 path = "src/main.rs"
-required-features = ["dev-cli"]
 
 [dependencies]
 sigx-core = { path = "../../crates/sigx-core" }

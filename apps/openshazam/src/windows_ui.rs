@@ -10347,17 +10347,17 @@ fn window_class(instance: HINSTANCE, proc: WNDPROC, class_name: PCWSTR) -> WNDCL
 
 /// Start the resident Windows UI. The hidden notification-area host is kept
 /// alive when the popup is closed; its draw path sleeps until an event arrives.
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let startup_task_activation = is_startup_task_activation();
+        let silent_startup = start_hidden || is_startup_task_activation();
         let (instance_mutex, already_running) = acquire_single_instance_mutex()?;
         if already_running {
             // A second explicit UI launch reuses the resident tray process.
             // A duplicate logon activation exits quietly and never foregrounds
             // the existing popup.
-            if !startup_task_activation && !activate_existing_instance() {
+            if !silent_startup && !activate_existing_instance() {
                 eprintln!("OpenShazam is already running, but its window could not be activated.");
             }
             drop(instance_mutex);
@@ -10493,7 +10493,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Let Explorer finish publishing the notification icon before asking
         // Shell_NotifyIconGetRect for its anchor. `ui` opens the popup on
         // launch; the tray icon remains available to hide/show it afterward.
-        if should_show_initial_popup(startup_task_activation) {
+        if should_show_initial_popup(silent_startup) {
             let _ = PostMessageW(Some(hwnd), WM_SHOW_INITIAL_POPUP, WPARAM(0), LPARAM(0));
         }
         let mut message = MSG::default();
