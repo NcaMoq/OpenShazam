@@ -7826,28 +7826,44 @@ unsafe fn notify_hidden_match(app: &mut AppState, track: &Track, artwork: Option
     }
 }
 
-fn scale_notification_artwork(pixels: &ArtworkPixels, side: u32) -> Option<Vec<u8>> {
+fn scale_notification_artwork_to_size(
+    pixels: &ArtworkPixels,
+    target_width: u32,
+    target_height: u32,
+) -> Option<Vec<u8>> {
     let source_width = usize::try_from(pixels.width).ok()?;
     let source_height = usize::try_from(pixels.height).ok()?;
-    let side = usize::try_from(side).ok()?;
+    let target_width = usize::try_from(target_width).ok()?;
+    let target_height = usize::try_from(target_height).ok()?;
     let expected_len = source_width.checked_mul(source_height)?.checked_mul(4)?;
-    if side == 0 || source_width == 0 || source_height == 0 || pixels.bgra.len() != expected_len {
+    if target_width == 0
+        || target_height == 0
+        || source_width == 0
+        || source_height == 0
+        || pixels.bgra.len() != expected_len
+    {
         return None;
     }
-    let output_len = side.checked_mul(side)?.checked_mul(4)?;
-    let crop_side = source_width.min(source_height) as f64;
-    let crop_x = (source_width as f64 - crop_side) * 0.5;
-    let crop_y = (source_height as f64 - crop_side) * 0.5;
+    let output_len = target_width.checked_mul(target_height)?.checked_mul(4)?;
+    let target_aspect = target_width as f64 / target_height as f64;
+    let source_aspect = source_width as f64 / source_height as f64;
+    let (crop_width, crop_height) = if source_aspect > target_aspect {
+        (source_height as f64 * target_aspect, source_height as f64)
+    } else {
+        (source_width as f64, source_width as f64 / target_aspect)
+    };
+    let crop_x = (source_width as f64 - crop_width) * 0.5;
+    let crop_y = (source_height as f64 - crop_height) * 0.5;
     let mut output = vec![0u8; output_len];
 
-    for y in 0..side {
-        let source_y = (crop_y + (y as f64 + 0.5) * crop_side / side as f64 - 0.5)
+    for y in 0..target_height {
+        let source_y = (crop_y + (y as f64 + 0.5) * crop_height / target_height as f64 - 0.5)
             .clamp(0.0, source_height.saturating_sub(1) as f64);
         let y0 = source_y.floor() as usize;
         let y1 = (y0 + 1).min(source_height - 1);
         let fy = source_y - y0 as f64;
-        for x in 0..side {
-            let source_x = (crop_x + (x as f64 + 0.5) * crop_side / side as f64 - 0.5)
+        for x in 0..target_width {
+            let source_x = (crop_x + (x as f64 + 0.5) * crop_width / target_width as f64 - 0.5)
                 .clamp(0.0, source_width.saturating_sub(1) as f64);
             let x0 = source_x.floor() as usize;
             let x1 = (x0 + 1).min(source_width - 1);
@@ -7858,7 +7874,7 @@ fn scale_notification_artwork(pixels: &ArtworkPixels, side: u32) -> Option<Vec<u
                 (y1 * source_width + x0) * 4,
                 (y1 * source_width + x1) * 4,
             ];
-            let destination = (y * side + x) * 4;
+            let destination = (y * target_width + x) * 4;
             for channel in 0..4 {
                 let top = f64::from(pixels.bgra[samples[0] + channel]) * (1.0 - fx)
                     + f64::from(pixels.bgra[samples[1] + channel]) * fx;
@@ -7875,10 +7891,20 @@ fn scale_notification_artwork(pixels: &ArtworkPixels, side: u32) -> Option<Vec<u
 unsafe fn create_notification_icon(
     pixels: &ArtworkPixels,
 ) -> windows::core::Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
-    let side = GetSystemMetrics(SM_CXICON)
-        .max(GetSystemMetrics(SM_CYICON))
-        .clamp(16, 256) as u32;
-    let scaled = scale_notification_artwork(pixels, side).ok_or_else(|| {
+    // NIIF_LARGE_ICON requires the custom hBalloonIcon to use the exact
+    // SM_CXICON x SM_CYICON dimensions. Using max(width, height) or clamping
+    // can make Explorer silently show its blue NIIF_INFO fallback instead.
+    let width = GetSystemMetrics(SM_CXICON);
+    let height = GetSystemMetrics(SM_CYICON);
+    if !(1..=512).contains(&width) || !(1..=512).contains(&height) {
+        return Err(Error::new(
+            windows::core::HRESULT(0x8007_0057u32 as i32),
+            "system notification icon dimensions are invalid",
+        ));
+    }
+    let width = width as u32;
+    let height = height as u32;
+    let scaled = scale_notification_artwork_to_size(pixels, width, height).ok_or_else(|| {
         Error::new(
             windows::core::HRESULT(0x8007_0057u32 as i32),
             "notification artwork has invalid pixel dimensions",
@@ -7892,8 +7918,8 @@ unsafe fn create_notification_icon(
     let color_info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: side as i32,
-            biHeight: -(side as i32),
+            biWidth: width as i32,
+            biHeight: -(height as i32),
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
@@ -7931,15 +7957,23 @@ unsafe fn create_notification_icon(
     let mask_info = MonochromeBitmapInfo {
         header: BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: side as i32,
-            biHeight: -(side as i32),
+            biWidth: width as i32,
+            biHeight: -(height as i32),
             biPlanes: 1,
             biBitCount: 1,
             biCompression: BI_RGB.0,
             biClrUsed: 2,
             ..Default::default()
         },
-        colors: [RGBQUAD::default(); 2],
+        colors: [
+            RGBQUAD::default(),
+            RGBQUAD {
+                rgbBlue: 255,
+                rgbGreen: 255,
+                rgbRed: 255,
+                rgbReserved: 0,
+            },
+        ],
     };
     let mut mask_bits = std::ptr::null_mut();
     let mask_bitmap = match CreateDIBSection(
@@ -7963,12 +7997,13 @@ unsafe fn create_notification_icon(
             return Err(error);
         }
     };
-    let mask_stride = (side as usize).div_ceil(32) * 4;
-    std::ptr::write_bytes(mask_bits.cast::<u8>(), 0, mask_stride * side as usize);
-    let mask = std::slice::from_raw_parts_mut(mask_bits.cast::<u8>(), mask_stride * side as usize);
-    for y in 0..side as usize {
-        for x in 0..side as usize {
-            if scaled[(y * side as usize + x) * 4 + 3] == 0 {
+    let mask_stride = (width as usize).div_ceil(32) * 4;
+    std::ptr::write_bytes(mask_bits.cast::<u8>(), 0, mask_stride * height as usize);
+    let mask =
+        std::slice::from_raw_parts_mut(mask_bits.cast::<u8>(), mask_stride * height as usize);
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            if scaled[(y * width as usize + x) * 4 + 3] == 0 {
                 let byte = y * mask_stride + x / 8;
                 mask[byte] |= 0x80 >> (x % 8);
             }
@@ -10658,13 +10693,22 @@ unsafe fn process_main_hit(app: &mut AppState, hit: MainHit) {
             }
         }
         MainHit::CenterButton => {
-            if matches!(app.phase, MainPhase::Listening { .. }) {
+            if capture_mode_in_progress(&app.phase).is_some() {
                 cancel_capture(app);
             } else {
                 start_capture(app, CaptureMode::Manual);
             }
         }
         MainHit::Other => {}
+    }
+}
+
+fn capture_mode_in_progress(phase: &MainPhase) -> Option<CaptureMode> {
+    match phase {
+        MainPhase::Starting { mode, .. }
+        | MainPhase::Listening { mode, .. }
+        | MainPhase::Cancelling { mode, .. } => Some(*mode),
+        _ => None,
     }
 }
 
@@ -10946,13 +10990,7 @@ unsafe extern "system" fn window_proc(
             if main_hit_test(app, x, y, body_top, data.renderer.as_ref()) == MainHit::CenterButton {
                 app.mouse_down_center = true;
                 app.long_press_consumed = true;
-                if matches!(
-                    app.phase,
-                    MainPhase::Listening {
-                        mode: CaptureMode::Auto,
-                        ..
-                    }
-                ) {
+                if capture_mode_in_progress(&app.phase) == Some(CaptureMode::Auto) {
                     cancel_capture(app);
                 } else {
                     start_capture(app, CaptureMode::Auto);
@@ -11088,13 +11126,7 @@ unsafe extern "system" fn window_proc(
                 app.long_press_consumed = true;
                 app.single_click_pending = false;
                 let _ = KillTimer(Some(hwnd), TIMER_SINGLE_CLICK);
-                if matches!(
-                    app.phase,
-                    MainPhase::Listening {
-                        mode: CaptureMode::Auto,
-                        ..
-                    }
-                ) {
+                if capture_mode_in_progress(&app.phase) == Some(CaptureMode::Auto) {
                     cancel_capture(app);
                 } else {
                     start_capture(app, CaptureMode::Auto);
@@ -11201,13 +11233,7 @@ unsafe extern "system" fn window_proc(
                 0.0
             };
             if main_hit_test(app, x, y, body_top, data.renderer.as_ref()) == MainHit::CenterButton {
-                if matches!(
-                    app.phase,
-                    MainPhase::Listening {
-                        mode: CaptureMode::Auto,
-                        ..
-                    }
-                ) {
+                if capture_mode_in_progress(&app.phase) == Some(CaptureMode::Auto) {
                     cancel_capture(app);
                 } else {
                     start_capture(app, CaptureMode::Auto);
@@ -11732,21 +11758,21 @@ mod tests {
         advance_result_card_stage, animation_needs_frame, artwork_pixel_fingerprint,
         artwork_request_is_current, artwork_request_matches_track,
         artwork_request_urls_match_track, button_border_arc_points, capture_animation_start,
-        composition_button_pixel_snap_offset, composition_header_viewport_offset,
-        composition_root_layer_order, composition_scale_for_dpi, composition_scene_layer_order,
-        copy_notification_text, copy_panel_pixels_into, create_text_format_with_locale,
-        d2d_color_from_system, directwrite_locale, fallback_match_artwork_rect,
-        finish_active_artwork_request, gradient_origin_transform, header_fill_scope,
-        history_artwork_frame, history_row_top, history_text_rects, history_title_color,
-        inverse_circle_clip_radii, is_offline_failure, is_tray_activation_event, localized_ui_text,
-        native_icon_layout, no_match_copy, no_match_icon_rect, page_url_for_display_id,
-        phase_animation_state, phase_needs_frame_at, phase_needs_timeout, point_in_rect,
-        popup_base_color, remember_auto_candidate_key, resolve_page_link,
-        resolve_page_link_checked, resolve_page_link_for_generation, result_artwork_rect,
-        result_card_link_hit, result_details_rects, result_gradient_colors,
+        capture_mode_in_progress, composition_button_pixel_snap_offset,
+        composition_header_viewport_offset, composition_root_layer_order,
+        composition_scale_for_dpi, composition_scene_layer_order, copy_notification_text,
+        copy_panel_pixels_into, create_text_format_with_locale, d2d_color_from_system,
+        directwrite_locale, fallback_match_artwork_rect, finish_active_artwork_request,
+        gradient_origin_transform, header_fill_scope, history_artwork_frame, history_row_top,
+        history_text_rects, history_title_color, inverse_circle_clip_radii, is_offline_failure,
+        is_tray_activation_event, localized_ui_text, native_icon_layout, no_match_copy,
+        no_match_icon_rect, page_url_for_display_id, phase_animation_state, phase_needs_frame_at,
+        phase_needs_timeout, point_in_rect, popup_base_color, remember_auto_candidate_key,
+        resolve_page_link, resolve_page_link_checked, resolve_page_link_for_generation,
+        result_artwork_rect, result_card_link_hit, result_details_rects, result_gradient_colors,
         result_header_hit_test_contains, result_header_visible_height, result_overlay_child_offset,
         result_overlay_occludes_shazam_button, result_panel_draw_top, result_panel_top_at,
-        scale_notification_artwork, select_ui_language_from_multisz,
+        scale_notification_artwork_to_size, select_ui_language_from_multisz,
         should_defer_hide_for_tray_activation, should_hide_popup_on_deactivation,
         should_replace_cached_artwork, should_show_initial_popup, should_start_startup_logo,
         status_text_snapshot, theme_from_foreground_rgb, timeout_copy, ui_model,
@@ -12866,13 +12892,32 @@ mod tests {
         };
 
         assert_eq!(
-            scale_notification_artwork(&pixels, 1),
+            scale_notification_artwork_to_size(&pixels, 1, 1),
             Some(vec![30, 40, 50, 255])
         );
-        assert_eq!(scale_notification_artwork(&pixels, 0), None);
+        assert_eq!(
+            scale_notification_artwork_to_size(&pixels, 1, 2),
+            Some(vec![20, 30, 40, 255, 40, 50, 60, 255])
+        );
+        assert_eq!(scale_notification_artwork_to_size(&pixels, 0, 0), None);
         let mut malformed = pixels;
         malformed.bgra.pop();
-        assert_eq!(scale_notification_artwork(&malformed, 1), None);
+        assert_eq!(scale_notification_artwork_to_size(&malformed, 1, 1), None);
+    }
+
+    #[test]
+    fn custom_notification_artwork_creates_a_native_icon_handle() {
+        let pixels = ArtworkPixels {
+            width: 1,
+            height: 1,
+            fingerprint: 0,
+            bgra: vec![40, 80, 120, 255],
+        };
+        unsafe {
+            let icon = super::create_notification_icon(&pixels).unwrap();
+            assert!(!icon.0.is_null());
+            let _ = super::DestroyIcon(icon);
+        }
     }
 
     #[test]
@@ -14203,6 +14248,37 @@ mod tests {
             capture_animation_start(&manual_starting, CaptureMode::Manual, capture_event),
             capture_event
         );
+    }
+
+    #[test]
+    fn auto_capture_can_be_cancelled_during_start_listen_and_cancel_phases() {
+        let now = Instant::now();
+        for phase in [
+            MainPhase::Starting {
+                mode: CaptureMode::Auto,
+                entered_at: now,
+            },
+            MainPhase::Listening {
+                mode: CaptureMode::Auto,
+                started_at: now,
+            },
+            MainPhase::Cancelling {
+                mode: CaptureMode::Auto,
+                entered_at: now,
+            },
+        ] {
+            assert_eq!(capture_mode_in_progress(&phase), Some(CaptureMode::Auto));
+        }
+
+        let manual_starting = MainPhase::Starting {
+            mode: CaptureMode::Manual,
+            entered_at: now,
+        };
+        assert_eq!(
+            capture_mode_in_progress(&manual_starting),
+            Some(CaptureMode::Manual)
+        );
+        assert_eq!(capture_mode_in_progress(&MainPhase::Ready), None);
     }
 
     #[test]
