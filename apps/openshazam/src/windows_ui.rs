@@ -31,7 +31,9 @@ use windows::{
         WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
     },
     Win32::{
-        Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
+        Foundation::{
+            HANDLE, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+        },
         Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME},
         Graphics::{
             Direct2D::{
@@ -105,19 +107,19 @@ use windows::{
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos, GetWindowLongPtrW,
-                GetWindowRect, KillTimer, LoadCursorW, LoadIconW, PeekMessageW, PostMessageW,
-                PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-                SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
-                TranslateMessage, UpdateLayeredWindow, WaitMessage, CS_DBLCLKS, CW_USEDEFAULT,
-                GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE,
-                SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
-                SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_ACTIVATE, WM_APP,
-                WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS,
-                WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-                WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS,
-                WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMECHANGE, WM_TIMER, WNDCLASSW, WNDPROC,
-                WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+                DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect, GetCursorPos,
+                GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, LoadIconW, PeekMessageW,
+                PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+                SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+                TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, WaitMessage, CS_DBLCLKS,
+                CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION, MF_SEPARATOR, MF_STRING,
+                MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+                SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
+                WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN,
+                WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+                WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_RBUTTONUP,
+                WM_SETFOCUS, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMECHANGE, WM_TIMER, WNDCLASSW,
+                WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
             },
         },
     },
@@ -137,6 +139,13 @@ use windows::{
     },
 };
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateMutexW(attributes: *mut c_void, initial_owner: i32, name: *const u16) -> HANDLE;
+    fn GetLastError() -> u32;
+    fn CloseHandle(handle: HANDLE) -> i32;
+}
+
 use windows_numerics::{Matrix3x2, Vector2, Vector3};
 
 use openshazam::WindowsRecognitionBackend;
@@ -153,6 +162,8 @@ use crate::ui_model::{
 };
 
 const CLASS_NAME: &str = "OpenShazamNativeUiWindow";
+const SINGLE_INSTANCE_MUTEX: &str = "Local\\OpenShazam.WindowsUi.Singleton";
+const ERROR_ALREADY_EXISTS: u32 = 183;
 const WM_TRAYICON_MESSAGE: u32 = WM_APP + 0x41;
 const WM_SHOW_INITIAL_POPUP: u32 = WM_APP + 0x43;
 const WM_OS_THEME_CHANGED: u32 = WM_APP + 0x44;
@@ -6741,6 +6752,49 @@ fn is_startup_task_activation() -> bool {
         .is_some_and(|kind| kind == ActivationKind::StartupTask)
 }
 
+struct SingleInstanceMutex(HANDLE);
+
+impl Drop for SingleInstanceMutex {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+fn acquire_single_instance_mutex() -> windows::core::Result<(SingleInstanceMutex, bool)> {
+    acquire_named_single_instance_mutex(SINGLE_INSTANCE_MUTEX)
+}
+
+fn acquire_named_single_instance_mutex(
+    name: &str,
+) -> windows::core::Result<(SingleInstanceMutex, bool)> {
+    let name = wide(name);
+    let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+    if handle.0.is_null() {
+        return Err(Error::from_thread());
+    }
+    let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    Ok((SingleInstanceMutex(handle), already_running))
+}
+
+fn activate_existing_instance() -> bool {
+    let class_name = wide(CLASS_NAME);
+    let title = wide("OpenShazam");
+    for _ in 0..50 {
+        let hwnd = unsafe {
+            FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR(title.as_ptr())).unwrap_or_default()
+        };
+        if !hwnd.0.is_null() {
+            return unsafe {
+                PostMessageW(Some(hwnd), WM_SHOW_INITIAL_POPUP, WPARAM(0), LPARAM(0)).is_ok()
+            };
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 unsafe fn create_window(
     app: *mut AppState,
     kind: WindowKind,
@@ -9717,9 +9771,10 @@ fn high_word(value: isize) -> u16 {
 
 fn no_auxiliary_window_visible(app: &AppState) -> bool {
     !app.settings_opening
-        && !app.settings_host
-        .as_ref()
-        .is_some_and(|host| host.visible())
+        && !app
+            .settings_host
+            .as_ref()
+            .is_some_and(|host| host.visible())
         && !app.about_visible
         && !app.microphone_visible
 }
@@ -9772,6 +9827,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let startup_task_activation = is_startup_task_activation();
+        let (instance_mutex, already_running) = acquire_single_instance_mutex()?;
+        if already_running {
+            // A second explicit UI launch reuses the resident tray process.
+            // A duplicate logon activation exits quietly and never foregrounds
+            // the existing popup.
+            if !startup_task_activation && !activate_existing_instance() {
+                eprintln!("OpenShazam is already running, but its window could not be activated.");
+            }
+            drop(instance_mutex);
+            CoUninitialize();
+            return Ok(());
+        }
+        let _instance_mutex = instance_mutex;
         let instance = GetModuleHandleW(None)?;
         let class_name = wide(CLASS_NAME);
         let class = window_class(
@@ -10078,6 +10146,27 @@ mod tests {
         WHITE_CLOSE_ICON_PIXELS,
     };
     use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    #[test]
+    fn named_single_instance_mutex_tracks_live_handle_lifetime() {
+        let name = format!("Local\\OpenShazam.WindowsUi.Test.{}", std::process::id());
+        let (first, already_running) = super::acquire_named_single_instance_mutex(&name).unwrap();
+        assert!(!already_running);
+
+        let (second, already_running) = super::acquire_named_single_instance_mutex(&name).unwrap();
+        assert!(already_running);
+        drop(second);
+
+        let (while_first_is_alive, already_running) =
+            super::acquire_named_single_instance_mutex(&name).unwrap();
+        assert!(already_running);
+        drop(while_first_is_alive);
+        drop(first);
+
+        let (_after_last_handle_is_closed, already_running) =
+            super::acquire_named_single_instance_mutex(&name).unwrap();
+        assert!(!already_running);
+    }
 
     #[test]
     fn ui229_history_keeps_controller_event_time_when_ui_delivery_is_delayed() {
