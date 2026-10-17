@@ -560,7 +560,7 @@ namespace
 
             auto dpi = ::GetDpiForWindow(parent);
             if (dpi < 96) dpi = 96;
-            auto windowTitle = Localized(L"Shazam Settings", L"Shazam の設定");
+            auto windowTitle = Localized(L"Shazam", L"Shazam");
             hwnd = ::CreateWindowExW(0, kSettingsClass, windowTitle.c_str(),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                 ::MulDiv(kWidthDips, dpi, 96), ::MulDiv(kHeightDips, dpi, 96),
