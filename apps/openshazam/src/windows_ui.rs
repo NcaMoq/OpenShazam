@@ -104,7 +104,10 @@ use windows::{
                 GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
             },
-            Input::KeyboardAndMouse::{GetDoubleClickTime, ReleaseCapture, SetCapture, VK_ESCAPE},
+            Input::KeyboardAndMouse::{
+                GetDoubleClickTime, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE,
+                TRACKMOUSEEVENT, VK_ESCAPE,
+            },
             Shell::{
                 ShellExecuteExW, Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_GUID, NIF_ICON,
                 NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIIF_LARGE_ICON, NIIF_USER,
@@ -182,6 +185,7 @@ const WM_ACTIVATE_MAIN_POPUP: u32 = WM_APP + 0x46;
 const WM_OPEN_SETTINGS: u32 = WM_APP + 0x47;
 const WM_APPEARANCE_CHANGED: u32 = WM_APP + 0x48;
 const WM_ARTWORK_LOAD_FINISHED: u32 = WM_APP + 0x49;
+const WM_MOUSELEAVE: u32 = 0x02A3;
 const TRAY_ICON_ID: u32 = 1;
 const APP_ICON_RESOURCE_ID: usize = 101;
 const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
@@ -1086,6 +1090,7 @@ struct AppState {
     history_composition_ready: bool,
     scroll_offset: f32,
     hovered_row: Option<usize>,
+    mouse_leave_tracking: bool,
     // UI-only adapter points. No service meter output is assumed or inferred.
     ui_levels: UiLevels,
     // Core Animation default spring coefficients and the explicit 0.2s track
@@ -9377,6 +9382,8 @@ fn hide_main(app: &mut AppState) {
         hide_when_complete: true,
     });
     app.visible = false;
+    clear_history_hover(&mut app.hovered_row);
+    app.mouse_leave_tracking = false;
     app.main_activated = false;
     app.popup_activation_grace_until = None;
     set_auto_recognition_context(app, RecognitionContext::Background);
@@ -12191,6 +12198,15 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE if data.kind == WindowKind::Main => {
+            if !app.mouse_leave_tracking {
+                let mut tracking = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                app.mouse_leave_tracking = unsafe { TrackMouseEvent(&mut tracking).is_ok() };
+            }
             let (x, y) = client_dips(hwnd, lparam);
             let body_top = if app.arrow_edge == ArrowEdge::Top {
                 POPUP_ARROW_HEIGHT as f32
@@ -12213,6 +12229,13 @@ unsafe extern "system" fn window_proc(
             };
             if next != app.hovered_row {
                 app.hovered_row = next;
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE if data.kind == WindowKind::Main => {
+            app.mouse_leave_tracking = false;
+            if clear_history_hover(&mut app.hovered_row) {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
@@ -12523,6 +12546,7 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             history_composition_ready: false,
             scroll_offset: 0.0,
             hovered_row: None,
+            mouse_leave_tracking: false,
             ui_levels: UiLevels::default(),
             auto_spring: None,
             theme,
@@ -12788,6 +12812,10 @@ fn history_row_index_at(
         let top = history_row_top(index, transition, history_top, scroll_offset, now);
         visible_history_row_hit(y, top, history_top, history_bottom)
     })
+}
+
+fn clear_history_hover(hovered_row: &mut Option<usize>) -> bool {
+    hovered_row.take().is_some()
 }
 
 unsafe fn hovered_history_row_for_cursor(app: &AppState) -> Option<usize> {
@@ -14545,6 +14573,14 @@ mod tests {
             super::history_row_index_at(200.0, 200.0, 630.0, 5, None, 91.0, now),
             Some(1)
         );
+    }
+
+    #[test]
+    fn history_hover_clears_when_pointer_leaves_the_popup() {
+        let mut hovered_row = Some(3);
+        assert!(super::clear_history_hover(&mut hovered_row));
+        assert_eq!(hovered_row, None);
+        assert!(!super::clear_history_hover(&mut hovered_row));
     }
 
     #[test]
