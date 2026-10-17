@@ -9,6 +9,8 @@ CPU/GPU percentile values describe resource samples; frame interval p95/p99
 must be derived from the ETL in Windows Performance Analyzer (WPA).
 Use -ResourceOnly when WPR elevation is unavailable; this samples process
 resources without collecting ETW or frame timing.
+Use -ExpectedWindowState Hidden to profile the tray-only startup path and check
+for resource activity while the popup is not visible.
 
 .EXAMPLE
 $app = Get-Process -Name openshazam | Select-Object -First 1
@@ -17,11 +19,17 @@ $app = Get-Process -Name openshazam | Select-Object -First 1
 .EXAMPLE
 $app = Get-Process -Name openshazam | Select-Object -First 1
 .\tools\profile-windows-ui.ps1 -ProcessId $app.Id -DurationSeconds 30 -ResourceOnly
+
+.EXAMPLE
+$app = Get-Process -Name openshazam | Select-Object -First 1
+.\tools\profile-windows-ui.ps1 -ProcessId $app.Id -DurationSeconds 15 -ResourceOnly -ExpectedWindowState Hidden -OutputDirectory profiles
 #>
 param(
     [int]$ProcessId = 0,
     [ValidateRange(5, 600)]
     [int]$DurationSeconds = 30,
+    [ValidateSet('Visible', 'Hidden')]
+    [string]$ExpectedWindowState = 'Visible',
     [switch]$ResourceOnly,
     [string]$OutputDirectory = (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\windows-x64') 'profiles')
 )
@@ -100,8 +108,12 @@ $targetProcess = Get-Process -Id $ProcessId -ErrorAction Stop
 if ($targetProcess.ProcessName -ne 'openshazam') {
     throw "PID $ProcessId is '$($targetProcess.ProcessName)', not OpenShazam."
 }
-if (-not [OpenShazamProfileWindowProbe]::HasVisibleMainWindow($ProcessId)) {
-    throw 'The OpenShazam popup is not visible. Open the popup before starting this profile.'
+$hasVisibleMainWindow = [OpenShazamProfileWindowProbe]::HasVisibleMainWindow($ProcessId)
+if ($ExpectedWindowState -eq 'Visible' -and -not $hasVisibleMainWindow) {
+    throw 'The OpenShazam popup is not visible. Open the popup or use -ExpectedWindowState Hidden for tray-only profiling.'
+}
+if ($ExpectedWindowState -eq 'Hidden' -and $hasVisibleMainWindow) {
+    throw 'The OpenShazam popup is visible. Hide the popup before profiling the tray-only state.'
 }
 
 $wpr = $null
@@ -217,6 +229,7 @@ try {
 
     $summary = [pscustomobject]@{
         ProcessId = $ProcessId
+        ExpectedWindowState = $ExpectedWindowState
         DurationSeconds = $DurationSeconds
         SampleCount = $samples.Count
         CpuPercentOfMachine = [pscustomobject]@{
