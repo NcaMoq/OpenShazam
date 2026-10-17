@@ -263,7 +263,7 @@ public static class OpenShazamSettingsHostSmoke
                 }
                 uint dpi = GetDpiForWindow(settingsWindow);
                 if (dpi < 96) dpi = 96;
-                int minimumClientWidth = (int)Math.Ceiling(460.0 * dpi / 96.0);
+                int minimumClientWidth = (int)Math.Ceiling(690.0 * dpi / 96.0);
                 int minimumClientHeight = (int)Math.Ceiling(320.0 * dpi / 96.0);
                 if (minMax.MinTrackSize.X <= minimumClientWidth ||
                     minMax.MinTrackSize.Y <= minimumClientHeight)

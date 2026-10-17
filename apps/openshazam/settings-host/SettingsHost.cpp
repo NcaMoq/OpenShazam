@@ -65,9 +65,9 @@ namespace
     constexpr uint32_t kAppearanceDark = 2;
     constexpr double kSettingsControlLaneWidthDips = 208.0;
     constexpr double kStartupControlGroupWidthDips = 94.0;
-    constexpr int kWidthDips = 520;
+    constexpr int kWidthDips = 720;
     constexpr int kHeightDips = 380;
-    constexpr int kMinimumClientWidthDips = 460;
+    constexpr int kMinimumClientWidthDips = 690;
     constexpr int kMinimumClientHeightDips = 320;
     constexpr wchar_t kStartupRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kStartupRunValue[] = L"OpenShazam";
