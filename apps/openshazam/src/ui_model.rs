@@ -213,6 +213,35 @@ pub fn native_bezier(progress: f64) -> f64 {
     cubic_bezier_timing(progress, BEZIER_X1, BEZIER_Y1, BEZIER_X2, BEZIER_Y2)
 }
 
+/// Core Animation's `kCAMediaTimingFunctionEaseOut` timing curve.
+pub fn ease_out(progress: f64) -> f64 {
+    cubic_bezier_timing(progress, 0.0, 0.0, 0.58, 1.0)
+}
+
+/// Return the exact normalized tail of the native EaseOut curve after progress.
+/// Composition can use this when a UI timer reaches a track after its begin time.
+pub fn ease_out_tail(progress: f64) -> Option<CubicBezier> {
+    let x0 = finite_unit(progress);
+    if x0 >= 1.0 {
+        return None;
+    }
+    let t0 = cubic_bezier_parameter(x0, 0.0, 0.58);
+    let y0 = cubic_component(t0, 0.0, 1.0);
+    let start_dx = cubic_component_derivative(t0, 0.0, 0.58);
+    let start_dy = cubic_component_derivative(t0, 0.0, 1.0);
+    let end_dx = cubic_component_derivative(1.0, 0.0, 0.58);
+    let end_dy = cubic_component_derivative(1.0, 0.0, 1.0);
+    let span = 1.0 - t0;
+    let width = 1.0 - x0;
+    let height = 1.0 - y0;
+    Some(CubicBezier {
+        x1: (start_dx * span / 3.0 / width).clamp(0.0, 1.0),
+        y1: (start_dy * span / 3.0 / height).clamp(0.0, 1.0),
+        x2: (1.0 - end_dx * span / 3.0 - x0) / width,
+        y2: (1.0 - end_dy * span / 3.0 - y0) / height,
+    })
+}
+
 /// Core Animation's `kCAMediaTimingFunctionEaseInEaseOut` curve, used by
 /// UI-224's 0.4-second status-text push transition.
 pub fn ease_in_out(progress: f64) -> f64 {
@@ -249,6 +278,20 @@ fn cubic_bezier_timing(progress: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64
         }
     }
     cubic_component(t, y1, y2)
+}
+
+fn cubic_bezier_parameter(x: f64, x1: f64, x2: f64) -> f64 {
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..48 {
+        let middle = (low + high) * 0.5;
+        if cubic_component(middle, x1, x2) < x {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    (low + high) * 0.5
 }
 
 /// Deterministic presentation values for the UI-169 one-shot logo drawing.
@@ -973,6 +1016,57 @@ impl SettlingDuration {
     }
 }
 
+/// [I] Estimate Core Animation's spring settling time from its damped response.
+/// Apple documents the result as estimated and dependent on the physical
+/// parameters, but does not publish QuartzCore's exact threshold/formula.
+/// The 0.001 tolerance follows Apple's documented SwiftUI spring convention;
+/// replace this estimate if a runtime-measured QuartzCore value becomes
+/// available. Only the under-damped profile used by NoMatch is needed here.
+pub fn spring_settling_duration_estimate(
+    profile: SpringProfile,
+    normalized_epsilon: f64,
+) -> Option<f64> {
+    if ![
+        profile.from,
+        profile.to,
+        profile.mass,
+        profile.damping,
+        profile.stiffness,
+        profile.initial_velocity,
+        normalized_epsilon,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+        || profile.mass <= 0.0
+        || profile.damping <= 0.0
+        || profile.stiffness <= 0.0
+        || normalized_epsilon <= 0.0
+        || !(0.0..1.0).contains(&normalized_epsilon)
+    {
+        return None;
+    }
+
+    let natural_frequency = (profile.stiffness / profile.mass).sqrt();
+    let decay = profile.damping / (2.0 * profile.mass);
+    let discriminant = natural_frequency * natural_frequency - decay * decay;
+    if discriminant <= 0.0 {
+        return None;
+    }
+    let damped_frequency = discriminant.sqrt();
+    let displacement = profile.from - profile.to;
+    let sine_coefficient = (profile.initial_velocity + decay * displacement) / damped_frequency;
+    let displacement_envelope = displacement.hypot(sine_coefficient);
+    let velocity_cosine = -decay * displacement + damped_frequency * sine_coefficient;
+    let velocity_sine = -decay * sine_coefficient - damped_frequency * displacement;
+    let normalized_velocity_envelope = velocity_cosine.hypot(velocity_sine) / natural_frequency;
+    let amplitude = displacement
+        .abs()
+        .max(displacement_envelope)
+        .max(normalized_velocity_envelope);
+    let tolerance = normalized_epsilon * amplitude.max(1.0);
+    Some(((amplitude / tolerance).ln() / decay).max(0.0))
+}
+
 pub fn dpi_scale(dpi: u32) -> f64 {
     f64::from(dpi.max(1)) / 96.0
 }
@@ -985,18 +1079,34 @@ pub fn physical_pixels(logical_units: f64, dpi: u32) -> i32 {
 pub fn no_match_timing(settling: SettlingDuration) -> Option<NoMatchTiming> {
     let spring_settle = settling.resolved()?;
     Some(NoMatchTiming {
-        tag_button_center_begin: 0.3,
+        tag_button_center_begin: NO_MATCH_POSITION_DELAY_SECONDS,
         tagging_layer_left_fraction: -0.15,
         button_layer_left_fraction: -0.07,
         button_layer_center_spring_duration: 1.1,
         tagging_layer_center_spring_duration: 0.5,
         button_scale_down: (0.0, 0.3),
-        button_scale_up_begin: spring_settle - 0.35,
+        button_scale_up_begin: spring_settle + NO_MATCH_SETTLE_BASE_SECONDS
+            - NO_MATCH_BUTTON_SCALE_UP_SETTLE_SUBTRACTION_SECONDS,
         button_scale_up: 0.3,
-        icon_mask_initial_fade: (0.1, 0.15),
-        icon_mask_secondary_fade: (spring_settle - 0.3, 0.2),
-        logo_fade_in: (spring_settle - 0.25, 0.35),
-        logo_scale_in: (spring_settle - 0.25, 0.5),
+        icon_mask_initial_fade: (
+            NO_MATCH_ICON_FADE_DELAY_SECONDS,
+            NO_MATCH_ICON_FADE_DURATION_SECONDS,
+        ),
+        icon_mask_secondary_fade: (
+            spring_settle + NO_MATCH_SETTLE_BASE_SECONDS
+                - NO_MATCH_ICON_FADE_OUT_SETTLE_SUBTRACTION_SECONDS,
+            NO_MATCH_ICON_FADE_OUT_DURATION_SECONDS,
+        ),
+        logo_fade_out: (0.0, NO_MATCH_LOGO_FADE_OUT_DURATION_SECONDS),
+        logo_scale_out: (0.0, NO_MATCH_LOGO_SCALE_OUT_DURATION_SECONDS),
+        logo_fade_in: (
+            spring_settle + NO_MATCH_SETTLE_BASE_SECONDS - NO_MATCH_LOGO_SETTLE_SUBTRACTION_SECONDS,
+            NO_MATCH_LOGO_FADE_IN_DURATION_SECONDS,
+        ),
+        logo_scale_in: (
+            spring_settle + NO_MATCH_SETTLE_BASE_SECONDS - NO_MATCH_LOGO_SETTLE_SUBTRACTION_SECONDS,
+            NO_MATCH_LOGO_SCALE_IN_DURATION_SECONDS,
+        ),
         logo_scale_spring: [1.0, 14.0, 100.0, 23.0],
     })
 }
@@ -1030,9 +1140,118 @@ pub struct NoMatchTiming {
     pub button_scale_up: f64,
     pub icon_mask_initial_fade: (f64, f64),
     pub icon_mask_secondary_fade: (f64, f64),
+    pub logo_fade_out: (f64, f64),
+    pub logo_scale_out: (f64, f64),
     pub logo_fade_in: (f64, f64),
     pub logo_scale_in: (f64, f64),
     pub logo_scale_spring: [f64; 4],
+}
+
+pub const NO_MATCH_DISPATCH_DELAY_SECONDS: f64 = 0.180_000_007_152_557_37;
+pub const NO_MATCH_POSITION_DELAY_SECONDS: f64 = 0.300_000_008_195_638_66;
+const NO_MATCH_SETTLE_BASE_SECONDS: f64 = 0.300_000_008_195_638_66;
+const NO_MATCH_BUTTON_SCALE_UP_SETTLE_SUBTRACTION_SECONDS: f64 = 0.650_000_000_0;
+const NO_MATCH_ICON_FADE_OUT_SETTLE_SUBTRACTION_SECONDS: f64 = 0.600_000_023_841_857_9;
+const NO_MATCH_LOGO_SETTLE_SUBTRACTION_SECONDS: f64 = 0.550_000_011_920_929;
+pub const NO_MATCH_SETTLING_ESTIMATE_EPSILON: f64 = 0.001;
+
+pub const NO_MATCH_LOGO_FADE_OUT_DURATION_SECONDS: f64 = 0.119_999_997_317_790_99;
+pub const NO_MATCH_LOGO_SCALE_OUT_DURATION_SECONDS: f64 = 0.300_000_011_920_928_96;
+pub const NO_MATCH_LOGO_SCALE_OUT_FROM: f64 = 1.0;
+pub const NO_MATCH_LOGO_SCALE_OUT_TO: f64 = 0.800_000_011_920_929;
+pub const NO_MATCH_LOGO_FADE_IN_DURATION_SECONDS: f64 = 0.349_999_994_039_535_5;
+pub const NO_MATCH_LOGO_SCALE_IN_DURATION_SECONDS: f64 = 0.5;
+
+pub fn no_match_icon_center_spring_profile() -> SpringProfile {
+    no_match_position_profile(
+        96.0,
+        -0.070_000_000_298_023_22,
+        3.940_000_057_220_459,
+        1.100_000_023_841_858,
+    )
+}
+
+/// [I] Uses the measured NoMatch icon-center spring parameters and the
+/// replaceable 0.001 damped-envelope estimator above.
+pub fn no_match_settling_duration_estimate() -> Option<f64> {
+    spring_settling_duration_estimate(
+        no_match_icon_center_spring_profile(),
+        NO_MATCH_SETTLING_ESTIMATE_EPSILON,
+    )
+}
+
+/// Native NoMatch icon-mask opacity timing: value 1 -> 0, linear, beginning
+/// 100 ms after the composite starts and lasting 150 ms.
+pub const NO_MATCH_ICON_FADE_DELAY_SECONDS: f64 = 0.100_000_001_490_116_12;
+pub const NO_MATCH_ICON_FADE_DURATION_SECONDS: f64 = 0.150_000_005_960_464_48;
+pub const NO_MATCH_ICON_FADE_OUT_DURATION_SECONDS: f64 = 0.200_000_002_980_232_24;
+
+/// Deterministic value of the native initial NoMatch icon fade at an elapsed
+/// time relative to the composite animation's start.
+#[cfg(test)]
+pub fn no_match_icon_opacity_at(elapsed_seconds: f64) -> f64 {
+    if !elapsed_seconds.is_finite() || elapsed_seconds <= NO_MATCH_ICON_FADE_DELAY_SECONDS {
+        return 1.0;
+    }
+    let progress = ((elapsed_seconds - NO_MATCH_ICON_FADE_DELAY_SECONDS)
+        / NO_MATCH_ICON_FADE_DURATION_SECONDS)
+        .clamp(0.0, 1.0);
+    1.0 - progress
+}
+
+#[cfg(test)]
+pub fn no_match_logo_fade_out_at(elapsed_seconds: f64) -> f64 {
+    let progress = if elapsed_seconds.is_finite() {
+        (elapsed_seconds / NO_MATCH_LOGO_FADE_OUT_DURATION_SECONDS).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    1.0 - progress
+}
+
+#[cfg(test)]
+pub fn no_match_logo_scale_down_at(elapsed_seconds: f64) -> f64 {
+    let progress = if elapsed_seconds.is_finite() {
+        (elapsed_seconds / NO_MATCH_LOGO_SCALE_OUT_DURATION_SECONDS).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    NO_MATCH_LOGO_SCALE_OUT_FROM
+        + (NO_MATCH_LOGO_SCALE_OUT_TO - NO_MATCH_LOGO_SCALE_OUT_FROM) * ease_out(progress)
+}
+
+#[cfg(test)]
+pub fn no_match_logo_fade_in_at(elapsed_seconds: f64, settling: SettlingDuration) -> Option<f64> {
+    let (start, duration) = no_match_timing(settling)?.logo_fade_in;
+    let elapsed = if elapsed_seconds.is_finite() {
+        elapsed_seconds
+    } else {
+        0.0
+    };
+    Some(((elapsed - start) / duration).clamp(0.0, 1.0))
+}
+
+#[cfg(test)]
+pub fn no_match_logo_scale_in_at(elapsed_seconds: f64, settling: SettlingDuration) -> Option<f64> {
+    let timing = no_match_timing(settling)?;
+    let elapsed = if elapsed_seconds.is_finite() {
+        elapsed_seconds
+    } else {
+        0.0
+    };
+    let progress = ((elapsed - timing.logo_scale_in.0) / timing.logo_scale_in.1).clamp(0.0, 1.0);
+    Some(spring_value(
+        progress,
+        SpringProfile {
+            from: NO_MATCH_LOGO_SCALE_OUT_TO,
+            to: 1.0,
+            mass: timing.logo_scale_spring[0],
+            damping: timing.logo_scale_spring[1],
+            stiffness: timing.logo_scale_spring[2],
+            initial_velocity: timing.logo_scale_spring[3],
+            duration_seconds: timing.logo_scale_in.1,
+        },
+    ))
 }
 
 fn finite_unit(value: f64) -> f64 {
@@ -1339,15 +1558,28 @@ mod tests {
     }
 
     #[test]
-    fn no_match_native_settling_is_unresolved_but_formula_is_replaceable() {
+    fn no_match_native_settling_input_is_replaceable() {
         assert_eq!(SettlingDuration::default().settling_seconds, None);
         let timing = no_match_timing(SettlingDuration {
             settling_seconds: Some(0.77),
         })
         .unwrap();
-        close(timing.button_scale_up_begin, 0.42, 1e-12);
-        close(timing.icon_mask_secondary_fade.0, 0.47, 1e-12);
-        close(timing.logo_fade_in.0, 0.52, 1e-12);
+        close(
+            timing.button_scale_up_begin,
+            0.77 + NO_MATCH_SETTLE_BASE_SECONDS
+                - NO_MATCH_BUTTON_SCALE_UP_SETTLE_SUBTRACTION_SECONDS,
+            1e-12,
+        );
+        close(
+            timing.icon_mask_secondary_fade.0,
+            0.77 + NO_MATCH_SETTLE_BASE_SECONDS - NO_MATCH_ICON_FADE_OUT_SETTLE_SUBTRACTION_SECONDS,
+            1e-12,
+        );
+        close(
+            timing.logo_fade_in.0,
+            0.77 + NO_MATCH_SETTLE_BASE_SECONDS - NO_MATCH_LOGO_SETTLE_SUBTRACTION_SECONDS,
+            1e-12,
+        );
         close(timing.tagging_layer_left_fraction, -0.15, 1e-12);
         close(timing.button_layer_left_fraction, -0.07, 1e-12);
         assert!(no_match_timing(SettlingDuration::default()).is_none());
@@ -1355,6 +1587,47 @@ mod tests {
             settling_seconds: Some(f64::NAN)
         })
         .is_none());
+    }
+
+    #[test]
+    fn ease_out_tail_preserves_the_original_native_curve() {
+        for start in [0.0, 0.1, 0.25, 0.5, 0.8, 0.95] {
+            let tail = ease_out_tail(start).unwrap();
+            let original_start = ease_out(start);
+            for local in [0.0, 0.1, 0.25, 0.5, 0.75, 1.0] {
+                close(
+                    sample_bezier_curve(local, tail),
+                    (ease_out(start + (1.0 - start) * local) - original_start)
+                        / (1.0 - original_start),
+                    2e-6,
+                );
+            }
+        }
+        assert!(ease_out_tail(1.0).is_none());
+    }
+
+    #[test]
+    fn no_match_spring_settling_estimate_is_damped_and_replaceable() {
+        let profile = no_match_icon_center_spring_profile();
+        let estimate = no_match_settling_duration_estimate().unwrap();
+        assert!(estimate > profile.duration_seconds);
+        assert!((1.3..1.5).contains(&estimate));
+        assert!(spring_settling_duration_estimate(profile, 0.0).is_none());
+        let overdamped = SpringProfile {
+            damping: 40.0,
+            ..profile
+        };
+        assert!(spring_settling_duration_estimate(overdamped, 0.001).is_none());
+        let timing = no_match_timing(SettlingDuration {
+            settling_seconds: Some(estimate),
+        })
+        .unwrap();
+        assert!(
+            timing.icon_mask_secondary_fade.0
+                >= NO_MATCH_ICON_FADE_DELAY_SECONDS + NO_MATCH_ICON_FADE_DURATION_SECONDS
+        );
+        assert!(timing.logo_fade_in.0 >= timing.logo_fade_out.1);
+        assert!(timing.logo_scale_in.0 >= timing.logo_scale_out.1);
     }
 
     #[test]
@@ -1369,5 +1642,71 @@ mod tests {
         assert_eq!(spring_value(0.0, tagging), tagging.from);
         assert_eq!(spring_value(0.0, button), button.from);
         assert_ne!(spring_value(0.5, tagging), spring_value(0.5, button));
+    }
+
+    #[test]
+    fn no_match_icon_opacity_uses_native_initial_linear_fade_track() {
+        close(no_match_icon_opacity_at(0.0), 1.0, 1e-12);
+        close(
+            no_match_icon_opacity_at(NO_MATCH_ICON_FADE_DELAY_SECONDS),
+            1.0,
+            1e-12,
+        );
+        close(
+            no_match_icon_opacity_at(
+                NO_MATCH_ICON_FADE_DELAY_SECONDS + NO_MATCH_ICON_FADE_DURATION_SECONDS * 0.5,
+            ),
+            0.5,
+            1e-12,
+        );
+        close(
+            no_match_icon_opacity_at(
+                NO_MATCH_ICON_FADE_DELAY_SECONDS + NO_MATCH_ICON_FADE_DURATION_SECONDS,
+            ),
+            0.0,
+            1e-12,
+        );
+        close(no_match_icon_opacity_at(1.0), 0.0, 1e-12);
+    }
+
+    #[test]
+    fn no_match_logo_tracks_match_native_values_and_begin_times() {
+        close(no_match_logo_fade_out_at(0.0), 1.0, 1e-12);
+        close(
+            no_match_logo_fade_out_at(NO_MATCH_LOGO_FADE_OUT_DURATION_SECONDS * 0.5),
+            0.5,
+            1e-12,
+        );
+        close(
+            no_match_logo_fade_out_at(NO_MATCH_LOGO_FADE_OUT_DURATION_SECONDS),
+            0.0,
+            1e-12,
+        );
+        close(no_match_logo_scale_down_at(0.0), 1.0, 1e-12);
+        close(
+            no_match_logo_scale_down_at(NO_MATCH_LOGO_SCALE_OUT_DURATION_SECONDS),
+            NO_MATCH_LOGO_SCALE_OUT_TO,
+            1e-12,
+        );
+        let settling = SettlingDuration {
+            settling_seconds: Some(0.77),
+        };
+        let timing = no_match_timing(settling).unwrap();
+        close(
+            no_match_logo_fade_in_at(timing.logo_fade_in.0, settling).unwrap(),
+            0.0,
+            1e-12,
+        );
+        close(
+            no_match_logo_fade_in_at(timing.logo_fade_in.0 + timing.logo_fade_in.1, settling)
+                .unwrap(),
+            1.0,
+            1e-12,
+        );
+        close(
+            no_match_logo_scale_in_at(timing.logo_scale_in.0, settling).unwrap(),
+            NO_MATCH_LOGO_SCALE_OUT_TO,
+            1e-12,
+        );
     }
 }
