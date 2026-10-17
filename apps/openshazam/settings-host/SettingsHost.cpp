@@ -449,6 +449,7 @@ namespace
             state->startupCard = markup::XamlReader::Load(
                 LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="14" />)"
             ).as<controls::Border>();
+            state->startupCard.HorizontalAlignment(x::HorizontalAlignment::Stretch);
             state->startupRow = controls::Grid{};
             auto startupRow = state->startupRow;
             startupRow.HorizontalAlignment(x::HorizontalAlignment::Stretch);
@@ -466,6 +467,7 @@ namespace
             startupLabel.FontSize(14.0);
             startupLabel.HorizontalAlignment(x::HorizontalAlignment::Left);
             startupLabel.VerticalAlignment(x::VerticalAlignment::Center);
+            startupLabel.TextAlignment(x::TextAlignment::Left);
             automation::AutomationProperties::SetName(startupLabel, startupName);
             controls::Grid::SetColumn(startupLabel, 0);
             startupRow.Children().Append(startupLabel);
@@ -489,6 +491,7 @@ namespace
             state->appearanceCard = markup::XamlReader::Load(
                 LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="14" />)"
             ).as<controls::Border>();
+            state->appearanceCard.HorizontalAlignment(x::HorizontalAlignment::Stretch);
             state->appearanceRow = controls::Grid{};
             auto appearanceRow = state->appearanceRow;
             appearanceRow.HorizontalAlignment(x::HorizontalAlignment::Stretch);
