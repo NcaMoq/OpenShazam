@@ -5,12 +5,26 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $hostDir = Join-Path $root 'apps\openshazam\settings-host'
 $dist = Join-Path $root 'dist\windows-x64'
+$msbuildCommand = Get-Command msbuild.exe -ErrorAction SilentlyContinue
+if ($msbuildCommand) {
+    $msbuild = $msbuildCommand.Source
+}
+else {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path -LiteralPath $vswhere)) {
+        throw 'MSBuild was not found. Install Visual Studio 2022 with the C++ desktop workload.'
+    }
+    $msbuild = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+    if (-not $msbuild) {
+        throw 'MSBuild was not found. Install Visual Studio 2022 with the C++ desktop workload.'
+    }
+}
 Push-Location $root
 try {
     & nuget restore (Join-Path $hostDir 'packages.config') -PackagesDirectory (Join-Path $hostDir 'packages') -NonInteractive
     if ($LASTEXITCODE -ne 0) { throw "Could not restore C++/WinRT WinUI 3 native dependencies" }
 
-    & msbuild (Join-Path $hostDir 'SettingsHost.vcxproj') /p:Configuration=Release /p:Platform=x64 /m
+    & $msbuild (Join-Path $hostDir 'SettingsHost.vcxproj') /p:Configuration=Release /p:Platform=x64 /p:_CppCommonExtensionTargets= /m /v:minimal
     if ($LASTEXITCODE -ne 0) { throw "In-process WinUI 3 Settings host failed to compile" }
 
     & cargo +1.85.0 build --locked --release -p openshazam --bin openshazam
@@ -22,6 +36,10 @@ try {
     $dll = Join-Path $nativeOut 'OpenShazam.SettingsHost.dll'
     if (-not (Test-Path -LiteralPath $dll)) { throw "SettingsHost DLL was not produced: $dll" }
     Copy-Item -LiteralPath $dll -Destination (Join-Path $dist 'OpenShazam.SettingsHost.dll') -Force
+
+    $bootstrap = Join-Path $nativeOut 'Microsoft.WindowsAppRuntime.Bootstrap.dll'
+    if (-not (Test-Path -LiteralPath $bootstrap)) { throw "Windows App SDK bootstrapper was not produced: $bootstrap" }
+    Copy-Item -LiteralPath $bootstrap -Destination (Join-Path $dist 'Microsoft.WindowsAppRuntime.Bootstrap.dll') -Force
 
     # Preserve compiled WinUI/XAML package resource indexes emitted by MSBuild.
     Get-ChildItem -LiteralPath $nativeOut -File -Filter '*.pri' | ForEach-Object {

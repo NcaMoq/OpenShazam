@@ -158,6 +158,7 @@ const WM_SHOW_INITIAL_POPUP: u32 = WM_APP + 0x43;
 const WM_OS_THEME_CHANGED: u32 = WM_APP + 0x44;
 const WM_ARTWORK_READY: u32 = WM_APP + 0x45;
 const WM_ACTIVATE_MAIN_POPUP: u32 = WM_APP + 0x46;
+const WM_OPEN_SETTINGS: u32 = WM_APP + 0x47;
 const TRAY_ICON_ID: u32 = 1;
 const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
     data1: 0x6a3d77b1,
@@ -706,6 +707,7 @@ struct AppState {
     main_hwnd: HWND,
     taskbar_created_message: u32,
     settings_host: Option<crate::windows_settings::SettingsHost>,
+    settings_opening: bool,
     about_hwnd: HWND,
     microphone_hwnd: HWND,
     d2d_factory: ID2D1Factory,
@@ -7149,23 +7151,66 @@ enum MainHit {
 }
 
 unsafe fn open_settings(app: &mut AppState) {
-    // Settings is WinUI 3 only. Lazy-loading the native C++/WinRT island
-    // keeps XAML out of the permanent audio/GPU hot path and never starts a
-    // second recognition process. No fallback Win32 Settings UI exists.
-    if app.settings_host.is_none() {
+    // Do not initialize or show WinUI from inside the popup's WndProc. Showing
+    // a top-level window synchronously sends activation messages to its owner;
+    // defer it until the current callback has returned to avoid re-entering
+    // this function while it holds &mut AppState.
+    if PostMessageW(Some(app.main_hwnd), WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0)).is_err() {
+        app.message = Some(format!(
+            "Could not schedule Settings: {}",
+            Error::from_thread()
+        ));
+    }
+}
+
+unsafe fn open_settings_after_wndproc(app_ptr: *mut AppState) -> LRESULT {
+    if app_ptr.is_null() {
+        return LRESULT(0);
+    }
+
+    // ShowWindow/activation can synchronously re-enter the main WndProc. Mark
+    // the host as active before loading or calling into WinUI so that the
+    // re-entrant activation path does not call back into the same DLL to query
+    // its visibility while its Show export is still on the stack.
+    (*app_ptr).settings_opening = true;
+
+    // Loading the host can initialize WinUI and the Windows App SDK. Keep this
+    // outside any AppState borrow as well, even though it normally does not
+    // dispatch owner-window messages.
+    if (*app_ptr).settings_host.is_none() {
         match crate::windows_settings::SettingsHost::load() {
-            Ok(host) => app.settings_host = Some(host),
+            Ok(host) => (*app_ptr).settings_host = Some(host),
             Err(error) => {
-                app.message = Some(error);
-                return;
+                (*app_ptr).settings_opening = false;
+                (*app_ptr).message = Some(error);
+                let owner = (*app_ptr).main_hwnd;
+                let _ = InvalidateRect(Some(owner), None, false);
+                return LRESULT(0);
             }
         }
     }
-    if let Some(host) = app.settings_host.as_ref() {
-        if let Err(error) = host.show(app.main_hwnd) {
-            app.message = Some(error);
-        }
+
+    // Copy only plain handles/function pointers out. Drop all Rust references
+    // before calling WinUI, whose ShowWindow/activation path re-enters WndProc.
+    let (show, owner) = {
+        let app = &mut *app_ptr;
+        let Some(host) = app.settings_host.as_ref() else {
+            app.settings_opening = false;
+            return LRESULT(0);
+        };
+        (host.show_callback(), app.main_hwnd)
+    };
+
+    let hr = show(owner.0);
+    (*app_ptr).settings_opening = false;
+    if hr < 0 {
+        (*app_ptr).message = Some(format!(
+            "WinUI 3 Settings failed to open (HRESULT 0x{:08X})",
+            hr as u32
+        ));
+        let _ = InvalidateRect(Some(owner), None, false);
     }
+    LRESULT(0)
 }
 
 // Legacy About panel is retained for source compatibility until the
@@ -9180,6 +9225,17 @@ unsafe extern "system" fn window_proc(
         return LRESULT(1);
     }
 
+    // This must run before `window_data()` creates an `&mut WindowData` and
+    // before taking `&mut AppState`: showing WinUI synchronously re-enters the
+    // owner window's procedure while activation changes.
+    if message == WM_OPEN_SETTINGS {
+        let data_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowData;
+        if data_ptr.is_null() {
+            return LRESULT(0);
+        }
+        return open_settings_after_wndproc((*data_ptr).app);
+    }
+
     let Some(data) = window_data(hwnd) else {
         return DefWindowProcW(hwnd, message, wparam, lparam);
     };
@@ -9660,7 +9716,8 @@ fn high_word(value: isize) -> u16 {
 }
 
 fn no_auxiliary_window_visible(app: &AppState) -> bool {
-    !app.settings_host
+    !app.settings_opening
+        && !app.settings_host
         .as_ref()
         .is_some_and(|host| host.visible())
         && !app.about_visible
@@ -9741,6 +9798,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             main_hwnd: HWND::default(),
             taskbar_created_message,
             settings_host: None,
+            settings_opening: false,
             about_hwnd: HWND::default(),
             microphone_hwnd: HWND::default(),
             d2d_factory,

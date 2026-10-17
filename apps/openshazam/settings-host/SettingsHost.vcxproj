@@ -16,7 +16,6 @@
     <VCProjectVersion>17.0</VCProjectVersion>
     <ProjectGuid>{8D3A0D88-6F08-4E8E-9F01-B1A0BDBD0203}</ProjectGuid>
     <RootNamespace>OpenShazamSettingsHost</RootNamespace>
-    <ApplicationType>Windows Store</ApplicationType>
     <WindowsTargetPlatformMinVersion>10.0.19041.0</WindowsTargetPlatformMinVersion>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
     <WindowsPackageType>None</WindowsPackageType>
@@ -42,6 +41,7 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <WarningLevel>Level4</WarningLevel>

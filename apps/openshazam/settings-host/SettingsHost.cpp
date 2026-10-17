@@ -1,23 +1,31 @@
 // WinUI 3 Settings XAML Island hosted IN the native Rust/Win32 process.
 // No second recognition controller, process, webview, or legacy Win32 settings UI.
 #include "pch.h"
+#include <appmodel.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Microsoft.UI.Xaml.Automation.h>
 
 namespace x = winrt::Microsoft::UI::Xaml;
 namespace controls = winrt::Microsoft::UI::Xaml::Controls;
 namespace hosting = winrt::Microsoft::UI::Xaml::Hosting;
 namespace dispatch = winrt::Microsoft::UI::Dispatching;
-namespace appmodel = winrt::Windows::ApplicationModel;
+namespace automation = winrt::Microsoft::UI::Xaml::Automation;
 namespace markup = winrt::Microsoft::UI::Xaml::Markup;
 namespace typeinfo = winrt::Microsoft::UI::Xaml::XamlTypeInfo;
+namespace appmodel = winrt::Windows::ApplicationModel;
 
 namespace
 {
-    // No App.xaml, XAML compiler-generated ABI or a second app process is
-    // needed. ApplicationT provides the metadata interface required by the
-    // built-in Fluent WinUI 3 controls.
+    // WinUI XAML Islands require an active Application for control metadata
+    // and XamlControlsResources, even when content is authored in C++/WinRT.
+    // Keep the framework initialized on the same STA/DispatcherQueue thread.
     struct SettingsApplication : x::ApplicationT<SettingsApplication, markup::IXamlMetadataProvider>
     {
+        SettingsApplication()
+            : xamlManager(hosting::WindowsXamlManager::InitializeForCurrentThread())
+        {
+        }
+
         markup::IXamlType GetXamlType(
             winrt::Windows::UI::Xaml::Interop::TypeName const& name)
         {
@@ -35,13 +43,14 @@ namespace
         }
 
     private:
+        hosting::WindowsXamlManager xamlManager{ nullptr };
         typeinfo::XamlControlsXamlMetaDataProvider provider;
     };
 
     constexpr wchar_t kSettingsClass[] = L"OpenShazamWinUI3Preferences";
     constexpr wchar_t kStartupTask[] = L"OpenShazamStartup";
     constexpr int kWidthDips = 520;
-    constexpr int kHeightDips = 300;
+    constexpr int kHeightDips = 380;
 
     bool IsJapanese() noexcept
     {
@@ -63,20 +72,69 @@ namespace
         void Status(winrt::hstring const& message, controls::InfoBarSeverity level)
         {
             if (!alive) return;
+            info.Title(Localized(L"Startup setting", L"自動起動"));
             info.Severity(level);
             info.Message(message);
             info.IsOpen(true);
         }
     };
 
-    winrt::fire_and_forget RefreshStartup(std::weak_ptr<SettingsState> weak)
+    bool IsPackagedApp() noexcept
+    {
+        UINT32 packageNameLength = 0;
+        const auto result = ::GetCurrentPackageFullName(&packageNameLength, nullptr);
+        return result != APPMODEL_ERROR_NO_PACKAGE;
+    }
+
+    void ShowStartupFailureNoThrow(
+        std::shared_ptr<SettingsState> const& state,
+        winrt::hstring const& message = {},
+        controls::InfoBarSeverity severity = controls::InfoBarSeverity::Error,
+        bool unexpectedFailure = false) noexcept
+    {
+        if (!state || !state->alive) return;
+        state->loading = false;
+        try
+        {
+            state->toggle.IsOn(false);
+            state->toggle.IsEnabled(false);
+            if (!message.empty())
+            {
+                state->Status(message, severity);
+            }
+            else if (!unexpectedFailure && !IsPackagedApp())
+            {
+                state->Status(Localized(
+                    L"Automatic startup is available in the packaged MSIX version.",
+                    L"自動起動はMSIXパッケージ版で利用できます。"),
+                    controls::InfoBarSeverity::Informational);
+            }
+            else
+            {
+                state->Status(Localized(
+                    L"Windows could not read or update the startup setting.",
+                    L"Windowsで自動起動の設定を読み込めませんでした。"),
+                    controls::InfoBarSeverity::Error);
+            }
+        }
+        catch (...)
+        {
+            // WinRT property updates can fail while the island is closing.
+            // Never allow an exception to escape a fire_and_forget coroutine.
+        }
+    }
+
+    winrt::fire_and_forget RefreshStartup(
+        std::weak_ptr<SettingsState> weak,
+        winrt::hstring failureMessage = {},
+        controls::InfoBarSeverity failureSeverity = controls::InfoBarSeverity::Error)
     {
         auto state = weak.lock();
         if (!state || !state->alive) co_return;
-        state->loading = true;
-        state->toggle.IsEnabled(false);
         try
         {
+            state->loading = true;
+            state->toggle.IsEnabled(false);
             auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
             if (!state->alive) co_return;
             auto current = task.State();
@@ -105,28 +163,28 @@ namespace
                 state->info.IsOpen(false);
                 break;
             }
+            if (!failureMessage.empty())
+                state->Status(failureMessage, failureSeverity);
+            state->loading = false;
         }
         catch (winrt::hresult_error const&)
         {
-            if (!state->alive) co_return;
-            state->toggle.IsOn(false);
-            state->toggle.IsEnabled(false);
-            state->Status(Localized(
-                L"Automatic startup is available in the packaged MSIX version.",
-                L"自動起動はMSIXパッケージ版で利用できます。"),
-                controls::InfoBarSeverity::Informational);
+            ShowStartupFailureNoThrow(state, failureMessage, failureSeverity);
         }
-        state->loading = false;
+        catch (...)
+        {
+            ShowStartupFailureNoThrow(state, failureMessage, failureSeverity, true);
+        }
     }
 
     winrt::fire_and_forget ChangeStartup(std::weak_ptr<SettingsState> weak, bool enable)
     {
         auto state = weak.lock();
         if (!state || !state->alive) co_return;
-        state->loading = true;
-        state->toggle.IsEnabled(false);
         try
         {
+            state->loading = true;
+            state->toggle.IsEnabled(false);
             auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
             if (!state->alive) co_return;
             if (enable)
@@ -137,17 +195,27 @@ namespace
             {
                 task.Disable();
             }
+            if (!state->alive) co_return;
+            RefreshStartup(weak);
         }
         catch (winrt::hresult_error const&)
         {
-            if (!state->alive) co_return;
-            state->Status(Localized(
-                L"Windows could not update the startup setting.",
-                L"Windowsで自動起動の設定を変更できませんでした。"),
-                controls::InfoBarSeverity::Error);
+            try
+            {
+                ShowStartupFailureNoThrow(state, Localized(
+                    L"Windows could not update the startup setting.",
+                    L"Windowsで自動起動の設定を変更できませんでした。"),
+                    controls::InfoBarSeverity::Error);
+            }
+            catch (...)
+            {
+                ShowStartupFailureNoThrow(state);
+            }
         }
-        if (!state->alive) co_return;
-        RefreshStartup(weak);
+        catch (...)
+        {
+            ShowStartupFailureNoThrow(state, {}, controls::InfoBarSeverity::Error, true);
+        }
     }
 
     struct SettingsHost;
@@ -159,8 +227,8 @@ namespace
         HWND owner{};
         hosting::DesktopWindowXamlSource island{ nullptr };
         dispatch::DispatcherQueueController queue{ nullptr };
-        bool ownsQueue{};
         x::Application app{ nullptr };
+        bool ownsQueue{};
         std::shared_ptr<SettingsState> state;
 
         void Initialize(HWND parent)
@@ -174,7 +242,10 @@ namespace
                 queue = dispatch::DispatcherQueueController::CreateOnCurrentThread();
                 ownsQueue = true;
             }
+            // Instantiate the XAML Application after the queue and before any
+            // island/control. It supplies WinUI metadata and owns the manager.
             app = winrt::make<SettingsApplication>();
+            app.Resources().MergedDictionaries().Append(controls::XamlControlsResources{});
             auto instance = ::GetModuleHandleW(nullptr);
             WNDCLASSW wc{};
             wc.lpfnWndProc = &WindowProc;
@@ -187,14 +258,14 @@ namespace
 
             auto dpi = ::GetDpiForWindow(parent);
             if (dpi < 96) dpi = 96;
-            hwnd = ::CreateWindowExW(0, kSettingsClass, L"OpenShazam Settings",
+            auto windowTitle = Localized(L"OpenShazam Settings", L"OpenShazam の設定");
+            hwnd = ::CreateWindowExW(0, kSettingsClass, windowTitle.c_str(),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                 ::MulDiv(kWidthDips, dpi, 96), ::MulDiv(kHeightDips, dpi, 96),
                 parent, nullptr, instance, nullptr);
             if (!hwnd) winrt::throw_last_error();
             island = hosting::DesktopWindowXamlSource{};
             island.Initialize(winrt::Microsoft::UI::GetWindowIdFromWindow(hwnd));
-            app.Resources().MergedDictionaries().Append(controls::XamlControlsResources{});
             auto child = winrt::Microsoft::UI::GetWindowFromWindowId(island.SiteBridge().WindowId());
             auto style = ::GetWindowLongPtrW(child, GWL_STYLE);
             ::SetWindowLongPtrW(child, GWL_STYLE, style | WS_TABSTOP | WS_VISIBLE);
@@ -207,26 +278,50 @@ namespace
         x::UIElement BuildContent()
         {
             controls::StackPanel stack;
-            stack.Spacing(18);
+            stack.Spacing(20);
             stack.Padding(x::ThicknessHelper::FromUniformLength(24));
 
             controls::TextBlock title;
             title.Text(Localized(L"Settings", L"設定"));
-            title.FontSize(26);
+            title.FontSize(28);
             title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
             stack.Children().Append(title);
 
             controls::TextBlock description;
-            description.Text(Localized(
-                L"Manage how OpenShazam starts and behaves.",
+            description.Text(Localized(L"Choose how OpenShazam starts.",
                 L"OpenShazamの起動方法を設定します。"));
             description.TextWrapping(x::TextWrapping::Wrap);
             stack.Children().Append(description);
 
+            controls::TextBlock generalHeader;
+            generalHeader.Text(Localized(L"General", L"全般"));
+            generalHeader.FontSize(20);
+            generalHeader.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            stack.Children().Append(generalHeader);
+
             state->toggle = controls::ToggleSwitch{};
-            state->toggle.Header(winrt::box_value(Localized(
+            controls::StackPanel startupHeader;
+            startupHeader.Spacing(4);
+            auto startupName = Localized(
                 L"Launch OpenShazam when I sign in",
-                L"Windowsへのサインイン時にOpenShazamを起動")));
+                L"Windowsへのサインイン時にOpenShazamを起動");
+            auto startupHelp = Localized(
+                L"Start in the notification area. Music recognition will not start automatically.",
+                L"サインイン時に通知領域へ起動します。楽曲認識は自動で開始しません。");
+            controls::TextBlock startupTitle;
+            startupTitle.Text(startupName);
+            startupTitle.TextWrapping(x::TextWrapping::Wrap);
+            startupTitle.FontSize(16);
+            startupTitle.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            startupHeader.Children().Append(startupTitle);
+
+            controls::TextBlock startupDescription;
+            startupDescription.Text(startupHelp);
+            startupDescription.TextWrapping(x::TextWrapping::Wrap);
+            startupHeader.Children().Append(startupDescription);
+            state->toggle.Header(startupHeader);
+            automation::AutomationProperties::SetName(state->toggle, startupName);
+            automation::AutomationProperties::SetHelpText(state->toggle, startupHelp);
             state->toggle.OnContent(winrt::box_value(Localized(L"On", L"オン")));
             state->toggle.OffContent(winrt::box_value(Localized(L"Off", L"オフ")));
             state->toggle.IsEnabled(false);
@@ -237,12 +332,18 @@ namespace
             });
             stack.Children().Append(state->toggle);
 
-            controls::TextBlock note;
-            note.Text(Localized(
-                L"OpenShazam starts in the notification area; recognition does not start automatically.",
-                L"OpenShazamは通知領域で起動します。楽曲認識は自動では開始しません。"));
-            note.TextWrapping(x::TextWrapping::Wrap);
-            stack.Children().Append(note);
+            controls::TextBlock inputHeader;
+            inputHeader.Text(Localized(L"Audio input", L"音声入力"));
+            inputHeader.FontSize(20);
+            inputHeader.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            stack.Children().Append(inputHeader);
+
+            controls::TextBlock inputDescription;
+            inputDescription.Text(Localized(
+                L"Recognition uses system audio that is currently playing on this PC.",
+                L"このPCで現在再生中のシステム音声を認識します。"));
+            inputDescription.TextWrapping(x::TextWrapping::Wrap);
+            stack.Children().Append(inputDescription);
 
             state->info = controls::InfoBar{};
             state->info.IsOpen(false);
