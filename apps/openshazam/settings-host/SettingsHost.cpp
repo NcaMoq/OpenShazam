@@ -323,6 +323,7 @@ namespace
             auto startupName = Localized(L"Start on sign-in", L"自動起動");
             startupLabel.Text(startupName);
             startupLabel.FontSize(14.0);
+            startupLabel.HorizontalAlignment(x::HorizontalAlignment::Left);
             startupLabel.VerticalAlignment(x::VerticalAlignment::Center);
             automation::AutomationProperties::SetName(startupLabel, startupName);
             controls::Grid::SetColumn(startupLabel, 0);
@@ -332,7 +333,7 @@ namespace
             state->toggle.OnContent(winrt::box_value(Localized(L"On", L"オン")));
             state->toggle.OffContent(winrt::box_value(Localized(L"Off", L"オフ")));
             state->toggle.VerticalAlignment(x::VerticalAlignment::Center);
-            state->toggle.Margin(x::ThicknessHelper::FromLengths(64.0, 0.0, 0.0, 0.0));
+            state->toggle.HorizontalAlignment(x::HorizontalAlignment::Right);
             state->toggle.IsEnabled(false);
             std::weak_ptr<SettingsState> weak = state;
             state->toggle.Toggled([weak](auto const&, auto const&) {
@@ -363,23 +364,27 @@ namespace
             controls::FontIcon appearanceIcon;
             appearanceIcon.Glyph(L"\uE790");
             appearanceIcon.FontSize(20.0);
+            appearanceIcon.HorizontalAlignment(x::HorizontalAlignment::Left);
             appearanceIcon.VerticalAlignment(x::VerticalAlignment::Center);
             controls::Grid::SetColumn(appearanceIcon, 0);
             appearanceRow.Children().Append(appearanceIcon);
 
             controls::StackPanel appearanceLabels;
             appearanceLabels.Spacing(2.0);
+            appearanceLabels.HorizontalAlignment(x::HorizontalAlignment::Left);
             appearanceLabels.VerticalAlignment(x::VerticalAlignment::Center);
             controls::TextBlock appearanceTitle;
             auto appearanceName = Localized(L"Choose a mode", L"モードを選ぶ");
             appearanceTitle.Text(appearanceName);
             appearanceTitle.FontSize(14.0);
+            appearanceTitle.TextAlignment(x::TextAlignment::Left);
             automation::AutomationProperties::SetName(appearanceTitle, appearanceName);
             controls::TextBlock appearanceDescription;
             appearanceDescription.Text(Localized(
                 L"Changes the colors displayed in Windows and apps",
                 L"Windows とアプリに表示される色を変更します"));
             appearanceDescription.FontSize(12.0);
+            appearanceDescription.TextAlignment(x::TextAlignment::Left);
             appearanceLabels.Children().Append(appearanceTitle);
             appearanceLabels.Children().Append(appearanceDescription);
             controls::Grid::SetColumn(appearanceLabels, 1);
@@ -391,6 +396,7 @@ namespace
             state->appearance.Items().Append(winrt::box_value(Localized(
                 L"Use system setting", L"システム設定に合わせる")));
             state->appearance.Width(208.0);
+            state->appearance.HorizontalAlignment(x::HorizontalAlignment::Right);
             state->appearance.VerticalAlignment(x::VerticalAlignment::Center);
             automation::AutomationProperties::SetName(state->appearance, appearanceName);
             state->appearance.SelectedIndex(ComboIndexFromAppearance(state->appearanceMode));
@@ -436,6 +442,13 @@ namespace
                 {
                     state->startupCard.Width(cardWidth);
                     state->appearanceCard.Width(cardWidth);
+                    // Border padding consumes 14 DIPs on each side. Pin each
+                    // row to the remaining content width so the trailing
+                    // control stays at the card's right edge even when the
+                    // island is measured before its host window is shown.
+                    const double rowWidth = cardWidth - 28.0;
+                    state->startupRow.Width(rowWidth);
+                    state->appearanceRow.Width(rowWidth);
                 }
             }
             island.SiteBridge().MoveAndResize({0, 0, rect.right - rect.left, rect.bottom - rect.top});
