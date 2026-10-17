@@ -78,3 +78,31 @@ jobs:
           name: OpenShazam-Native-WinUI3-Settings-x64-unsigned
           path: dist/windows-x64/
           if-no-files-found: error
+
+  windows-msix-pack:
+    name: Windows x64 unsigned MSIX package validation
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.85.0'
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build, pack, and unpack unsigned MSIX
+        shell: pwsh
+        run: .\tools\package-windows-msix.ps1
+      - name: Verify package checksum sidecar
+        shell: pwsh
+        run: |
+          $package = Get-ChildItem target/windows-msix -Filter 'OpenShazam-*-x64.msix' | Select-Object -First 1
+          if (-not $package) { throw 'The MSIX package was not produced.' }
+          $sidecar = Get-Content -LiteralPath "$($package.FullName).sha256" -Raw
+          $actual = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if (-not $sidecar.StartsWith($actual, [StringComparison]::Ordinal)) { throw 'The MSIX SHA-256 sidecar does not match the package.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenShazam-MSIX-x64-unsigned-validation
+          path: |
+            target/windows-msix/*.msix
+            target/windows-msix/*.sha256
+          if-no-files-found: error
