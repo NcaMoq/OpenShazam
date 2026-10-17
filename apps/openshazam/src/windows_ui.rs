@@ -11,10 +11,12 @@ use std::{
     mem::size_of,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
     process::{Command, Stdio},
-    sync::OnceLock,
+    sync::atomic::{AtomicU32, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use crate::windows_history_store::{HistoryStore, PersistedTrack, RecognitionSource};
 
 use windows::{
     core::{implement, Error, Interface, Ref, BOOL, HSTRING, PCWSTR, PWSTR},
@@ -79,10 +81,16 @@ use windows::{
                 RGBQUAD,
             },
         },
+        Storage::EnhancedStorage::{PKEY_AppUserModel_ID, PKEY_AppUserModel_RelaunchIconResource},
         System::{
             Com::{
-                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-                COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
+                CoCreateInstance, CoInitializeEx, CoTaskMemAlloc, CoTaskMemFree, CoUninitialize,
+                IPersistFile,
+                StructuredStorage::{
+                    PropVariantClear, PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0,
+                    PROPVARIANT_0_0_0,
+                },
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
             },
             LibraryLoader::GetModuleHandleW,
             Registry::{
@@ -90,6 +98,7 @@ use windows::{
                 HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD,
                 REG_OPTION_NON_VOLATILE,
             },
+            Variant::VT_LPWSTR,
             WinRT::Composition::{
                 ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
             },
@@ -105,11 +114,15 @@ use windows::{
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
             },
             Input::KeyboardAndMouse::{
-                GetDoubleClickTime, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE,
-                TRACKMOUSEEVENT, VK_ESCAPE,
+                GetDoubleClickTime, RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent,
+                UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT, TME_LEAVE, TRACKMOUSEEVENT,
+                VK_ESCAPE,
             },
+            Shell::PropertiesSystem::IPropertyStore,
             Shell::{
-                ShellExecuteExW, Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_GUID, NIF_ICON,
+                FOLDERID_Programs, IShellLinkW, SHGetKnownFolderPath,
+                SetCurrentProcessExplicitAppUserModelID, ShellExecuteExW, ShellLink,
+                Shell_NotifyIconGetRect, Shell_NotifyIconW, KNOWN_FOLDER_FLAG, NIF_GUID, NIF_ICON,
                 NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIIF_LARGE_ICON, NIIF_USER,
                 NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS, NIM_SETVERSION, NIN_BALLOONHIDE,
                 NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
@@ -128,11 +141,11 @@ use windows::{
                 SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
                 SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_RETURNCMD, TPM_RIGHTBUTTON,
                 ULW_ALPHA, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
-                WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-                WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT,
-                WM_RBUTTONUP, WM_SETFOCUS, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMECHANGE,
-                WM_TIMER, WNDCLASSW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
-                WS_VISIBLE,
+                WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+                WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
+                WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS, WM_SETTINGCHANGE, WM_THEMECHANGED,
+                WM_TIMECHANGE, WM_TIMER, WNDCLASSW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+                WS_POPUP, WS_VISIBLE,
             },
         },
     },
@@ -145,7 +158,7 @@ use windows::{
             CompositionEllipseGeometry, CompositionGeometricClip, CompositionGraphicsDevice,
             CompositionPath, CompositionPathGeometry, CompositionSpriteShape, CompositionStretch,
             CompositionSurfaceBrush, CompositionVisualSurface, Compositor, ContainerVisual,
-            CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow,
+            CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow, InsetClip,
             ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual, Vector2KeyFrameAnimation,
             Vector3KeyFrameAnimation,
         },
@@ -185,9 +198,24 @@ const WM_ACTIVATE_MAIN_POPUP: u32 = WM_APP + 0x46;
 const WM_OPEN_SETTINGS: u32 = WM_APP + 0x47;
 const WM_APPEARANCE_CHANGED: u32 = WM_APP + 0x48;
 const WM_ARTWORK_LOAD_FINISHED: u32 = WM_APP + 0x49;
+const WM_GLOBAL_SHORTCUT_CHANGED: u32 = WM_APP + 0x4a;
+const WM_GLOBAL_SHORTCUT_CAPTURE: u32 = WM_APP + 0x4b;
+const WM_LANGUAGE_CHANGED: u32 = WM_APP + 0x4c;
+const GLOBAL_SHORTCUT_ID_PRIMARY: i32 = 0x5301;
+const GLOBAL_SHORTCUT_ID_SECONDARY: i32 = 0x5302;
+const GLOBAL_SHORTCUT_MODIFIER_MASK: u32 = 0x0f;
+const DEFAULT_GLOBAL_SHORTCUT: GlobalShortcut = GlobalShortcut {
+    modifiers: 0x03, // Ctrl + Alt
+    key: 0x53,       // S
+};
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const TRAY_ICON_ID: u32 = 1;
 const APP_ICON_RESOURCE_ID: usize = 101;
+const APP_USER_MODEL_ID: &str = "OpenShazam.Desktop";
+// Result cards must share the layered popup's single antialiased mask. A
+// separate Composition card is blended over the already masked blue header,
+// which leaves a blue fringe at the card's outer edge.
+const COMPOSITION_RESULT_CARD_ENABLED: bool = false;
 const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
     data1: 0x6a3d77b1,
     data2: 0x8e9c,
@@ -197,7 +225,6 @@ const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
 const TRAY_TASKBAR_CREATED_NAME: &str = "TaskbarCreated";
 const TRAY_MENU_SETTINGS: usize = 1;
 const TRAY_MENU_EXIT: usize = 2;
-const POPUP_FADE_DURATION: Duration = Duration::from_millis(100);
 const POPUP_ACTIVATION_GRACE: Duration = Duration::from_millis(350);
 const TIMER_SINGLE_CLICK: usize = 0x4f53;
 const TIMER_LONG_PRESS: usize = 0x4f54;
@@ -357,6 +384,117 @@ impl ThemePreference {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GlobalShortcut {
+    modifiers: u32,
+    key: u32,
+}
+
+impl GlobalShortcut {
+    fn is_valid(self) -> bool {
+        let modifier_key = matches!(self.key, 0x10..=0x12 | 0x5b..=0x5c | 0xa0..=0xa5);
+        self.modifiers & !GLOBAL_SHORTCUT_MODIFIER_MASK == 0
+            && (1..=0xff).contains(&self.key)
+            && !modifier_key
+            && self.key != 0x7b // F12 is reserved for debuggers by Windows.
+    }
+
+    fn packed(self) -> u32 {
+        (self.key << 16) | self.modifiers
+    }
+
+    fn from_packed(value: u32) -> Option<Self> {
+        let shortcut = Self {
+            modifiers: value & GLOBAL_SHORTCUT_MODIFIER_MASK,
+            key: (value >> 16) & 0xff,
+        };
+        shortcut.is_valid().then_some(shortcut)
+    }
+}
+
+fn load_global_shortcut() -> GlobalShortcut {
+    let key_path = wide("Software\\OpenShazam");
+    let value_name = wide("GlobalShortcut");
+    let mut key = HKEY::default();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            None,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if opened.0 != 0 {
+        return DEFAULT_GLOBAL_SHORTCUT;
+    }
+
+    let mut value = 0u32;
+    let mut value_type = Default::default();
+    let mut byte_count = size_of::<u32>() as u32;
+    let queried = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut value_type),
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut byte_count),
+        )
+    };
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    if queried.0 == 0 && value_type == REG_DWORD && byte_count == size_of::<u32>() as u32 {
+        GlobalShortcut::from_packed(value).unwrap_or(DEFAULT_GLOBAL_SHORTCUT)
+    } else {
+        DEFAULT_GLOBAL_SHORTCUT
+    }
+}
+
+fn save_global_shortcut(shortcut: GlobalShortcut) -> Result<(), i32> {
+    let key_path = wide("Software\\OpenShazam");
+    let value_name = wide("GlobalShortcut");
+    let mut key = HKEY::default();
+    let created = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            Some(0),
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+    };
+    if created.0 != 0 {
+        return Err(created.0 as i32);
+    }
+
+    let value = shortcut.packed();
+    let bytes = unsafe {
+        std::slice::from_raw_parts((&value as *const u32).cast::<u8>(), size_of::<u32>())
+    };
+    let saved = unsafe {
+        let saved = RegSetValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            Some(0),
+            REG_DWORD,
+            Some(bytes),
+        );
+        let _ = RegCloseKey(key);
+        saved
+    };
+    if saved.0 == 0 {
+        Ok(())
+    } else {
+        Err(saved.0 as i32)
+    }
+}
+
 fn load_theme_preference() -> ThemePreference {
     let key_path = wide("Software\\OpenShazam");
     let value_name = wide("AppearanceMode");
@@ -431,6 +569,89 @@ fn save_theme_preference(preference: ThemePreference) {
             Some(bytes),
         );
         let _ = RegCloseKey(key);
+    }
+}
+
+fn load_ui_language_preference() -> UiLanguage {
+    let key_path = wide("Software\\OpenShazam");
+    let value_name = wide("Language");
+    let mut key = HKEY::default();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            None,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if opened.0 != 0 {
+        return detect_ui_language();
+    }
+
+    let mut value = 0u32;
+    let mut value_type = Default::default();
+    let mut byte_count = size_of::<u32>() as u32;
+    let queried = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut value_type),
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut byte_count),
+        )
+    };
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    if queried.0 == 0 && value_type == REG_DWORD && byte_count == size_of::<u32>() as u32 {
+        UiLanguage::from_id(value).unwrap_or_else(detect_ui_language)
+    } else {
+        detect_ui_language()
+    }
+}
+
+fn save_ui_language_preference(language: UiLanguage) -> Result<(), i32> {
+    let key_path = wide("Software\\OpenShazam");
+    let value_name = wide("Language");
+    let mut key = HKEY::default();
+    let created = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            Some(0),
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+    };
+    if created.0 != 0 {
+        return Err(created.0 as i32);
+    }
+
+    let value = language.id();
+    let bytes = unsafe {
+        std::slice::from_raw_parts((&value as *const u32).cast::<u8>(), size_of::<u32>())
+    };
+    let saved = unsafe {
+        let saved = RegSetValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            Some(0),
+            REG_DWORD,
+            Some(bytes),
+        );
+        let _ = RegCloseKey(key);
+        saved
+    };
+    if saved.0 == 0 {
+        Ok(())
+    } else {
+        Err(saved.0 as i32)
     }
 }
 
@@ -613,19 +834,8 @@ fn refresh_history_date_labels(history: &mut [Track]) {
     }
 }
 
-fn result_panel_draw_top(
-    panel_top: Option<f32>,
-    body_top: f32,
-    composition_cache_ready: bool,
-    composition_cache_hit: bool,
-) -> Option<f32> {
-    panel_top.and_then(|top| {
-        if composition_cache_ready {
-            (!composition_cache_hit).then_some(body_top)
-        } else {
-            Some(top)
-        }
-    })
+fn result_panel_draw_top(panel_top: Option<f32>, composition_cache_ready: bool) -> Option<f32> {
+    panel_top.and_then(|top| (!composition_cache_ready).then_some(top))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -663,17 +873,37 @@ enum ArtworkSource {
 }
 
 fn should_replace_cached_artwork(
-    cached: Option<(ArtworkSource, u128)>,
+    cached: Option<(ArtworkSource, u32, u32, u128)>,
     incoming_source: ArtworkSource,
+    incoming_width: u32,
+    incoming_height: u32,
     incoming_fingerprint: u128,
 ) -> bool {
     match cached {
         None => true,
-        Some((ArtworkSource::HighQuality, _)) if incoming_source == ArtworkSource::Standard => {
-            false
-        }
-        Some((cached_source, cached_fingerprint)) => {
-            cached_source != incoming_source || cached_fingerprint != incoming_fingerprint
+        Some((cached_source, cached_width, cached_height, cached_fingerprint)) => {
+            let cached_dimensions = (
+                cached_width.min(cached_height),
+                cached_width.max(cached_height),
+            );
+            let incoming_dimensions = (
+                incoming_width.min(incoming_height),
+                incoming_width.max(incoming_height),
+            );
+            match incoming_dimensions.cmp(&cached_dimensions) {
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => {
+                    if cached_source == ArtworkSource::HighQuality
+                        && incoming_source == ArtworkSource::Standard
+                    {
+                        false
+                    } else {
+                        cached_source != incoming_source
+                            || cached_fingerprint != incoming_fingerprint
+                    }
+                }
+            }
         }
     }
 }
@@ -994,6 +1224,13 @@ struct HistoryMutationTransition {
     event: HistoryMutationEvent,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct HistoryScrollAnimation {
+    started_at: Instant,
+    from_offset: f32,
+    to_offset: f32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HistoryCompositionKey {
     started_at: Instant,
@@ -1016,6 +1253,7 @@ const SUCCESS_SETTLE_TOTAL: Duration = Duration::from_secs(1);
 // [I/U] Native NSTableView slide duration was not recovered. Keep this
 // implementation value replaceable rather than presenting it as native data.
 const HISTORY_INSERT_TRANSITION: Duration = Duration::from_millis(250);
+const HISTORY_SCROLL_TRANSITION: Duration = Duration::from_millis(180);
 // Nib frame y values (-39,55,149,243,336) use a bottom-left origin. Convert
 // each 94-DIP row into the history's top-left coordinate space (0..430).
 const EMPTY_HISTORY_ROW_TOPS: [f32; 5] = [0.0, 93.0, 187.0, 281.0, 375.0];
@@ -1073,6 +1311,9 @@ struct RecognitionSessionUi {
 struct AppState {
     main_hwnd: HWND,
     taskbar_created_message: u32,
+    global_shortcut: GlobalShortcut,
+    global_shortcut_registration_id: Option<i32>,
+    global_shortcut_capture_suspended: bool,
     settings_host: Option<crate::windows_settings::SettingsHost>,
     settings_opening: bool,
     about_hwnd: HWND,
@@ -1089,6 +1330,7 @@ struct AppState {
     history_transition: Option<HistoryMutationTransition>,
     history_composition_ready: bool,
     scroll_offset: f32,
+    history_scroll_animation: Option<HistoryScrollAnimation>,
     hovered_row: Option<usize>,
     mouse_leave_tracking: bool,
     // UI-only adapter points. No service meter output is assumed or inferred.
@@ -1102,7 +1344,6 @@ struct AppState {
     theme_generation: u64,
     visible: bool,
     popup_opacity: u8,
-    popup_transition: Option<PopupOpacityTransition>,
     main_activated: bool,
     popup_activation_grace_until: Option<Instant>,
     deactivation_hide_pending: bool,
@@ -1121,6 +1362,7 @@ struct AppState {
     single_click_pending: bool,
     recognition_controller: Option<ApplicationController>,
     recognition_session: Option<RecognitionSessionUi>,
+    history_store: Option<HistoryStore>,
     auto_candidate_dedupe: VecDeque<String>,
     controller_sequence: u64,
     dropped_notifications: u64,
@@ -1135,14 +1377,6 @@ struct AppState {
     owned_balloon_icons: VecDeque<Option<windows::Win32::UI::WindowsAndMessaging::HICON>>,
     ui_configs: HashMap<u64, UiConfigSnapshot>,
     message: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PopupOpacityTransition {
-    started_at: Instant,
-    from: u8,
-    to: u8,
-    hide_when_complete: bool,
 }
 
 struct WindowData {
@@ -1243,6 +1477,11 @@ struct CachedResultDetailsMetrics {
     metrics: ResultDetailsMetrics,
 }
 
+struct CachedResultPanelBitmap {
+    key: ResultOverlayContentKey,
+    bitmap: ID2D1Bitmap,
+}
+
 struct Renderer {
     factory: ID2D1Factory,
     write_factory: IDWriteFactory,
@@ -1256,17 +1495,21 @@ struct Renderer {
     layered_surface: Option<LayeredSurface>,
     palette: Palette,
     text: TextStyles,
+    language: UiLanguage,
     dpi: u32,
     theme_generation: u64,
     composition: Option<CompositionScene>,
     status_text_composition_enabled: bool,
     popup_layer: Option<ID2D1Layer>,
+    history_skeleton_layer: Option<ID2D1Layer>,
     artwork_layer: Option<ID2D1Layer>,
     artwork_geometries: [(u32, ID2D1Geometry); 2],
     artwork_bitmaps: RefCell<HashMap<u64, CachedArtworkBitmap>>,
     popup_outline: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     popup_header: RefCell<Option<(ArrowEdge, u32, ID2D1Geometry)>>,
     result_details_cache: RefCell<Option<CachedResultDetailsMetrics>>,
+    result_panel_bitmap: Option<CachedResultPanelBitmap>,
+    result_panel_bitmap_failure_key: Option<ResultOverlayContentKey>,
     history_text_metrics_cache: RefCell<HashMap<u64, CachedHistoryTextMetrics>>,
     history_overlay_failure_transition: Option<Instant>,
     result_overlay_content_key: Option<ResultOverlayContentKey>,
@@ -1486,10 +1729,7 @@ impl Drop for LayeredSurface {
     }
 }
 
-// Copy only the current result panel from the premultiplied layered-window
-// surface. The cached bytes become the Composition surface; the original
-// Direct2D panel remains the pixel source so text, artwork, and popup masking
-// stay identical while the result is above the Composition button/ripples.
+// Copy a rectangular pixel range from a premultiplied DIB into a tight buffer.
 fn copy_panel_pixels_into(
     source: &[u8],
     source_width: u32,
@@ -2062,26 +2302,39 @@ impl CompositionHistoryOverlay {
                 previous_frame.size.width as usize * previous_frame.size.height as usize * 4,
             )
         };
-        copy_panel_pixels_into(
-            previous_bytes,
-            previous_frame.size.width,
-            previous_frame.size.height,
-            (history_top * self.dpi as f32 / 96.0).round() as i32,
-            self.size.width,
-            previous_height,
-            &mut previous,
+        let initial_insert = matches!(
+            transition.event,
+            HistoryMutationEvent::Insert {
+                index: 0,
+                previous_count: 0,
+            }
         );
+        if !initial_insert {
+            copy_panel_pixels_into(
+                previous_bytes,
+                previous_frame.size.width,
+                previous_frame.size.height,
+                (history_top * self.dpi as f32 / 96.0).round() as i32,
+                self.size.width,
+                previous_height,
+                &mut previous,
+            );
+        }
 
         // The new row sits one pitch above the prior list. A single +91pt
         // Composition track then moves the inserted row into place while
-        // shifting every existing row down by the same amount.
+        // shifting every existing row down by the same amount. For the first
+        // row there is no prior list: leave the rest transparent so the empty
+        // skeleton can fade away beneath the independently moving row.
         let mut combined = vec![0; self.size.width as usize * self.size.height as usize * 4];
         combined[..row_len].copy_from_slice(row_pixels);
         let previous_len = width * previous_height as usize * 4;
         let destination_start = row_len.min(combined.len());
         let copy_len = previous_len.min(combined.len().saturating_sub(destination_start));
-        combined[destination_start..destination_start + copy_len]
-            .copy_from_slice(&previous[..copy_len]);
+        if !initial_insert {
+            combined[destination_start..destination_start + copy_len]
+                .copy_from_slice(&previous[..copy_len]);
+        }
         self.upload_pixels(&combined)?;
 
         self.group
@@ -3465,7 +3718,8 @@ struct CompositionScene {
     root: ContainerVisual,
     _popup_clip: CompositionGeometricClip,
     popup_clip_key: (ArrowEdge, u32),
-    tagging_root: ContainerVisual,
+    tagging_clip: InsetClip,
+    tagging_clip_bottom: f32,
     history_overlay: CompositionHistoryOverlay,
     result_overlay: CompositionResultOverlay,
     status_text: CompositionStatusText,
@@ -3487,7 +3741,6 @@ struct CompositionScene {
     rings: [CompositionRing; 6],
     button: ContainerVisual,
     button_visible: bool,
-    result_fallback_suppresses_tagging: bool,
     button_content: ContainerVisual,
     button_fill: CompositionColorBrush,
     logo: CompositionLogo,
@@ -4681,7 +4934,8 @@ impl CompositionScene {
             root,
             _popup_clip: popup_clip,
             popup_clip_key,
-            tagging_root,
+            tagging_clip: clip,
+            tagging_clip_bottom: clip_bottom.max(0.0),
             history_overlay,
             result_overlay,
             status_text,
@@ -4703,7 +4957,6 @@ impl CompositionScene {
             rings,
             button,
             button_visible: true,
-            result_fallback_suppresses_tagging: false,
             button_content,
             button_fill,
             logo,
@@ -4782,6 +5035,13 @@ impl CompositionScene {
         motion_changed: bool,
     ) -> windows::core::Result<()> {
         if let (Some(source), Some(capture_top)) = (source, capture_top) {
+            // A content-key miss captures a replacement card through the
+            // layered D2D surface. Hide the previous Composition card before
+            // refreshing that surface so consecutive NoMatch results cannot
+            // briefly show the old card alongside the capture copy.
+            self.result_overlay
+                .hide()
+                .map_err(|error| overlay_surface_error("HideBeforeRefresh", error))?;
             self.result_overlay
                 .update_from_layered(source, capture_top, body_top, dpi)?;
         } else {
@@ -4800,16 +5060,24 @@ impl CompositionScene {
         }
     }
 
-    fn set_result_fallback_tagging_suppressed(
+    fn set_result_fallback_tagging_clip(
         &mut self,
-        suppressed: bool,
+        panel_top: Option<f32>,
+        body_top: f32,
     ) -> windows::core::Result<()> {
-        if self.result_fallback_suppresses_tagging == suppressed {
-            return Ok(());
+        // The D2D fallback card is below the Composition tree. Keep the
+        // controls above its moving top edge visible and clip the rest, so
+        // the button and gear reappear progressively as the card exits.
+        let header_bottom = body_top + TOP_HEIGHT as f32;
+        let visible_bottom = panel_top
+            .filter(|top| result_overlay_intersects_header(Some(*top), body_top))
+            .map(|top| top.clamp(0.0, header_bottom))
+            .unwrap_or(header_bottom);
+        let clip_bottom = (MAIN_WINDOW_HEIGHT as f32 - visible_bottom).max(0.0);
+        if (self.tagging_clip_bottom - clip_bottom).abs() > f32::EPSILON {
+            self.tagging_clip.SetBottomInset(clip_bottom)?;
+            self.tagging_clip_bottom = clip_bottom;
         }
-        self.tagging_root
-            .SetOpacity(if suppressed { 0.0 } else { 1.0 })?;
-        self.result_fallback_suppresses_tagging = suppressed;
         Ok(())
     }
 
@@ -4858,10 +5126,9 @@ impl CompositionScene {
                 self.body_top,
             ))?;
             let bottom_inset = MAIN_WINDOW_HEIGHT as f32 - (snapshot.body_top + TOP_HEIGHT as f32);
-            let clip =
-                self.compositor
-                    .CreateInsetClipWithInsets(0.0, 0.0, 0.0, bottom_inset.max(0.0))?;
-            self.tagging_root.SetClip(&clip)?;
+            let bottom_inset = bottom_inset.max(0.0);
+            self.tagging_clip.SetBottomInset(bottom_inset)?;
+            self.tagging_clip_bottom = bottom_inset;
             self.result_overlay.set_viewport(self.dpi, self.body_top)?;
             self.history_overlay.set_viewport(self.dpi, self.body_top)?;
             let inner_bounds = INNER_MASK_BOUNDS;
@@ -6217,6 +6484,37 @@ fn history_scroll_offset_after_wheel(
     (current - distance).clamp(0.0, maximum)
 }
 
+fn history_scroll_offset_at(animation: HistoryScrollAnimation, now: Instant) -> (f32, bool) {
+    let progress = (now
+        .saturating_duration_since(animation.started_at)
+        .as_secs_f32()
+        / HISTORY_SCROLL_TRANSITION.as_secs_f32())
+    .clamp(0.0, 1.0);
+    let eased = 1.0 - (1.0 - progress).powi(3);
+    (
+        animation.from_offset + (animation.to_offset - animation.from_offset) * eased,
+        progress < 1.0,
+    )
+}
+
+fn advance_history_scroll(app: &mut AppState, now: Instant) -> bool {
+    let Some(animation) = app.history_scroll_animation else {
+        return false;
+    };
+    let (offset, still_animating) = history_scroll_offset_at(animation, now);
+    let offset = if still_animating {
+        offset
+    } else {
+        animation.to_offset
+    };
+    let changed = (offset - app.scroll_offset).abs() > f32::EPSILON;
+    app.scroll_offset = offset;
+    if !still_animating {
+        app.history_scroll_animation = None;
+    }
+    changed
+}
+
 fn history_offset_after_insert(
     current_offset: f32,
     new_item_count: usize,
@@ -6514,6 +6812,11 @@ impl Renderer {
         } else {
             None
         };
+        let history_skeleton_layer = if kind == WindowKind::Main {
+            Some(target.CreateLayer(None)?)
+        } else {
+            None
+        };
         let artwork_layer = target.CreateLayer(None)?;
         let artwork_geometries = [
             (
@@ -6554,17 +6857,21 @@ impl Renderer {
             layered_surface,
             palette,
             text,
+            language: ui_language(),
             dpi,
             theme_generation,
             composition,
             status_text_composition_enabled: false,
             popup_layer,
+            history_skeleton_layer,
             artwork_layer: Some(artwork_layer),
             artwork_geometries,
             artwork_bitmaps: RefCell::new(HashMap::new()),
             popup_outline: RefCell::new(None),
             popup_header: RefCell::new(None),
             result_details_cache: RefCell::new(None),
+            result_panel_bitmap: None,
+            result_panel_bitmap_failure_key: None,
             history_text_metrics_cache: RefCell::new(HashMap::new()),
             history_overlay_failure_transition: None,
             result_overlay_content_key: None,
@@ -6631,6 +6938,102 @@ impl Renderer {
         result_overlay_identity_matches_phase(&key.identity, &app.phase, current_artwork)
     }
 
+    fn cached_result_panel_bitmap(&self, key: &ResultOverlayContentKey) -> Option<&ID2D1Bitmap> {
+        self.result_panel_bitmap
+            .as_ref()
+            .filter(|cached| cached.key == *key)
+            .map(|cached| &cached.bitmap)
+    }
+
+    unsafe fn ensure_result_panel_bitmap(
+        &mut self,
+        app: &AppState,
+        key: &ResultOverlayContentKey,
+    ) -> windows::core::Result<()> {
+        if self.cached_result_panel_bitmap(key).is_some() {
+            return Ok(());
+        }
+
+        let (pixels, width, height) = self.rasterize_result_panel(app)?;
+        let properties = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: self.dpi as f32,
+            dpiY: self.dpi as f32,
+        };
+        let bitmap = self.target.CreateBitmap(
+            D2D_SIZE_U { width, height },
+            Some(pixels.as_ptr().cast()),
+            width.saturating_mul(4),
+            &properties,
+        )?;
+        self.result_panel_bitmap = Some(CachedResultPanelBitmap {
+            key: key.clone(),
+            bitmap,
+        });
+        Ok(())
+    }
+
+    unsafe fn rasterize_result_panel(
+        &self,
+        app: &AppState,
+    ) -> windows::core::Result<(Vec<u8>, u32, u32)> {
+        let dc_target = self.dc_target.as_ref().ok_or_else(|| {
+            Error::new(
+                windows::core::HRESULT(0x80004005_u32 as i32),
+                "The result card requires a Direct2D DC render target",
+            )
+        })?;
+        let main_surface = self.layered_surface.as_ref().ok_or_else(|| {
+            Error::new(
+                windows::core::HRESULT(0x80004005_u32 as i32),
+                "The result card requires a layered main-window surface",
+            )
+        })?;
+        let scale = composition_scale_for_dpi(self.dpi);
+        let width = (CONTENT_WIDTH as f32 * scale).ceil() as u32;
+        let height = (TOP_HEIGHT as f32 * scale).ceil() as u32;
+        let offscreen = LayeredSurface::new(width, height)?;
+        let offscreen_bounds = RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+        dc_target.BindDC(offscreen.dc, &offscreen_bounds)?;
+        self.target.BeginDraw();
+        self.target.Clear(Some(&d2d_color(0, 0, 0, 0.0)));
+        let draw_result = match &app.phase {
+            MainPhase::Matched { track, .. } => {
+                self.draw_result_panel(app, track, 0.0, app.arrow_edge)
+            }
+            MainPhase::NoMatch { .. } => self.draw_no_match_panel(0.0, false, app.arrow_edge),
+            MainPhase::Offline { .. } => self.draw_no_match_panel(0.0, true, app.arrow_edge),
+            _ => Err(Error::new(
+                windows::core::HRESULT(0x80070057_u32 as i32),
+                "Cannot rasterize a result card outside a result phase",
+            )),
+        };
+        let end_result = self.target.EndDraw(None, None);
+        let main_bounds = RECT {
+            left: 0,
+            top: 0,
+            right: main_surface.size.width as i32,
+            bottom: main_surface.size.height as i32,
+        };
+        let restore_result = dc_target.BindDC(main_surface.dc, &main_bounds);
+        draw_result?;
+        end_result?;
+        restore_result?;
+
+        let byte_len = offscreen.size.width as usize * offscreen.size.height as usize * 4;
+        let pixels =
+            unsafe { std::slice::from_raw_parts(offscreen._pixels.cast::<u8>(), byte_len) };
+        Ok((pixels.to_vec(), width, height))
+    }
+
     unsafe fn on_size(&mut self, hwnd: HWND) {
         let mut client = RECT::default();
         if GetClientRect(hwnd, &mut client).is_ok() {
@@ -6683,6 +7086,19 @@ impl Renderer {
         }
     }
 
+    unsafe fn refresh_language_if_needed(&mut self) {
+        let language = ui_language();
+        if self.language == language {
+            return;
+        }
+        if let Ok(text) = create_text_styles(&self.write_factory) {
+            self.text = text;
+            self.language = language;
+            *self.result_details_cache.borrow_mut() = None;
+            self.history_text_metrics_cache.borrow_mut().clear();
+        }
+    }
+
     unsafe fn prepare_history_overlay(
         &mut self,
         app: &AppState,
@@ -6692,10 +7108,7 @@ impl Renderer {
         let transition = app.history_transition.filter(|transition| {
             matches!(
                 transition.event,
-                HistoryMutationEvent::Insert {
-                    index: 0,
-                    previous_count: 1..,
-                }
+                HistoryMutationEvent::Insert { index: 0, .. }
             ) && now.saturating_duration_since(transition.started_at) < HISTORY_INSERT_TRANSITION
         });
         let Some(transition) = transition else {
@@ -6784,6 +7197,7 @@ impl Renderer {
 
     unsafe fn draw(&mut self, app: &AppState, kind: WindowKind) -> windows::core::Result<bool> {
         self.refresh_theme_if_needed(app);
+        self.refresh_language_if_needed();
         let body_top = if app.arrow_edge == ArrowEdge::Top {
             POPUP_ARROW_HEIGHT as f32
         } else {
@@ -6814,11 +7228,31 @@ impl Renderer {
         let overlay_key = (kind == WindowKind::Main)
             .then(|| self.result_overlay_content_key(app, app.arrow_edge))
             .flatten();
+        if panel_top.is_some() {
+            if let Some(key) = overlay_key.as_ref() {
+                if self.result_panel_bitmap_failure_key.as_ref() != Some(key)
+                    && self.cached_result_panel_bitmap(key).is_none()
+                {
+                    match unsafe { self.ensure_result_panel_bitmap(app, key) } {
+                        Ok(()) => self.result_panel_bitmap_failure_key = None,
+                        Err(error) => {
+                            self.result_panel_bitmap_failure_key = Some(key.clone());
+                            eprintln!("Windows UI result card bitmap cache failed: {error}");
+                        }
+                    }
+                }
+            }
+        }
+        let result_panel_bitmap = overlay_key
+            .as_ref()
+            .and_then(|key| self.cached_result_panel_bitmap(key))
+            .cloned();
         let overlay_motion = (kind == WindowKind::Main)
             .then(|| result_overlay_motion_animation(&app.phase, Instant::now()))
             .flatten();
         let overlay_motion_key = overlay_motion.as_ref().map(|motion| motion.key.clone());
-        let overlay_motion_changed = self.result_overlay_motion_key != overlay_motion_key;
+        let overlay_motion_changed =
+            COMPOSITION_RESULT_CARD_ENABLED && self.result_overlay_motion_key != overlay_motion_key;
         if kind == WindowKind::Main
             && self.result_overlay_failure_key.is_some()
             && (panel_top.is_none()
@@ -6837,7 +7271,8 @@ impl Renderer {
                 self.result_overlay_failure_key.as_ref(),
                 overlay_key.as_ref(),
             );
-        let composition_cache_ready = self.composition.is_some()
+        let composition_cache_ready = COMPOSITION_RESULT_CARD_ENABLED
+            && self.composition.is_some()
             && self.layered_surface.is_some()
             && panel_top.is_some()
             && !overlay_failure_latched;
@@ -6845,14 +7280,9 @@ impl Renderer {
             && overlay_key
                 .as_ref()
                 .is_some_and(|key| self.result_overlay_content_key.as_ref() == Some(key));
-        // Rasterize the card once at the fixed header origin. Its animated
-        // offset is applied by the Composition visual.
-        let result_panel_draw_top = result_panel_draw_top(
-            panel_top,
-            body_top,
-            composition_cache_ready,
-            composition_cache_hit,
-        );
+        // Keep result cards in the same D2D pass as the popup mask. A separate
+        // Composition surface blends its soft edge over the blue header.
+        let result_panel_draw_top = result_panel_draw_top(panel_top, composition_cache_ready);
         self.target.BeginDraw();
         let clear = d2d_color(0, 0, 0, 0.0);
         self.target.Clear(Some(&clear));
@@ -6879,9 +7309,12 @@ impl Renderer {
             self.target.PushLayer(parameters, layer);
         }
         let draw_result = match kind {
-            WindowKind::Main => {
-                self.draw_main(app, result_panel_draw_top, history_composition_active)
-            }
+            WindowKind::Main => self.draw_main(
+                app,
+                result_panel_draw_top,
+                history_composition_active,
+                result_panel_bitmap.as_ref(),
+            ),
             WindowKind::About => self.draw_about(app),
             WindowKind::MicrophoneInfo => self.draw_microphone_info(app),
         };
@@ -6894,7 +7327,15 @@ impl Renderer {
             let mut overlay_error = None;
             let mut overlay_update_failed = false;
             if let Some(scene) = self.composition.as_mut() {
-                let overlay_update = if overlay_failure_latched {
+                let overlay_update = if !COMPOSITION_RESULT_CARD_ENABLED {
+                    if self.result_overlay_content_key.is_some()
+                        || self.result_overlay_motion_key.is_some()
+                    {
+                        scene.result_overlay.hide()
+                    } else {
+                        Ok(())
+                    }
+                } else if overlay_failure_latched {
                     Ok(())
                 } else if self.layered_surface.is_some() {
                     scene.update_result_overlay(
@@ -6929,7 +7370,11 @@ impl Renderer {
                             } else {
                                 None
                             };
-                            self.result_overlay_motion_key = overlay_motion_key.clone();
+                            self.result_overlay_motion_key = if COMPOSITION_RESULT_CARD_ENABLED {
+                                overlay_motion_key.clone()
+                            } else {
+                                None
+                            };
                         }
                     }
                     Err(error) => {
@@ -6946,20 +7391,24 @@ impl Renderer {
                     }
                 }
                 // The layered D2D fallback is behind the desktop Composition
-                // tree. Suppress the complete tagging group while the card
-                // intersects the fixed header; parent opacity leaves its GPU
-                // animation clocks running while preventing visual overlap.
-                let fallback_suppresses_tagging =
+                // tree. Clip tagging visuals at the card's moving top edge;
+                // hiding the full group made the gear and button disappear
+                // until the card had completely left the header.
+                let fallback_panel_top = if COMPOSITION_RESULT_CARD_ENABLED {
                     result_overlay_failure_matches(
                         self.result_overlay_failure_key.as_ref(),
                         overlay_key.as_ref(),
-                    ) && result_overlay_intersects_header(panel_top, body_top);
+                    )
+                    .then_some(panel_top)
+                    .flatten()
+                } else {
+                    panel_top
+                };
                 if let Err(error) =
-                    scene.set_result_fallback_tagging_suppressed(fallback_suppresses_tagging)
+                    scene.set_result_fallback_tagging_clip(fallback_panel_top, body_top)
                 {
                     if overlay_error.is_none() {
-                        overlay_error =
-                            Some(overlay_surface_error("FallbackTaggingOpacity", error));
+                        overlay_error = Some(overlay_surface_error("FallbackTaggingClip", error));
                     }
                 }
             } else {
@@ -7012,7 +7461,16 @@ impl Renderer {
         if let Some(layer) = self.popup_layer.as_ref() {
             self.target.PushLayer(&parameters, layer);
         }
-        let draw_result = self.draw_main(app, panel_top, history_composition_active);
+        let result_panel_bitmap = self
+            .result_overlay_content_key(app, app.arrow_edge)
+            .and_then(|key| self.cached_result_panel_bitmap(&key))
+            .cloned();
+        let draw_result = self.draw_main(
+            app,
+            panel_top,
+            history_composition_active,
+            result_panel_bitmap.as_ref(),
+        );
         if self.popup_layer.is_some() {
             self.target.PopLayer();
         }
@@ -7251,6 +7709,7 @@ impl Renderer {
         app: &AppState,
         result_panel_draw_top: Option<f32>,
         history_composition_active: bool,
+        result_panel_bitmap: Option<&ID2D1Bitmap>,
     ) -> windows::core::Result<()> {
         let arrow_top = app.arrow_edge == ArrowEdge::Top;
         let body_top = if arrow_top {
@@ -7358,18 +7817,10 @@ impl Renderer {
             windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
         );
         let now = Instant::now();
-        if app.history.is_empty()
-            || app.history_transition.is_some_and(|transition| {
-                matches!(
-                    transition.event,
-                    HistoryMutationEvent::Insert {
-                        previous_count: 0,
-                        ..
-                    }
-                )
-            })
-        {
+        if app.history.is_empty() {
             self.draw_skeleton(history_rect);
+        } else if let Some(progress) = history_first_insert_progress(app.history_transition, now) {
+            self.draw_skeleton_with_opacity(history_rect, 1.0 - progress);
         }
         self.draw_history(app, history_top, now, history_composition_active)?;
         self.target.PopAxisAlignedClip();
@@ -7389,24 +7840,44 @@ impl Renderer {
                 self.draw_cancel_button(body_top, app.arrow_edge);
             }
             MainPhase::Matched { ref track, .. } => {
-                self.draw_status_text(app, body_top);
+                // `taggingDidFinish` calls stopTagging before presenting the
+                // independent result card. The ready-state settings control
+                // therefore remains in the background while the card enters,
+                // holds, and slides away; the result overlay covers only the
+                // portion currently occupied by the card.
+                self.draw_ready(app, body_top);
                 if let Some(top) = result_panel_draw_top {
                     self.with_result_header_clip(body_top, || {
-                        self.draw_result_panel(app, track, top, app.arrow_edge)
+                        if let Some(bitmap) = result_panel_bitmap {
+                            self.draw_result_panel_bitmap(bitmap, top);
+                            Ok(())
+                        } else {
+                            self.draw_result_panel(app, track, top, app.arrow_edge)
+                        }
                     })?;
                 }
             }
             MainPhase::NoMatch { .. } => {
                 if let Some(top) = result_panel_draw_top {
                     self.with_result_header_clip(body_top, || {
-                        self.draw_no_match_panel(top, false, app.arrow_edge)
+                        if let Some(bitmap) = result_panel_bitmap {
+                            self.draw_result_panel_bitmap(bitmap, top);
+                            Ok(())
+                        } else {
+                            self.draw_no_match_panel(top, false, app.arrow_edge)
+                        }
                     })?;
                 }
             }
             MainPhase::Offline { .. } => {
                 if let Some(top) = result_panel_draw_top {
                     self.with_result_header_clip(body_top, || {
-                        self.draw_no_match_panel(top, true, app.arrow_edge)
+                        if let Some(bitmap) = result_panel_bitmap {
+                            self.draw_result_panel_bitmap(bitmap, top);
+                            Ok(())
+                        } else {
+                            self.draw_no_match_panel(top, true, app.arrow_edge)
+                        }
                     })?;
                 }
             }
@@ -7692,6 +8163,37 @@ impl Renderer {
             .FillRectangle(&history, &self.palette.empty_overlay);
     }
 
+    unsafe fn draw_skeleton_with_opacity(&self, history: D2D_RECT_F, opacity: f32) {
+        let opacity = opacity.clamp(0.0, 1.0);
+        if opacity >= 1.0 {
+            self.draw_skeleton(history);
+            return;
+        }
+        if opacity <= 0.0 {
+            return;
+        }
+        let Some(layer) = self.history_skeleton_layer.as_ref() else {
+            self.draw_skeleton(history);
+            return;
+        };
+        let parameters = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS {
+            contentBounds: history,
+            geometricMask: std::mem::ManuallyDrop::new(None),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: Matrix3x2 {
+                M11: 1.0,
+                M22: 1.0,
+                ..Default::default()
+            },
+            opacity,
+            opacityBrush: std::mem::ManuallyDrop::new(None),
+            layerOptions: D2D1_LAYER_OPTIONS_NONE,
+        };
+        self.target.PushLayer(&parameters, layer);
+        self.draw_skeleton(history);
+        self.target.PopLayer();
+    }
+
     unsafe fn draw_track_artwork(
         &self,
         app: &AppState,
@@ -7705,8 +8207,15 @@ impl Renderer {
         let mut bitmaps = self.artwork_bitmaps.borrow_mut();
         let replace_cached = bitmaps.get(&track.display_id).is_none_or(|cached| {
             should_replace_cached_artwork(
-                Some((cached.source, cached.fingerprint)),
+                Some((
+                    cached.source,
+                    cached.width,
+                    cached.height,
+                    cached.fingerprint,
+                )),
                 *source,
+                pixels.width,
+                pixels.height,
                 pixels.fingerprint,
             )
         });
@@ -8005,6 +8514,17 @@ impl Renderer {
         );
         self.draw_result_close_icon(top, edge);
         Ok(())
+    }
+
+    unsafe fn draw_result_panel_bitmap(&self, bitmap: &ID2D1Bitmap, top: f32) {
+        let destination = rect(0.0, top, CONTENT_WIDTH as f32, top + TOP_HEIGHT as f32);
+        self.target.DrawBitmap(
+            bitmap,
+            Some(&destination),
+            1.0,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            None,
+        );
     }
 
     unsafe fn draw_no_match_panel(
@@ -8523,10 +9043,13 @@ fn acquire_named_single_instance_mutex(
 
 fn activate_existing_instance() -> bool {
     let class_name = wide(CLASS_NAME);
-    let title = wide("OpenShazam");
     for _ in 0..50 {
         let hwnd = unsafe {
-            FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR(title.as_ptr())).unwrap_or_default()
+            // The main popup is an undecorated WS_POPUP tool window. Windows
+            // does not consistently expose its creation text through
+            // FindWindow's title filter, so locate the single-instance host by
+            // its private window class instead.
+            FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR::null()).unwrap_or_default()
         };
         if !hwnd.0.is_null() {
             return unsafe {
@@ -9286,7 +9809,7 @@ unsafe fn open_settings_after_wndproc(app_ptr: *mut AppState) -> LRESULT {
 
     // Copy only plain handles/function pointers out. Drop all Rust references
     // before calling WinUI, whose ShowWindow/activation path re-enters WndProc.
-    let (show, owner, theme_preference) = {
+    let (show, owner, theme_preference, shortcut, language) = {
         let app = &mut *app_ptr;
         let Some(host) = app.settings_host.as_ref() else {
             app.settings_opening = false;
@@ -9296,10 +9819,18 @@ unsafe fn open_settings_after_wndproc(app_ptr: *mut AppState) -> LRESULT {
             host.show_callback(),
             app.main_hwnd,
             app.theme_preference.id(),
+            app.global_shortcut,
+            ui_language().id(),
         )
     };
 
-    let hr = show(owner.0, theme_preference);
+    let hr = show(
+        owner.0,
+        theme_preference,
+        shortcut.modifiers,
+        shortcut.key,
+        language,
+    );
     (*app_ptr).settings_opening = false;
     if hr < 0 {
         (*app_ptr).message = Some(format!(
@@ -9308,11 +9839,130 @@ unsafe fn open_settings_after_wndproc(app_ptr: *mut AppState) -> LRESULT {
         ));
         let _ = InvalidateRect(Some(owner), None, false);
     } else {
+        // Show initializes the WinUI island on the first request; send the
+        // current in-memory history after that initialization has completed.
+        update_settings_history(&*app_ptr);
         // Settings takes focus without going through the popup's ordinary
         // deactivation path, so dismiss the main popup explicitly on success.
         hide_main(&mut *app_ptr);
     }
     LRESULT(0)
+}
+
+unsafe fn register_global_shortcut(
+    hwnd: HWND,
+    registration_id: i32,
+    shortcut: GlobalShortcut,
+) -> Result<(), i32> {
+    if !shortcut.is_valid() {
+        return Err(87); // ERROR_INVALID_PARAMETER
+    }
+    RegisterHotKey(
+        Some(hwnd),
+        registration_id,
+        HOT_KEY_MODIFIERS(shortcut.modifiers | MOD_NOREPEAT.0),
+        shortcut.key,
+    )
+    .map_err(|error| error.code().0)
+}
+
+unsafe fn update_global_shortcut(app: &mut AppState, shortcut: GlobalShortcut) -> Result<(), i32> {
+    if !shortcut.is_valid() {
+        return Err(87);
+    }
+    if app.global_shortcut == shortcut && app.global_shortcut_registration_id.is_some() {
+        return Ok(());
+    }
+
+    // Register with the alternate ID first. If Windows reports a conflict,
+    // the old binding stays active and the user can continue using it.
+    let next_id = match app.global_shortcut_registration_id {
+        Some(GLOBAL_SHORTCUT_ID_PRIMARY) => GLOBAL_SHORTCUT_ID_SECONDARY,
+        _ => GLOBAL_SHORTCUT_ID_PRIMARY,
+    };
+    register_global_shortcut(app.main_hwnd, next_id, shortcut)?;
+    if let Err(error) = save_global_shortcut(shortcut) {
+        let _ = UnregisterHotKey(Some(app.main_hwnd), next_id);
+        return Err(error);
+    }
+
+    if let Some(previous_id) = app.global_shortcut_registration_id {
+        if let Err(error) = UnregisterHotKey(Some(app.main_hwnd), previous_id) {
+            let _ = UnregisterHotKey(Some(app.main_hwnd), next_id);
+            let _ = save_global_shortcut(app.global_shortcut);
+            return Err(error.code().0);
+        }
+    }
+    app.global_shortcut = shortcut;
+    app.global_shortcut_registration_id = Some(next_id);
+    Ok(())
+}
+
+unsafe fn set_global_shortcut_capture(app: &mut AppState, suspended: bool) -> Result<(), i32> {
+    if suspended {
+        if app.global_shortcut_capture_suspended {
+            return Ok(());
+        }
+        if let Some(registration_id) = app.global_shortcut_registration_id {
+            UnregisterHotKey(Some(app.main_hwnd), registration_id)
+                .map_err(|error| error.code().0)?;
+            app.global_shortcut_registration_id = None;
+        }
+        app.global_shortcut_capture_suspended = true;
+        return Ok(());
+    }
+
+    if !app.global_shortcut_capture_suspended && app.global_shortcut_registration_id.is_some() {
+        return Ok(());
+    }
+    app.global_shortcut_capture_suspended = false;
+    if app.global_shortcut_registration_id.is_none() {
+        register_global_shortcut(
+            app.main_hwnd,
+            GLOBAL_SHORTCUT_ID_PRIMARY,
+            app.global_shortcut,
+        )?;
+        app.global_shortcut_registration_id = Some(GLOBAL_SHORTCUT_ID_PRIMARY);
+    }
+    Ok(())
+}
+
+unsafe fn update_global_shortcut_after_wndproc(
+    app_ptr: *mut AppState,
+    modifiers: u32,
+    key: u32,
+) -> LRESULT {
+    if app_ptr.is_null() {
+        return LRESULT(0);
+    }
+    match update_global_shortcut(&mut *app_ptr, GlobalShortcut { modifiers, key }) {
+        Ok(()) => LRESULT(1),
+        Err(error) => {
+            (*app_ptr).message = Some(format!(
+                "Windows could not register this shortcut (error {error})."
+            ));
+            if (*app_ptr).visible {
+                let _ = InvalidateRect(Some((*app_ptr).main_hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+    }
+}
+
+unsafe fn set_global_shortcut_capture_after_wndproc(
+    app_ptr: *mut AppState,
+    suspended: bool,
+) -> LRESULT {
+    if app_ptr.is_null() {
+        return LRESULT(0);
+    }
+    match set_global_shortcut_capture(&mut *app_ptr, suspended) {
+        Ok(()) => LRESULT(1),
+        Err(error) => {
+            eprintln!("Could not update global shortcut capture state (error {error}).");
+            LRESULT(0)
+        }
+    }
 }
 
 // Legacy About panel is retained for source compatibility until the
@@ -9366,25 +10016,11 @@ unsafe fn open_microphone_info(app: &mut AppState) {
 }
 
 fn hide_main(app: &mut AppState) {
-    if !app.visible && app.popup_opacity == 0 && app.popup_transition.is_none() {
+    if !app.visible && app.popup_opacity == 0 {
         return;
     }
     unsafe { cancel_deferred_deactivation_hide(app) };
-    if app
-        .popup_transition
-        .is_some_and(|transition| !app.visible && transition.hide_when_complete)
-    {
-        return;
-    }
-    let now = Instant::now();
-    let from = popup_opacity_at(app, now);
-    app.popup_opacity = from;
-    app.popup_transition = Some(PopupOpacityTransition {
-        started_at: now,
-        from,
-        to: 0,
-        hide_when_complete: true,
-    });
+    app.popup_opacity = 0;
     app.visible = false;
     clear_history_hover(&mut app.hovered_row);
     app.mouse_leave_tracking = false;
@@ -9394,47 +10030,9 @@ fn hide_main(app: &mut AppState) {
     unsafe {
         sync_main_timers(app);
         if !app.main_hwnd.0.is_null() {
-            let _ = InvalidateRect(Some(app.main_hwnd), None, false);
-        }
-    }
-}
-
-fn popup_opacity_at(app: &AppState, now: Instant) -> u8 {
-    let Some(transition) = app.popup_transition else {
-        return app.popup_opacity;
-    };
-    let elapsed = now.saturating_duration_since(transition.started_at);
-    let progress = (elapsed.as_secs_f64() / POPUP_FADE_DURATION.as_secs_f64()).clamp(0.0, 1.0);
-    popup_transition_opacity(transition.from, transition.to, progress)
-}
-
-fn popup_transition_opacity(from: u8, to: u8, progress: f64) -> u8 {
-    let progress = progress.clamp(0.0, 1.0);
-    // Reach either endpoint quickly while preserving a short, soft transition.
-    // This makes tray activation responsive and outside-click dismissal prompt.
-    let progress = 1.0 - (1.0 - progress).powi(3);
-    let opacity = f64::from(from) + (f64::from(to) - f64::from(from)) * progress;
-    opacity.round().clamp(0.0, 255.0) as u8
-}
-
-unsafe fn advance_popup_transition(app: &mut AppState, now: Instant) -> bool {
-    let Some(transition) = app.popup_transition else {
-        return false;
-    };
-    let elapsed = now.saturating_duration_since(transition.started_at);
-    let complete = elapsed >= POPUP_FADE_DURATION;
-    app.popup_opacity = if complete {
-        transition.to
-    } else {
-        popup_opacity_at(app, now)
-    };
-    if complete {
-        app.popup_transition = None;
-        if transition.hide_when_complete && !app.visible && !app.main_hwnd.0.is_null() {
             let _ = ShowWindow(app.main_hwnd, SW_HIDE);
         }
     }
-    true
 }
 
 fn start_capture(app: &mut AppState, mode: CaptureMode) {
@@ -9933,7 +10531,7 @@ fn show_controller_match(
     config_generation: Option<u64>,
     event_time_utc: Option<SystemTime>,
 ) {
-    let track = record_controller_track(app, candidate, config_generation, event_time_utc);
+    let track = record_controller_track(app, candidate, mode, config_generation, event_time_utc);
     app.status_alternator = Some(StatusTextAlternator::after_success(track.recognized_at));
     if app.visible {
         app.success_wave_frame = current_success_wave_frame(app);
@@ -9976,7 +10574,13 @@ fn apply_auto_match_candidate(
     if let MainPhase::Starting { entered_at, .. } = &app.phase {
         enter_listening(app, CaptureMode::Auto, *entered_at);
     }
-    let track = record_controller_track(app, candidate, config_generation, event_time_utc);
+    let track = record_controller_track(
+        app,
+        candidate,
+        CaptureMode::Auto,
+        config_generation,
+        event_time_utc,
+    );
     if !app.visible {
         queue_hidden_match_notification(app, &track);
     }
@@ -10027,6 +10631,7 @@ fn auto_candidate_identity(candidate: &TrackCandidate) -> Option<String> {
 fn record_controller_track(
     app: &mut AppState,
     candidate: TrackCandidate,
+    mode: CaptureMode,
     config_generation: Option<u64>,
     event_time_utc: Option<SystemTime>,
 ) -> Track {
@@ -10065,17 +10670,35 @@ fn record_controller_track(
         config_generation,
         page_url,
     };
+    if let Some(store) = app.history_store.as_ref() {
+        store.save(PersistedTrack {
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            recognized_at_utc: track.recognized_at_utc,
+            track_key: track.track_key.clone(),
+            artwork_url: track.artwork_url.clone(),
+            hq_artwork_url: track.hq_artwork_url.clone(),
+            background_artwork_url: track.background_artwork_url.clone(),
+            shazam_page_url: track.page_url.as_ref().map(|url| url.0.clone()),
+            source: match mode {
+                CaptureMode::Manual => RecognitionSource::Manual,
+                CaptureMode::Auto => RecognitionSource::Auto,
+            },
+        });
+    }
     let artwork_request = register_artwork_request(app, &track);
     let previous_count = app.history.len();
     let previous_scroll_offset = app.scroll_offset;
     app.history.insert(0, track.clone());
     app.history.truncate(40);
+    update_settings_history(app);
     let (next_scroll_offset, animate_insert) = history_offset_after_insert(
         previous_scroll_offset,
         app.history.len(),
         HISTORY_HEIGHT as f32,
     );
     app.scroll_offset = next_scroll_offset;
+    app.history_scroll_animation = None;
     app.history_transition = animate_insert.then(|| HistoryMutationTransition {
         started_at: Instant::now(),
         event: HistoryMutationEvent::Insert {
@@ -10095,6 +10718,96 @@ fn record_controller_track(
         );
     }
     track
+}
+
+fn restore_history_tracks(entries: Vec<PersistedTrack>) -> Vec<Track> {
+    entries
+        .into_iter()
+        .take(40)
+        .enumerate()
+        .map(|(index, entry)| {
+            let _source = entry.source;
+            Track {
+                display_id: index as u64 + 1,
+                title: entry.title,
+                artist: entry.artist,
+                recognized_at: Instant::now(),
+                recognized_date_label: format_history_date_label(entry.recognized_at_utc),
+                recognized_at_utc: entry.recognized_at_utc,
+                timestamp_source: HistoryTimestampSource::ControllerEvent,
+                artwork_url: entry.artwork_url,
+                hq_artwork_url: entry.hq_artwork_url,
+                background_artwork_url: entry.background_artwork_url,
+                track_key: entry.track_key,
+                config_generation: None,
+                page_url: entry
+                    .shazam_page_url
+                    .filter(|url| valid_shazam_page_url(url))
+                    .map(ValidatedWebTrackUrl),
+            }
+        })
+        .collect()
+}
+
+fn request_history_artwork_at_offset(app: &mut AppState, offset: f32) {
+    let first = (offset.max(0.0) / HISTORY_ROW_PITCH).floor() as usize;
+    let visible_count = (HISTORY_HEIGHT as f32 / HISTORY_ROW_PITCH).ceil() as usize + 2;
+    let end = first.saturating_add(visible_count).min(app.history.len());
+    let requests = (first..end)
+        .filter_map(|index| {
+            let track = app.history.get(index)?.clone();
+            let identity = TrackIdentity {
+                display_id: track.display_id,
+            };
+            if app.artwork_resources.contains_key(&track.display_id)
+                || app.active_artwork_requests.contains_key(&identity)
+            {
+                return None;
+            }
+            register_artwork_request(app, &track).map(|request| (track, request))
+        })
+        .collect::<Vec<_>>();
+    let dpi = unsafe { GetDpiForWindow(app.main_hwnd) }.max(96);
+    for (_, request) in requests {
+        start_artwork_load(app.main_hwnd, request, dpi);
+    }
+}
+
+fn update_settings_history(app: &AppState) {
+    let Some(host) = app.settings_host.as_ref() else {
+        return;
+    };
+
+    let strings: Vec<[Vec<u16>; 4]> = app
+        .history
+        .iter()
+        .map(|track| {
+            [
+                settings_wide_string(&track.title),
+                settings_wide_string(&track.artist),
+                settings_wide_string(&track.recognized_date_label),
+                settings_wide_string(
+                    &resolve_track_page_url(track, &app.ui_configs)
+                        .map(|url| url.0)
+                        .unwrap_or_default(),
+                ),
+            ]
+        })
+        .collect();
+    let items: Vec<_> = strings
+        .iter()
+        .map(|row| crate::windows_settings::SettingsHistoryItem {
+            title: row[0].as_ptr(),
+            artist: row[1].as_ptr(),
+            recognized_at: row[2].as_ptr(),
+            page_url: row[3].as_ptr(),
+        })
+        .collect();
+    host.update_history(&items);
+}
+
+fn settings_wide_string(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn current_success_wave_frame(app: &AppState) -> Option<ui_model::WaveFrame> {
@@ -10177,43 +10890,48 @@ fn invalidate_orphaned_artwork_requests(app: &mut AppState) {
     }
 }
 
-fn start_artwork_load(hwnd: HWND, request: ArtworkRequest, dpi: u32) {
+fn start_artwork_load(hwnd: HWND, request: ArtworkRequest, _dpi: u32) {
     let hwnd_value = hwnd.0 as isize;
-    let required_pixels = 150u32.saturating_mul(dpi.max(96)).saturating_add(95) / 96;
-    thread::spawn(move || {
-        let mut standard_size = None;
-        if let Some(url) = request
-            .standard_url
-            .as_deref()
-            .filter(|url| valid_https_resource_url(url))
-        {
-            if let Ok(pixels) = fetch_and_decode_artwork(&url) {
-                standard_size = Some(pixels.width.min(pixels.height));
-                post_artwork_ready(
-                    hwnd_value,
-                    request.identity,
-                    ArtworkSource::Standard,
-                    pixels,
-                );
-            }
+    let identity = request.identity;
+    let mut jobs = Vec::with_capacity(2);
+    if let Some(url) = request
+        .standard_url
+        .as_deref()
+        .filter(|url| valid_https_resource_url(url))
+    {
+        jobs.push((ArtworkSource::Standard, url.to_owned()));
+    }
+    if let Some(url) = request
+        .high_quality_url
+        .as_deref()
+        .filter(|url| valid_https_resource_url(url))
+    {
+        if !jobs.iter().any(|(_, existing)| existing == url) {
+            jobs.push((ArtworkSource::HighQuality, url.to_owned()));
         }
-        if standard_size.is_none_or(|size| size < required_pixels) {
-            if let Some(url) = request
-                .high_quality_url
-                .as_deref()
-                .filter(|url| valid_https_resource_url(url))
-            {
-                if let Ok(pixels) = fetch_and_decode_artwork(&url) {
-                    post_artwork_ready(
-                        hwnd_value,
-                        request.identity,
-                        ArtworkSource::HighQuality,
-                        pixels,
-                    );
+    }
+    thread::spawn(move || {
+        thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            for (source, url) in jobs {
+                let sender = sender.clone();
+                scope.spawn(move || {
+                    let result = fetch_and_decode_artwork(&url);
+                    let _ = sender.send((source, result));
+                });
+            }
+            drop(sender);
+
+            // Apply each result as soon as its download and decode finish. In
+            // particular, a slow standard endpoint must not hold back the
+            // high-resolution endpoint (or vice versa).
+            for (source, result) in receiver {
+                if let Ok(pixels) = result {
+                    post_artwork_ready(hwnd_value, identity, source, pixels);
                 }
             }
-        }
-        post_artwork_load_finished(hwnd_value, request.identity);
+        });
+        post_artwork_load_finished(hwnd_value, identity);
     });
 }
 
@@ -10843,6 +11561,23 @@ enum UiLanguage {
     English,
 }
 
+impl UiLanguage {
+    fn id(self) -> u32 {
+        match self {
+            Self::Japanese => 1,
+            Self::English => 2,
+        }
+    }
+
+    fn from_id(id: u32) -> Option<Self> {
+        match id {
+            1 => Some(Self::Japanese),
+            2 => Some(Self::English),
+            _ => None,
+        }
+    }
+}
+
 fn directwrite_locale(language: UiLanguage) -> &'static str {
     match language {
         UiLanguage::Japanese => "ja-JP",
@@ -10850,10 +11585,18 @@ fn directwrite_locale(language: UiLanguage) -> &'static str {
     }
 }
 
-static UI_LANGUAGE: OnceLock<UiLanguage> = OnceLock::new();
+static UI_LANGUAGE: AtomicU32 = AtomicU32::new(0);
 
 fn ui_language() -> UiLanguage {
-    *UI_LANGUAGE.get_or_init(detect_ui_language)
+    UiLanguage::from_id(UI_LANGUAGE.load(Ordering::Relaxed)).unwrap_or_else(|| {
+        let detected = detect_ui_language();
+        UI_LANGUAGE.store(detected.id(), Ordering::Relaxed);
+        detected
+    })
+}
+
+fn set_ui_language(language: UiLanguage) {
+    UI_LANGUAGE.store(language.id(), Ordering::Relaxed);
 }
 
 fn select_ui_language_from_multisz(buffer: &[u16]) -> UiLanguage {
@@ -10998,7 +11741,7 @@ fn timeout_copy(language: UiLanguage) -> (&'static str, &'static str, &'static s
 
 unsafe fn update_visible_windows(app: &mut AppState) {
     sync_main_timers(app);
-    if app.visible || app.popup_transition.is_some() {
+    if app.visible {
         let _ = InvalidateRect(Some(app.main_hwnd), None, false);
     }
     if app.about_visible {
@@ -11074,9 +11817,7 @@ fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
 
 unsafe fn sync_main_timers(app: &mut AppState) {
     let hwnd = app.main_hwnd;
-    if (app.visible || app.recognition_session.is_some() || app.popup_transition.is_some())
-        && !hwnd.0.is_null()
-    {
+    if app.visible || app.recognition_session.is_some() && !hwnd.0.is_null() {
         let track_phase = phase_needs_timeout(&app.phase)
             || app.history_transition.is_some()
             || app.recognition_session.is_some()
@@ -11090,6 +11831,7 @@ unsafe fn sync_main_timers(app: &mut AppState) {
         }
         let content_animation_needs_frame =
             animation_needs_frame(&app.phase, app.startup_animation_pending)
+                || app.history_scroll_animation.is_some()
                 || result_overlay_fallback_needs_frame(
                     &app.phase,
                     app.result_overlay_composition_ready,
@@ -11098,15 +11840,12 @@ unsafe fn sync_main_timers(app: &mut AppState) {
                     && app
                         .status_alternator
                         .is_some_and(|status| status.animating(Instant::now())))
-                || (app.history_transition.is_some_and(|transition| {
-                    Instant::now().saturating_duration_since(transition.started_at)
-                        < HISTORY_INSERT_TRANSITION
-                }) && !app.history_composition_ready);
-        let animate = animation_timer_needed(
-            app.visible,
-            app.popup_transition.is_some(),
-            content_animation_needs_frame,
-        );
+                || history_transition_requires_d2d_frame(
+                    app.history_transition,
+                    Instant::now(),
+                    app.history_composition_ready,
+                );
+        let animate = animation_timer_needed(app.visible, content_animation_needs_frame);
         if animate && !app.animation_timer_active {
             let _ = SetTimer(Some(hwnd), TIMER_ANIMATION, ANIMATION_TICK_MS, None);
             app.animation_timer_active = true;
@@ -11427,6 +12166,39 @@ fn linear_transition_progress(started_at: Instant, now: Instant, duration: Durat
         .clamp(0.0, 1.0)
 }
 
+fn history_first_insert_progress(
+    transition: Option<HistoryMutationTransition>,
+    now: Instant,
+) -> Option<f32> {
+    let transition = transition?;
+    matches!(
+        transition.event,
+        HistoryMutationEvent::Insert {
+            index: 0,
+            previous_count: 0,
+        }
+    )
+    .then(|| linear_transition_progress(transition.started_at, now, HISTORY_INSERT_TRANSITION))
+}
+
+fn history_transition_requires_d2d_frame(
+    transition: Option<HistoryMutationTransition>,
+    now: Instant,
+    composition_ready: bool,
+) -> bool {
+    transition.is_some_and(|transition| {
+        let first_insert = history_first_insert_progress(Some(transition), now).is_some();
+        let frame_deadline = HISTORY_INSERT_TRANSITION
+            + if first_insert {
+                Duration::from_millis(u64::from(ANIMATION_TICK_MS))
+            } else {
+                Duration::ZERO
+            };
+        now.saturating_duration_since(transition.started_at) < frame_deadline
+            && (!composition_ready || first_insert)
+    })
+}
+
 fn history_composition_offset(started_at: Instant, now: Instant) -> f32 {
     let progress = linear_transition_progress(started_at, now, HISTORY_INSERT_TRANSITION);
     -HISTORY_ROW_PITCH * (1.0 - progress)
@@ -11482,12 +12254,8 @@ fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> 
     startup_animation_pending || phase_needs_frame(phase)
 }
 
-fn animation_timer_needed(
-    visible: bool,
-    popup_transition_active: bool,
-    content_animation_needs_frame: bool,
-) -> bool {
-    popup_transition_active || (visible && content_animation_needs_frame)
+fn animation_timer_needed(visible: bool, content_animation_needs_frame: bool) -> bool {
+    visible && content_animation_needs_frame
 }
 
 fn result_overlay_fallback_needs_frame(phase: &MainPhase, composition_ready: bool) -> bool {
@@ -11524,18 +12292,11 @@ unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
     // that activation handoff as an outside click that should close the UI.
     app.main_activated = false;
     app.popup_activation_grace_until = Some(now + POPUP_ACTIVATION_GRACE);
-    let from = popup_opacity_at(app, now);
-    app.popup_opacity = from;
-    app.popup_transition = Some(PopupOpacityTransition {
-        started_at: now,
-        from,
-        to: 255,
-        hide_when_complete: false,
-    });
+    app.popup_opacity = 255;
     app.visible = true;
     set_auto_recognition_context(app, RecognitionContext::Foreground);
     if let Some(renderer) = renderer.as_deref_mut() {
-        if let Err(error) = renderer.set_popup_opacity(from) {
+        if let Err(error) = renderer.set_popup_opacity(255) {
             app.message = Some(format!("Popup opacity setup failed: {error}"));
         }
         match renderer.start_startup_logo() {
@@ -11756,6 +12517,17 @@ unsafe extern "system" fn window_proc(
         }
         return open_settings_after_wndproc((*data_ptr).app);
     }
+    if message == WM_GLOBAL_SHORTCUT_CHANGED || message == WM_GLOBAL_SHORTCUT_CAPTURE {
+        let data_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowData;
+        if data_ptr.is_null() || (*data_ptr).kind != WindowKind::Main {
+            return LRESULT(0);
+        }
+        let app_ptr = (*data_ptr).app;
+        if message == WM_GLOBAL_SHORTCUT_CHANGED {
+            return update_global_shortcut_after_wndproc(app_ptr, wparam.0 as u32, lparam.0 as u32);
+        }
+        return set_global_shortcut_capture_after_wndproc(app_ptr, wparam.0 != 0);
+    }
 
     let Some(data) = window_data(hwnd) else {
         return DefWindowProcW(hwnd, message, wparam, lparam);
@@ -11763,6 +12535,17 @@ unsafe extern "system" fn window_proc(
     let app = &mut *data.app;
 
     match message {
+        WM_HOTKEY
+            if data.kind == WindowKind::Main
+                && app.global_shortcut_registration_id == Some(wparam.0 as i32) =>
+        {
+            if !app.visible {
+                show_main(app, data.renderer.as_mut());
+            }
+            start_capture(app, CaptureMode::Manual);
+            update_visible_windows(app);
+            LRESULT(0)
+        }
         _ if message == app.taskbar_created_message && app.taskbar_created_message != 0 => {
             restore_tray_icon(hwnd);
             LRESULT(0)
@@ -11794,8 +12577,10 @@ unsafe extern "system" fn window_proc(
                         .get(&identity.track.display_id)
                         .is_some_and(|(source, cached)| {
                             !should_replace_cached_artwork(
-                                Some((*source, cached.fingerprint)),
+                                Some((*source, cached.width, cached.height, cached.fingerprint)),
                                 ready.source,
+                                pixels.width,
+                                pixels.height,
                                 pixels.fingerprint,
                             )
                         });
@@ -11877,6 +12662,34 @@ unsafe extern "system" fn window_proc(
                 update_visible_windows(app);
             }
             LRESULT(0)
+        }
+        WM_LANGUAGE_CHANGED if data.kind == WindowKind::Main => {
+            let Some(language) = UiLanguage::from_id(wparam.0 as u32) else {
+                return LRESULT(0);
+            };
+            if let Err(error) = save_ui_language_preference(language) {
+                eprintln!(
+                    "OpenShazam could not save the display language (Windows error {error})."
+                );
+                return LRESULT(0);
+            }
+            set_ui_language(language);
+            refresh_history_date_labels(&mut app.history);
+            if let Some(renderer) = data.renderer.as_mut() {
+                match renderer.update_composition(animation_snapshot(app)) {
+                    Ok(()) => {
+                        app.status_text_composition_ready = renderer.status_text_composition_enabled
+                    }
+                    Err(error) => {
+                        app.status_text_composition_ready = false;
+                        app.message = Some(format!(
+                            "Windows Composition language update failed: {error}"
+                        ));
+                    }
+                }
+            }
+            update_visible_windows(app);
+            LRESULT(1)
         }
         WM_CREATE => {
             let dpi = GetDpiForWindow(hwnd).max(96);
@@ -12110,68 +12923,59 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_TIMER if data.kind == WindowKind::Main && wparam.0 == TIMER_ANIMATION => {
-            if app.visible || app.popup_transition.is_some() {
+            if app.visible {
                 let now = Instant::now();
-                let fading = app.popup_transition.is_some();
-                if fading {
-                    advance_popup_transition(app, now);
-                    if let Some(renderer) = data.renderer.as_mut() {
-                        if let Err(error) = renderer.set_popup_opacity(app.popup_opacity) {
-                            app.message = Some(format!("Popup opacity update failed: {error}"));
-                        }
-                    }
-                    if app.visible || app.popup_transition.is_some() {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
+                let history_scroll_moved = advance_history_scroll(app, now);
+                if history_scroll_moved {
+                    app.hovered_row = unsafe { hovered_history_row_for_cursor(app) };
                 }
-                if app.visible {
-                    let composition_frame_needed =
-                        animation_needs_frame(&app.phase, app.startup_animation_pending);
-                    if composition_frame_needed {
-                        if let Some(renderer) = data.renderer.as_mut() {
-                            match renderer.update_composition(animation_snapshot(app)) {
-                                Ok(()) => {
-                                    app.status_text_composition_ready =
-                                        renderer.status_text_composition_enabled;
-                                    if app.startup_animation_pending {
-                                        app.startup_animation_pending = renderer
-                                            .composition
-                                            .as_ref()
-                                            .is_some_and(|scene| !scene.startup_logo_complete());
-                                    }
+                let composition_frame_needed =
+                    animation_needs_frame(&app.phase, app.startup_animation_pending);
+                if composition_frame_needed {
+                    if let Some(renderer) = data.renderer.as_mut() {
+                        match renderer.update_composition(animation_snapshot(app)) {
+                            Ok(()) => {
+                                app.status_text_composition_ready =
+                                    renderer.status_text_composition_enabled;
+                                if app.startup_animation_pending {
+                                    app.startup_animation_pending = renderer
+                                        .composition
+                                        .as_ref()
+                                        .is_some_and(|scene| !scene.startup_logo_complete());
                                 }
-                                Err(error) => {
-                                    app.status_text_composition_ready = false;
-                                    app.message =
-                                        Some(format!("Windows Composition update failed: {error}"));
-                                    app.startup_animation_pending = false;
-                                }
+                            }
+                            Err(error) => {
+                                app.status_text_composition_ready = false;
+                                app.message =
+                                    Some(format!("Windows Composition update failed: {error}"));
+                                app.startup_animation_pending = false;
                             }
                         }
                     }
-                    let status_text_animating = app
-                        .status_alternator
-                        .is_some_and(|status| status.animating(now));
-                    let result_overlay_composition_ready = data
-                        .renderer
-                        .as_ref()
-                        .is_some_and(|renderer| renderer.result_overlay_matches_current(app));
-                    app.result_overlay_composition_ready = result_overlay_composition_ready;
-                    let history_row_animating = !app.history_composition_ready
-                        && app.history_transition.is_some_and(|transition| {
-                            now.saturating_duration_since(transition.started_at)
-                                < HISTORY_INSERT_TRANSITION
-                        });
-                    if history_row_animating
-                        || animation_needs_d2d_redraw(
-                            &app.phase,
-                            status_text_animating,
-                            app.status_text_composition_ready,
-                            result_overlay_composition_ready,
-                        )
-                    {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
+                }
+                let status_text_animating = app
+                    .status_alternator
+                    .is_some_and(|status| status.animating(now));
+                let result_overlay_composition_ready = data
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.result_overlay_matches_current(app));
+                app.result_overlay_composition_ready = result_overlay_composition_ready;
+                let history_row_animating = history_transition_requires_d2d_frame(
+                    app.history_transition,
+                    now,
+                    app.history_composition_ready,
+                );
+                if history_scroll_moved
+                    || history_row_animating
+                    || animation_needs_d2d_redraw(
+                        &app.phase,
+                        status_text_animating,
+                        app.status_text_composition_ready,
+                        result_overlay_composition_ready,
+                    )
+                {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 sync_main_timers(app);
             }
@@ -12269,25 +13073,27 @@ unsafe extern "system" fn window_proc(
             }
 
             let delta = (high_word(wparam.0 as isize) as i16) as f32;
+            let current_target = app
+                .history_scroll_animation
+                .map_or(app.scroll_offset, |animation| animation.to_offset);
             let next = history_scroll_offset_after_wheel(
-                app.scroll_offset,
+                current_target,
                 delta,
                 system_wheel_scroll_lines(),
                 app.history.len(),
                 HISTORY_HEIGHT as f32,
             );
-            if next != app.scroll_offset {
-                app.scroll_offset = next;
-                app.hovered_row = history_row_index_at(
-                    y,
-                    history_top,
-                    history_top + HISTORY_HEIGHT as f32,
-                    app.history.len(),
-                    app.history_transition,
-                    app.scroll_offset,
-                    Instant::now(),
-                );
+            if (next - app.scroll_offset).abs() > f32::EPSILON {
+                app.history_scroll_animation = Some(HistoryScrollAnimation {
+                    started_at: Instant::now(),
+                    from_offset: app.scroll_offset,
+                    to_offset: next,
+                });
+                request_history_artwork_at_offset(app, next);
+                sync_main_timers(app);
                 let _ = InvalidateRect(Some(hwnd), None, false);
+            } else if app.history_scroll_animation.take().is_some() {
+                sync_main_timers(app);
             }
             LRESULT(0)
         }
@@ -12482,12 +13288,92 @@ unsafe fn load_application_icon(instance: HINSTANCE) -> HICON {
         .unwrap_or_default()
 }
 
+unsafe fn set_shortcut_string_property(
+    property_store: &IPropertyStore,
+    key: &windows::Win32::Foundation::PROPERTYKEY,
+    value: &str,
+) -> windows::core::Result<()> {
+    let value = wide(value);
+    let allocation = CoTaskMemAlloc(value.len() * size_of::<u16>()).cast::<u16>();
+    if allocation.is_null() {
+        return Err(Error::from_thread());
+    }
+    allocation.copy_from_nonoverlapping(value.as_ptr(), value.len());
+
+    let mut variant = PROPVARIANT {
+        Anonymous: PROPVARIANT_0 {
+            Anonymous: std::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
+                vt: VT_LPWSTR,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: PROPVARIANT_0_0_0 {
+                    pwszVal: PWSTR(allocation),
+                },
+            }),
+        },
+    };
+    let result = property_store
+        .SetValue(key, &variant)
+        .and_then(|()| property_store.Commit());
+    // PROPVARIANT owns its VT_LPWSTR allocation. Let the Windows API clear
+    // the full variant so its allocator and nested union layout stay paired.
+    let clear_result = PropVariantClear(&mut variant);
+    result?;
+    clear_result
+}
+
+unsafe fn register_notification_application() -> windows::core::Result<()> {
+    let executable_path = std::env::current_exe()
+        .map_err(|_| Error::from_thread())?
+        .to_string_lossy()
+        .into_owned();
+    let executable = wide(&executable_path);
+    let executable_parent = std::path::Path::new(&executable_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_string_lossy()
+        .into_owned();
+    let working_directory = wide(&executable_parent);
+    let arguments = wide("ui");
+    let icon_resource = format!("{executable_path},-{APP_ICON_RESOURCE_ID}");
+
+    let programs = SHGetKnownFolderPath(&FOLDERID_Programs, KNOWN_FOLDER_FLAG(0), None)?;
+    let programs_path = PCWSTR(programs.0).to_string();
+    CoTaskMemFree(Some(programs.0.cast()));
+    let programs_path = programs_path?;
+    let shortcut_path = wide(&format!("{programs_path}\\OpenShazam.lnk"));
+
+    let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+    link.SetPath(PCWSTR(executable.as_ptr()))?;
+    link.SetArguments(PCWSTR(arguments.as_ptr()))?;
+    link.SetWorkingDirectory(PCWSTR(working_directory.as_ptr()))?;
+    link.SetIconLocation(PCWSTR(executable.as_ptr()), 0)?;
+
+    let property_store: IPropertyStore = link.cast()?;
+    set_shortcut_string_property(&property_store, &PKEY_AppUserModel_ID, APP_USER_MODEL_ID)?;
+    set_shortcut_string_property(
+        &property_store,
+        &PKEY_AppUserModel_RelaunchIconResource,
+        &icon_resource,
+    )?;
+
+    let persist_file: IPersistFile = link.cast()?;
+    persist_file.Save(PCWSTR(shortcut_path.as_ptr()), true)
+}
+
 /// Start the resident Windows UI. The hidden notification-area host is kept
 /// alive when the popup is closed; its draw path sleeps until an event arrives.
 pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let app_user_model_id = wide(APP_USER_MODEL_ID);
+        if let Err(error) =
+            SetCurrentProcessExplicitAppUserModelID(PCWSTR(app_user_model_id.as_ptr()))
+        {
+            eprintln!("OpenShazam could not set its Windows notification identity: {error}");
+        }
         let silent_startup = start_hidden || is_startup_task_activation();
         let (instance_mutex, already_running) = acquire_single_instance_mutex()?;
         if already_running {
@@ -12502,6 +13388,9 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         let _instance_mutex = instance_mutex;
+        if let Err(error) = register_notification_application() {
+            eprintln!("OpenShazam could not register its Windows notification icon: {error}");
+        }
         let instance = GetModuleHandleW(None)?;
         let class_name = wide(CLASS_NAME);
         let class = window_class(
@@ -12522,6 +13411,19 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
         let compositor = Compositor::new()?;
         let theme_settings = UISettings::new()?;
         let theme_preference = load_theme_preference();
+        let language = load_ui_language_preference();
+        set_ui_language(language);
+        let global_shortcut = load_global_shortcut();
+        let (history_store, history) = match HistoryStore::open() {
+            Ok((store, entries)) => (Some(store), restore_history_tracks(entries)),
+            Err(error) => {
+                eprintln!(
+                    "OpenShazam could not restore persistent history; new results remain in memory only: {error}"
+                );
+                (None, Vec::new())
+            }
+        };
+        let next_display_id = history.len() as u64 + 1;
         let (system_theme, os_foreground) = theme_from_ui_settings(&theme_settings)?;
         let theme = theme_preference.resolve(system_theme);
         let system_foreground = match theme_preference {
@@ -12533,6 +13435,9 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
         let app = Box::new(AppState {
             main_hwnd: HWND::default(),
             taskbar_created_message,
+            global_shortcut,
+            global_shortcut_registration_id: None,
+            global_shortcut_capture_suspended: false,
             settings_host: None,
             settings_opening: false,
             about_hwnd: HWND::default(),
@@ -12545,10 +13450,11 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             theme_changed_token: None,
             system_foreground,
             phase: MainPhase::Ready,
-            history: Vec::new(),
+            history,
             history_transition: None,
             history_composition_ready: false,
             scroll_offset: 0.0,
+            history_scroll_animation: None,
             hovered_row: None,
             mouse_leave_tracking: false,
             ui_levels: UiLevels::default(),
@@ -12558,7 +13464,6 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             theme_generation: 0,
             visible: false,
             popup_opacity: 0,
-            popup_transition: None,
             main_activated: false,
             popup_activation_grace_until: None,
             deactivation_hide_pending: false,
@@ -12577,12 +13482,13 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             single_click_pending: false,
             recognition_controller: None,
             recognition_session: None,
+            history_store,
             auto_candidate_dedupe: VecDeque::new(),
             controller_sequence: 0,
             dropped_notifications: 0,
             status_alternator: Some(StatusTextAlternator::ready(Instant::now())),
             success_wave_frame: None,
-            next_display_id: 1,
+            next_display_id,
             next_artwork_request_id: 1,
             artwork_generations: HashMap::new(),
             active_artwork_requests: HashMap::new(),
@@ -12603,6 +13509,7 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             false,
         )?;
         (*app_ptr).main_hwnd = hwnd;
+        request_history_artwork_at_offset(&mut *app_ptr, 0.0);
         let callback_hwnd = hwnd.0 as isize;
         let theme_changed_handler =
             TypedEventHandler::<UISettings, windows::core::IInspectable>::new(move |_, _| {
@@ -12633,6 +13540,18 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             let _ = DestroyWindow(hwnd);
             drop(Box::from_raw(app_ptr));
             return Err(Box::new(error));
+        }
+        match register_global_shortcut(hwnd, GLOBAL_SHORTCUT_ID_PRIMARY, (*app_ptr).global_shortcut)
+        {
+            Ok(()) => {
+                (*app_ptr).global_shortcut_registration_id = Some(GLOBAL_SHORTCUT_ID_PRIMARY);
+            }
+            Err(error) => {
+                eprintln!("Could not register global Shazam shortcut (error {error}).");
+                (*app_ptr).message = Some(format!(
+                    "Could not register global Shazam shortcut (Windows error {error})."
+                ));
+            }
         }
         // Let Explorer finish publishing the notification icon before asking
         // Shell_NotifyIconGetRect for its anchor. `ui` opens the popup on
@@ -12674,6 +13593,9 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
         // Shutdown WinUI XAML before releasing the STA and compositor.
         (*app_ptr).settings_host.take();
+        if let Some(registration_id) = (*app_ptr).global_shortcut_registration_id.take() {
+            let _ = UnregisterHotKey(Some((*app_ptr).main_hwnd), registration_id);
+        }
         if !(*app_ptr).about_hwnd.0.is_null() {
             let _ = DestroyWindow((*app_ptr).about_hwnd);
         }
@@ -12867,17 +13789,17 @@ mod tests {
         copy_notification_text, copy_panel_pixels_into, create_text_format_with_locale,
         d2d_color_from_system, directwrite_locale, fallback_match_artwork_rect,
         finish_active_artwork_request, gradient_origin_transform, header_fill_scope,
-        history_artwork_frame, history_composition_offset, history_row_top, history_text_rects,
-        history_title_color, inverse_circle_clip_radii, is_offline_failure,
+        history_artwork_frame, history_composition_offset, history_first_insert_progress,
+        history_row_top, history_text_rects, history_title_color,
+        history_transition_requires_d2d_frame, inverse_circle_clip_radii, is_offline_failure,
         is_tray_activation_event, localized_ui_text, native_icon_layout, no_match_copy,
         no_match_icon_rect, page_url_for_display_id, phase_animation_state, phase_needs_frame_at,
-        phase_needs_timeout, point_in_rect, popup_base_color, popup_transition_opacity,
-        remember_auto_candidate_key, resolve_page_link, resolve_page_link_checked,
-        resolve_page_link_for_generation, result_artwork_rect, result_card_link_hit,
-        result_details_rects, result_gradient_colors, result_header_hit_test_contains,
-        result_header_visible_height, result_overlay_child_offset, result_overlay_failure_matches,
-        result_overlay_intersects_header, result_panel_draw_top, result_panel_top_at,
-        scale_notification_artwork_to_size, select_ui_language_from_multisz,
+        phase_needs_timeout, point_in_rect, popup_base_color, remember_auto_candidate_key,
+        resolve_page_link, resolve_page_link_checked, resolve_page_link_for_generation,
+        result_artwork_rect, result_card_link_hit, result_details_rects, result_gradient_colors,
+        result_header_hit_test_contains, result_header_visible_height, result_overlay_child_offset,
+        result_overlay_failure_matches, result_overlay_intersects_header, result_panel_draw_top,
+        result_panel_top_at, scale_notification_artwork_to_size, select_ui_language_from_multisz,
         should_defer_hide_for_tray_activation, should_hide_popup_on_deactivation,
         should_replace_cached_artwork, should_show_initial_popup, should_start_startup_logo,
         status_text_snapshot, theme_from_foreground_rgb, timeout_copy, ui_model,
@@ -12962,21 +13884,19 @@ mod tests {
     }
 
     #[test]
-    fn ui234_result_card_is_rasterized_once_then_composition_moves_only_its_visual() {
+    fn ui234_result_card_uses_the_single_d2d_popup_mask_to_avoid_edge_fringe() {
         let body_top = 10.0;
+        assert!(!super::COMPOSITION_RESULT_CARD_ENABLED);
         assert_eq!(
-            result_panel_draw_top(Some(body_top - TOP_HEIGHT as f32), body_top, true, false),
-            Some(body_top)
+            result_panel_draw_top(Some(body_top - TOP_HEIGHT as f32), false),
+            Some(body_top - TOP_HEIGHT as f32)
         );
+        assert_eq!(result_panel_draw_top(Some(body_top + 90.0), true), None);
         assert_eq!(
-            result_panel_draw_top(Some(body_top + 90.0), body_top, true, true),
-            None
-        );
-        assert_eq!(
-            result_panel_draw_top(Some(body_top + 90.0), body_top, false, false),
+            result_panel_draw_top(Some(body_top + 90.0), false),
             Some(body_top + 90.0)
         );
-        assert_eq!(result_panel_draw_top(None, body_top, true, false), None);
+        assert_eq!(result_panel_draw_top(None, true), None);
     }
 
     #[test]
@@ -13959,26 +14879,36 @@ mod tests {
         assert!(should_replace_cached_artwork(
             None,
             ArtworkSource::Standard,
+            1,
+            1,
             first
         ));
         assert!(!should_replace_cached_artwork(
-            Some((ArtworkSource::Standard, first)),
+            Some((ArtworkSource::Standard, 1, 1, first)),
             ArtworkSource::Standard,
+            1,
+            1,
             first,
         ));
         assert!(should_replace_cached_artwork(
-            Some((ArtworkSource::Standard, first)),
+            Some((ArtworkSource::Standard, 1, 1, first)),
             ArtworkSource::Standard,
+            1,
+            1,
             refreshed,
         ));
         assert!(should_replace_cached_artwork(
-            Some((ArtworkSource::Standard, first)),
+            Some((ArtworkSource::Standard, 1, 1, first)),
             ArtworkSource::HighQuality,
+            1,
+            1,
             first,
         ));
         assert!(!should_replace_cached_artwork(
-            Some((ArtworkSource::HighQuality, refreshed)),
+            Some((ArtworkSource::HighQuality, 2, 2, refreshed)),
             ArtworkSource::Standard,
+            1,
+            1,
             first,
         ));
     }
@@ -14505,6 +15435,63 @@ mod tests {
     }
 
     #[test]
+    fn first_history_insert_slides_while_the_empty_skeleton_fades() {
+        let started_at = std::time::Instant::now();
+        let first_row = Some(HistoryMutationTransition {
+            started_at,
+            event: HistoryMutationEvent::Insert {
+                index: 0,
+                previous_count: 0,
+            },
+        });
+
+        assert_eq!(
+            history_first_insert_progress(first_row, started_at),
+            Some(0.0)
+        );
+        assert_eq!(
+            history_first_insert_progress(
+                first_row,
+                started_at + std::time::Duration::from_millis(125)
+            ),
+            Some(0.5)
+        );
+        assert_eq!(
+            history_first_insert_progress(
+                first_row,
+                started_at + std::time::Duration::from_millis(250)
+            ),
+            Some(1.0)
+        );
+        assert!(history_transition_requires_d2d_frame(
+            first_row, started_at, true
+        ));
+        assert!(history_transition_requires_d2d_frame(
+            first_row,
+            started_at + std::time::Duration::from_millis(250),
+            true
+        ));
+        assert!(!history_transition_requires_d2d_frame(
+            first_row,
+            started_at + std::time::Duration::from_millis(266),
+            true
+        ));
+
+        let later_insert = Some(HistoryMutationTransition {
+            started_at,
+            event: HistoryMutationEvent::Insert {
+                index: 0,
+                previous_count: 1,
+            },
+        });
+        assert!(!history_transition_requires_d2d_frame(
+            later_insert,
+            started_at,
+            true
+        ));
+    }
+
+    #[test]
     fn windows_history_scroll_range_uses_content_height_not_row_count() {
         assert_eq!(super::history_content_height(0), 0.0);
         assert_eq!(super::history_max_scroll_offset(0, 430.0), 0.0);
@@ -14855,12 +15842,41 @@ mod tests {
                     &[11, 22, 33, 255]
                 );
                 assert!(history.matches_key(key));
+
+                let first_started_at = Instant::now();
+                let first_key = HistoryCompositionKey {
+                    started_at: first_started_at,
+                    ..key
+                };
+                history.capture_and_animate(
+                    &compositor,
+                    &previous_frame,
+                    &row_pixels,
+                    history_top,
+                    10.0,
+                    96,
+                    HistoryMutationTransition {
+                        started_at: first_started_at,
+                        event: HistoryMutationEvent::Insert {
+                            index: 0,
+                            previous_count: 0,
+                        },
+                    },
+                    first_key,
+                    first_started_at,
+                )?;
+                assert_eq!(&history.pixels[..4], &[44, 55, 66, 255]);
+                assert_eq!(
+                    &history.pixels[old_row_start + 3 * 4..old_row_start + 4 * 4],
+                    &[0, 0, 0, 0]
+                );
+                assert!(history.matches_key(first_key));
                 history.resize(120)?;
                 history.set_viewport(120, 10.0)?;
                 assert!(history.size.width > 380);
                 assert!(history.size.height > (HISTORY_HEIGHT as f32 + HISTORY_ROW_PITCH) as u32);
                 history.hide()?;
-                assert!(!history.matches_key(key));
+                assert!(!history.matches_key(first_key));
                 Ok(())
             })();
             let _ = super::DestroyWindow(hwnd);
@@ -15552,23 +16568,11 @@ mod tests {
     }
 
     #[test]
-    fn hidden_popup_skips_content_animation_ticks_but_finishes_popup_transition() {
-        assert!(!animation_timer_needed(false, false, true));
-        assert!(!animation_timer_needed(false, false, false));
-        assert!(animation_timer_needed(true, false, true));
-        assert!(animation_timer_needed(false, true, false));
-    }
-
-    #[test]
-    fn popup_open_fade_becomes_visible_quickly_and_keeps_its_endpoint() {
-        assert_eq!(popup_transition_opacity(0, 255, 0.0), 0);
-        assert!(popup_transition_opacity(0, 255, 0.1) > 60);
-        assert!(popup_transition_opacity(0, 255, 0.35) > 180);
-        assert_eq!(popup_transition_opacity(0, 255, 1.0), 255);
-
-        assert!(popup_transition_opacity(255, 0, 0.1) < 200);
-        assert!(popup_transition_opacity(255, 0, 0.35) < 80);
-        assert_eq!(popup_transition_opacity(255, 0, 1.0), 0);
+    fn popup_visibility_does_not_schedule_opacity_animation_frames() {
+        assert!(!animation_timer_needed(false, true));
+        assert!(!animation_timer_needed(false, false));
+        assert!(animation_timer_needed(true, true));
+        assert!(!animation_timer_needed(true, false));
     }
 
     #[test]

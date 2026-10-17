@@ -1,4 +1,6 @@
 /target/
+/apps/openshazam/settings-host/Generated Files/
+/apps/openshazam/settings-host/packages/
 **/.build/
 /.DS_Store
 **/.DS_Store
@@ -18,3 +20,7 @@
 *.shazamsignature
 *.dSYM/
 /tests/fixtures/private/
+/dist/windows-x64/openshazam.exe
+/dist/windows-x64/OpenShazam.SettingsHost.dll
+/dist/windows-x64/Microsoft.WindowsAppRuntime.Bootstrap.dll
+/dist/windows-x64/*.pri

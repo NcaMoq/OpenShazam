@@ -78,7 +78,8 @@ public static class OpenShazamSettingsHostSmoke
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void BootstrapShutdown();
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-    private delegate int SettingsShow(IntPtr owner, uint appearanceMode);
+    private delegate int SettingsShow(IntPtr owner, uint appearanceMode,
+        uint shortcutModifiers, uint shortcutKey);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void SettingsShutdown();
 
@@ -214,7 +215,7 @@ public static class OpenShazamSettingsHostSmoke
                 if (owner == IntPtr.Zero) throw new InvalidOperationException("Create owner window: " + Marshal.GetLastWin32Error());
 
                 stage = "initialize and show XAML host";
-                hr = show(owner, 0); // Start in "Use system setting" mode.
+                hr = show(owner, 0, 0x03, 0x53); // System theme, Ctrl+Alt+S.
                 if (hr < 0) Marshal.ThrowExceptionForHR(hr);
 
                 stage = "pump hidden desktop for XAML callbacks";

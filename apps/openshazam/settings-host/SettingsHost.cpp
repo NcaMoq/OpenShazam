@@ -2,16 +2,30 @@
 // No second recognition controller, process, webview, or legacy Win32 settings UI.
 #include "pch.h"
 #include <appmodel.h>
+#include <shellapi.h>
 #include <algorithm>
+#include <cwchar>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.System.h>
 #include <winrt/Microsoft.UI.Windowing.h>
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
+#include <winrt/Microsoft.UI.Xaml.Input.h>
 
 #pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Shell32.lib")
+
+struct OpenShazamHistoryItem
+{
+    wchar_t const* title;
+    wchar_t const* artist;
+    wchar_t const* recognizedAt;
+    wchar_t const* pageUrl;
+};
 
 namespace x = winrt::Microsoft::UI::Xaml;
 namespace controls = winrt::Microsoft::UI::Xaml::Controls;
@@ -60,18 +74,28 @@ namespace
     constexpr wchar_t kSettingsClass[] = L"OpenShazamWinUI3Preferences";
     constexpr wchar_t kStartupTask[] = L"OpenShazamStartup";
     constexpr UINT WM_APPEARANCE_CHANGED = WM_APP + 0x48;
+    constexpr UINT WM_GLOBAL_SHORTCUT_CHANGED = WM_APP + 0x4a;
+    constexpr UINT WM_GLOBAL_SHORTCUT_CAPTURE = WM_APP + 0x4b;
+    constexpr UINT WM_LANGUAGE_CHANGED = WM_APP + 0x4c;
     constexpr uint32_t kAppearanceSystem = 0;
     constexpr uint32_t kAppearanceLight = 1;
     constexpr uint32_t kAppearanceDark = 2;
+    constexpr uint32_t kLanguageJapanese = 1;
+    constexpr uint32_t kLanguageEnglish = 2;
+    constexpr double kSettingsContentGutterDips = 24.0;
+    constexpr double kSettingsCardPaddingDips = 16.0;
+    constexpr double kSettingsSectionSpacingDips = 12.0;
+    constexpr double kSettingsInlineMessageSpacingDips = 8.0;
     constexpr double kSettingsControlLaneWidthDips = 208.0;
-    constexpr double kAppearanceSelectorWidthDips = 88.0;
+    constexpr double kAppearanceSelectorWidthDips = 120.0;
     constexpr double kStartupControlGroupWidthDips = 94.0;
-    constexpr int kWidthDips = 720;
-    constexpr int kHeightDips = 380;
-    constexpr int kMinimumClientWidthDips = 690;
-    constexpr int kMinimumClientHeightDips = 320;
+    constexpr int kWidthDips = 1040;
+    constexpr int kHeightDips = 680;
+    constexpr int kMinimumClientWidthDips = 800;
+    constexpr int kMinimumClientHeightDips = 480;
     constexpr wchar_t kStartupRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kStartupRunValue[] = L"OpenShazam";
+    uint32_t g_uiLanguage{};
 
     enum class PackageIdentityStatus
     {
@@ -240,7 +264,19 @@ namespace
 
     bool IsJapanese() noexcept
     {
+        if (g_uiLanguage == kLanguageJapanese) return true;
+        if (g_uiLanguage == kLanguageEnglish) return false;
         return PRIMARYLANGID(::GetUserDefaultUILanguage()) == LANG_JAPANESE;
+    }
+
+    uint32_t LanguageFromComboIndex(int32_t index) noexcept
+    {
+        return index == 0 ? kLanguageJapanese : kLanguageEnglish;
+    }
+
+    int32_t ComboIndexFromLanguage(uint32_t language) noexcept
+    {
+        return language == kLanguageJapanese ? 0 : 1;
     }
 
     winrt::hstring Localized(wchar_t const* en, wchar_t const* ja)
@@ -248,26 +284,281 @@ namespace
         return IsJapanese() ? winrt::hstring(ja) : winrt::hstring(en);
     }
 
+    std::wstring FormatShortcut(uint32_t modifiers, uint32_t key)
+    {
+        std::wstring label;
+        auto append = [&](wchar_t const* part) {
+            if (!label.empty()) label += L" + ";
+            label += part;
+        };
+        if (modifiers & MOD_CONTROL) append(L"Ctrl");
+        if (modifiers & MOD_ALT) append(L"Alt");
+        if (modifiers & MOD_SHIFT) append(L"Shift");
+        if (modifiers & MOD_WIN) append(L"Win");
+
+        wchar_t keyName[128]{};
+        const auto scanCode = ::MapVirtualKeyW(key, MAPVK_VK_TO_VSC);
+        LONG keyNameParam = static_cast<LONG>(scanCode << 16);
+        if (key == VK_LEFT || key == VK_UP || key == VK_RIGHT || key == VK_DOWN ||
+            key == VK_PRIOR || key == VK_NEXT || key == VK_END || key == VK_HOME ||
+            key == VK_INSERT || key == VK_DELETE || key == VK_DIVIDE || key == VK_NUMLOCK)
+            keyNameParam |= 1L << 24;
+        if (::GetKeyNameTextW(keyNameParam, keyName, static_cast<int>(std::size(keyName))) == 0)
+            std::swprintf(keyName, std::size(keyName), L"0x%02X", key);
+        append(keyName);
+        return label;
+    }
+
+    struct HistoryRow
+    {
+        std::wstring title;
+        std::wstring artist;
+        std::wstring recognizedAt;
+        std::wstring pageUrl;
+    };
+
     struct SettingsState
     {
         controls::ToggleSwitch toggle{ nullptr };
         controls::TextBlock startupValue{ nullptr };
+        controls::TextBlock settingsPageTitle{ nullptr };
+        controls::TextBlock startupTitle{ nullptr };
+        controls::TextBlock startupDescription{ nullptr };
+        controls::TextBlock appearanceTitle{ nullptr };
+        controls::TextBlock appearanceDescription{ nullptr };
+        controls::TextBlock languageTitle{ nullptr };
+        controls::TextBlock languageDescription{ nullptr };
+        controls::TextBlock shortcutTitle{ nullptr };
+        controls::TextBlock shortcutDescription{ nullptr };
         controls::InfoBar startupInfoBar{ nullptr };
         controls::ComboBox appearance{ nullptr };
-        controls::ScrollViewer viewer{ nullptr };
+        controls::ComboBox language{ nullptr };
+        controls::NavigationView navigation{ nullptr };
+        controls::Button shortcutButton{ nullptr };
+        controls::InfoBar shortcutInfoBar{ nullptr };
+        controls::ScrollViewer settingsViewer{ nullptr };
+        controls::ScrollViewer historyViewer{ nullptr };
+        controls::Grid pageHost{ nullptr };
+        controls::StackPanel settingsContent{ nullptr };
+        controls::StackPanel historyContent{ nullptr };
+        controls::StackPanel historyItems{ nullptr };
+        controls::TextBlock historyEmpty{ nullptr };
+        controls::TextBlock historyTitle{ nullptr };
+        controls::NavigationViewItem historyNavigationItem{ nullptr };
+        std::vector<HistoryRow> historySnapshot;
         controls::Border startupCard{ nullptr };
         controls::Border appearanceCard{ nullptr };
+        controls::Border languageCard{ nullptr };
+        controls::Border shortcutCard{ nullptr };
         controls::Grid startupRow{ nullptr };
         controls::Grid appearanceRow{ nullptr };
+        controls::Grid languageRow{ nullptr };
+        controls::Grid shortcutRow{ nullptr };
         HWND owner{};
         HWND hwnd{};
         uint32_t appearanceMode{ kAppearanceSystem };
+        uint32_t languageId{ kLanguageEnglish };
+        uint32_t shortcutModifiers{ MOD_CONTROL | MOD_ALT };
+        uint32_t shortcutKey{ 'S' };
         bool startupLastKnownEnabled{};
         bool startupHasKnownValue{};
         bool startupLoading{ true };
         bool appearanceLoading{ true };
+        bool languageLoading{ true };
+        bool shortcutRecording{};
         bool alive{ true };
     };
+
+    void EndShortcutCaptureNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
+    {
+        if (!state || !state->shortcutRecording) return;
+        try
+        {
+            state->shortcutRecording = false;
+            if (state->shortcutButton)
+                state->shortcutButton.Content(winrt::box_value(FormatShortcut(
+                    state->shortcutModifiers, state->shortcutKey)));
+            if (state->owner && ::IsWindow(state->owner))
+                ::SendMessageW(state->owner, WM_GLOBAL_SHORTCUT_CAPTURE, FALSE, 0);
+        }
+        catch (...)
+        {
+            // Closing a WinUI island must not strand the app's hotkey disabled.
+            if (state->owner && ::IsWindow(state->owner))
+                ::SendMessageW(state->owner, WM_GLOBAL_SHORTCUT_CAPTURE, FALSE, 0);
+        }
+    }
+
+    void UpdateSettingsCardWidths(
+        std::shared_ptr<SettingsState> const& state,
+        double fullWidthDips)
+    {
+        if (!state || !state->navigation || !state->startupCard ||
+            !state->appearanceCard || !state->languageCard || !state->shortcutCard ||
+            !state->startupRow || !state->appearanceRow || !state->languageRow ||
+            !state->shortcutRow)
+            return;
+        const double paneWidth = state->navigation.IsPaneOpen()
+            ? state->navigation.OpenPaneLength()
+            : state->navigation.CompactPaneLength();
+        const double cardWidth = fullWidthDips - paneWidth - 48.0;
+        if (cardWidth <= 28.0) return;
+        state->startupCard.Width(cardWidth);
+        state->appearanceCard.Width(cardWidth);
+        state->languageCard.Width(cardWidth);
+        state->shortcutCard.Width(cardWidth);
+        const double rowWidth = cardWidth - 32.0;
+        state->startupRow.Width(rowWidth);
+        state->appearanceRow.Width(rowWidth);
+        state->languageRow.Width(rowWidth);
+        state->shortcutRow.Width(rowWidth);
+    }
+
+    void RefreshHistoryNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
+    {
+        if (!state || !state->alive || !state->historyItems || !state->historyEmpty)
+            return;
+        try
+        {
+            state->historyItems.Children().Clear();
+            const auto count = state->historySnapshot.size();
+            state->historyEmpty.Visibility(count == 0
+                ? x::Visibility::Visible : x::Visibility::Collapsed);
+
+            for (size_t index = 0; index < count; ++index)
+            {
+                auto card = markup::XamlReader::Load(
+                    LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="16" />)"
+                ).as<controls::Border>();
+                card.HorizontalAlignment(x::HorizontalAlignment::Stretch);
+
+                controls::Grid row;
+                row.ColumnSpacing(12.0);
+                auto iconColumn = controls::ColumnDefinition{};
+                iconColumn.Width(x::GridLengthHelper::FromValueAndType(24.0, x::GridUnitType::Pixel));
+                auto textColumn = controls::ColumnDefinition{};
+                textColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
+                auto linkColumn = controls::ColumnDefinition{};
+                linkColumn.Width(x::GridLengthHelper::FromValueAndType(32.0, x::GridUnitType::Pixel));
+                row.ColumnDefinitions().Append(iconColumn);
+                row.ColumnDefinitions().Append(textColumn);
+                row.ColumnDefinitions().Append(linkColumn);
+
+                controls::FontIcon musicIcon;
+                musicIcon.Glyph(L"\uE189"); // MusicNote
+                musicIcon.FontSize(18.0);
+                musicIcon.VerticalAlignment(x::VerticalAlignment::Center);
+                controls::Grid::SetColumn(musicIcon, 0);
+                row.Children().Append(musicIcon);
+
+                controls::StackPanel text;
+                text.Spacing(3.0);
+                text.VerticalAlignment(x::VerticalAlignment::Center);
+                controls::TextBlock title;
+                title.Text(state->historySnapshot[index].title);
+                title.FontSize(16.0);
+                title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+                title.TextWrapping(x::TextWrapping::NoWrap);
+                title.TextTrimming(x::TextTrimming::CharacterEllipsis);
+                automation::AutomationProperties::SetName(title, title.Text());
+                text.Children().Append(title);
+
+                controls::TextBlock artist;
+                artist.Text(state->historySnapshot[index].artist);
+                artist.FontSize(14.0);
+                artist.TextWrapping(x::TextWrapping::NoWrap);
+                artist.TextTrimming(x::TextTrimming::CharacterEllipsis);
+                automation::AutomationProperties::SetName(artist, artist.Text());
+                text.Children().Append(artist);
+
+                controls::TextBlock recognizedAt;
+                recognizedAt.Text(state->historySnapshot[index].recognizedAt);
+                recognizedAt.FontSize(12.0);
+                recognizedAt.Opacity(0.72);
+                recognizedAt.TextWrapping(x::TextWrapping::NoWrap);
+                recognizedAt.TextTrimming(x::TextTrimming::CharacterEllipsis);
+                text.Children().Append(recognizedAt);
+
+                controls::Grid::SetColumn(text, 1);
+                row.Children().Append(text);
+
+                auto const& pageUrl = state->historySnapshot[index].pageUrl;
+                if (!pageUrl.empty())
+                {
+                    controls::FontIcon openIcon;
+                    openIcon.Glyph(L"\uE8A7"); // OpenInNewWindow
+                    openIcon.FontSize(16.0);
+                    openIcon.HorizontalAlignment(x::HorizontalAlignment::Right);
+                    openIcon.VerticalAlignment(x::VerticalAlignment::Center);
+                    controls::Grid::SetColumn(openIcon, 2);
+                    row.Children().Append(openIcon);
+                }
+
+                card.Child(row);
+                if (!pageUrl.empty())
+                {
+                    controls::Button openPage;
+                    openPage.Padding(x::ThicknessHelper::FromUniformLength(0.0));
+                    openPage.BorderThickness(x::ThicknessHelper::FromUniformLength(0.0));
+                    openPage.Background(media::SolidColorBrush(
+                        winrt::Microsoft::UI::ColorHelper::FromArgb(0, 0, 0, 0)));
+                    openPage.HorizontalAlignment(x::HorizontalAlignment::Stretch);
+                    openPage.HorizontalContentAlignment(x::HorizontalAlignment::Stretch);
+                    openPage.Content(card);
+                    automation::AutomationProperties::SetName(openPage, Localized(
+                        L"Open Shazam page", L"Shazamページを開く"));
+                    automation::AutomationProperties::SetHelpText(
+                        openPage, winrt::hstring(state->historySnapshot[index].title));
+                    openPage.Click([pageUrl](auto const&, auto const&) {
+                        ::ShellExecuteW(nullptr, L"open", pageUrl.c_str(), nullptr, nullptr,
+                            SW_SHOWNORMAL);
+                    });
+                    state->historyItems.Children().Append(openPage);
+                }
+                else
+                {
+                    state->historyItems.Children().Append(card);
+                }
+
+            }
+        }
+        catch (...)
+        {
+            // Keep the Settings host responsive even if a history row cannot
+            // be materialized while the WinUI island is changing state.
+        }
+    }
+
+    void SetHistoryNoThrow(
+        std::shared_ptr<SettingsState> const& state,
+        OpenShazamHistoryItem const* items,
+        size_t count) noexcept
+    {
+        if (!state || !state->alive) return;
+        try
+        {
+            state->historySnapshot.clear();
+            if (!items) count = 0;
+            count = (std::min)(count, size_t{100});
+            state->historySnapshot.reserve(count);
+            for (size_t index = 0; index < count; ++index)
+            {
+                state->historySnapshot.push_back({
+                    items[index].title ? items[index].title : L"",
+                    items[index].artist ? items[index].artist : L"",
+                    items[index].recognizedAt ? items[index].recognizedAt : L"",
+                    items[index].pageUrl ? items[index].pageUrl : L"",
+                });
+            }
+            if (state->hwnd && ::IsWindowVisible(state->hwnd) &&
+                state->historyViewer.Visibility() == x::Visibility::Visible)
+                RefreshHistoryNoThrow(state);
+        }
+        catch (...)
+        {
+            // A failed snapshot refresh should not affect recognition state.
+        }
+    }
 
     int ComboIndexFromAppearance(uint32_t mode) noexcept
     {
@@ -305,16 +596,154 @@ namespace
         }
     }
 
+    void ApplyLanguageToSettingsNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
+    {
+        if (!state || !state->alive) return;
+        try
+        {
+            const auto settingsText = Localized(L"Settings", L"\u8A2D\u5B9A");
+            if (state->settingsPageTitle)
+            {
+                state->settingsPageTitle.Text(settingsText);
+                automation::AutomationProperties::SetName(state->settingsPageTitle, settingsText);
+            }
+            if (state->startupTitle)
+            {
+                const auto text = Localized(L"Open at startup", L"\u8D77\u52D5\u6642\u306B\u958B\u304F");
+                state->startupTitle.Text(text);
+                automation::AutomationProperties::SetName(state->startupTitle, text);
+            }
+            if (state->startupDescription)
+            {
+                const auto text = Localized(
+                    L"Start Shazam every time Windows starts",
+                    L"Windows\u3092\u8D77\u52D5\u3059\u308B\u305F\u3073\u306BShazam\u30A2\u30D7\u30EA\u3082\u8D77\u52D5");
+                state->startupDescription.Text(text);
+                automation::AutomationProperties::SetName(state->startupDescription, text);
+            }
+            if (state->appearanceTitle)
+            {
+                const auto text = Localized(L"Theme", L"\u30C6\u30FC\u30DE");
+                state->appearanceTitle.Text(text);
+                automation::AutomationProperties::SetName(state->appearanceTitle, text);
+            }
+            if (state->appearanceDescription)
+            {
+                const auto text = Localized(
+                    L"Choose the app theme to display",
+                    L"\u8868\u793A\u3059\u308B\u30A2\u30D7\u30EA\u306E\u30C6\u30FC\u30DE\u3092\u9078\u629E\u3057\u307E\u3059");
+                state->appearanceDescription.Text(text);
+                automation::AutomationProperties::SetName(state->appearanceDescription, text);
+            }
+            if (state->languageTitle)
+            {
+                const auto text = Localized(L"Language", L"\u8A00\u8A9E");
+                state->languageTitle.Text(text);
+                automation::AutomationProperties::SetName(state->languageTitle, text);
+                if (state->language)
+                    automation::AutomationProperties::SetName(state->language, text);
+            }
+            if (state->languageDescription)
+            {
+                const auto text = Localized(
+                    L"Choose the display language.",
+                    L"\u8868\u793A\u8A00\u8A9E\u3092\u9078\u629E\u3057\u307E\u3059");
+                state->languageDescription.Text(text);
+                automation::AutomationProperties::SetName(state->languageDescription, text);
+            }
+            if (state->shortcutTitle)
+            {
+                const auto text = Localized(L"Shortcut", L"\u30B7\u30E7\u30FC\u30C8\u30AB\u30C3\u30C8");
+                state->shortcutTitle.Text(text);
+                automation::AutomationProperties::SetName(state->shortcutTitle, text);
+            }
+            if (state->shortcutDescription)
+            {
+                const auto text = Localized(
+                    L"Enter the keyboard shortcut to start Shazam from anywhere in Windows.",
+                    L"Windows\u4E0A\u306E\u3069\u3053\u304B\u3089\u3067\u3082 Shazam \u3092\u958B\u59CB\u3057\u305F\u3044\u3068\u304D\u306B\u4F7F\u3046\u30AD\u30FC\u30DC\u30FC\u30C9\u30B7\u30E7\u30FC\u30C8\u30AB\u30C3\u30C8\u3092\u5165\u529B\u3057\u307E\u3057\u3087\u3046\u3002");
+                state->shortcutDescription.Text(text);
+                automation::AutomationProperties::SetName(state->shortcutDescription, text);
+            }
+
+            if (state->appearance)
+            {
+                state->appearanceLoading = true;
+                state->appearance.Items().Clear();
+                state->appearance.Items().Append(winrt::box_value(Localized(L"Light", L"\u30E9\u30A4\u30C8")));
+                state->appearance.Items().Append(winrt::box_value(Localized(L"Dark", L"\u30C0\u30FC\u30AF")));
+                state->appearance.Items().Append(winrt::box_value(Localized(L"System", L"\u30B7\u30B9\u30C6\u30E0")));
+                state->appearance.SelectedIndex(ComboIndexFromAppearance(state->appearanceMode));
+                state->appearanceLoading = false;
+            }
+            if (state->language)
+            {
+                state->languageLoading = true;
+                state->language.Items().Clear();
+                state->language.Items().Append(winrt::box_value(Localized(L"Japanese", L"\u65E5\u672C\u8A9E")));
+                state->language.Items().Append(winrt::box_value(Localized(L"English", L"\u82F1\u8A9E")));
+                state->language.SelectedIndex(ComboIndexFromLanguage(state->languageId));
+                state->languageLoading = false;
+            }
+
+            if (state->historyTitle)
+            {
+                const auto text = Localized(L"History", L"\u5C65\u6B74");
+                state->historyTitle.Text(text);
+                automation::AutomationProperties::SetName(state->historyTitle, text);
+                if (state->historyNavigationItem)
+                {
+                    state->historyNavigationItem.Content(winrt::box_value(text));
+                    automation::AutomationProperties::SetName(state->historyNavigationItem, text);
+                }
+            }
+            if (state->historyEmpty)
+            {
+                const auto text = Localized(
+                    L"No recognized songs",
+                    L"\u307E\u3060\u8A8D\u8B58\u3057\u305F\u66F2\u306F\u3042\u308A\u307E\u305B\u3093");
+                state->historyEmpty.Text(text);
+                automation::AutomationProperties::SetName(state->historyEmpty, text);
+            }
+            if (state->navigation)
+            {
+                if (auto settingsItem = state->navigation.SettingsItem()
+                        .try_as<controls::NavigationViewItem>())
+                {
+                    settingsItem.Content(winrt::box_value(settingsText));
+                    automation::AutomationProperties::SetName(settingsItem, settingsText);
+                }
+            }
+            UpdateStartupValueNoThrow(state);
+            if (state->shortcutButton && !state->shortcutRecording)
+                state->shortcutButton.Content(winrt::box_value(FormatShortcut(
+                    state->shortcutModifiers, state->shortcutKey)));
+            if (state->shortcutInfoBar && state->shortcutInfoBar.IsOpen())
+            {
+                state->shortcutInfoBar.Title(Localized(
+                    L"Shortcut is unavailable", L"\u3053\u306E\u30B7\u30E7\u30FC\u30C8\u30AB\u30C3\u30C8\u306F\u4F7F\u7528\u3067\u304D\u307E\u305B\u3093"));
+                state->shortcutInfoBar.Message(Localized(
+                    L"Choose a different key combination.",
+                    L"\u5225\u306E\u30AD\u30FC\u306E\u7D44\u307F\u5408\u308F\u305B\u3092\u6307\u5B9A\u3057\u3066\u304F\u3060\u3055\u3044\u3002"));
+            }
+        }
+        catch (...)
+        {
+            state->appearanceLoading = false;
+            state->languageLoading = false;
+        }
+    }
+
     void ApplyAppearanceToSettings(std::shared_ptr<SettingsState> const& state, uint32_t mode)
     {
         if (!state || !state->alive) return;
         if (mode > kAppearanceDark) mode = kAppearanceSystem;
         state->appearanceMode = mode;
-        if (state->viewer)
+        if (state->navigation)
         {
             auto theme = mode == kAppearanceDark ? x::ElementTheme::Dark :
                 mode == kAppearanceLight ? x::ElementTheme::Light : x::ElementTheme::Default;
-            state->viewer.RequestedTheme(theme);
+            state->navigation.RequestedTheme(theme);
         }
         ApplyTitleBarTheme(state->hwnd, mode);
     }
@@ -332,6 +761,7 @@ namespace
             state->startupInfoBar.Severity(severity);
             state->startupInfoBar.Title(title);
             state->startupInfoBar.Message(message);
+            state->startupInfoBar.Visibility(x::Visibility::Visible);
             state->startupInfoBar.IsOpen(true);
         }
         catch (...)
@@ -355,7 +785,11 @@ namespace
             state->toggle.IsOn(enabled);
             state->toggle.IsEnabled(canChange);
             state->startupLoading = false;
-            if (state->startupInfoBar) state->startupInfoBar.IsOpen(false);
+            if (state->startupInfoBar)
+            {
+                state->startupInfoBar.IsOpen(false);
+                state->startupInfoBar.Visibility(x::Visibility::Collapsed);
+            }
             UpdateStartupValueNoThrow(state);
         }
         catch (...)
@@ -532,8 +966,10 @@ namespace
         bool ownsQueue{};
         std::shared_ptr<SettingsState> state;
 
-        void Initialize(HWND parent)
+        void Initialize(HWND parent, uint32_t languageId)
         {
+            g_uiLanguage = languageId == kLanguageJapanese
+                ? kLanguageJapanese : kLanguageEnglish;
             owner = parent;
             // The native application has an STA COM apartment and a USER32
             // message pump. This is only created on the first Settings request.
@@ -586,6 +1022,7 @@ namespace
             state = std::make_shared<SettingsState>();
             state->owner = owner;
             state->hwnd = hwnd;
+            state->languageId = g_uiLanguage;
             island.Content(BuildContent());
             Layout();
             RefreshStartup(state);
@@ -593,22 +1030,27 @@ namespace
 
         x::UIElement BuildContent()
         {
-            controls::StackPanel stack;
-            stack.Spacing(8);
-            stack.Padding(x::ThicknessHelper::FromUniformLength(24));
+            state->settingsContent = controls::StackPanel{};
+            auto stack = state->settingsContent;
+            stack.Spacing(kSettingsSectionSpacingDips);
+            stack.Padding(x::ThicknessHelper::FromUniformLength(kSettingsContentGutterDips));
 
             controls::TextBlock pageTitle;
-            pageTitle.Text(L"\u8A2D\u5B9A");
+            pageTitle.Text(Localized(L"Settings", L"\u8A2D\u5B9A"));
             pageTitle.FontSize(28.0);
             pageTitle.FontWeight(winrt::Windows::UI::Text::FontWeights::Bold());
             pageTitle.HorizontalAlignment(x::HorizontalAlignment::Left);
-            pageTitle.Margin(x::ThicknessHelper::FromLengths(0.0, 0.0, 0.0, 8.0));
-            automation::AutomationProperties::SetName(pageTitle, L"\u8A2D\u5B9A");
+            pageTitle.Margin(x::ThicknessHelper::FromLengths(0.0, 0.0, 0.0, 0.0));
+            automation::AutomationProperties::SetName(
+                pageTitle, Localized(L"Settings", L"\u8A2D\u5B9A"));
+            state->settingsPageTitle = pageTitle;
             stack.Children().Append(pageTitle);
 
             state->startupCard = markup::XamlReader::Load(
-                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="16" />)"
+                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" />)"
             ).as<controls::Border>();
+            state->startupCard.Padding(
+                x::ThicknessHelper::FromUniformLength(kSettingsCardPaddingDips));
             state->startupCard.HorizontalAlignment(x::HorizontalAlignment::Stretch);
             state->startupRow = controls::Grid{};
             auto startupRow = state->startupRow;
@@ -641,6 +1083,7 @@ namespace
             startupLabels.HorizontalAlignment(x::HorizontalAlignment::Left);
             startupLabels.VerticalAlignment(x::VerticalAlignment::Center);
             controls::TextBlock startupLabel;
+            state->startupTitle = startupLabel;
             state->toggle = controls::ToggleSwitch{};
             auto startupName = Localized(L"Open at startup", L"起動時に開く");
             startupLabel.Text(startupName);
@@ -651,6 +1094,7 @@ namespace
             automation::AutomationProperties::SetName(startupLabel, startupName);
             startupLabels.Children().Append(startupLabel);
             controls::TextBlock startupDescription;
+            state->startupDescription = startupDescription;
             auto startupDescriptionText = Localized(
                 L"Start Shazam every time Windows starts",
                 L"Windowsを起動するたびにShazamアプリも起動");
@@ -705,19 +1149,27 @@ namespace
             controls::Grid::SetColumn(startupControl, 2);
             startupRow.Children().Append(startupControl);
             state->startupCard.Child(startupRow);
-            stack.Children().Append(state->startupCard);
 
             // Normal settings stay compact. This standard WinUI InfoBar opens
             // only when Windows denies or cannot confirm the startup state.
             state->startupInfoBar = controls::InfoBar{};
             state->startupInfoBar.IsClosable(false);
             state->startupInfoBar.IsOpen(false);
+            state->startupInfoBar.Visibility(x::Visibility::Collapsed);
+            state->startupInfoBar.Margin(x::ThicknessHelper::FromLengths(
+                0.0, kSettingsInlineMessageSpacingDips, 0.0, 0.0));
             state->startupInfoBar.Severity(controls::InfoBarSeverity::Informational);
-            stack.Children().Append(state->startupInfoBar);
+            controls::StackPanel startupSection;
+            startupSection.Spacing(0.0);
+            startupSection.Children().Append(state->startupCard);
+            startupSection.Children().Append(state->startupInfoBar);
+            stack.Children().Append(startupSection);
 
             state->appearanceCard = markup::XamlReader::Load(
-                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="16" />)"
+                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" />)"
             ).as<controls::Border>();
+            state->appearanceCard.Padding(
+                x::ThicknessHelper::FromUniformLength(kSettingsCardPaddingDips));
             state->appearanceCard.HorizontalAlignment(x::HorizontalAlignment::Stretch);
             state->appearanceRow = controls::Grid{};
             auto appearanceRow = state->appearanceRow;
@@ -747,6 +1199,7 @@ namespace
             appearanceLabels.HorizontalAlignment(x::HorizontalAlignment::Left);
             appearanceLabels.VerticalAlignment(x::VerticalAlignment::Center);
             controls::TextBlock appearanceTitle;
+            state->appearanceTitle = appearanceTitle;
             auto appearanceName = Localized(L"Theme", L"テーマ");
             appearanceTitle.Text(appearanceName);
             appearanceTitle.FontSize(14.0);
@@ -754,6 +1207,7 @@ namespace
             appearanceTitle.TextAlignment(x::TextAlignment::Left);
             automation::AutomationProperties::SetName(appearanceTitle, appearanceName);
             controls::TextBlock appearanceDescription;
+            state->appearanceDescription = appearanceDescription;
             auto appearanceDescriptionText = Localized(
                 L"Choose the app theme to display",
                 L"表示するアプリのテーマを選択します");
@@ -793,17 +1247,374 @@ namespace
             state->appearanceCard.Child(appearanceRow);
             stack.Children().Append(state->appearanceCard);
 
-            // Keep the background as a XAML ThemeResource expression rather
-            // than copying the current brush instance. That lets the root
-            // switch palettes when Windows changes app appearance at runtime.
-            state->viewer = markup::XamlReader::Load(
+            state->languageCard = markup::XamlReader::Load(
+                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" />)"
+            ).as<controls::Border>();
+            state->languageCard.Padding(
+                x::ThicknessHelper::FromUniformLength(kSettingsCardPaddingDips));
+            state->languageCard.HorizontalAlignment(x::HorizontalAlignment::Stretch);
+            state->languageRow = controls::Grid{};
+            auto languageRow = state->languageRow;
+            languageRow.HorizontalAlignment(x::HorizontalAlignment::Stretch);
+            languageRow.ColumnSpacing(12.0);
+            auto languageIconColumn = controls::ColumnDefinition{};
+            languageIconColumn.Width(x::GridLengthHelper::FromValueAndType(34.0, x::GridUnitType::Pixel));
+            auto languageLabelColumn = controls::ColumnDefinition{};
+            languageLabelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
+            auto languageSelectorColumn = controls::ColumnDefinition{};
+            languageSelectorColumn.Width(x::GridLengthHelper::FromValueAndType(
+                kAppearanceSelectorWidthDips, x::GridUnitType::Pixel));
+            languageRow.ColumnDefinitions().Append(languageIconColumn);
+            languageRow.ColumnDefinitions().Append(languageLabelColumn);
+            languageRow.ColumnDefinitions().Append(languageSelectorColumn);
+
+            controls::FontIcon languageIcon;
+            languageIcon.Glyph(L"\uE774"); // Globe
+            languageIcon.FontSize(20.0);
+            languageIcon.HorizontalAlignment(x::HorizontalAlignment::Left);
+            languageIcon.VerticalAlignment(x::VerticalAlignment::Center);
+            controls::Grid::SetColumn(languageIcon, 0);
+            languageRow.Children().Append(languageIcon);
+
+            controls::StackPanel languageLabels;
+            languageLabels.Spacing(2.0);
+            languageLabels.HorizontalAlignment(x::HorizontalAlignment::Left);
+            languageLabels.VerticalAlignment(x::VerticalAlignment::Center);
+            controls::TextBlock languageTitle;
+            state->languageTitle = languageTitle;
+            const auto languageTitleText = Localized(L"Language", L"\u8A00\u8A9E");
+            languageTitle.Text(languageTitleText);
+            languageTitle.FontSize(14.0);
+            languageTitle.HorizontalAlignment(x::HorizontalAlignment::Left);
+            languageTitle.TextAlignment(x::TextAlignment::Left);
+            automation::AutomationProperties::SetName(languageTitle, languageTitleText);
+            languageLabels.Children().Append(languageTitle);
+            controls::TextBlock languageDescription;
+            state->languageDescription = languageDescription;
+            const auto languageDescriptionText = Localized(
+                L"Choose the display language.",
+                L"\u8868\u793A\u8A00\u8A9E\u3092\u9078\u629E\u3057\u307E\u3059");
+            languageDescription.Text(languageDescriptionText);
+            languageDescription.FontSize(12.0);
+            languageDescription.TextWrapping(x::TextWrapping::Wrap);
+            languageDescription.HorizontalAlignment(x::HorizontalAlignment::Left);
+            languageDescription.TextAlignment(x::TextAlignment::Left);
+            automation::AutomationProperties::SetName(languageDescription, languageDescriptionText);
+            languageLabels.Children().Append(languageDescription);
+            controls::Grid::SetColumn(languageLabels, 1);
+            languageRow.Children().Append(languageLabels);
+
+            state->language = controls::ComboBox{};
+            state->language.Items().Append(winrt::box_value(Localized(L"Japanese", L"\u65E5\u672C\u8A9E")));
+            state->language.Items().Append(winrt::box_value(Localized(L"English", L"\u82F1\u8A9E")));
+            state->language.Width(kAppearanceSelectorWidthDips);
+            state->language.MinWidth(kAppearanceSelectorWidthDips);
+            state->language.HorizontalAlignment(x::HorizontalAlignment::Right);
+            state->language.VerticalAlignment(x::VerticalAlignment::Center);
+            automation::AutomationProperties::SetName(state->language, languageTitleText);
+            state->language.SelectedIndex(ComboIndexFromLanguage(state->languageId));
+            state->languageLoading = false;
+            state->language.SelectionChanged([weak](auto const&, auto const&) {
+                auto state = weak.lock();
+                if (!state || !state->alive || state->languageLoading) return;
+                const uint32_t language = LanguageFromComboIndex(state->language.SelectedIndex());
+                const auto applied = ::SendMessageW(
+                    state->owner, WM_LANGUAGE_CHANGED, static_cast<WPARAM>(language), 0);
+                if (applied != 0)
+                {
+                    state->languageId = language;
+                    g_uiLanguage = language;
+                    ::SetWindowTextW(state->hwnd, L"Shazam");
+                    ApplyLanguageToSettingsNoThrow(state);
+                }
+                else
+                {
+                    state->languageLoading = true;
+                    state->language.SelectedIndex(ComboIndexFromLanguage(state->languageId));
+                    state->languageLoading = false;
+                }
+            });
+            controls::Grid::SetColumn(state->language, 2);
+            languageRow.Children().Append(state->language);
+            state->languageCard.Child(languageRow);
+            stack.Children().Append(state->languageCard);
+
+            state->shortcutCard = markup::XamlReader::Load(
+                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" />)"
+            ).as<controls::Border>();
+            state->shortcutCard.Padding(
+                x::ThicknessHelper::FromUniformLength(kSettingsCardPaddingDips));
+            state->shortcutCard.HorizontalAlignment(x::HorizontalAlignment::Stretch);
+            state->shortcutRow = controls::Grid{};
+            auto shortcutRow = state->shortcutRow;
+            shortcutRow.HorizontalAlignment(x::HorizontalAlignment::Stretch);
+            shortcutRow.ColumnSpacing(12.0);
+            auto shortcutIconColumn = controls::ColumnDefinition{};
+            shortcutIconColumn.Width(x::GridLengthHelper::FromValueAndType(34.0, x::GridUnitType::Pixel));
+            auto shortcutLabelColumn = controls::ColumnDefinition{};
+            shortcutLabelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
+            auto shortcutControlColumn = controls::ColumnDefinition{};
+            shortcutControlColumn.Width(x::GridLengthHelper::FromValueAndType(
+                kSettingsControlLaneWidthDips, x::GridUnitType::Pixel));
+            shortcutRow.ColumnDefinitions().Append(shortcutIconColumn);
+            shortcutRow.ColumnDefinitions().Append(shortcutLabelColumn);
+            shortcutRow.ColumnDefinitions().Append(shortcutControlColumn);
+
+            controls::FontIcon shortcutIcon;
+            shortcutIcon.Glyph(L"\uE765"); // KeyboardClassic
+            shortcutIcon.FontSize(20.0);
+            shortcutIcon.HorizontalAlignment(x::HorizontalAlignment::Left);
+            shortcutIcon.VerticalAlignment(x::VerticalAlignment::Center);
+            controls::Grid::SetColumn(shortcutIcon, 0);
+            shortcutRow.Children().Append(shortcutIcon);
+
+            controls::StackPanel shortcutLabels;
+            shortcutLabels.Spacing(2.0);
+            shortcutLabels.HorizontalAlignment(x::HorizontalAlignment::Left);
+            shortcutLabels.VerticalAlignment(x::VerticalAlignment::Center);
+            controls::TextBlock shortcutTitle;
+            state->shortcutTitle = shortcutTitle;
+            const auto shortcutTitleText = Localized(L"Shortcut", L"ショートカット");
+            shortcutTitle.Text(shortcutTitleText);
+            shortcutTitle.FontSize(14.0);
+            shortcutTitle.HorizontalAlignment(x::HorizontalAlignment::Left);
+            shortcutTitle.TextAlignment(x::TextAlignment::Left);
+            automation::AutomationProperties::SetName(shortcutTitle, shortcutTitleText);
+            controls::TextBlock shortcutDescription;
+            state->shortcutDescription = shortcutDescription;
+            const auto shortcutDescriptionText = Localized(
+                L"Enter the keyboard shortcut to start Shazam from anywhere in Windows.",
+                L"Windows上のどこからでも Shazam を開始したいときに使うキーボードショートカットを入力しましょう。");
+            shortcutDescription.Text(shortcutDescriptionText);
+            shortcutDescription.FontSize(12.0);
+            shortcutDescription.TextWrapping(x::TextWrapping::Wrap);
+            shortcutDescription.HorizontalAlignment(x::HorizontalAlignment::Left);
+            shortcutDescription.TextAlignment(x::TextAlignment::Left);
+            automation::AutomationProperties::SetName(shortcutDescription, shortcutDescriptionText);
+            shortcutLabels.Children().Append(shortcutTitle);
+            shortcutLabels.Children().Append(shortcutDescription);
+            controls::Grid::SetColumn(shortcutLabels, 1);
+            shortcutRow.Children().Append(shortcutLabels);
+
+            state->shortcutButton = controls::Button{};
+            state->shortcutButton.Content(winrt::box_value(FormatShortcut(
+                state->shortcutModifiers, state->shortcutKey)));
+            state->shortcutButton.MinWidth(144.0);
+            state->shortcutButton.HorizontalAlignment(x::HorizontalAlignment::Right);
+            state->shortcutButton.VerticalAlignment(x::VerticalAlignment::Center);
+            automation::AutomationProperties::SetName(state->shortcutButton, shortcutTitleText);
+            controls::Grid::SetColumn(state->shortcutButton, 2);
+            shortcutRow.Children().Append(state->shortcutButton);
+
+            state->shortcutInfoBar = controls::InfoBar{};
+            state->shortcutInfoBar.IsClosable(false);
+            state->shortcutInfoBar.IsOpen(false);
+            state->shortcutInfoBar.Visibility(x::Visibility::Collapsed);
+            state->shortcutInfoBar.Margin(x::ThicknessHelper::FromLengths(
+                0.0, kSettingsInlineMessageSpacingDips, 0.0, 0.0));
+            state->shortcutInfoBar.Severity(controls::InfoBarSeverity::Error);
+
+            state->shortcutButton.Click([weak](auto const&, auto const&) {
+                auto state = weak.lock();
+                if (!state || !state->alive || state->shortcutRecording) return;
+                state->shortcutRecording = true;
+                state->shortcutInfoBar.IsOpen(false);
+                state->shortcutInfoBar.Visibility(x::Visibility::Collapsed);
+                state->shortcutButton.Content(winrt::box_value(
+                    Localized(L"Press a key combination…", L"キーの組み合わせを入力…")));
+                const auto captureStarted = state->owner && ::IsWindow(state->owner)
+                    ? ::SendMessageW(state->owner, WM_GLOBAL_SHORTCUT_CAPTURE, TRUE, 0)
+                    : 0;
+                if (captureStarted == 0)
+                {
+                    state->shortcutInfoBar.Title(Localized(
+                        L"Shortcut capture could not start", L"ショートカットの入力を開始できません"));
+                    state->shortcutInfoBar.Message(Localized(
+                        L"Try opening Settings again.", L"設定画面を開き直してください。"));
+                    state->shortcutInfoBar.Visibility(x::Visibility::Visible);
+                    state->shortcutInfoBar.IsOpen(true);
+                    EndShortcutCaptureNoThrow(state);
+                    return;
+                }
+                state->shortcutButton.Focus(x::FocusState::Programmatic);
+            });
+            state->shortcutButton.KeyDown([weak](auto const&, auto const& args) {
+                auto state = weak.lock();
+                if (!state || !state->alive || !state->shortcutRecording) return;
+                const auto key = static_cast<uint32_t>(args.Key());
+                if (key == VK_ESCAPE &&
+                    (::GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
+                    (::GetKeyState(VK_MENU) & 0x8000) == 0 &&
+                    (::GetKeyState(VK_SHIFT) & 0x8000) == 0 &&
+                    (::GetKeyState(VK_LWIN) & 0x8000) == 0 &&
+                    (::GetKeyState(VK_RWIN) & 0x8000) == 0)
+                {
+                    EndShortcutCaptureNoThrow(state);
+                    args.Handled(true);
+                    return;
+                }
+                if (key == VK_SHIFT || key == VK_CONTROL || key == VK_MENU ||
+                    key == VK_LWIN || key == VK_RWIN ||
+                    (key >= VK_LSHIFT && key <= VK_RMENU))
+                {
+                    args.Handled(true);
+                    return;
+                }
+
+                uint32_t modifiers = 0;
+                if ((::GetKeyState(VK_CONTROL) & 0x8000) != 0) modifiers |= MOD_CONTROL;
+                if ((::GetKeyState(VK_MENU) & 0x8000) != 0) modifiers |= MOD_ALT;
+                if ((::GetKeyState(VK_SHIFT) & 0x8000) != 0) modifiers |= MOD_SHIFT;
+                if ((::GetKeyState(VK_LWIN) & 0x8000) != 0 ||
+                    (::GetKeyState(VK_RWIN) & 0x8000) != 0) modifiers |= MOD_WIN;
+
+                const auto result = state->owner && ::IsWindow(state->owner)
+                    ? ::SendMessageW(state->owner, WM_GLOBAL_SHORTCUT_CHANGED,
+                        static_cast<WPARAM>(modifiers), static_cast<LPARAM>(key))
+                    : 0;
+                if (result != 0)
+                {
+                    state->shortcutModifiers = modifiers;
+                    state->shortcutKey = key;
+                    state->shortcutButton.Content(winrt::box_value(
+                        FormatShortcut(modifiers, key)));
+                    EndShortcutCaptureNoThrow(state);
+                }
+                else
+                {
+                    state->shortcutInfoBar.Title(Localized(
+                        L"Shortcut is unavailable", L"このショートカットは使用できません"));
+                    state->shortcutInfoBar.Message(Localized(
+                        L"Choose a different key combination.",
+                        L"別のキーの組み合わせを指定してください。"));
+                    state->shortcutInfoBar.Visibility(x::Visibility::Visible);
+                    state->shortcutInfoBar.IsOpen(true);
+                    EndShortcutCaptureNoThrow(state);
+                }
+                args.Handled(true);
+            });
+            state->shortcutButton.LostFocus([weak](auto const&, auto const&) {
+                if (auto state = weak.lock(); state && state->alive)
+                    EndShortcutCaptureNoThrow(state);
+            });
+            state->shortcutCard.Child(shortcutRow);
+            controls::StackPanel shortcutSection;
+            shortcutSection.Spacing(0.0);
+            shortcutSection.Children().Append(state->shortcutCard);
+            shortcutSection.Children().Append(state->shortcutInfoBar);
+            stack.Children().Append(shortcutSection);
+
+            // Keep each page background as a XAML ThemeResource expression so
+            // the WinUI content follows the selected app theme.
+            state->settingsViewer = markup::XamlReader::Load(
                 LR"(<ScrollViewer xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" />)"
             ).as<controls::ScrollViewer>();
-            state->viewer.Content(stack);
-            state->viewer.VerticalScrollBarVisibility(controls::ScrollBarVisibility::Auto);
-            state->viewer.HorizontalScrollBarVisibility(controls::ScrollBarVisibility::Disabled);
+            state->settingsViewer.Content(stack);
+            state->settingsViewer.VerticalScrollBarVisibility(controls::ScrollBarVisibility::Auto);
+            state->settingsViewer.HorizontalScrollBarVisibility(controls::ScrollBarVisibility::Disabled);
+
+            state->historyViewer = markup::XamlReader::Load(
+                LR"(<ScrollViewer xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" />)"
+            ).as<controls::ScrollViewer>();
+            state->historyViewer.VerticalScrollBarVisibility(controls::ScrollBarVisibility::Auto);
+            state->historyViewer.HorizontalScrollBarVisibility(controls::ScrollBarVisibility::Disabled);
+            state->historyContent = controls::StackPanel{};
+            state->historyContent.Spacing(12.0);
+            state->historyContent.Padding(x::ThicknessHelper::FromUniformLength(24.0));
+
+            controls::TextBlock historyTitle;
+            state->historyTitle = historyTitle;
+            const auto historyTitleText = Localized(L"History", L"\u5C65\u6B74");
+            historyTitle.Text(historyTitleText);
+            historyTitle.FontSize(28.0);
+            historyTitle.FontWeight(winrt::Windows::UI::Text::FontWeights::Bold());
+            historyTitle.HorizontalAlignment(x::HorizontalAlignment::Left);
+            historyTitle.Margin(x::ThicknessHelper::FromLengths(0.0, 0.0, 0.0, 8.0));
+            automation::AutomationProperties::SetName(historyTitle, historyTitleText);
+            state->historyContent.Children().Append(historyTitle);
+
+            state->historyEmpty = controls::TextBlock{};
+            state->historyEmpty.Text(Localized(
+                L"No recognized songs",
+                L"\u307E\u3060\u8A8D\u8B58\u3057\u305F\u66F2\u306F\u3042\u308A\u307E\u305B\u3093"));
+            state->historyEmpty.FontSize(14.0);
+            state->historyEmpty.Opacity(0.72);
+            state->historyEmpty.Margin(x::ThicknessHelper::FromLengths(0.0, 12.0, 0.0, 0.0));
+            automation::AutomationProperties::SetName(state->historyEmpty,
+                state->historyEmpty.Text());
+            state->historyContent.Children().Append(state->historyEmpty);
+
+            state->historyItems = controls::StackPanel{};
+            state->historyItems.Spacing(8.0);
+            state->historyContent.Children().Append(state->historyItems);
+            state->historyViewer.Content(state->historyContent);
+            state->historyViewer.Visibility(x::Visibility::Collapsed);
+
+            state->pageHost = controls::Grid{};
+            state->pageHost.Children().Append(state->settingsViewer);
+            state->pageHost.Children().Append(state->historyViewer);
+
+            // Keep the rail on the same theme surface as the content. The
+            // native host window is intentionally Win32-owned, so its default
+            // COLOR_WINDOW brush must not show through an empty NavigationView
+            // pane (which otherwise appears as a white strip in dark mode).
+            state->navigation = markup::XamlReader::Load(
+                LR"(<NavigationView xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" />)"
+            ).as<controls::NavigationView>();
+            state->navigation.PaneDisplayMode(controls::NavigationViewPaneDisplayMode::LeftCompact);
+            state->navigation.CompactPaneLength(56.0);
+            state->navigation.OpenPaneLength(220.0);
+            state->navigation.IsPaneOpen(false);
+            state->navigation.IsPaneToggleButtonVisible(true);
+            // NavigationView's built-in Settings destination belongs in the
+            // footer, matching the standard Windows navigation silhouette.
+            state->navigation.IsSettingsVisible(true);
+            state->navigation.IsBackButtonVisible(controls::NavigationViewBackButtonVisible::Collapsed);
+
+            state->historyNavigationItem = controls::NavigationViewItem{};
+            state->historyNavigationItem.Content(winrt::box_value(historyTitleText));
+            controls::FontIcon historyIcon;
+            historyIcon.Glyph(L"\uE81C");
+            state->historyNavigationItem.Icon(historyIcon);
+            state->historyNavigationItem.Tag(winrt::box_value(1));
+            automation::AutomationProperties::SetName(
+                state->historyNavigationItem, historyTitleText);
+
+            state->navigation.MenuItems().Append(state->historyNavigationItem);
+            if (auto settingsItem = state->navigation.SettingsItem()
+                    .try_as<controls::NavigationViewItem>())
+            {
+                const auto settingsText = Localized(L"Settings", L"\u8A2D\u5B9A");
+                settingsItem.Content(winrt::box_value(settingsText));
+                automation::AutomationProperties::SetName(settingsItem, settingsText);
+            }
+            state->navigation.Content(state->pageHost);
+            state->navigation.SelectionChanged([weak](auto const&, auto const& args) {
+                auto state = weak.lock();
+                if (!state || !state->alive) return;
+                auto selected = args.SelectedItemContainer().try_as<controls::NavigationViewItem>();
+                const bool showSettings = args.IsSettingsSelected();
+                const int32_t page = !showSettings && selected
+                    ? winrt::unbox_value_or<int32_t>(selected.Tag(), 0)
+                    : 0;
+                const bool showHistory = !showSettings && page == 1;
+                state->settingsViewer.Visibility(showHistory
+                    ? x::Visibility::Collapsed : x::Visibility::Visible);
+                state->historyViewer.Visibility(showHistory
+                    ? x::Visibility::Visible : x::Visibility::Collapsed);
+                if (showHistory) RefreshHistoryNoThrow(state);
+            });
+            state->navigation.PaneOpened([weak](auto const&, auto const&) {
+                if (auto state = weak.lock(); state && state->alive)
+                    UpdateSettingsCardWidths(state, state->navigation.ActualWidth());
+            });
+            state->navigation.PaneClosed([weak](auto const&, auto const&) {
+                if (auto state = weak.lock(); state && state->alive)
+                    UpdateSettingsCardWidths(state, state->navigation.ActualWidth());
+            });
+            state->navigation.SelectedItem(state->navigation.SettingsItem());
             ApplyAppearanceToSettings(state, state->appearanceMode);
-            return state->viewer;
+            return state->navigation;
         }
 
         void Layout()
@@ -813,35 +1624,34 @@ namespace
             ::GetClientRect(hwnd, &rect);
             auto dpi = ::GetDpiForWindow(hwnd);
             if (dpi < 96) dpi = 96;
-            if (state && state->startupCard && state->appearanceCard &&
-                state->startupRow && state->appearanceRow)
-            {
-                const double cardWidth = ::MulDiv(rect.right - rect.left, 96, dpi) - 48.0;
-                if (cardWidth > 28.0)
-                {
-                    state->startupCard.Width(cardWidth);
-                    state->appearanceCard.Width(cardWidth);
-                    // Border padding consumes 16 DIPs on each side. Pin each
-                    // row to the remaining content width so the trailing
-                    // control stays at the card's right edge even when the
-                    // island is measured before its host window is shown.
-                    const double rowWidth = cardWidth - 32.0;
-                    state->startupRow.Width(rowWidth);
-                    state->appearanceRow.Width(rowWidth);
-                }
-            }
+            if (state)
+                UpdateSettingsCardWidths(state,
+                    static_cast<double>(::MulDiv(rect.right - rect.left, 96, dpi)));
             island.SiteBridge().MoveAndResize({0, 0, rect.right - rect.left, rect.bottom - rect.top});
         }
 
-        void Show(uint32_t appearanceMode)
+        void Show(
+            uint32_t appearanceMode,
+            uint32_t shortcutModifiers,
+            uint32_t shortcutKey,
+            uint32_t languageId)
         {
             if (!hwnd) return;
             if (state)
             {
+                g_uiLanguage = languageId == kLanguageJapanese
+                    ? kLanguageJapanese : kLanguageEnglish;
+                state->languageId = g_uiLanguage;
+                ApplyLanguageToSettingsNoThrow(state);
                 state->appearanceLoading = true;
                 state->appearance.SelectedIndex(ComboIndexFromAppearance(appearanceMode));
                 state->appearanceLoading = false;
                 ApplyAppearanceToSettings(state, appearanceMode);
+                EndShortcutCaptureNoThrow(state);
+                state->shortcutModifiers = shortcutModifiers;
+                state->shortcutKey = shortcutKey;
+                state->shortcutButton.Content(winrt::box_value(FormatShortcut(
+                    state->shortcutModifiers, state->shortcutKey)));
             }
             ::ShowWindow(hwnd, SW_SHOWNORMAL);
             // The island is initially measured while its host HWND is hidden.
@@ -869,6 +1679,7 @@ namespace
         {
             try
             {
+                if (state) EndShortcutCaptureNoThrow(state);
                 if (state) state->alive = false;
                 if (island) island.Close();
                 island = nullptr;
@@ -934,6 +1745,8 @@ namespace
                     ApplyAppearanceToSettings(host->state, host->state->appearanceMode);
                 return ::DefWindowProcW(h, msg, wp, lp);
             case WM_CLOSE:
+                if (host && host->hwnd == h)
+                    EndShortcutCaptureNoThrow(host->state);
                 // While Settings is visible, the owner popup deliberately
                 // ignores its activation loss so it stays open behind this
                 // window. Restore the owner's activation before hiding
@@ -961,7 +1774,8 @@ namespace
 }
 
 extern "C" __declspec(dllexport) HRESULT __stdcall OpenShazamSettingsShow(
-    HWND owner, uint32_t appearanceMode) noexcept
+    HWND owner, uint32_t appearanceMode, uint32_t shortcutModifiers,
+    uint32_t shortcutKey, uint32_t languageId) noexcept
 {
     try
     {
@@ -970,15 +1784,22 @@ extern "C" __declspec(dllexport) HRESULT __stdcall OpenShazamSettingsShow(
         {
             auto host = std::make_unique<SettingsHost>();
             g_active = host.get();
-            try { host->Initialize(owner); }
+            try { host->Initialize(owner, languageId); }
             catch (...) { host->Close(); g_active = nullptr; throw; }
             g_settings = std::move(host);
         }
-        g_settings->Show(appearanceMode);
+        g_settings->Show(appearanceMode, shortcutModifiers, shortcutKey, languageId);
         return S_OK;
     }
     catch (winrt::hresult_error const& e) { return e.code(); }
     catch (...) { return E_FAIL; }
+}
+
+extern "C" __declspec(dllexport) void __stdcall OpenShazamSettingsSetHistory(
+    OpenShazamHistoryItem const* items, size_t count) noexcept
+{
+    if (g_settings)
+        SetHistoryNoThrow(g_settings->state, items, count);
 }
 
 extern "C" __declspec(dllexport) BOOL __stdcall OpenShazamSettingsPreTranslate(MSG* msg) noexcept

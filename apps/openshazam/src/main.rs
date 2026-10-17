@@ -4,6 +4,8 @@ use std::process::ExitCode;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod ui_model;
 #[cfg(windows)]
+mod windows_history_store;
+#[cfg(windows)]
 mod windows_settings;
 #[cfg(windows)]
 mod windows_ui;

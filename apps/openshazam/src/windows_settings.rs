@@ -7,12 +7,21 @@ use std::{
     path::PathBuf,
 };
 
-pub(crate) type Show = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+pub(crate) type Show = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) -> i32;
+type UpdateHistory = unsafe extern "system" fn(*const SettingsHistoryItem, usize);
 type Translate = unsafe extern "system" fn(*mut c_void) -> i32;
 type IsVisible = unsafe extern "system" fn() -> i32;
 type Shutdown = unsafe extern "system" fn();
 type BootstrapInitialize = unsafe extern "system" fn(u32, *const u16, u64) -> i32;
 type BootstrapShutdown = unsafe extern "system" fn();
+
+#[repr(C)]
+pub(crate) struct SettingsHistoryItem {
+    pub title: *const u16,
+    pub artist: *const u16,
+    pub recognized_at: *const u16,
+    pub page_url: *const u16,
+}
 
 // Keep these values aligned with the Windows App SDK 1.8 package pinned by
 // settings-host/packages.config and its WindowsAppSDK-VersionInfo.h.
@@ -50,6 +59,7 @@ fn process_has_package_identity() -> Result<bool, String> {
 pub struct SettingsHost {
     library: *mut c_void,
     show: Show,
+    update_history: UpdateHistory,
     pre_translate: Translate,
     is_visible: IsVisible,
     shutdown: Shutdown,
@@ -180,6 +190,9 @@ impl SettingsHost {
             Ok(Self {
                 library: module,
                 show: std::mem::transmute::<*mut c_void, Show>(get(b"OpenShazamSettingsShow\0")?),
+                update_history: std::mem::transmute::<*mut c_void, UpdateHistory>(get(
+                    b"OpenShazamSettingsSetHistory\0",
+                )?),
                 pre_translate: std::mem::transmute::<*mut c_void, Translate>(get(
                     b"OpenShazamSettingsPreTranslate\0",
                 )?),
@@ -210,6 +223,13 @@ impl SettingsHost {
     /// activation messages to its owner, which re-enters the app window proc.
     pub(crate) fn show_callback(&self) -> Show {
         self.show
+    }
+
+    pub(crate) fn update_history(&self, items: &[SettingsHistoryItem]) {
+        // The WinUI host copies every string before returning. The string
+        // buffers and descriptor slice therefore only need to live for this
+        // synchronous call.
+        unsafe { (self.update_history)(items.as_ptr(), items.len()) };
     }
 
     pub fn visible(&self) -> bool {
