@@ -8026,6 +8026,7 @@ fn scale_notification_artwork_to_size(
     let crop_x = (source_width as f64 - crop_width) * 0.5;
     let crop_y = (source_height as f64 - crop_height) * 0.5;
     let mut output = vec![0u8; output_len];
+    let corner_radius = target_width.min(target_height) as f64 / 8.0;
 
     for y in 0..target_height {
         let source_y = (crop_y + (y as f64 + 0.5) * crop_height / target_height as f64 - 0.5)
@@ -8054,9 +8055,32 @@ fn scale_notification_artwork_to_size(
                 output[destination + channel] =
                     (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
             }
+            if target_width >= 8 && target_height >= 8 {
+                let coverage =
+                    rounded_corner_coverage(x, y, target_width, target_height, corner_radius);
+                for channel in 0..4 {
+                    let index = destination + channel;
+                    output[index] = (f64::from(output[index]) * coverage)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
+            }
         }
     }
     Some(output)
+}
+
+fn rounded_corner_coverage(x: usize, y: usize, width: usize, height: usize, radius: f64) -> f64 {
+    // Signed-distance coverage produces a soft alpha edge at the four corners
+    // without changing the square artwork edges or relying on Explorer masks.
+    let half_width = width as f64 * 0.5;
+    let half_height = height as f64 * 0.5;
+    let qx = ((x as f64 + 0.5) - half_width).abs() - (half_width - radius);
+    let qy = ((y as f64 + 0.5) - half_height).abs() - (half_height - radius);
+    let outside_x = qx.max(0.0);
+    let outside_y = qy.max(0.0);
+    let signed_distance = outside_x.hypot(outside_y) + qx.max(qy).min(0.0) - radius;
+    (0.5 - signed_distance).clamp(0.0, 1.0)
 }
 
 unsafe fn create_notification_icon(
@@ -13182,6 +13206,19 @@ mod tests {
             scale_notification_artwork_to_size(&pixels, 1, 2),
             Some(vec![20, 30, 40, 255, 40, 50, 60, 255])
         );
+
+        let solid_artwork = ArtworkPixels {
+            width: 2,
+            height: 2,
+            fingerprint: 0,
+            bgra: vec![255; 2 * 2 * 4],
+        };
+        let rounded = scale_notification_artwork_to_size(&solid_artwork, 32, 32).unwrap();
+        let alpha_at = |x: usize, y: usize| rounded[(y * 32 + x) * 4 + 3];
+        assert_eq!(alpha_at(0, 0), 0);
+        assert!((1..255).contains(&alpha_at(0, 1)));
+        assert_eq!(alpha_at(16, 16), 255);
+
         assert_eq!(scale_notification_artwork_to_size(&pixels, 0, 0), None);
         let mut malformed = pixels;
         malformed.bgra.pop();
