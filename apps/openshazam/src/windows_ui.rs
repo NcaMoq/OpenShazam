@@ -2903,6 +2903,10 @@ fn status_text_snapshot(
         MainPhase::Listening {
             mode: CaptureMode::Auto,
             ..
+        }
+        | MainPhase::Starting {
+            mode: CaptureMode::Auto,
+            ..
         } => Some(StatusCycle::Auto),
         MainPhase::Listening {
             mode: CaptureMode::Manual,
@@ -2914,7 +2918,10 @@ fn status_text_snapshot(
                 transition_started_at: None,
             };
         }
-        MainPhase::Starting { .. }
+        MainPhase::Starting {
+            mode: CaptureMode::Manual,
+            ..
+        }
         | MainPhase::Cancelling { .. }
         | MainPhase::NoMatch { .. }
         | MainPhase::Offline { .. }
@@ -8481,6 +8488,9 @@ fn start_capture(app: &mut AppState, mode: CaptureMode) {
             if mode == CaptureMode::Auto {
                 app.auto_candidate_dedupe.clear();
             }
+            let entered_at = Instant::now();
+            app.status_alternator =
+                (mode == CaptureMode::Auto).then(|| StatusTextAlternator::auto(entered_at));
             app.recognition_session = Some(RecognitionSessionUi {
                 ticket,
                 mode,
@@ -8488,10 +8498,7 @@ fn start_capture(app: &mut AppState, mode: CaptureMode) {
                 last_sequence: 0,
                 result_presented: false,
             });
-            app.phase = MainPhase::Starting {
-                mode,
-                entered_at: Instant::now(),
-            };
+            app.phase = MainPhase::Starting { mode, entered_at };
         }
         Err(error) => {
             app.phase = MainPhase::Error {
@@ -8754,9 +8761,30 @@ fn reconcile_controller_snapshot(
 }
 
 fn enter_listening(app: &mut AppState, mode: CaptureMode, started_at: Instant) {
-    app.phase = MainPhase::Listening { mode, started_at };
+    // Native Auto changes the tagging layer to state 2 and starts its spring
+    // before the recorder reports CaptureStarted. Keep the animation clock
+    // anchored to the UI command so the spring and ripple phase do not restart
+    // when the asynchronous capture event arrives.
+    let animation_started_at = capture_animation_start(&app.phase, mode, started_at);
+    app.phase = MainPhase::Listening {
+        mode,
+        started_at: animation_started_at,
+    };
     app.status_alternator =
-        (mode == CaptureMode::Auto).then(|| StatusTextAlternator::auto(started_at));
+        (mode == CaptureMode::Auto).then(|| StatusTextAlternator::auto(animation_started_at));
+}
+
+fn capture_animation_start(phase: &MainPhase, mode: CaptureMode, fallback: Instant) -> Instant {
+    match (phase, mode) {
+        (
+            MainPhase::Starting {
+                mode: CaptureMode::Auto,
+                entered_at,
+            },
+            CaptureMode::Auto,
+        ) => *entered_at,
+        _ => fallback,
+    }
 }
 
 fn reconcile_session_snapshot(app: &mut AppState, session: &RecognitionSessionSnapshot) -> bool {
@@ -9956,9 +9984,8 @@ unsafe fn update_visible_windows(app: &mut AppState) {
     }
 }
 
-fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
-    let now = Instant::now();
-    let (mode, show_button, show_ripples) = match app.phase {
+fn phase_animation_state(phase: &MainPhase) -> (TaggingMode, bool, bool) {
+    match phase {
         MainPhase::Listening {
             mode: CaptureMode::Manual,
             ..
@@ -9966,15 +9993,27 @@ fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
         MainPhase::Listening {
             mode: CaptureMode::Auto,
             ..
+        }
+        | MainPhase::Starting {
+            mode: CaptureMode::Auto,
+            ..
         } => (TaggingMode::Auto, true, true),
         MainPhase::Matched { .. } => (TaggingMode::Ready, true, false),
         MainPhase::NoMatch { .. } | MainPhase::Offline { .. } => (TaggingMode::Ready, false, false),
         MainPhase::Ready
-        | MainPhase::Starting { .. }
+        | MainPhase::Starting {
+            mode: CaptureMode::Manual,
+            ..
+        }
         | MainPhase::Cancelling { .. }
         | MainPhase::Error { .. } => (TaggingMode::Ready, true, false),
         MainPhase::Timeout { .. } => (TaggingMode::Ready, false, false),
-    };
+    }
+}
+
+fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
+    let now = Instant::now();
+    let (mode, show_button, show_ripples) = phase_animation_state(&app.phase);
     AnimationSnapshot {
         mode,
         elapsed: phase_elapsed(&app.phase),
@@ -10072,10 +10111,14 @@ fn phase_needs_frame_at(phase: &MainPhase, now: Instant) -> bool {
         // Listening ripples are continuous Windows Composition keyframes.
         // They do not need an 8 ms UI-thread timer; future meter values enter
         // through a change event and update the audio transforms once per value.
-        MainPhase::Listening {
+        MainPhase::Starting {
             mode: CaptureMode::Auto,
-            started_at,
-        } => now.saturating_duration_since(*started_at) < AUTO_START_SPRING_DURATION,
+            entered_at,
+        }
+        | MainPhase::Listening {
+            mode: CaptureMode::Auto,
+            started_at: entered_at,
+        } => now.saturating_duration_since(*entered_at) < AUTO_START_SPRING_DURATION,
         MainPhase::Listening {
             mode: CaptureMode::Manual,
             ..
@@ -11570,6 +11613,10 @@ fn update_phase_timers(app: &mut AppState) -> bool {
             mode: CaptureMode::Auto,
             ..
         } => Some(StatusCycle::Auto),
+        MainPhase::Starting {
+            mode: CaptureMode::Auto,
+            ..
+        } => Some(StatusCycle::Auto),
         _ => None,
     };
     match desired_status_cycle {
@@ -11684,7 +11731,7 @@ mod tests {
     use super::{
         advance_result_card_stage, animation_needs_frame, artwork_pixel_fingerprint,
         artwork_request_is_current, artwork_request_matches_track,
-        artwork_request_urls_match_track, button_border_arc_points,
+        artwork_request_urls_match_track, button_border_arc_points, capture_animation_start,
         composition_button_pixel_snap_offset, composition_header_viewport_offset,
         composition_root_layer_order, composition_scale_for_dpi, composition_scene_layer_order,
         copy_notification_text, copy_panel_pixels_into, create_text_format_with_locale,
@@ -11693,28 +11740,29 @@ mod tests {
         history_artwork_frame, history_row_top, history_text_rects, history_title_color,
         inverse_circle_clip_radii, is_offline_failure, is_tray_activation_event, localized_ui_text,
         native_icon_layout, no_match_copy, no_match_icon_rect, page_url_for_display_id,
-        phase_needs_frame_at, phase_needs_timeout, point_in_rect, popup_base_color,
-        remember_auto_candidate_key, resolve_page_link, resolve_page_link_checked,
-        resolve_page_link_for_generation, result_artwork_rect, result_card_link_hit,
-        result_details_rects, result_gradient_colors, result_header_hit_test_contains,
-        result_header_visible_height, result_overlay_child_offset,
+        phase_animation_state, phase_needs_frame_at, phase_needs_timeout, point_in_rect,
+        popup_base_color, remember_auto_candidate_key, resolve_page_link,
+        resolve_page_link_checked, resolve_page_link_for_generation, result_artwork_rect,
+        result_card_link_hit, result_details_rects, result_gradient_colors,
+        result_header_hit_test_contains, result_header_visible_height, result_overlay_child_offset,
         result_overlay_occludes_shazam_button, result_panel_draw_top, result_panel_top_at,
         scale_notification_artwork, select_ui_language_from_multisz,
         should_defer_hide_for_tray_activation, should_hide_popup_on_deactivation,
         should_replace_cached_artwork, should_show_initial_popup, should_start_startup_logo,
-        theme_from_foreground_rgb, timeout_copy, ui_model, valid_page_template,
-        visible_history_row_hit, ArrowEdge, ArtworkPixels, ArtworkRequest, ArtworkRequestIdentity,
-        ArtworkSource, CaptureMode, CompositionRootLayer, CompositionSceneLayer, HeaderFillScope,
-        HistoryMutationEvent, HistoryMutationTransition, HistoryTimestampSource, MainPhase,
-        NoMatchIconCommand, PageLinkFailure, ResultCardAdvance, ResultCardStage, Theme,
-        ThemePreference, Track, TrackIdentity, UiConfigSnapshot, UiLanguage, UiTextKey,
-        ValidatedWebTrackUrl, WindowKind, BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X,
-        CLOSE_BUTTON_GA_PIXELS, FALLBACK_MATCH_DARK_PIXELS, FALLBACK_MATCH_LIGHT_PIXELS,
-        FALLBACK_MATCH_LOGICAL_SIDE, HISTORY_HEIGHT, HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS,
-        NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT,
-        RESULT_ACTION_HEIGHT, RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD,
-        RESULT_CARD_TRANSITION, RESULT_CLOSE_ICON_PIXELS, RESULT_DETAILS_LEFT,
-        RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
+        status_text_snapshot, theme_from_foreground_rgb, timeout_copy, ui_model,
+        valid_page_template, visible_history_row_hit, ArrowEdge, ArtworkPixels, ArtworkRequest,
+        ArtworkRequestIdentity, ArtworkSource, CaptureMode, CompositionRootLayer,
+        CompositionSceneLayer, HeaderFillScope, HistoryMutationEvent, HistoryMutationTransition,
+        HistoryTimestampSource, MainPhase, NoMatchIconCommand, PageLinkFailure, ResultCardAdvance,
+        ResultCardStage, Theme, ThemePreference, Track, TrackIdentity, UiConfigSnapshot,
+        UiLanguage, UiTextKey, ValidatedWebTrackUrl, WindowKind, AUTO_START_SPRING_DURATION,
+        BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, CLOSE_BUTTON_GA_PIXELS,
+        FALLBACK_MATCH_DARK_PIXELS, FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE,
+        HISTORY_HEIGHT, HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH,
+        OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT, RESULT_ACTION_HEIGHT,
+        RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD, RESULT_CARD_TRANSITION,
+        RESULT_CLOSE_ICON_PIXELS, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS,
+        TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
     };
     use std::collections::HashMap;
     use std::collections::VecDeque;
@@ -14108,6 +14156,53 @@ mod tests {
             &auto_listening,
             auto_started + Duration::from_millis(200)
         ));
+    }
+
+    #[test]
+    fn auto_wave_and_button_spring_start_before_capture_and_keep_the_same_clock() {
+        let auto_started = Instant::now();
+        let capture_event = auto_started + Duration::from_millis(120);
+        let starting = MainPhase::Starting {
+            mode: CaptureMode::Auto,
+            entered_at: auto_started,
+        };
+
+        assert_eq!(
+            phase_animation_state(&starting),
+            (ui_model::TaggingMode::Auto, true, true)
+        );
+        assert_eq!(
+            status_text_snapshot(&starting, None).current,
+            Some(super::StatusTextLabel::AutoOn)
+        );
+        assert!(phase_needs_frame_at(&starting, auto_started));
+        assert!(phase_needs_frame_at(
+            &starting,
+            auto_started + Duration::from_millis(199)
+        ));
+        assert!(!phase_needs_frame_at(
+            &starting,
+            auto_started + AUTO_START_SPRING_DURATION
+        ));
+        assert_eq!(
+            capture_animation_start(&starting, CaptureMode::Auto, capture_event),
+            auto_started,
+            "CaptureStarted must not restart the native Auto pulse"
+        );
+
+        let manual_starting = MainPhase::Starting {
+            mode: CaptureMode::Manual,
+            entered_at: auto_started,
+        };
+        assert_eq!(
+            phase_animation_state(&manual_starting),
+            (ui_model::TaggingMode::Ready, true, false)
+        );
+        assert_eq!(status_text_snapshot(&manual_starting, None).current, None);
+        assert_eq!(
+            capture_animation_start(&manual_starting, CaptureMode::Manual, capture_event),
+            capture_event
+        );
     }
 
     #[test]
