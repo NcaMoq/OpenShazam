@@ -5,7 +5,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::c_void,
     io::Read,
     mem::size_of,
@@ -17,7 +17,7 @@ use std::{
 };
 
 use windows::{
-    core::{implement, Error, Interface, Ref, HSTRING, PCWSTR, PWSTR},
+    core::{implement, Error, Interface, Ref, BOOL, HSTRING, PCWSTR, PWSTR},
     ApplicationModel::{Activation::ActivationKind, AppInstance},
     Foundation::{DateTime, TimeSpan, TypedEventHandler},
     Globalization::DateTimeFormatting::DateTimeFormatter,
@@ -76,6 +76,7 @@ use windows::{
                 GetMonitorInfoW, InvalidateRect, MonitorFromRect, ScreenToClient, SelectObject,
                 AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
                 DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+                RGBQUAD,
             },
         },
         System::{
@@ -106,19 +107,21 @@ use windows::{
             Input::KeyboardAndMouse::{GetDoubleClickTime, ReleaseCapture, SetCapture, VK_ESCAPE},
             Shell::{
                 ShellExecuteExW, Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_GUID, NIF_ICON,
-                NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
-                NIM_MODIFY, NIM_SETFOCUS, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
+                NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIIF_LARGE_ICON, NIIF_USER,
+                NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS, NIM_SETVERSION, NIN_BALLOONHIDE,
+                NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
                 NOTIFYICON_VERSION_4, SEE_MASK_DEFAULT, SHELLEXECUTEINFOW,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect, GetCursorPos,
-                GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, LoadIconW, PeekMessageW,
-                PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-                SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-                SystemParametersInfoW, TrackPopupMenu, TranslateMessage, UpdateLayeredWindow,
-                WaitMessage, CS_DBLCLKS, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION,
-                MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE,
+                AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+                DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
+                GetClientRect, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
+                KillTimer, LoadCursorW, LoadIconW, PeekMessageW, PostMessageW, PostQuitMessage,
+                RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
+                SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu,
+                TranslateMessage, UpdateLayeredWindow, WaitMessage, CS_DBLCLKS, CW_USEDEFAULT,
+                GWLP_USERDATA, ICONINFO, IDC_ARROW, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG,
+                PM_REMOVE, SM_CXICON, SM_CYICON, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE,
                 SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
                 SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
                 WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN,
@@ -156,10 +159,10 @@ use windows_numerics::{Matrix3x2, Vector2, Vector3};
 
 use openshazam::WindowsRecognitionBackend;
 use openshazam_controller::{
-    ApplicationController, CommandId, CommandResultLookup, CommandStatus, NativeManualResultStage,
-    NativeManualUiEvent, RecognitionCommand, RecognitionContext, RecognitionEvent,
-    RecognitionEventCategory, RecognitionEventKind, RecognitionSessionSnapshot, SessionEndReason,
-    SessionPhase, TrackCandidate, UiConfigSnapshot, UiRecognitionEvent,
+    ApplicationController, CommandId, CommandResultLookup, CommandStatus, NativeAutoUiEvent,
+    NativeManualResultStage, NativeManualUiEvent, RecognitionCommand, RecognitionContext,
+    RecognitionEvent, RecognitionEventCategory, RecognitionEventKind, RecognitionSessionSnapshot,
+    SessionEndReason, SessionPhase, TrackCandidate, UiConfigSnapshot, UiRecognitionEvent,
 };
 
 use crate::ui_model::{
@@ -194,10 +197,14 @@ const TIMER_SINGLE_CLICK: usize = 0x4f53;
 const TIMER_LONG_PRESS: usize = 0x4f54;
 const TIMER_PHASE: usize = 0x4f55;
 const TIMER_ANIMATION: usize = 0x4f56;
+const TIMER_DEFERRED_DEACTIVATION_HIDE: usize = 0x4f57;
 const SINGLE_CLICK_TIMEOUT_MS: u32 = 280;
 const LONG_PRESS_TIMEOUT_MS: u32 = 500;
+const DEACTIVATION_HIDE_DELAY_MS: u32 = 250;
 const PHASE_TICK_MS: u32 = 100;
 const ANIMATION_TICK_MS: u32 = 8;
+const AUTO_START_SPRING_DURATION: Duration = Duration::from_millis(200);
+const AUTO_CANDIDATE_DEDUPE_LIMIT: usize = 40;
 const MAIN_WINDOW_WIDTH: f64 = CONTENT_WIDTH;
 const MAIN_WINDOW_HEIGHT: f64 = CONTENT_HEIGHT + POPUP_ARROW_HEIGHT;
 const ABOUT_WIDTH: f64 = 600.0;
@@ -914,6 +921,9 @@ const SUCCESS_SETTLE_TOTAL: Duration = Duration::from_secs(1);
 // [I/U] Native NSTableView slide duration was not recovered. Keep this
 // implementation value replaceable rather than presenting it as native data.
 const HISTORY_INSERT_TRANSITION: Duration = Duration::from_millis(250);
+// Nib frame y values (-39,55,149,243,336) use a bottom-left origin. Convert
+// each 94-DIP row into the history's top-left coordinate space (0..430).
+const EMPTY_HISTORY_ROW_TOPS: [f32; 5] = [0.0, 93.0, 187.0, 281.0, 375.0];
 
 // Keeping Track inline avoids a heap allocation on the recognition-to-popup
 // fast path; this state machine is not copied on every animation frame.
@@ -985,8 +995,9 @@ struct AppState {
     hovered_row: Option<usize>,
     // UI-only adapter points. No service meter output is assumed or inferred.
     ui_levels: UiLevels,
-    // Core Animation's Auto spring parameters are unresolved in the source;
-    // leave the transform neutral until a measured profile is supplied.
+    // Core Animation default spring coefficients and the explicit 0.2s track
+    // are supplied when Auto starts. Keeping this optional lets UI tests inject
+    // an alternate measured profile without changing the recognition engine.
     auto_spring: Option<ui_model::SpringProfile>,
     theme: Theme,
     theme_preference: ThemePreference,
@@ -996,6 +1007,7 @@ struct AppState {
     popup_transition: Option<PopupOpacityTransition>,
     main_activated: bool,
     popup_activation_grace_until: Option<Instant>,
+    deactivation_hide_pending: bool,
     phase_timer_active: bool,
     animation_timer_active: bool,
     status_text_composition_ready: bool,
@@ -1010,6 +1022,7 @@ struct AppState {
     single_click_pending: bool,
     recognition_controller: Option<ApplicationController>,
     recognition_session: Option<RecognitionSessionUi>,
+    auto_candidate_dedupe: VecDeque<String>,
     controller_sequence: u64,
     dropped_notifications: u64,
     status_alternator: Option<StatusTextAlternator>,
@@ -1019,6 +1032,8 @@ struct AppState {
     artwork_generations: HashMap<TrackIdentity, u64>,
     active_artwork_requests: HashMap<TrackIdentity, ArtworkRequest>,
     artwork_resources: HashMap<u64, (ArtworkSource, ArtworkPixels)>,
+    pending_match_notifications: HashMap<u64, Track>,
+    owned_balloon_icons: VecDeque<Option<windows::Win32::UI::WindowsAndMessaging::HICON>>,
     ui_configs: HashMap<u64, UiConfigSnapshot>,
     message: Option<String>,
 }
@@ -4341,6 +4356,10 @@ impl CompositionScene {
                 Y: frame.auto_shadow_scale as f32,
                 Z: 1.0,
             })?;
+            self.auto_shadow_mask.SetScale(Vector2 {
+                X: frame.button_child_scale as f32,
+                Y: frame.button_child_scale as f32,
+            })?;
             self.button.SetScale(Vector3 {
                 X: frame.button_child_scale as f32,
                 Y: frame.button_child_scale as f32,
@@ -6799,8 +6818,7 @@ impl Renderer {
     }
 
     unsafe fn draw_skeleton(&self, history: D2D_RECT_F) {
-        let rows = [0.0f32, 93.0, 187.0, 281.0, 375.0];
-        for top in rows {
+        for top in EMPTY_HISTORY_ROW_TOPS {
             let row_top = history.top + top;
             let art = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
                 rect: rect(10.0, row_top + 13.0, 75.0, row_top + 78.0),
@@ -7747,22 +7765,222 @@ unsafe fn show_tray_context_menu(app: &mut AppState) {
     }
 }
 
-unsafe fn notify_hidden_match(hwnd: HWND, track: &Track) {
+fn queue_hidden_match_notification(app: &mut AppState, track: &Track) {
+    let display_id = track.display_id;
+    if let Some(pixels) = app
+        .artwork_resources
+        .get(&display_id)
+        .map(|(_, pixels)| pixels.clone())
+    {
+        unsafe { notify_hidden_match(app, track, Some(&pixels)) };
+    } else if app
+        .active_artwork_requests
+        .contains_key(&TrackIdentity { display_id })
+    {
+        // Wait for the worker so the first notification can use the album cover.
+        app.pending_match_notifications
+            .insert(display_id, track.clone());
+    } else {
+        unsafe { notify_hidden_match(app, track, None) };
+    }
+}
+
+unsafe fn notify_hidden_match(app: &mut AppState, track: &Track, artwork: Option<&ArtworkPixels>) {
     let body = format!("{} — {}", track.title, track.artist);
+    let balloon_icon = artwork.and_then(|pixels| match create_notification_icon(pixels) {
+        Ok(icon) => Some(icon),
+        Err(error) => {
+            eprintln!("OpenShazam could not create notification artwork icon: {error}");
+            None
+        }
+    });
     let mut data = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
-        hWnd: hwnd,
+        hWnd: app.main_hwnd,
         uID: TRAY_ICON_ID,
         uFlags: NIF_INFO | NIF_GUID,
-        dwInfoFlags: NIIF_INFO,
+        dwInfoFlags: if balloon_icon.is_some() {
+            NIIF_USER | NIIF_LARGE_ICON
+        } else {
+            NIIF_INFO
+        },
+        hBalloonIcon: balloon_icon.unwrap_or_default(),
         guidItem: TRAY_ICON_GUID,
         ..Default::default()
     };
     copy_notification_text(&mut data.szInfoTitle, "Shazam");
     copy_notification_text(&mut data.szInfo, &body);
-    let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+    if Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() {
+        // Explorer sends the matching end event after the balloon is no longer
+        // using this custom icon. Keep None entries to preserve event ordering.
+        app.owned_balloon_icons.push_back(balloon_icon);
+    } else if let Some(icon) = balloon_icon {
+        let _ = DestroyIcon(icon);
+    }
 }
 
+fn scale_notification_artwork(pixels: &ArtworkPixels, side: u32) -> Option<Vec<u8>> {
+    let source_width = usize::try_from(pixels.width).ok()?;
+    let source_height = usize::try_from(pixels.height).ok()?;
+    let side = usize::try_from(side).ok()?;
+    let expected_len = source_width.checked_mul(source_height)?.checked_mul(4)?;
+    if side == 0 || source_width == 0 || source_height == 0 || pixels.bgra.len() != expected_len {
+        return None;
+    }
+    let output_len = side.checked_mul(side)?.checked_mul(4)?;
+    let crop_side = source_width.min(source_height) as f64;
+    let crop_x = (source_width as f64 - crop_side) * 0.5;
+    let crop_y = (source_height as f64 - crop_side) * 0.5;
+    let mut output = vec![0u8; output_len];
+
+    for y in 0..side {
+        let source_y = (crop_y + (y as f64 + 0.5) * crop_side / side as f64 - 0.5)
+            .clamp(0.0, source_height.saturating_sub(1) as f64);
+        let y0 = source_y.floor() as usize;
+        let y1 = (y0 + 1).min(source_height - 1);
+        let fy = source_y - y0 as f64;
+        for x in 0..side {
+            let source_x = (crop_x + (x as f64 + 0.5) * crop_side / side as f64 - 0.5)
+                .clamp(0.0, source_width.saturating_sub(1) as f64);
+            let x0 = source_x.floor() as usize;
+            let x1 = (x0 + 1).min(source_width - 1);
+            let fx = source_x - x0 as f64;
+            let samples = [
+                (y0 * source_width + x0) * 4,
+                (y0 * source_width + x1) * 4,
+                (y1 * source_width + x0) * 4,
+                (y1 * source_width + x1) * 4,
+            ];
+            let destination = (y * side + x) * 4;
+            for channel in 0..4 {
+                let top = f64::from(pixels.bgra[samples[0] + channel]) * (1.0 - fx)
+                    + f64::from(pixels.bgra[samples[1] + channel]) * fx;
+                let bottom = f64::from(pixels.bgra[samples[2] + channel]) * (1.0 - fx)
+                    + f64::from(pixels.bgra[samples[3] + channel]) * fx;
+                output[destination + channel] =
+                    (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    Some(output)
+}
+
+unsafe fn create_notification_icon(
+    pixels: &ArtworkPixels,
+) -> windows::core::Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    let side = GetSystemMetrics(SM_CXICON)
+        .max(GetSystemMetrics(SM_CYICON))
+        .clamp(16, 256) as u32;
+    let scaled = scale_notification_artwork(pixels, side).ok_or_else(|| {
+        Error::new(
+            windows::core::HRESULT(0x8007_0057u32 as i32),
+            "notification artwork has invalid pixel dimensions",
+        )
+    })?;
+    let dc = CreateCompatibleDC(None);
+    if dc.0.is_null() {
+        return Err(Error::from_thread());
+    }
+
+    let color_info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: side as i32,
+            biHeight: -(side as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut color_bits = std::ptr::null_mut();
+    let color_bitmap = match CreateDIBSection(
+        Some(dc),
+        &color_info,
+        DIB_RGB_COLORS,
+        &mut color_bits,
+        None,
+        0,
+    ) {
+        Ok(bitmap) if !color_bits.is_null() => bitmap,
+        Ok(bitmap) => {
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            return Err(Error::from_thread());
+        }
+        Err(error) => {
+            let _ = DeleteDC(dc);
+            return Err(error);
+        }
+    };
+    std::ptr::copy_nonoverlapping(scaled.as_ptr(), color_bits.cast::<u8>(), scaled.len());
+
+    #[repr(C)]
+    struct MonochromeBitmapInfo {
+        header: BITMAPINFOHEADER,
+        colors: [RGBQUAD; 2],
+    }
+    let mask_info = MonochromeBitmapInfo {
+        header: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: side as i32,
+            biHeight: -(side as i32),
+            biPlanes: 1,
+            biBitCount: 1,
+            biCompression: BI_RGB.0,
+            biClrUsed: 2,
+            ..Default::default()
+        },
+        colors: [RGBQUAD::default(); 2],
+    };
+    let mut mask_bits = std::ptr::null_mut();
+    let mask_bitmap = match CreateDIBSection(
+        Some(dc),
+        (&mask_info as *const MonochromeBitmapInfo).cast::<BITMAPINFO>(),
+        DIB_RGB_COLORS,
+        &mut mask_bits,
+        None,
+        0,
+    ) {
+        Ok(bitmap) if !mask_bits.is_null() => bitmap,
+        Ok(bitmap) => {
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteObject(color_bitmap.into());
+            let _ = DeleteDC(dc);
+            return Err(Error::from_thread());
+        }
+        Err(error) => {
+            let _ = DeleteObject(color_bitmap.into());
+            let _ = DeleteDC(dc);
+            return Err(error);
+        }
+    };
+    let mask_stride = (side as usize).div_ceil(32) * 4;
+    std::ptr::write_bytes(mask_bits.cast::<u8>(), 0, mask_stride * side as usize);
+    let mask = std::slice::from_raw_parts_mut(mask_bits.cast::<u8>(), mask_stride * side as usize);
+    for y in 0..side as usize {
+        for x in 0..side as usize {
+            if scaled[(y * side as usize + x) * 4 + 3] == 0 {
+                let byte = y * mask_stride + x / 8;
+                mask[byte] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+
+    let icon_info = ICONINFO {
+        fIcon: BOOL(1),
+        xHotspot: 0,
+        yHotspot: 0,
+        hbmMask: mask_bitmap,
+        hbmColor: color_bitmap,
+    };
+    let icon = CreateIconIndirect(&icon_info);
+    let _ = DeleteObject(mask_bitmap.into());
+    let _ = DeleteObject(color_bitmap.into());
+    let _ = DeleteDC(dc);
+    icon
+}
 fn copy_notification_text(destination: &mut [u16], value: &str) {
     destination.fill(0);
     let capacity = destination.len().saturating_sub(1);
@@ -8170,6 +8388,7 @@ fn hide_main(app: &mut AppState) {
     if !app.visible && app.popup_opacity == 0 && app.popup_transition.is_none() {
         return;
     }
+    unsafe { cancel_deferred_deactivation_hide(app) };
     if app
         .popup_transition
         .is_some_and(|transition| !app.visible && transition.hide_when_complete)
@@ -8256,6 +8475,12 @@ fn start_capture(app: &mut AppState, mode: CaptureMode) {
     };
     match ticket {
         Ok(ticket) => {
+            app.auto_spring =
+                (mode == CaptureMode::Auto).then(ui_model::auto_tagging_button_spring_profile);
+            app.success_wave_frame = None;
+            if mode == CaptureMode::Auto {
+                app.auto_candidate_dedupe.clear();
+            }
             app.recognition_session = Some(RecognitionSessionUi {
                 ticket,
                 mode,
@@ -8455,6 +8680,16 @@ fn apply_recognition_event(app: &mut AppState, event: RecognitionEvent, mode: Ca
             );
             true
         }
+        RecognitionEventKind::AutoUiEvent(NativeAutoUiEvent::ContinuousMatchCandidate(result))
+            if mode == CaptureMode::Auto =>
+        {
+            apply_auto_match_candidate(
+                app,
+                result.primary_track,
+                config_generation,
+                Some(event_time_utc),
+            )
+        }
         RecognitionEventKind::ManualUiEvent(NativeManualUiEvent::NoMatch)
         | RecognitionEventKind::NoMatch { .. } => {
             app.phase = MainPhase::NoMatch {
@@ -8555,6 +8790,18 @@ fn reconcile_session_snapshot(app: &mut AppState, session: &RecognitionSessionSn
             }
         }
     }
+    if ui_session.mode == CaptureMode::Auto {
+        if let Some(UiRecognitionEvent::Auto(NativeAutoUiEvent::ContinuousMatchCandidate(result))) =
+            session.last_result.as_ref()
+        {
+            changed |= apply_auto_match_candidate(
+                app,
+                result.primary_track.clone(),
+                session.config.as_ref().map(|config| config.generation),
+                session.last_result_at_utc,
+            );
+        }
+    }
     match session.phase {
         SessionPhase::Starting => {}
         SessionPhase::Running => {
@@ -8632,6 +8879,103 @@ fn show_controller_match(
     config_generation: Option<u64>,
     event_time_utc: Option<SystemTime>,
 ) {
+    let track = record_controller_track(app, candidate, config_generation, event_time_utc);
+    app.status_alternator = Some(StatusTextAlternator::after_success(track.recognized_at));
+    if app.visible {
+        app.success_wave_frame = current_success_wave_frame(app);
+        app.phase = MainPhase::Matched {
+            track,
+            stage: ResultCardStage::Entering {
+                started_at: Instant::now(),
+            },
+        };
+    } else {
+        app.success_wave_frame = None;
+        app.phase = MainPhase::Ready;
+        if mode == CaptureMode::Manual {
+            queue_hidden_match_notification(app, &track);
+        }
+    }
+}
+
+fn apply_auto_match_candidate(
+    app: &mut AppState,
+    candidate: TrackCandidate,
+    config_generation: Option<u64>,
+    event_time_utc: Option<SystemTime>,
+) -> bool {
+    if !matches!(
+        app.phase,
+        MainPhase::Starting {
+            mode: CaptureMode::Auto,
+            ..
+        } | MainPhase::Listening {
+            mode: CaptureMode::Auto,
+            ..
+        }
+    ) {
+        return false;
+    }
+    if auto_candidate_already_seen(app, &candidate) {
+        return false;
+    }
+    if let MainPhase::Starting { entered_at, .. } = &app.phase {
+        enter_listening(app, CaptureMode::Auto, *entered_at);
+    }
+    let track = record_controller_track(app, candidate, config_generation, event_time_utc);
+    if !app.visible {
+        queue_hidden_match_notification(app, &track);
+    }
+    true
+}
+
+fn auto_candidate_already_seen(app: &mut AppState, candidate: &TrackCandidate) -> bool {
+    let Some(identity) = auto_candidate_identity(candidate) else {
+        return false;
+    };
+    // A track already present in past history is still a valid new Auto
+    // Shazam result. Suppress only repeats from this active Auto session.
+    !remember_auto_candidate_key(&mut app.auto_candidate_dedupe, identity)
+}
+
+fn remember_auto_candidate_key(recent: &mut VecDeque<String>, identity: String) -> bool {
+    if recent.contains(&identity) {
+        return false;
+    }
+    recent.push_back(identity);
+    while recent.len() > AUTO_CANDIDATE_DEDUPE_LIMIT {
+        recent.pop_front();
+    }
+    true
+}
+
+fn auto_candidate_identity(candidate: &TrackCandidate) -> Option<String> {
+    if let Some(key) = candidate
+        .ui_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.track_key.as_deref())
+        .filter(|key| !key.trim().is_empty())
+    {
+        return Some(format!("track-key:{key}"));
+    }
+    if let Some(id) = candidate
+        .track_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        return Some(format!("candidate-id:{id}"));
+    }
+    let title = candidate.title.trim().to_lowercase();
+    let artist = candidate.artist.trim().to_lowercase();
+    (!title.is_empty() || !artist.is_empty()).then(|| format!("display:{title}\u{001f}{artist}"))
+}
+
+fn record_controller_track(
+    app: &mut AppState,
+    candidate: TrackCandidate,
+    config_generation: Option<u64>,
+    event_time_utc: Option<SystemTime>,
+) -> Track {
     let metadata = candidate.ui_metadata.as_ref();
     let display_id = app.next_display_id;
     app.next_display_id = app.next_display_id.wrapping_add(1).max(1);
@@ -8689,7 +9033,6 @@ fn show_controller_match(
     let next_hover = unsafe { hovered_history_row_for_cursor(app) };
     app.hovered_row = next_hover;
     invalidate_orphaned_artwork_requests(app);
-    app.status_alternator = Some(StatusTextAlternator::after_success(track.recognized_at));
     if let Some(request) = artwork_request {
         start_artwork_load(
             app.main_hwnd,
@@ -8697,21 +9040,7 @@ fn show_controller_match(
             unsafe { GetDpiForWindow(app.main_hwnd) }.max(96),
         );
     }
-    if app.visible {
-        app.success_wave_frame = current_success_wave_frame(app);
-        app.phase = MainPhase::Matched {
-            track,
-            stage: ResultCardStage::Entering {
-                started_at: Instant::now(),
-            },
-        };
-    } else {
-        app.success_wave_frame = None;
-        app.phase = MainPhase::Ready;
-        if mode == CaptureMode::Manual {
-            unsafe { notify_hidden_match(app.main_hwnd, &track) };
-        }
-    }
+    track
 }
 
 fn current_success_wave_frame(app: &AppState) -> Option<ui_model::WaveFrame> {
@@ -8777,6 +9106,21 @@ fn invalidate_orphaned_artwork_requests(app: &mut AppState) {
             display_id: *display_id,
         })
     });
+    let orphaned_notifications: Vec<_> = app
+        .pending_match_notifications
+        .keys()
+        .filter(|display_id| {
+            !live_tracks.contains(&TrackIdentity {
+                display_id: **display_id,
+            })
+        })
+        .copied()
+        .collect();
+    for display_id in orphaned_notifications {
+        if let Some(track) = app.pending_match_notifications.remove(&display_id) {
+            unsafe { notify_hidden_match(app, &track, None) };
+        }
+    }
 }
 
 fn start_artwork_load(hwnd: HWND, request: ArtworkRequest, dpi: u32) {
@@ -9720,15 +10064,26 @@ fn phase_needs_timeout(phase: &MainPhase) -> bool {
 }
 
 fn phase_needs_frame(phase: &MainPhase) -> bool {
+    phase_needs_frame_at(phase, Instant::now())
+}
+
+fn phase_needs_frame_at(phase: &MainPhase, now: Instant) -> bool {
     match phase {
         // Listening ripples are continuous Windows Composition keyframes.
         // They do not need an 8 ms UI-thread timer; future meter values enter
         // through a change event and update the audio transforms once per value.
-        MainPhase::Listening { .. } => false,
+        MainPhase::Listening {
+            mode: CaptureMode::Auto,
+            started_at,
+        } => now.saturating_duration_since(*started_at) < AUTO_START_SPRING_DURATION,
+        MainPhase::Listening {
+            mode: CaptureMode::Manual,
+            ..
+        } => false,
         MainPhase::Matched { stage, .. } => match stage {
             ResultCardStage::Entering { started_at }
             | ResultCardStage::Exiting { started_at, .. } => {
-                started_at.elapsed() < RESULT_CARD_TRANSITION
+                now.saturating_duration_since(*started_at) < RESULT_CARD_TRANSITION
             }
             ResultCardStage::Holding { .. } => false,
         },
@@ -9743,9 +10098,10 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
             // Keep UI-thread redraws only for the 300 ms panel transition and
             // the 180 ms deferred spring kickoff. The position/scale tracks
             // continue on the Composition clock once they have started.
-            entered_at.elapsed() < Duration::from_millis(350)
-                || returned_to_ready_at
-                    .is_some_and(|start| start.elapsed() < Duration::from_millis(350))
+            now.saturating_duration_since(*entered_at) < Duration::from_millis(350)
+                || returned_to_ready_at.is_some_and(|start| {
+                    now.saturating_duration_since(start) < Duration::from_millis(350)
+                })
         }
         MainPhase::Ready
         | MainPhase::Starting { .. }
@@ -10063,6 +10419,7 @@ fn animation_needs_d2d_redraw(
 }
 
 unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
+    cancel_deferred_deactivation_hide(app);
     refresh_os_theme(app);
     let now = Instant::now();
     // Showing/positioning the popup can produce focus notifications before
@@ -10124,6 +10481,65 @@ unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
         LPARAM(0),
     );
     update_visible_windows(app);
+}
+
+unsafe fn cancel_deferred_deactivation_hide(app: &mut AppState) {
+    if app.deactivation_hide_pending {
+        let _ = KillTimer(Some(app.main_hwnd), TIMER_DEFERRED_DEACTIVATION_HIDE);
+        app.deactivation_hide_pending = false;
+    }
+}
+
+unsafe fn defer_or_hide_main_after_deactivation(app: &mut AppState) {
+    if !should_hide_main_after_deactivation(app, Instant::now()) {
+        return;
+    }
+    let cursor_over_tray = cursor_over_tray_icon(app.main_hwnd);
+    if !should_defer_hide_for_tray_activation(cursor_over_tray) {
+        hide_main(app);
+        return;
+    }
+    if app.deactivation_hide_pending {
+        return;
+    }
+    app.deactivation_hide_pending = true;
+    if SetTimer(
+        Some(app.main_hwnd),
+        TIMER_DEFERRED_DEACTIVATION_HIDE,
+        DEACTIVATION_HIDE_DELAY_MS,
+        None,
+    ) == 0
+    {
+        app.deactivation_hide_pending = false;
+        hide_main(app);
+    }
+}
+
+unsafe fn cursor_over_tray_icon(hwnd: HWND) -> Option<bool> {
+    let mut cursor = POINT::default();
+    GetCursorPos(&mut cursor).ok()?;
+    let identifier = NOTIFYICONIDENTIFIER {
+        cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        guidItem: TRAY_ICON_GUID,
+    };
+    let tray = Shell_NotifyIconGetRect(&identifier).ok()?;
+    Some(
+        cursor.x >= tray.left
+            && cursor.x < tray.right
+            && cursor.y >= tray.top
+            && cursor.y < tray.bottom,
+    )
+}
+
+fn should_defer_hide_for_tray_activation(cursor_over_tray: Option<bool>) -> bool {
+    // Explorer can report activation loss before delivering the icon's own
+    // selection callback. When the pointer is on the icon (or the shell cannot
+    // resolve its overflow-area rectangle), let that callback decide whether
+    // the already-open popup should close. Ordinary outside clicks still hide
+    // immediately.
+    cursor_over_tray != Some(false)
 }
 
 fn refresh_os_theme(app: &mut AppState) -> bool {
@@ -10292,9 +10708,19 @@ unsafe extern "system" fn window_proc(
                             };
                             app.artwork_resources.remove(&oldest);
                         }
-                        if app.visible {
-                            let _ = InvalidateRect(Some(app.main_hwnd), None, false);
-                        }
+                    }
+                    if let Some(track) = app
+                        .pending_match_notifications
+                        .remove(&identity.track.display_id)
+                    {
+                        let pixels = app
+                            .artwork_resources
+                            .get(&identity.track.display_id)
+                            .map(|(_, pixels)| pixels.clone());
+                        unsafe { notify_hidden_match(app, &track, pixels.as_ref()) };
+                    }
+                    if app.visible {
+                        let _ = InvalidateRect(Some(app.main_hwnd), None, false);
                     }
                 }
             }
@@ -10305,6 +10731,16 @@ unsafe extern "system" fn window_proc(
             if !pointer.is_null() {
                 let identity = *Box::from_raw(pointer);
                 if finish_active_artwork_request(&mut app.active_artwork_requests, identity) {
+                    if let Some(track) = app
+                        .pending_match_notifications
+                        .remove(&identity.track.display_id)
+                    {
+                        let pixels = app
+                            .artwork_resources
+                            .get(&identity.track.display_id)
+                            .map(|(_, pixels)| pixels.clone());
+                        unsafe { notify_hidden_match(app, &track, pixels.as_ref()) };
+                    }
                     let track_is_retained = app
                         .history
                         .iter()
@@ -10420,6 +10856,7 @@ unsafe extern "system" fn window_proc(
             // silently drops clicks because the upper word is nonzero.
             let event = (lparam.0 as u32 & 0xffff) as u16;
             if is_tray_activation_event(event) {
+                cancel_deferred_deactivation_hide(app);
                 if app.visible {
                     hide_main(app);
                 } else {
@@ -10427,6 +10864,13 @@ unsafe extern "system" fn window_proc(
                 }
             } else if event == windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU as u16 {
                 show_tray_context_menu(app);
+            } else if matches!(
+                u32::from(event),
+                NIN_BALLOONHIDE | NIN_BALLOONTIMEOUT | NIN_BALLOONUSERCLICK
+            ) {
+                if let Some(Some(icon)) = app.owned_balloon_icons.pop_front() {
+                    let _ = DestroyIcon(icon);
+                }
             }
             LRESULT(0)
         }
@@ -10513,6 +10957,16 @@ unsafe extern "system" fn window_proc(
                     if track.recognized_at.elapsed() < SUCCESS_SETTLE_TOTAL
             );
             if update_phase_timers(app) || recognition_changed || settle_frame {
+                update_visible_windows(app);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER
+            if data.kind == WindowKind::Main && wparam.0 == TIMER_DEFERRED_DEACTIVATION_HIDE =>
+        {
+            cancel_deferred_deactivation_hide(app);
+            if should_hide_main_after_deactivation(app, Instant::now()) {
+                hide_main(app);
                 update_visible_windows(app);
             }
             LRESULT(0)
@@ -10744,20 +11198,20 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_SETFOCUS if data.kind == WindowKind::Main => {
+            cancel_deferred_deactivation_hide(app);
             app.main_activated = true;
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_KILLFOCUS if data.kind == WindowKind::Main => {
-            if should_hide_main_after_deactivation(app, Instant::now()) {
-                hide_main(app);
-            }
+            defer_or_hide_main_after_deactivation(app);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_ACTIVATE if data.kind == WindowKind::Main => {
             let activation = wparam.0 & 0xffff;
-            if activation == 0 && should_hide_main_after_deactivation(app, Instant::now()) {
-                hide_main(app);
+            if activation == 0 {
+                defer_or_hide_main_after_deactivation(app);
             } else if activation != 0 {
+                cancel_deferred_deactivation_hide(app);
                 app.main_activated = true;
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
@@ -10778,6 +11232,9 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY if data.kind == WindowKind::Main => {
             delete_tray_icon(hwnd);
+            for icon in app.owned_balloon_icons.drain(..).flatten() {
+                let _ = DestroyIcon(icon);
+            }
             if let Some(controller) = app.recognition_controller.take() {
                 thread::spawn(move || {
                     let _ = controller.join();
@@ -10943,6 +11400,7 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             popup_transition: None,
             main_activated: false,
             popup_activation_grace_until: None,
+            deactivation_hide_pending: false,
             phase_timer_active: false,
             animation_timer_active: false,
             status_text_composition_ready: false,
@@ -10957,6 +11415,7 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             single_click_pending: false,
             recognition_controller: None,
             recognition_session: None,
+            auto_candidate_dedupe: VecDeque::new(),
             controller_sequence: 0,
             dropped_notifications: 0,
             status_alternator: Some(StatusTextAlternator::ready(Instant::now())),
@@ -10966,6 +11425,8 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             artwork_generations: HashMap::new(),
             active_artwork_requests: HashMap::new(),
             artwork_resources: HashMap::new(),
+            pending_match_notifications: HashMap::new(),
+            owned_balloon_icons: VecDeque::new(),
             ui_configs: HashMap::new(),
             message: None,
         });
@@ -11232,16 +11693,18 @@ mod tests {
         history_artwork_frame, history_row_top, history_text_rects, history_title_color,
         inverse_circle_clip_radii, is_offline_failure, is_tray_activation_event, localized_ui_text,
         native_icon_layout, no_match_copy, no_match_icon_rect, page_url_for_display_id,
-        phase_needs_timeout, point_in_rect, popup_base_color, resolve_page_link,
-        resolve_page_link_checked, resolve_page_link_for_generation, result_artwork_rect,
-        result_card_link_hit, result_details_rects, result_gradient_colors,
-        result_header_hit_test_contains, result_header_visible_height, result_overlay_child_offset,
+        phase_needs_frame_at, phase_needs_timeout, point_in_rect, popup_base_color,
+        remember_auto_candidate_key, resolve_page_link, resolve_page_link_checked,
+        resolve_page_link_for_generation, result_artwork_rect, result_card_link_hit,
+        result_details_rects, result_gradient_colors, result_header_hit_test_contains,
+        result_header_visible_height, result_overlay_child_offset,
         result_overlay_occludes_shazam_button, result_panel_draw_top, result_panel_top_at,
-        select_ui_language_from_multisz, should_hide_popup_on_deactivation,
+        scale_notification_artwork, select_ui_language_from_multisz,
+        should_defer_hide_for_tray_activation, should_hide_popup_on_deactivation,
         should_replace_cached_artwork, should_show_initial_popup, should_start_startup_logo,
         theme_from_foreground_rgb, timeout_copy, ui_model, valid_page_template,
-        visible_history_row_hit, ArrowEdge, ArtworkRequest, ArtworkRequestIdentity, ArtworkSource,
-        CaptureMode, CompositionRootLayer, CompositionSceneLayer, HeaderFillScope,
+        visible_history_row_hit, ArrowEdge, ArtworkPixels, ArtworkRequest, ArtworkRequestIdentity,
+        ArtworkSource, CaptureMode, CompositionRootLayer, CompositionSceneLayer, HeaderFillScope,
         HistoryMutationEvent, HistoryMutationTransition, HistoryTimestampSource, MainPhase,
         NoMatchIconCommand, PageLinkFailure, ResultCardAdvance, ResultCardStage, Theme,
         ThemePreference, Track, TrackIdentity, UiConfigSnapshot, UiLanguage, UiTextKey,
@@ -11254,6 +11717,7 @@ mod tests {
         RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
     };
     use std::collections::HashMap;
+    use std::collections::VecDeque;
     use std::time::SystemTime;
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -11546,6 +12010,50 @@ mod tests {
             false,
             None,
             grace_until + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn tray_click_activation_wins_over_the_focus_loss_it_causes() {
+        assert!(should_defer_hide_for_tray_activation(Some(true)));
+        assert!(should_defer_hide_for_tray_activation(None));
+        assert!(!should_defer_hide_for_tray_activation(Some(false)));
+    }
+
+    #[test]
+    fn empty_history_skeleton_matches_nib_rows_after_coordinate_flip() {
+        let nib_bottom_origin_y = [-39.0_f32, 55.0, 149.0, 243.0, 336.0];
+        let mut expected_top_origin_y = nib_bottom_origin_y.map(|y| 430.0 - (y + 94.0));
+        expected_top_origin_y.sort_by(f32::total_cmp);
+        assert_eq!(super::EMPTY_HISTORY_ROW_TOPS, expected_top_origin_y);
+    }
+
+    #[test]
+    fn auto_candidate_dedupe_is_bounded_and_suppresses_repeated_candidates() {
+        let mut recent = VecDeque::new();
+        assert!(remember_auto_candidate_key(
+            &mut recent,
+            "track-key:a".to_owned()
+        ));
+        assert!(!remember_auto_candidate_key(
+            &mut recent,
+            "track-key:a".to_owned()
+        ));
+        assert!(remember_auto_candidate_key(
+            &mut recent,
+            "track-key:b".to_owned()
+        ));
+
+        for index in 0..super::AUTO_CANDIDATE_DEDUPE_LIMIT {
+            assert!(remember_auto_candidate_key(
+                &mut recent,
+                format!("track-key:{index}")
+            ));
+        }
+        assert_eq!(recent.len(), super::AUTO_CANDIDATE_DEDUPE_LIMIT);
+        assert!(remember_auto_candidate_key(
+            &mut recent,
+            "track-key:a".to_owned()
         ));
     }
 
@@ -12285,6 +12793,38 @@ mod tests {
             ArtworkSource::Standard,
             first,
         ));
+    }
+
+    #[test]
+    fn notification_artwork_uses_bilinear_center_crop_and_rejects_bad_buffers() {
+        let mut bgra = Vec::new();
+        for pixel in [
+            [0, 0, 0, 255],
+            [10, 20, 30, 255],
+            [30, 40, 50, 255],
+            [100, 100, 100, 255],
+            [200, 200, 200, 255],
+            [30, 40, 50, 255],
+            [50, 60, 70, 255],
+            [200, 200, 200, 255],
+        ] {
+            bgra.extend_from_slice(&pixel);
+        }
+        let pixels = ArtworkPixels {
+            width: 4,
+            height: 2,
+            fingerprint: 0,
+            bgra,
+        };
+
+        assert_eq!(
+            scale_notification_artwork(&pixels, 1),
+            Some(vec![30, 40, 50, 255])
+        );
+        assert_eq!(scale_notification_artwork(&pixels, 0), None);
+        let mut malformed = pixels;
+        malformed.bgra.pop();
+        assert_eq!(scale_notification_artwork(&malformed, 1), None);
     }
 
     #[test]
@@ -13553,6 +14093,21 @@ mod tests {
             started_at: std::time::Instant::now(),
         };
         assert!(!animation_needs_frame(&listening, false));
+
+        let auto_started = Instant::now();
+        let auto_listening = MainPhase::Listening {
+            mode: CaptureMode::Auto,
+            started_at: auto_started,
+        };
+        assert!(phase_needs_frame_at(&auto_listening, auto_started));
+        assert!(phase_needs_frame_at(
+            &auto_listening,
+            auto_started + Duration::from_millis(199)
+        ));
+        assert!(!phase_needs_frame_at(
+            &auto_listening,
+            auto_started + Duration::from_millis(200)
+        ));
     }
 
     #[test]

@@ -207,6 +207,23 @@ pub struct SpringProfile {
     pub to: f64,
 }
 
+/// Auto Shazam's one-shot button spring from UI-102. The native code sets the
+/// endpoints and 0.2-second duration but leaves the physical coefficients at
+/// Core Animation's documented defaults (mass 1, damping 10, stiffness 100,
+/// initial velocity 0). Keep the profile replaceable for presentation-based
+/// calibration if native runtime samples become available.
+pub fn auto_tagging_button_spring_profile() -> SpringProfile {
+    SpringProfile {
+        mass: 1.0,
+        damping: 10.0,
+        stiffness: 100.0,
+        initial_velocity: 0.0,
+        duration_seconds: 0.2,
+        from: 0.95,
+        to: 0.85,
+    }
+}
+
 /// Cubic Bezier timing function (0.44, 0.05, 0.55, 0.95), solving x(t)=time.
 /// This is the curve used by both native methods named in the source spec.
 pub fn native_bezier(progress: f64) -> f64 {
@@ -1539,6 +1556,44 @@ mod tests {
             }),
         );
         assert_ne!(injected.button_child_scale, auto.button_child_scale);
+    }
+
+    #[test]
+    fn auto_button_uses_the_native_default_spring_once_and_holds_its_endpoint() {
+        let profile = auto_tagging_button_spring_profile();
+        assert_eq!(profile.from, 0.95);
+        assert_eq!(profile.to, 0.85);
+        assert_eq!(profile.duration_seconds, 0.2);
+        assert_eq!(profile.mass, 1.0);
+        assert_eq!(profile.damping, 10.0);
+        assert_eq!(profile.stiffness, 100.0);
+        assert_eq!(profile.initial_velocity, 0.0);
+
+        let at_start = wave_frame_at_with_auto_spring(
+            TaggingMode::Auto,
+            0.0,
+            UiLevels::default(),
+            Some(profile),
+        );
+        let at_end = wave_frame_at_with_auto_spring(
+            TaggingMode::Auto,
+            profile.duration_seconds,
+            UiLevels::default(),
+            Some(profile),
+        );
+        let after_end = wave_frame_at_with_auto_spring(
+            TaggingMode::Auto,
+            12.0,
+            UiLevels::default(),
+            Some(profile),
+        );
+        close(at_start.button_child_scale, profile.from, 1e-12);
+        close(at_end.button_child_scale, spring_value(1.0, profile), 1e-12);
+        close(
+            after_end.button_child_scale,
+            at_end.button_child_scale,
+            1e-12,
+        );
     }
 
     #[test]
