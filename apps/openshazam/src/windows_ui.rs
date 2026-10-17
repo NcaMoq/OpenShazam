@@ -1062,6 +1062,7 @@ struct TextStyles {
     date: IDWriteTextFormat,
     result_title: IDWriteTextFormat,
     result_artist: IDWriteTextFormat,
+    result_action: IDWriteTextFormat,
     button: IDWriteTextFormat,
     centered_body: IDWriteTextFormat,
     centered_title: IDWriteTextFormat,
@@ -1074,7 +1075,6 @@ struct TextStyles {
 struct ResultDetailsRects {
     title: D2D_RECT_F,
     artist: D2D_RECT_F,
-    #[allow(dead_code)] // Reserved for the provider action when UI-233 data becomes available.
     action: D2D_RECT_F,
 }
 
@@ -4934,7 +4934,7 @@ fn result_details_rects(
             rect(
                 RESULT_DETAILS_LEFT,
                 action_top,
-                RESULT_DETAILS_LEFT + 70.0,
+                RESULT_DETAILS_RIGHT,
                 action_top + RESULT_ACTION_HEIGHT,
             )
         } else {
@@ -6578,7 +6578,7 @@ impl Renderer {
         self.fill_gradient_rect(&panel, gradient, top)?;
         let details = self.result_details_metrics(track)?;
         let detail_rects =
-            result_details_rects(top, details.title_height, details.artist_height, false);
+            result_details_rects(top, details.title_height, details.artist_height, true);
         // The image view is 150×150pt and clips at radius5. The native
         // placeholder has its own centered 131pt intrinsic image size and
         // alpha, so do not paint an opaque square under it.
@@ -6598,9 +6598,15 @@ impl Renderer {
             &self.text.result_artist,
             &self.palette.result_label,
         );
-        // The current Track presentation has no verified store provider or
-        // store-badge image. UI-233 requires hiding this control in that case;
-        // do not draw an inert generic play pill.
+        // UI-233 keeps a fixed Apple Music CTA visible. The current UI model
+        // has no verified destination, so show it disabled and keep its hit
+        // rectangle separate from the Shazam page link.
+        self.text(
+            localized_ui_text(UiTextKey::AppleMusicAction, ui_language()),
+            detail_rects.action,
+            &self.text.result_action,
+            &self.palette.subtitle,
+        );
         self.draw_result_close_icon(top, edge);
         Ok(())
     }
@@ -7004,6 +7010,12 @@ unsafe fn create_text_styles(factory: &IDWriteFactory) -> windows::core::Result<
             factory,
             14.0,
             DWRITE_FONT_WEIGHT_BOLD,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+        )?,
+        result_action: create_text_format(
+            factory,
+            12.0,
+            DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_TEXT_ALIGNMENT_LEADING,
         )?,
         button: create_text_format(
@@ -7431,7 +7443,13 @@ unsafe fn window_data(hwnd: HWND) -> Option<&'static mut WindowData> {
     ptr.as_mut()
 }
 
-unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHit {
+unsafe fn main_hit_test(
+    app: &AppState,
+    x: f32,
+    y: f32,
+    body_top: f32,
+    renderer: Option<&Renderer>,
+) -> MainHit {
     let result_accepts_input = result_header_hit_test_contains(y, body_top)
         && match &app.phase {
             MainPhase::Matched { stage, .. } => !matches!(stage, ResultCardStage::Exiting { .. }),
@@ -7454,8 +7472,30 @@ unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHi
             return MainHit::CloseResult;
         }
         if let MainPhase::Matched { track, .. } = &app.phase {
+            let action = renderer
+                .and_then(|renderer| renderer.result_details_metrics(track).ok())
+                .map(|metrics| {
+                    result_details_rects(
+                        body_top,
+                        metrics.title_height,
+                        metrics.artist_height,
+                        true,
+                    )
+                    .action
+                })
+                .unwrap_or_else(|| {
+                    // If DirectWrite metrics are unavailable, conservatively
+                    // keep the whole details column out of the Shazam link.
+                    rect(
+                        RESULT_DETAILS_LEFT,
+                        body_top,
+                        RESULT_DETAILS_RIGHT,
+                        body_top + TOP_HEIGHT as f32,
+                    )
+                });
+            let action_bounds = [action.left, action.top, action.right, action.bottom];
             if resolve_track_page_url(track, &app.ui_configs).is_some()
-                && result_card_link_hit(x, local_y, body_top, close, None)
+                && result_card_link_hit(x, local_y, body_top, close, Some(action_bounds))
             {
                 return MainHit::OpenTrack(track.display_id);
             }
@@ -9011,6 +9051,7 @@ enum UiTextKey {
     NoMatchBody,
     OfflineBody,
     TryAgain,
+    AppleMusicAction,
     TimeoutDescription,
     TimeoutDismiss,
     TimeoutRestart,
@@ -9050,6 +9091,10 @@ fn localized_ui_text(key: UiTextKey, language: UiLanguage) -> &'static str {
         (UiTextKey::OfflineBody, UiLanguage::English) => "Please check your connection",
         (UiTextKey::TryAgain, UiLanguage::Japanese) => "再度試す",
         (UiTextKey::TryAgain, UiLanguage::English) => "Try Again",
+        (UiTextKey::AppleMusicAction, UiLanguage::Japanese) => {
+            "Apple Music\u{3067}\u{8074}\u{304f}"
+        }
+        (UiTextKey::AppleMusicAction, UiLanguage::English) => "Listen on Apple Music",
         (UiTextKey::TimeoutDescription, UiLanguage::Japanese) => {
             "引き続き聴きたい？「再起動」をクリックして Shazam を続けましょう！"
         }
@@ -9922,7 +9967,8 @@ unsafe extern "system" fn window_proc(
             } else {
                 0.0
             };
-            app.mouse_down_center = main_hit_test(app, x, y, body_top) == MainHit::CenterButton;
+            app.mouse_down_center =
+                main_hit_test(app, x, y, body_top, data.renderer.as_ref()) == MainHit::CenterButton;
             app.long_press_consumed = false;
             if app.mouse_down_center {
                 let _ = SetCapture(hwnd);
@@ -9940,7 +9986,7 @@ unsafe extern "system" fn window_proc(
             } else {
                 0.0
             };
-            if main_hit_test(app, x, y, body_top) == MainHit::CenterButton {
+            if main_hit_test(app, x, y, body_top, data.renderer.as_ref()) == MainHit::CenterButton {
                 app.mouse_down_center = true;
                 app.long_press_consumed = true;
                 if matches!(
@@ -9957,7 +10003,10 @@ unsafe extern "system" fn window_proc(
             } else {
                 app.mouse_down_center = false;
                 app.long_press_consumed = false;
-                process_main_hit(app, main_hit_test(app, x, y, body_top));
+                process_main_hit(
+                    app,
+                    main_hit_test(app, x, y, body_top, data.renderer.as_ref()),
+                );
             }
             update_visible_windows(app);
             LRESULT(0)
@@ -9980,7 +10029,7 @@ unsafe extern "system" fn window_proc(
                 } else {
                     0.0
                 };
-                let hit = main_hit_test(app, x, y, body_top);
+                let hit = main_hit_test(app, x, y, body_top, data.renderer.as_ref());
                 process_main_hit(app, hit);
                 update_visible_windows(app);
             }
@@ -10184,7 +10233,7 @@ unsafe extern "system" fn window_proc(
             } else {
                 0.0
             };
-            if main_hit_test(app, x, y, body_top) == MainHit::CenterButton {
+            if main_hit_test(app, x, y, body_top, data.renderer.as_ref()) == MainHit::CenterButton {
                 if matches!(
                     app.phase,
                     MainPhase::Listening {
@@ -10729,7 +10778,7 @@ mod tests {
         ValidatedWebTrackUrl, WindowKind, BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X,
         FALLBACK_MATCH_DARK_PIXELS, FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE,
         HISTORY_HEIGHT, HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH,
-        OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT,
+        OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT, RESULT_ACTION_HEIGHT,
         RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD, RESULT_CARD_TRANSITION,
         RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT,
         WHITE_CLOSE_ICON_PIXELS,
@@ -11441,23 +11490,40 @@ mod tests {
     }
 
     #[test]
-    fn ui233_absent_store_badge_does_not_leave_an_inert_hit_area() {
+    fn ui233_fixed_store_cta_is_visible_but_separate_from_shazam_page_hit() {
         let top = 42.0;
         let close = [353.0, top + 25.0, 365.0, top + 37.0];
         let action = result_details_rects(top, 24.0, 18.0, true).action;
+        assert_eq!(action.left, RESULT_DETAILS_LEFT);
+        assert_eq!(action.right, RESULT_DETAILS_RIGHT);
+        assert_eq!(action.bottom - action.top, RESULT_ACTION_HEIGHT);
         let action_center = (
             (action.left + action.right) * 0.5,
             (action.top + action.bottom) * 0.5,
         );
 
-        assert!(result_card_link_hit(
+        assert!(!result_card_link_hit(
             action_center.0,
             action_center.1,
             top,
             close,
-            None,
+            Some([action.left, action.top, action.right, action.bottom]),
         ));
-        assert!(!result_card_link_hit(359.0, top + 31.0, top, close, None));
+        assert!(result_card_link_hit(
+            30.0,
+            top + 80.0,
+            top,
+            close,
+            Some([action.left, action.top, action.right, action.bottom]),
+        ));
+        assert_eq!(
+            localized_ui_text(UiTextKey::AppleMusicAction, UiLanguage::Japanese),
+            "Apple Musicで聴く"
+        );
+        assert_eq!(
+            localized_ui_text(UiTextKey::AppleMusicAction, UiLanguage::English),
+            "Listen on Apple Music"
+        );
     }
 
     #[test]
