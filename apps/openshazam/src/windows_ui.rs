@@ -9729,7 +9729,6 @@ fn valid_shazam_page_url(url: &str) -> bool {
     if url.len() > 4_096
         || !url.starts_with("https://")
         || url.chars().any(char::is_control)
-        || url.contains('#')
         || url.contains('@')
         || url.contains('\\')
     {
@@ -12993,6 +12992,14 @@ mod tests {
         assert!(valid_page_template(
             "https://www.shazam.com/track/{trackid}"
         ));
+        let referrer_template = "https://www.shazam.com/track/{trackid}#referrer=shazamapp";
+        assert!(valid_page_template(referrer_template));
+        assert_eq!(
+            resolve_page_link_checked(Some(referrer_template), Some("abc123")),
+            Ok(ValidatedWebTrackUrl(
+                "https://www.shazam.com/track/abc123#referrer=shazamapp".to_owned()
+            ))
+        );
         assert!(!valid_page_template(
             "https://www.shazam.com/track/{trackid}/{trackid}"
         ));
