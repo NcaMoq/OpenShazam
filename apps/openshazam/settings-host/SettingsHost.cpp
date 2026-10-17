@@ -362,17 +362,14 @@ namespace
             state->info.IsClosable(false);
             stack.Children().Append(state->info);
 
-            controls::ScrollViewer viewer;
+            // Keep the background as a XAML ThemeResource expression rather
+            // than copying the current brush instance. That lets the root
+            // switch palettes when Windows changes app appearance at runtime.
+            controls::ScrollViewer viewer = markup::XamlReader::Load(
+                LR"(<ScrollViewer xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" />)"
+            ).as<controls::ScrollViewer>();
             viewer.Content(stack);
             viewer.VerticalScrollBarVisibility(controls::ScrollBarVisibility::Auto);
-            // A Win32 host paints COLOR_WINDOW behind a transparent island.
-            // On a dark Windows theme that leaves the WinUI's light text on a
-            // white native surface. Fill the XAML root with WinUI's own
-            // theme resource so content and foreground use the same palette.
-            auto pageBackground = app.Resources()
-                .Lookup(winrt::box_value(L"ApplicationPageBackgroundThemeBrush"))
-                .as<winrt::Microsoft::UI::Xaml::Media::Brush>();
-            viewer.Background(pageBackground);
             return viewer;
         }
 
