@@ -2855,13 +2855,15 @@ enum CompositionRootLayer {
 }
 
 fn composition_root_layer_order() -> [CompositionRootLayer; 4] {
-    // Insert back-to-front: keep the Auto shadow behind both ripple groups,
-    // and keep every ripple below the Shazam button.
+    // Insert back-to-front to match SHUTaggingLayer: the inner ripple group
+    // sits below the Shazam button and the outer group is added above it.
+    // The inner inverse clip follows the button scale so its fill cannot paint
+    // over the button; the larger outer rings remain clear of its bounds.
     [
         CompositionRootLayer::AutoShadow,
-        CompositionRootLayer::OuterRipples,
         CompositionRootLayer::InnerRipples,
         CompositionRootLayer::Button,
+        CompositionRootLayer::OuterRipples,
     ]
 }
 
@@ -12290,16 +12292,34 @@ mod tests {
     }
 
     #[test]
-    fn listening_layers_keep_all_ripples_behind_the_button() {
+    fn listening_layers_match_native_z_order_without_covering_the_button() {
         assert_eq!(
             composition_root_layer_order(),
             [
                 CompositionRootLayer::AutoShadow,
-                CompositionRootLayer::OuterRipples,
                 CompositionRootLayer::InnerRipples,
                 CompositionRootLayer::Button,
+                CompositionRootLayer::OuterRipples,
             ]
         );
+
+        let levels = ui_model::UiLevels {
+            bass: 1.0,
+            treble: 0.0,
+        };
+        let max_button_diameter = BUTTON_SIZE as f64
+            * ui_model::wave_frame_at(ui_model::TaggingMode::Manual, 0.0, levels)
+                .button_child_scale;
+        for step in 0..=500 {
+            let elapsed = ui_model::OUTER_LOOP_DURATION * f64::from(step) / 500.0;
+            let frame = ui_model::wave_frame_at(ui_model::TaggingMode::Manual, elapsed, levels);
+            for (index, ring) in frame.outer.iter().enumerate() {
+                assert!(
+                    ring.diameter - ring.stroke_width > max_button_diameter,
+                    "outer ring {index} overlaps the maximum button diameter at {elapsed:.4}s"
+                );
+            }
+        }
         assert_eq!(
             composition_scene_layer_order(),
             [
