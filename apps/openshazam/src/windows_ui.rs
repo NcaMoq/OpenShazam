@@ -1135,6 +1135,7 @@ struct Renderer {
     target: ID2D1RenderTarget,
     settings_icon: ID2D1Bitmap,
     white_close_icon: ID2D1Bitmap,
+    result_close_icon: ID2D1Bitmap,
     fallback_match_artwork: Option<(ID2D1Bitmap, ID2D1Bitmap)>,
     hwnd_target: Option<ID2D1HwndRenderTarget>,
     dc_target: Option<ID2D1DCRenderTarget>,
@@ -1160,6 +1161,52 @@ struct Renderer {
 
 const SETTINGS_ICON_PIXELS: &[u8; 4096] = include_bytes!("../assets/settings-2x.bgra");
 const WHITE_CLOSE_ICON_PIXELS: &[u8; 2304] = include_bytes!("../assets/WhiteClose-2x.bgra");
+// ShazamUI's native closeButton @2x GA8 rendition, extracted from its
+// bottom-origin CoreUI atlas and stored inline so normal builds need no
+// generated files outside dist.
+const CLOSE_BUTTON_GA_PIXELS: &[u8; 1152] = &[
+    0, 0, 16, 39, 71, 179, 93, 237, 88, 223, 57, 143, 5, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 12, 57, 144, 88, 224, 94, 238, 71, 180, 16, 39, 0, 0,
+    16, 39, 97, 245, 100, 255, 100, 255, 100, 255, 100, 255, 84, 214, 10, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 24, 84, 214, 100, 255, 100, 255, 100, 255, 100, 255, 97, 245, 16, 39,
+    71, 180, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 71, 179,
+    93, 237, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 93, 237,
+    88, 223, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 88, 223,
+    57, 143, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 57, 143,
+    5, 11, 84, 214, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 84, 214, 5, 12,
+    0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0,
+    0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0,
+    0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0,
+    5, 12, 84, 214, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 84, 214, 5, 12,
+    57, 143, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 57, 144,
+    88, 223, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 88, 224,
+    93, 237, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 94, 238,
+    71, 179, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 85, 215, 10, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 24, 85, 215, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 100, 255, 71, 180,
+    16, 39, 97, 245, 100, 255, 100, 255, 100, 255, 100, 255, 84, 214, 10, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 24, 84, 214, 100, 255, 100, 255, 100, 255, 100, 255, 97, 245, 16, 39,
+    0, 0, 16, 39, 71, 180, 94, 238, 88, 224, 57, 144, 5, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 12, 57, 144, 88, 224, 94, 238, 71, 180, 16, 39, 0, 0,
+];
+const fn close_button_ga_to_bgra(pixels: &[u8; 1152]) -> [u8; 2304] {
+    let mut output = [0u8; 2304];
+    let mut index = 0;
+    while index < 24 * 24 {
+        let gray = pixels[index * 2] as u16;
+        let alpha = pixels[index * 2 + 1];
+        let premultiplied = ((gray * alpha as u16 + 127) / 255) as u8;
+        let offset = index * 4;
+        output[offset] = premultiplied;
+        output[offset + 1] = premultiplied;
+        output[offset + 2] = premultiplied;
+        output[offset + 3] = alpha;
+        index += 1;
+    }
+    output
+}
+const RESULT_CLOSE_ICON_PIXELS: [u8; 2304] = close_button_ga_to_bgra(CLOSE_BUTTON_GA_PIXELS);
 const FALLBACK_MATCH_LIGHT_PIXELS: &[u8; 274_576] =
     include_bytes!("../assets/fallbackArtworkMatch-light-2x.bgra");
 const FALLBACK_MATCH_DARK_PIXELS: &[u8; 274_576] =
@@ -5258,6 +5305,7 @@ impl Renderer {
         target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         let settings_icon = create_ui_icon_bitmap(&target, SETTINGS_ICON_PIXELS, 32, 32)?;
         let white_close_icon = create_ui_icon_bitmap(&target, WHITE_CLOSE_ICON_PIXELS, 24, 24)?;
+        let result_close_icon = create_ui_icon_bitmap(&target, &RESULT_CLOSE_ICON_PIXELS, 24, 24)?;
         let fallback_match_artwork = if kind == WindowKind::Main {
             Some((
                 create_ui_icon_bitmap(&target, FALLBACK_MATCH_LIGHT_PIXELS, 262, 262)?,
@@ -5320,6 +5368,7 @@ impl Renderer {
             target,
             settings_icon,
             white_close_icon,
+            result_close_icon,
             fallback_match_artwork,
             hwnd_target,
             dc_target,
@@ -6658,7 +6707,7 @@ impl Renderer {
         let [left, top, right, bottom] = native_icon_layout(body_top, edge).result_close_visual;
         let destination = rect(left, top, right, bottom);
         self.target.DrawBitmap(
-            &self.white_close_icon,
+            &self.result_close_icon,
             Some(&destination),
             1.0,
             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
@@ -10780,8 +10829,8 @@ mod tests {
         HISTORY_HEIGHT, HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH,
         OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT, RESULT_ACTION_HEIGHT,
         RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD, RESULT_CARD_TRANSITION,
-        RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT,
-        WHITE_CLOSE_ICON_PIXELS,
+        RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, RESULT_CLOSE_ICON_PIXELS, SETTINGS_ICON_PIXELS,
+        TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS, CLOSE_BUTTON_GA_PIXELS,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -11968,11 +12017,14 @@ mod tests {
     fn native_header_icons_embed_the_high_resolution_catalog_renditions() {
         assert_eq!(SETTINGS_ICON_PIXELS.len(), 32 * 32 * 4);
         assert_eq!(WHITE_CLOSE_ICON_PIXELS.len(), 24 * 24 * 4);
+        assert_eq!(CLOSE_BUTTON_GA_PIXELS.len(), 24 * 24 * 2);
+        assert_eq!(RESULT_CLOSE_ICON_PIXELS.len(), 24 * 24 * 4);
         // The catalog packs these images in a bottom-origin atlas. Preserve
         // their recognizable silhouettes so another valid but wrong crop
         // (for example a social icon) cannot pass as the settings/close art.
         assert_eq!(SETTINGS_ICON_PIXELS[(16 * 32 + 16) * 4 + 3], 0);
         assert!(WHITE_CLOSE_ICON_PIXELS[(12 * 24 + 12) * 4 + 3] > 0);
+        assert!(RESULT_CLOSE_ICON_PIXELS[(12 * 24 + 12) * 4 + 3] > 0);
     }
 
     #[test]
