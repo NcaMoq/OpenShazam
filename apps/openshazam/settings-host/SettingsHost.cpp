@@ -64,6 +64,8 @@ namespace
     constexpr uint32_t kAppearanceDark = 2;
     constexpr int kWidthDips = 520;
     constexpr int kHeightDips = 380;
+    constexpr int kMinimumWidthDips = 460;
+    constexpr int kMinimumHeightDips = 320;
     constexpr wchar_t kStartupRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kStartupRunValue[] = L"OpenShazam";
 
@@ -689,6 +691,16 @@ namespace
             auto* host = g_active;
             switch (msg)
             {
+            case WM_GETMINMAXINFO:
+                if (lp)
+                {
+                    auto* limits = reinterpret_cast<MINMAXINFO*>(lp);
+                    auto dpi = ::GetDpiForWindow(h);
+                    if (dpi < 96) dpi = 96;
+                    limits->ptMinTrackSize.x = ::MulDiv(kMinimumWidthDips, dpi, 96);
+                    limits->ptMinTrackSize.y = ::MulDiv(kMinimumHeightDips, dpi, 96);
+                }
+                return 0;
             case WM_SIZE:
                 if (host && host->hwnd == h) host->Layout();
                 return 0;
