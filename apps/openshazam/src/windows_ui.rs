@@ -73,9 +73,9 @@ use windows::{
             Dxgi::{Common::DXGI_FORMAT_B8G8R8A8_UNORM, IDXGIDevice},
             Gdi::{
                 BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
-                GetMonitorInfoW, InvalidateRect, MonitorFromRect, SelectObject, AC_SRC_ALPHA,
-                AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
-                HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+                GetMonitorInfoW, InvalidateRect, MonitorFromRect, ScreenToClient, SelectObject,
+                AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
+                DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
             },
         },
         System::{
@@ -116,10 +116,11 @@ use windows::{
                 GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, LoadIconW, PeekMessageW,
                 PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
                 SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-                TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, WaitMessage, CS_DBLCLKS,
-                CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION, MF_SEPARATOR, MF_STRING,
-                MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
-                SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
+                SystemParametersInfoW, TrackPopupMenu, TranslateMessage, UpdateLayeredWindow,
+                WaitMessage, CS_DBLCLKS, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, IDI_APPLICATION,
+                MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE,
+                SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
                 WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN,
                 WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
                 WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_RBUTTONUP,
@@ -295,8 +296,8 @@ fn result_card_link_hit(
 
 fn visible_history_row_hit(y: f32, row_top: f32, history_top: f32, history_bottom: f32) -> bool {
     let visible_top = row_top.max(history_top);
-    let visible_bottom = (row_top + 89.0).min(history_bottom);
-    visible_top <= visible_bottom && (visible_top..=visible_bottom).contains(&y)
+    let visible_bottom = (row_top + HISTORY_ROW_HEIGHT).min(history_bottom);
+    visible_top < visible_bottom && visible_top <= y && y < visible_bottom
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4941,6 +4942,11 @@ fn result_details_rects(
 }
 
 const HISTORY_ROW_HEIGHT: f32 = 89.0;
+const HISTORY_ROW_SPACING: f32 = 2.0;
+const HISTORY_ROW_PITCH: f32 = HISTORY_ROW_HEIGHT + HISTORY_ROW_SPACING;
+// One native wheel line follows the history text's approximate DirectWrite line height.
+// The number of lines per detent comes from SPI_GETWHEELSCROLLLINES.
+const HISTORY_SCROLL_LINE_DIP: f32 = 18.0;
 const HISTORY_TEXT_LEFT: f32 = 95.0;
 const HISTORY_TEXT_RIGHT: f32 = 360.0;
 const HISTORY_ARTWORK_SIZE: f32 = 65.0;
@@ -4948,6 +4954,59 @@ const HISTORY_ARTWORK_LEFT: f32 = 20.0;
 const HISTORY_ARTWORK_TOP: f32 = 11.0;
 const HISTORY_ARTWORK_CENTER_Y: f32 = HISTORY_ARTWORK_TOP + HISTORY_ARTWORK_SIZE * 0.5;
 const HISTORY_TEXT_GAP: f32 = 5.0;
+
+fn history_content_height(item_count: usize) -> f32 {
+    if item_count == 0 {
+        0.0
+    } else {
+        item_count as f32 * HISTORY_ROW_PITCH - HISTORY_ROW_SPACING
+    }
+}
+
+fn history_max_scroll_offset(item_count: usize, viewport_height: f32) -> f32 {
+    (history_content_height(item_count) - viewport_height.max(0.0)).max(0.0)
+}
+
+fn history_scroll_offset_after_wheel(
+    current_offset: f32,
+    delta: f32,
+    wheel_lines: u32,
+    item_count: usize,
+    viewport_height: f32,
+) -> f32 {
+    let maximum = history_max_scroll_offset(item_count, viewport_height);
+    let current = if current_offset.is_finite() {
+        current_offset
+    } else {
+        0.0
+    };
+    if !delta.is_finite() || wheel_lines == 0 {
+        return current.clamp(0.0, maximum);
+    }
+
+    let distance = if wheel_lines == u32::MAX {
+        delta / 120.0 * viewport_height
+    } else {
+        delta / 120.0 * wheel_lines as f32 * HISTORY_SCROLL_LINE_DIP
+    };
+    (current - distance).clamp(0.0, maximum)
+}
+
+fn history_offset_after_insert(
+    current_offset: f32,
+    new_item_count: usize,
+    viewport_height: f32,
+) -> (f32, bool) {
+    if current_offset > 0.0 {
+        (
+            (current_offset + HISTORY_ROW_PITCH)
+                .min(history_max_scroll_offset(new_item_count, viewport_height)),
+            false,
+        )
+    } else {
+        (0.0, true)
+    }
+}
 
 fn history_text_rects(
     row_top: f32,
@@ -8098,15 +8157,25 @@ fn show_controller_match(
     };
     let artwork_request = register_artwork_request(app, &track);
     let previous_count = app.history.len();
+    let previous_scroll_offset = app.scroll_offset;
     app.history.insert(0, track.clone());
-    app.history_transition = Some(HistoryMutationTransition {
+    app.history.truncate(40);
+    let (next_scroll_offset, animate_insert) = history_offset_after_insert(
+        previous_scroll_offset,
+        app.history.len(),
+        HISTORY_HEIGHT as f32,
+    );
+    app.scroll_offset = next_scroll_offset;
+    app.history_transition = animate_insert.then(|| HistoryMutationTransition {
         started_at: Instant::now(),
         event: HistoryMutationEvent::Insert {
             index: 0,
             previous_count,
         },
     });
-    app.history.truncate(40);
+    // The stationary pointer may now be over a different visible row.
+    let next_hover = unsafe { hovered_history_row_for_cursor(app) };
+    app.hovered_row = next_hover;
     invalidate_orphaned_artwork_requests(app);
     app.status_alternator = Some(StatusTextAlternator::after_success(track.recognized_at));
     if let Some(request) = artwork_request {
@@ -10017,16 +10086,23 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE if data.kind == WindowKind::Main => {
-            let (_x, y) = client_dips(hwnd, lparam);
+            let (x, y) = client_dips(hwnd, lparam);
             let body_top = if app.arrow_edge == ArrowEdge::Top {
                 POPUP_ARROW_HEIGHT as f32
             } else {
                 0.0
             };
             let history_top = body_top + TOP_HEIGHT as f32;
-            let next = if y >= history_top {
-                let row = ((y - history_top + app.scroll_offset) / 91.0).floor() as usize;
-                (row < app.history.len()).then_some(row)
+            let next = if (0.0..CONTENT_WIDTH as f32).contains(&x) {
+                history_row_index_at(
+                    y,
+                    history_top,
+                    history_top + HISTORY_HEIGHT as f32,
+                    app.history.len(),
+                    app.history_transition,
+                    app.scroll_offset,
+                    Instant::now(),
+                )
             } else {
                 None
             };
@@ -10037,10 +10113,48 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_MOUSEWHEEL if data.kind == WindowKind::Main => {
-            if !app.history.is_empty() {
-                let delta = (high_word(wparam.0 as isize) as i16) as f32;
-                let extent = (app.history.len().saturating_sub(1) as f32 * 91.0).max(0.0);
-                app.scroll_offset = (app.scroll_offset - delta / 120.0 * 91.0).clamp(0.0, extent);
+            let mut cursor = POINT {
+                x: low_word(lparam.0) as i16 as i32,
+                y: high_word(lparam.0) as i16 as i32,
+            };
+            if !ScreenToClient(hwnd, &mut cursor).as_bool() {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+            let scale = 96.0 / GetDpiForWindow(hwnd).max(96) as f32;
+            let x = cursor.x as f32 * scale;
+            let y = cursor.y as f32 * scale;
+            let body_top = if app.arrow_edge == ArrowEdge::Top {
+                POPUP_ARROW_HEIGHT as f32
+            } else {
+                0.0
+            };
+            let history_top = body_top + TOP_HEIGHT as f32;
+            if !(0.0..CONTENT_WIDTH as f32).contains(&x)
+                || y < history_top
+                || y >= history_top + HISTORY_HEIGHT as f32
+            {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+
+            let delta = (high_word(wparam.0 as isize) as i16) as f32;
+            let next = history_scroll_offset_after_wheel(
+                app.scroll_offset,
+                delta,
+                system_wheel_scroll_lines(),
+                app.history.len(),
+                HISTORY_HEIGHT as f32,
+            );
+            if next != app.scroll_offset {
+                app.scroll_offset = next;
+                app.hovered_row = history_row_index_at(
+                    y,
+                    history_top,
+                    history_top + HISTORY_HEIGHT as f32,
+                    app.history.len(),
+                    app.history_transition,
+                    app.scroll_offset,
+                    Instant::now(),
+                );
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
@@ -10161,6 +10275,23 @@ fn low_word(value: isize) -> u16 {
 
 fn high_word(value: isize) -> u16 {
     ((value as usize >> 16) & 0xffff) as u16
+}
+
+fn system_wheel_scroll_lines() -> u32 {
+    let mut lines = 3u32;
+    let result = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some((&mut lines as *mut u32).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if result.is_ok() {
+        lines
+    } else {
+        3
+    }
 }
 
 fn no_auxiliary_window_visible(app: &AppState) -> bool {
@@ -10496,7 +10627,7 @@ fn history_row_top(
     scroll_offset: f32,
     now: Instant,
 ) -> f32 {
-    let base = history_top + index as f32 * 91.0 - scroll_offset;
+    let base = history_top + index as f32 * HISTORY_ROW_PITCH - scroll_offset;
     let Some(transition) = transition else {
         return base;
     };
@@ -10505,14 +10636,64 @@ fn history_row_top(
     match transition.event {
         HistoryMutationEvent::Insert {
             index: inserted, ..
-        } if index >= inserted => base - 91.0 * (1.0 - progress),
+        } if index >= inserted => base - HISTORY_ROW_PITCH * (1.0 - progress),
         HistoryMutationEvent::Delete { index: deleted } if index >= deleted => {
-            base + 91.0 * (1.0 - progress)
+            base + HISTORY_ROW_PITCH * (1.0 - progress)
         }
         HistoryMutationEvent::Insert { .. }
         | HistoryMutationEvent::Update { .. }
         | HistoryMutationEvent::Delete { .. } => base,
     }
+}
+
+fn history_row_index_at(
+    y: f32,
+    history_top: f32,
+    history_bottom: f32,
+    item_count: usize,
+    transition: Option<HistoryMutationTransition>,
+    scroll_offset: f32,
+    now: Instant,
+) -> Option<usize> {
+    if y < history_top || y >= history_bottom {
+        return None;
+    }
+    (0..item_count).find(|&index| {
+        let top = history_row_top(index, transition, history_top, scroll_offset, now);
+        visible_history_row_hit(y, top, history_top, history_bottom)
+    })
+}
+
+unsafe fn hovered_history_row_for_cursor(app: &AppState) -> Option<usize> {
+    if !app.visible {
+        return None;
+    }
+    let mut cursor = POINT::default();
+    GetCursorPos(&mut cursor).ok()?;
+    if !ScreenToClient(app.main_hwnd, &mut cursor).as_bool() {
+        return None;
+    }
+    let scale = 96.0 / GetDpiForWindow(app.main_hwnd).max(96) as f32;
+    let x = cursor.x as f32 * scale;
+    if !(0.0..CONTENT_WIDTH as f32).contains(&x) {
+        return None;
+    }
+    let y = cursor.y as f32 * scale;
+    let body_top = if app.arrow_edge == ArrowEdge::Top {
+        POPUP_ARROW_HEIGHT as f32
+    } else {
+        0.0
+    };
+    let history_top = body_top + TOP_HEIGHT as f32;
+    history_row_index_at(
+        y,
+        history_top,
+        history_top + HISTORY_HEIGHT as f32,
+        app.history.len(),
+        app.history_transition,
+        app.scroll_offset,
+        Instant::now(),
+    )
 }
 
 #[cfg(test)]
@@ -12001,6 +12182,97 @@ mod tests {
             event: HistoryMutationEvent::Update { index: 1 },
         });
         assert_eq!(history_row_top(1, update, 100.0, 0.0, started_at), 191.0);
+    }
+
+    #[test]
+    fn windows_history_scroll_range_uses_content_height_not_row_count() {
+        assert_eq!(super::history_content_height(0), 0.0);
+        assert_eq!(super::history_max_scroll_offset(0, 430.0), 0.0);
+        assert_eq!(super::history_max_scroll_offset(1, 430.0), 0.0);
+        assert_eq!(super::history_max_scroll_offset(4, 430.0), 0.0);
+        assert_eq!(super::history_max_scroll_offset(5, 430.0), 23.0);
+        assert_eq!(super::history_max_scroll_offset(6, 430.0), 114.0);
+        assert_eq!(super::history_max_scroll_offset(40, 430.0), 3_208.0);
+    }
+
+    #[test]
+    fn windows_history_wheel_respects_system_lines_page_mode_and_fractional_delta() {
+        let count = 40;
+        assert_eq!(
+            super::history_scroll_offset_after_wheel(100.0, 120.0, 3, count, 430.0),
+            46.0
+        );
+        assert_eq!(
+            super::history_scroll_offset_after_wheel(100.0, -120.0, 1, count, 430.0),
+            118.0
+        );
+        assert_eq!(
+            super::history_scroll_offset_after_wheel(100.0, -120.0, 3, count, 430.0),
+            154.0
+        );
+        let first_half_detent =
+            super::history_scroll_offset_after_wheel(0.0, -30.0, 3, count, 430.0);
+        let second_half_detent =
+            super::history_scroll_offset_after_wheel(first_half_detent, -30.0, 3, count, 430.0);
+        assert_eq!(first_half_detent, 13.5);
+        assert_eq!(second_half_detent, 27.0);
+        assert_eq!(
+            super::history_scroll_offset_after_wheel(100.0, -120.0, u32::MAX, count, 430.0),
+            530.0
+        );
+        assert_eq!(
+            super::history_scroll_offset_after_wheel(100.0, -120.0, 0, count, 430.0),
+            100.0
+        );
+        assert_eq!(
+            super::history_scroll_offset_after_wheel(100.0, f32::NAN, 3, count, 430.0),
+            100.0
+        );
+        assert_eq!(
+            super::history_scroll_offset_after_wheel(100.0, 120.0, 3, 4, 430.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn windows_history_rows_hit_with_the_same_clip_spacing_and_scroll_geometry() {
+        let now = Instant::now();
+        assert_eq!(
+            super::history_row_index_at(280.0, 200.0, 630.0, 5, None, 0.0, now),
+            Some(0)
+        );
+        assert_eq!(
+            super::history_row_index_at(289.5, 200.0, 630.0, 5, None, 0.0, now),
+            None
+        );
+        assert_eq!(
+            super::history_row_index_at(291.0, 200.0, 630.0, 5, None, 0.0, now),
+            Some(1)
+        );
+        assert_eq!(
+            super::history_row_index_at(630.0, 200.0, 630.0, 5, None, 0.0, now),
+            None
+        );
+        assert_eq!(
+            super::history_row_index_at(200.0, 200.0, 630.0, 5, None, 91.0, now),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn windows_history_insert_preserves_scrolled_content_and_only_animates_at_top() {
+        assert_eq!(
+            super::history_offset_after_insert(0.0, 5, 430.0),
+            (0.0, true)
+        );
+        assert_eq!(
+            super::history_offset_after_insert(23.0, 6, 430.0),
+            (114.0, false)
+        );
+        assert_eq!(
+            super::history_offset_after_insert(3_208.0, 40, 430.0),
+            (3_208.0, false)
+        );
     }
 
     #[test]
