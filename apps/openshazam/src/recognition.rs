@@ -2093,6 +2093,27 @@ fn service_windows_progressive(
                     completion.attempt
                 )
             });
+            let classification = match &completion.outcome {
+                RecognitionOutcome::Match { retry } => format!(
+                    "match, candidates={}, retry={}",
+                    completion.candidates.len(),
+                    retry.is_some()
+                ),
+                RecognitionOutcome::NoMatch { retry } => {
+                    format!("no_match, retry={}", retry.is_some())
+                }
+                RecognitionOutcome::MatcherFailure { retry } => {
+                    format!("matcher_failure, retry={}", retry.is_some())
+                }
+                RecognitionOutcome::InvalidResponse => "invalid_response".to_owned(),
+                RecognitionOutcome::TransportFailure => "transport_failure".to_owned(),
+            };
+            progressive_log_for_backend(backend_events, jsonl_output, || {
+                format!(
+                    "recognition attempt {} parsed as {classification}",
+                    completion.attempt
+                )
+            });
         }
         if let Some(message) = completion.error {
             #[cfg(feature = "dev-cli")]

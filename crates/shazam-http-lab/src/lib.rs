@@ -61,8 +61,8 @@ pub struct TrackCandidate {
     /// dictionary carries a non-empty `alternativetrack` dictionary.
     /// This is not derived from the second entry in `matches`.
     pub alternative_track: Option<Box<TrackCandidate>>,
-    /// Provenance used to avoid treating an unverified `matches` array order
-    /// as the Native matcher `tags` order for UI callback construction.
+    /// Provenance used to keep Manual root-track callbacks distinct from the
+    /// ordered Auto Type 2 `matches` candidates.
     #[doc(hidden)]
     pub origin: TrackCandidateOrigin,
 }
@@ -74,7 +74,8 @@ pub enum TrackCandidateOrigin {
     RootTrack,
     /// The separate `alternativetrack` dictionary from that root response.
     AlternativeTrack,
-    /// An entry from a fallback `matches` array with unverified Native order.
+    /// An entry from `matches`, preserved in response array order. Native
+    /// Shazam converts these entries to tags in order; Auto uses the first.
     MatchesEntry,
     /// A synthetic candidate created by tests or a caller.
     Synthetic,
@@ -182,13 +183,16 @@ pub fn native_auto_ui_event_to_json(event: &NativeAutoUiEvent) -> String {
     }
 }
 
-/// Build the supported Auto Type 2 UI candidate from the same root `track`
-/// shape used by the inspected continuous-tag conversion path. Fallback
-/// `matches` entries are not promoted because their correspondence to Native
-/// `TagResult` ordering is unverified.
+/// Build the Auto Type 2 UI candidate from the first delivered tag candidate.
+/// The inspected ShazamTagging path converts root `matches` entries to tags
+/// in array order, and ShazamAppLogic selects the first tag for the continuous
+/// callback. Manual Type 1 continues to require the separate root `track` path.
 pub fn native_auto_result_event(candidates: Vec<TrackCandidate>) -> Option<NativeAutoResultEvent> {
     let mut primary_track = candidates.into_iter().next()?;
-    if primary_track.origin != TrackCandidateOrigin::RootTrack {
+    if !matches!(
+        primary_track.origin,
+        TrackCandidateOrigin::RootTrack | TrackCandidateOrigin::MatchesEntry
+    ) {
         return None;
     }
     let alternative_track = primary_track.alternative_track.take();
@@ -1602,6 +1606,25 @@ pub fn interpret_progressive_http_response_for_signature(
     current_signature_length_ms: Option<u64>,
     maximum_signature_length_ms: Option<u64>,
 ) -> ProgressiveHttpResponse {
+    interpret_progressive_http_response_for_tagging_type(
+        status,
+        body,
+        current_signature_length_ms,
+        maximum_signature_length_ms,
+        NativeTaggingType::Manual,
+    )
+}
+
+/// Interpret a progressive HTTP response using the response-to-tag path for
+/// the active Native tagging type. Auto Type 2 builds its ordered tags from
+/// root `matches`; Manual Type 1 keeps its root `track` bridge.
+pub fn interpret_progressive_http_response_for_tagging_type(
+    status: u16,
+    body: &[u8],
+    current_signature_length_ms: Option<u64>,
+    maximum_signature_length_ms: Option<u64>,
+    tagging_type: NativeTaggingType,
+) -> ProgressiveHttpResponse {
     let retry_for_response = || {
         match (current_signature_length_ms, maximum_signature_length_ms) {
             (Some(current), Some(maximum)) => {
@@ -1621,7 +1644,11 @@ pub fn interpret_progressive_http_response_for_signature(
         return ProgressiveHttpResponse::HttpError { status, retry };
     }
 
-    match parse_track_candidates(body) {
+    let parsed_candidates = match tagging_type {
+        NativeTaggingType::Manual => parse_track_candidates(body),
+        NativeTaggingType::Auto => parse_auto_track_candidates(body),
+    };
+    match parsed_candidates {
         Ok(candidates) if !candidates.is_empty() => ProgressiveHttpResponse::Matched {
             candidates,
             retry: retry_for_response(),
@@ -2451,7 +2478,7 @@ where
     )?;
     Ok(ProgressiveRecognitionResult {
         status: response.status,
-        response: interpret_progressive_http_response_for_signature(
+        response: interpret_progressive_http_response_for_tagging_type(
             response.status,
             &response.body,
             Some(sample_ms),
@@ -2460,6 +2487,7 @@ where
                     .manual_timing()
                     .effective_maximum_signature_length_ms(),
             ),
+            tagging_type,
         ),
     })
 }
@@ -2835,10 +2863,9 @@ fn is_url_unreserved(byte: u8) -> bool {
 /// Decode the currently observed response keys into displayable candidates.
 ///
 /// The `matches`, `trackid`, `title`, and `artist` keys exist in the installed
-/// binary. The complete live response envelope has not been captured. The
-/// fallback `matches` forms are parsed for diagnostics but are not promoted to
-/// Native UI callback inputs because their order relative to
-/// `tags.firstObject` is unverified.
+/// binary. Auto Type 2's live response uses an ordered `matches` array; those
+/// entries are parsed in place and promoted by the Auto callback adapter.
+/// Manual callback construction remains limited to a root `track` dictionary.
 pub fn parse_track_candidates(response_body: &[u8]) -> Result<Vec<TrackCandidate>, Error> {
     let root: Value = serde_json::from_slice(response_body)
         .map_err(|error| Error::BadResponse(format!("response is not valid JSON: {error}")))?;
@@ -2859,6 +2886,19 @@ pub fn parse_track_candidates(response_body: &[u8]) -> Result<Vec<TrackCandidate
         }
     }
 
+    parse_matches_candidates(&root)
+}
+
+/// Parse Auto Type 2 candidates from the root `matches` array, preserving the
+/// order that ShazamTagging uses when it creates continuous tags. A root
+/// `track` object does not take precedence on the Auto route.
+pub fn parse_auto_track_candidates(response_body: &[u8]) -> Result<Vec<TrackCandidate>, Error> {
+    let root: Value = serde_json::from_slice(response_body)
+        .map_err(|error| Error::BadResponse(format!("response is not valid JSON: {error}")))?;
+    parse_matches_candidates(&root)
+}
+
+fn parse_matches_candidates(root: &Value) -> Result<Vec<TrackCandidate>, Error> {
     let matches = root
         .get("matches")
         .ok_or_else(|| Error::BadResponse("response has no `matches` field".into()))?;
@@ -2891,11 +2931,11 @@ pub fn parse_track_candidates(response_body: &[u8]) -> Result<Vec<TrackCandidate
 fn track_candidate(track: &Value, origin: TrackCandidateOrigin) -> Option<TrackCandidate> {
     let images = track.get("images").and_then(Value::as_object);
     let artwork_url = images
-        .and_then(|images| images.get("coverart"))
+        .and_then(|images| images.get("coverart").or_else(|| images.get("image100")))
         .and_then(Value::as_str)
         .map(str::to_owned);
     let hq_artwork_url = images
-        .and_then(|images| images.get("coverarthq"))
+        .and_then(|images| images.get("coverarthq").or_else(|| images.get("image400")))
         .and_then(Value::as_str)
         .map(str::to_owned);
     let background_image_url = images
@@ -2945,6 +2985,16 @@ fn track_candidate(track: &Value, origin: TrackCandidateOrigin) -> Option<TrackC
     // root result without subtitle is withheld instead of fabricating a value.
     let artist = match origin {
         TrackCandidateOrigin::RootTrack => track.get("subtitle").and_then(Value::as_str),
+        TrackCandidateOrigin::MatchesEntry => track
+            .get("subtitle")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                track
+                    .get("heading")
+                    .and_then(|heading| heading.get("subtitle"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| track.get("description").and_then(Value::as_str)),
         _ => track
             .get("artist")
             .and_then(Value::as_str)
@@ -2954,16 +3004,24 @@ fn track_candidate(track: &Value, origin: TrackCandidateOrigin) -> Option<TrackC
     Some(TrackCandidate {
         track_id: track
             .get("trackid")
+            .or_else(|| track.get("trackId"))
             .or_else(|| track.get("key"))
             .or_else(|| track.get("trackKey"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+            .and_then(json_string_value),
         title: track.get("title")?.as_str()?.to_owned(),
         artist: artist.to_owned(),
         ui_metadata,
         alternative_track: None,
         origin,
     })
+}
+
+fn json_string_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.is_empty() => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn track_candidate_json(candidate: &TrackCandidate) -> Value {
@@ -3382,16 +3440,110 @@ mod tests {
     }
 
     #[test]
-    fn auto_continuous_candidate_requires_native_root_track_shape() {
-        let fallback = TrackCandidate {
-            track_id: Some("fallback-track".into()),
-            title: "Unverified fallback".into(),
-            artist: "Unverified artist".into(),
-            ui_metadata: None,
-            alternative_track: None,
-            origin: TrackCandidateOrigin::MatchesEntry,
+    fn auto_matches_response_uses_first_native_tag_candidate() {
+        let body = r#"{
+            "intervalseconds": 12,
+            "track": {"title": "Manual root song", "subtitle": "Manual root artist"},
+            "matches": [
+                {
+                    "title": "Fluorite [Instrumental]",
+                    "description": "初星学園 & 有村麻央",
+                    "caption": "一致しました…",
+                    "key": "shazam-track-key",
+                    "trackId": 1098765432,
+                    "images": {
+                        "image100": "https://img.test/fluorite-100.jpg",
+                        "image400": "https://img.test/fluorite-400.jpg"
+                    },
+                    "tjson": {
+                        "matches": [],
+                        "tag": {"timestamp": "2026-10-17T00:00:00Z"},
+                        "track": {"id": "only-an-id"}
+                    }
+                },
+                {
+                    "title": "Later candidate",
+                    "description": "Other artist",
+                    "caption": "一致しました…",
+                    "key": "later-key"
+                }
+            ]
+        }"#
+        .as_bytes();
+        let ProgressiveHttpResponse::Matched {
+            candidates: manual_candidates,
+            ..
+        } = interpret_progressive_http_response_for_signature(
+            200,
+            body,
+            Some(12_000),
+            Some(12_000),
+        )
+        else {
+            panic!("Manual response parsing must retain the root track path");
         };
-        assert!(native_auto_result_event(vec![fallback]).is_none());
+        assert_eq!(manual_candidates.len(), 1);
+        assert_eq!(manual_candidates[0].title, "Manual root song");
+
+        let ProgressiveHttpResponse::Matched { candidates, .. } =
+            interpret_progressive_http_response_for_tagging_type(
+                200,
+                body,
+                Some(12_000),
+                Some(12_000),
+                NativeTaggingType::Auto,
+            )
+        else {
+            panic!("Auto matches response must parse as a match");
+        };
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].title, "Fluorite [Instrumental]");
+        assert_eq!(candidates[0].artist, "初星学園 & 有村麻央");
+        assert_eq!(candidates[0].track_id.as_deref(), Some("1098765432"));
+        let metadata = candidates[0].ui_metadata.as_ref().unwrap();
+        assert_eq!(metadata.track_key.as_deref(), Some("shazam-track-key"));
+        assert_eq!(
+            metadata.artwork_url.as_deref(),
+            Some("https://img.test/fluorite-100.jpg")
+        );
+        assert_eq!(
+            metadata.hq_artwork_url.as_deref(),
+            Some("https://img.test/fluorite-400.jpg")
+        );
+        assert!(native_manual_result_event(candidates.clone(), None).is_none());
+
+        let timing = RecognitionTiming {
+            sample_rate: 16_000,
+            minimum_signature_ms: 2_000,
+            initial_sample_ms: 3_000,
+            maximum_sample_ms: 6_000,
+            default_retry_interval_ms: 12_000,
+            maximum_retry_duration_ms: Some(6_000),
+            session_timeout_ms: None,
+            request_timeout_ms: 5_000,
+            maximum_retry_delay_ms: None,
+            maximum_attempts: None,
+        };
+        let mut session =
+            ProgressiveSession::new_for_type(timing, NativeTaggingType::Auto).unwrap();
+        session.push_i16_at(&vec![0; 48_000], 3_000).unwrap();
+        let job = session.poll(3_000).unwrap().unwrap();
+        let delivery = apply_progressive_response(
+            &mut session,
+            job.attempt,
+            RecognitionOutcome::Match { retry: None },
+            candidates,
+            3_100,
+        )
+        .unwrap();
+        let event = delivery
+            .native_auto_ui_event()
+            .expect("first matches entry must reach the Auto continuous callback");
+        let NativeAutoUiEvent::ContinuousMatchCandidate(result) = event;
+        assert_eq!(result.primary_track.title, "Fluorite [Instrumental]");
+        assert_eq!(result.primary_track.artist, "初星学園 & 有村麻央");
+        assert_eq!(result.primary_track.track_id.as_deref(), Some("1098765432"));
+        assert!(result.alternative_track.is_none());
     }
 
     #[test]
