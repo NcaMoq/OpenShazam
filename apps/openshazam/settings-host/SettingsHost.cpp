@@ -719,7 +719,7 @@ namespace
             labelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
             auto selectorColumn = controls::ColumnDefinition{};
             selectorColumn.Width(x::GridLengthHelper::FromValueAndType(
-                kSettingsControlLaneWidthDips, x::GridUnitType::Pixel));
+                kAppearanceSelectorWidthDips, x::GridUnitType::Pixel));
             appearanceRow.ColumnDefinitions().Append(iconColumn);
             appearanceRow.ColumnDefinitions().Append(labelColumn);
             appearanceRow.ColumnDefinitions().Append(selectorColumn);

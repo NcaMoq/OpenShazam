@@ -150,6 +150,7 @@ public static class OpenShazamSettingsHostSmoke
         string pixelSummary = "pixel check not run";
         string minimumSizeSummary = "minimum size check not run";
         string alignmentSummary = "alignment check not run";
+        string appearanceDropdownSummary = "appearance dropdown check not run";
         string closeActivationSummary = "close activation check not run";
         IntPtr desktop = IntPtr.Zero;
         var thread = new Thread(() =>
@@ -351,10 +352,10 @@ public static class OpenShazamSettingsHostSmoke
                         appearanceSelectorFound = true;
                         appearanceSelector = descendants[i];
                     }
-                    if (name == "Choose a mode" || name == "\u30E2\u30FC\u30C9\u3092\u9078\u3076")
+                    if (name == "Theme" || name == "\u30C6\u30FC\u30DE")
                         appearanceLabelFound = true;
-                    if ((name == "Changes the colors displayed in Windows and apps" ||
-                        name == "Windows \u3068\u30A2\u30D7\u30EA\u306B\u8868\u793A\u3055\u308C\u308B\u8272\u3092\u5909\u66F4\u3057\u307E\u3059") &&
+                    if ((name == "Choose the app theme to display" ||
+                        name == "\u8868\u793A\u3059\u308B\u30A2\u30D7\u30EA\u306E\u30C6\u30FC\u30DE\u3092\u9078\u629E\u3057\u307E\u3059") &&
                         descendants[i].Current.ControlType == ControlType.Text)
                         appearanceDescription = descendants[i];
                 }
@@ -413,13 +414,19 @@ public static class OpenShazamSettingsHostSmoke
                 bool lightOptionFound = false;
                 bool darkOptionFound = false;
                 bool systemOptionFound = false;
+                double largestOptionWidth = 0.0;
                 for (int i = 0; i < expandedElements.Count; i++)
                 {
                     string name = expandedElements[i].Current.Name;
                     if (name == "Light" || name == "\u30E9\u30A4\u30C8") lightOptionFound = true;
                     if (name == "Dark" || name == "\u30C0\u30FC\u30AF") darkOptionFound = true;
-                    if (name == "System settings" || name == "\u30B7\u30B9\u30C6\u30E0\u8A2D\u5B9A\u306B\u5408\u308F\u305B\u308B")
+                    if (name == "System" || name == "\u30B7\u30B9\u30C6\u30E0")
                         systemOptionFound = true;
+                    if (name == "Light" || name == "\u30E9\u30A4\u30C8" ||
+                        name == "Dark" || name == "\u30C0\u30FC\u30AF" ||
+                        name == "System" || name == "\u30B7\u30B9\u30C6\u30E0")
+                        largestOptionWidth = Math.Max(largestOptionWidth,
+                            expandedElements[i].Current.BoundingRectangle.Width);
                 }
                 expandCollapse.Collapse();
                 if (!lightOptionFound || !darkOptionFound || !systemOptionFound)
@@ -427,6 +434,13 @@ public static class OpenShazamSettingsHostSmoke
                         "Appearance selector did not expose Light, Dark and System settings. " +
                         "Light=" + lightOptionFound + "; Dark=" + darkOptionFound +
                         "; System=" + systemOptionFound + "; names=" + expandedElements.Count);
+                if (largestOptionWidth > appearanceSelectorRect.Width + 24.0)
+                    throw new InvalidOperationException(
+                        "Theme dropdown options should stay within the compact selector width. " +
+                        "Selector=" + appearanceSelectorRect.Width + "px; option=" +
+                        largestOptionWidth + "px.");
+                appearanceDropdownSummary = "themeSelector=" + appearanceSelectorRect.Width +
+                    "px; widestOption=" + largestOptionWidth + "px";
 
                 stage = "verify rendered WinUI island pixels";
                 int width = islandRect.Right - islandRect.Left;
@@ -492,7 +506,8 @@ public static class OpenShazamSettingsHostSmoke
         thread.Join();
         if (desktop != IntPtr.Zero) CloseDesktop(desktop);
         return error ?? "Composition + WinUI Settings host initialized and shut down successfully; " +
-            minimumSizeSummary + "; " + alignmentSummary + "; " + pixelSummary + "; " + closeActivationSummary;
+            minimumSizeSummary + "; " + alignmentSummary + "; " + appearanceDropdownSummary +
+            "; " + pixelSummary + "; " + closeActivationSummary;
     }
 
     private static IntPtr Activate(string className)
