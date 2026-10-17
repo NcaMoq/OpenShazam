@@ -922,6 +922,20 @@ namespace
                     ApplyAppearanceToSettings(host->state, host->state->appearanceMode);
                 return ::DefWindowProcW(h, msg, wp, lp);
             case WM_CLOSE:
+                // While Settings is visible, the owner popup deliberately
+                // ignores its activation loss so it stays open behind this
+                // window. Restore the owner's activation before hiding
+                // Settings so the next outside click reaches the normal
+                // popup deactivation path and dismisses the main UI.
+                if (host && host->hwnd == h && host->owner &&
+                    ::IsWindowVisible(host->owner))
+                {
+                    if (!::SetForegroundWindow(host->owner))
+                    {
+                        ::SetActiveWindow(host->owner);
+                        ::SetFocus(host->owner);
+                    }
+                }
                 ::ShowWindow(h, SW_HIDE);
                 return 0;
             case WM_DESTROY:

@@ -100,6 +100,8 @@ public static class OpenShazamSettingsHostSmoke
     private static extern IntPtr GetWindowLongPtrW(IntPtr window, int index);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetActiveWindow();
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetWindowRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll", SetLastError = true)]
@@ -148,6 +150,7 @@ public static class OpenShazamSettingsHostSmoke
         string pixelSummary = "pixel check not run";
         string minimumSizeSummary = "minimum size check not run";
         string alignmentSummary = "alignment check not run";
+        string closeActivationSummary = "close activation check not run";
         IntPtr desktop = IntPtr.Zero;
         var thread = new Thread(() =>
         {
@@ -205,8 +208,8 @@ public static class OpenShazamSettingsHostSmoke
                 var show = Marshal.GetDelegateForFunctionPointer<SettingsShow>(GetProcAddress(settingsHost, "OpenShazamSettingsShow"));
                 shutdownSettings = Marshal.GetDelegateForFunctionPointer<SettingsShutdown>(GetProcAddress(settingsHost, "OpenShazamSettingsShutdown"));
 
-                stage = "create hidden owner window";
-                owner = CreateWindowExW(0, "STATIC", "OpenShazam settings smoke owner", 0, 0, 0, 100, 100, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                stage = "create visible isolated-desktop owner window";
+                owner = CreateWindowExW(0, "STATIC", "OpenShazam settings smoke owner", 0x10000000, 0, 0, 100, 100, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
                 if (owner == IntPtr.Zero) throw new InvalidOperationException("Create owner window: " + Marshal.GetLastWin32Error());
 
                 stage = "initialize and show XAML host";
@@ -454,6 +457,16 @@ public static class OpenShazamSettingsHostSmoke
                     throw new InvalidOperationException(
                         "WinUI controls are present in UI Automation but the island rendered a blank white surface. " +
                         pixelSummary);
+                stage = "verify closing Settings restores owner activation";
+                SendMessage(settingsWindow, 0x0010, IntPtr.Zero, IntPtr.Zero); // WM_CLOSE
+                if (IsWindowVisible(settingsWindow))
+                    throw new InvalidOperationException("Settings remained visible after WM_CLOSE.");
+                IntPtr activeWindow = GetActiveWindow();
+                if (activeWindow != owner)
+                    throw new InvalidOperationException(
+                        "Closing Settings should restore activation to its visible owner. " +
+                        "owner=" + owner + "; activeWindow=" + activeWindow);
+                closeActivationSummary = "closeRestoredOwnerActivation=true";
                 stage = "shutdown XAML host";
             }
             catch (Exception exception)
@@ -479,7 +492,7 @@ public static class OpenShazamSettingsHostSmoke
         thread.Join();
         if (desktop != IntPtr.Zero) CloseDesktop(desktop);
         return error ?? "Composition + WinUI Settings host initialized and shut down successfully; " +
-            minimumSizeSummary + "; " + alignmentSummary + "; " + pixelSummary;
+            minimumSizeSummary + "; " + alignmentSummary + "; " + pixelSummary + "; " + closeActivationSummary;
     }
 
     private static IntPtr Activate(string className)
