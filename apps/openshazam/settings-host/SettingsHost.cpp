@@ -64,7 +64,7 @@ namespace
     constexpr uint32_t kAppearanceLight = 1;
     constexpr uint32_t kAppearanceDark = 2;
     constexpr double kSettingsControlLaneWidthDips = 208.0;
-    constexpr double kAppearanceSelectorWidthDips = 112.0;
+    constexpr double kAppearanceSelectorWidthDips = 100.0;
     constexpr double kStartupControlGroupWidthDips = 94.0;
     constexpr int kWidthDips = 720;
     constexpr int kHeightDips = 380;
@@ -774,6 +774,7 @@ namespace
             state->appearance.Items().Append(winrt::box_value(Localized(
                 L"System", L"システム")));
             state->appearance.Width(kAppearanceSelectorWidthDips);
+            state->appearance.MinWidth(kAppearanceSelectorWidthDips);
             state->appearance.HorizontalAlignment(x::HorizontalAlignment::Right);
             state->appearance.VerticalAlignment(x::VerticalAlignment::Center);
             automation::AutomationProperties::SetName(state->appearance, appearanceName);
