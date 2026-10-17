@@ -2745,7 +2745,16 @@ fn logo_shadow_color(_theme: Theme) -> Color {
 
 const INNER_MASK_BOUNDS: f32 = 336.0;
 const BUTTON_CLEAR_DIAMETER: f32 = 96.0;
+const AUTO_SHADOW_DISPLAY_BOUNDS: f32 = BUTTON_CLEAR_DIAMETER;
 const INNER_MASK_GEOMETRY_TOLERANCE: f32 = 0.01;
+
+fn auto_shadow_host_center() -> Vector2 {
+    let center = AUTO_SHADOW_DISPLAY_BOUNDS * 0.5;
+    Vector2 {
+        X: center,
+        Y: center,
+    }
+}
 
 fn inverse_circle_clip_radii(size: f32, hole: f32) -> Option<(f32, f32)> {
     (size.is_finite() && hole.is_finite() && size > 0.0 && hole >= 0.0 && hole < size)
@@ -2758,25 +2767,43 @@ unsafe fn make_inverse_circle_clip(
     size: f32,
     hole: f32,
 ) -> windows::core::Result<CompositionGeometricClip> {
+    make_inverse_circle_clip_at(
+        compositor,
+        d2d_factory,
+        size,
+        hole,
+        Vector2 {
+            X: size * 0.5,
+            Y: size * 0.5,
+        },
+    )
+}
+
+unsafe fn make_inverse_circle_clip_at(
+    compositor: &Compositor,
+    d2d_factory: &ID2D1Factory,
+    size: f32,
+    hole: f32,
+    center: Vector2,
+) -> windows::core::Result<CompositionGeometricClip> {
     let (outer_radius, inner_radius) = inverse_circle_clip_radii(size, hole).ok_or_else(|| {
         Error::new(
             windows::core::HRESULT(0x80070057u32 as i32),
             "invalid ripple mask dimensions",
         )
     })?;
-    let center = size * 0.5;
     let outer = d2d_factory.CreateEllipseGeometry(&D2D1_ELLIPSE {
         point: Vector2 {
-            X: center,
-            Y: center,
+            X: center.X,
+            Y: center.Y,
         },
         radiusX: outer_radius,
         radiusY: outer_radius,
     })?;
     let inner = d2d_factory.CreateEllipseGeometry(&D2D1_ELLIPSE {
         point: Vector2 {
-            X: center,
-            Y: center,
+            X: center.X,
+            Y: center.Y,
         },
         radiusX: inner_radius,
         radiusY: inner_radius,
@@ -3376,49 +3403,58 @@ impl CompositionScene {
         ring_brushes.push(compositor.CreateColorBrushWithColor(ring_color)?);
         let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
         let center_y = body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32;
-        // Native uses a 3.5×96pt inverse mask (336pt) around the button.
-        // The largest visible inner fill remains 288pt inside that mask.
+        // The inverse-mask canvas is 336pt, but AutoShadow itself follows the
+        // 96pt button host bounds. Keep those coordinate spaces independent:
+        // using the mask canvas as the shadow ellipse makes the Auto layer
+        // appear 3.5x too large.
         let inner_bounds = INNER_MASK_BOUNDS;
+        let auto_shadow_bounds = AUTO_SHADOW_DISPLAY_BOUNDS;
         let auto_shadow_root = compositor.CreateContainerVisual()?;
         auto_shadow_root.SetSize(Vector2 {
-            X: inner_bounds,
-            Y: inner_bounds,
+            X: auto_shadow_bounds,
+            Y: auto_shadow_bounds,
         })?;
         auto_shadow_root.SetCenterPoint(Vector3 {
-            X: inner_bounds * 0.5,
-            Y: inner_bounds * 0.5,
+            X: auto_shadow_bounds * 0.5,
+            Y: auto_shadow_bounds * 0.5,
             Z: 0.0,
         })?;
         auto_shadow_root.SetOffset(Vector3 {
-            X: center_x - inner_bounds * 0.5,
-            Y: center_y - inner_bounds * 0.5,
+            X: center_x - auto_shadow_bounds * 0.5,
+            Y: center_y - auto_shadow_bounds * 0.5,
             Z: 0.0,
         })?;
         auto_shadow_root.SetOpacity(0.0)?;
+        // The mask keeps its native 336pt backing bounds, but its center is
+        // aligned to the 96pt AutoShadow host. The host clips the mask's
+        // oversized outer area, leaving only the button-scale edge reveal.
         let auto_shadow_mask = unsafe {
-            make_inverse_circle_clip(compositor, d2d_factory, inner_bounds, BUTTON_CLEAR_DIAMETER)?
+            make_inverse_circle_clip_at(
+                compositor,
+                d2d_factory,
+                inner_bounds,
+                BUTTON_CLEAR_DIAMETER,
+                auto_shadow_host_center(),
+            )?
         };
-        auto_shadow_mask.SetCenterPoint(Vector2 {
-            X: inner_bounds * 0.5,
-            Y: inner_bounds * 0.5,
-        })?;
+        auto_shadow_mask.SetCenterPoint(auto_shadow_host_center())?;
         auto_shadow_root.SetClip(&auto_shadow_mask)?;
         let auto_shadow_brush =
             compositor.CreateColorBrushWithColor(composition_auto_shadow_color(theme))?;
         let auto_shadow_source = compositor.CreateShapeVisual()?;
         auto_shadow_source.SetSize(Vector2 {
-            X: inner_bounds,
-            Y: inner_bounds,
+            X: auto_shadow_bounds,
+            Y: auto_shadow_bounds,
         })?;
         let auto_shadow_geometry: CompositionEllipseGeometry =
             compositor.CreateEllipseGeometry()?;
         auto_shadow_geometry.SetCenter(Vector2 {
-            X: inner_bounds * 0.5,
-            Y: inner_bounds * 0.5,
+            X: auto_shadow_bounds * 0.5,
+            Y: auto_shadow_bounds * 0.5,
         })?;
         auto_shadow_geometry.SetRadius(Vector2 {
-            X: inner_bounds * 0.5,
-            Y: inner_bounds * 0.5,
+            X: auto_shadow_bounds * 0.5,
+            Y: auto_shadow_bounds * 0.5,
         })?;
         let auto_shadow_shape = compositor.CreateSpriteShapeWithGeometry(&auto_shadow_geometry)?;
         auto_shadow_shape.SetFillBrush(&auto_shadow_brush)?;
@@ -3427,8 +3463,8 @@ impl CompositionScene {
         auto_shadow_surface.SetSourceVisual(&auto_shadow_source)?;
         auto_shadow_surface.SetSourceOffset(Vector2 { X: 0.0, Y: 0.0 })?;
         auto_shadow_surface.SetSourceSize(Vector2 {
-            X: inner_bounds,
-            Y: inner_bounds,
+            X: auto_shadow_bounds,
+            Y: auto_shadow_bounds,
         })?;
         let auto_shadow_surface_brush =
             compositor.CreateSurfaceBrushWithSurface(&auto_shadow_surface)?;
@@ -3442,8 +3478,8 @@ impl CompositionScene {
         )?;
         let auto_shadow_sprite = compositor.CreateSpriteVisual()?;
         auto_shadow_sprite.SetSize(Vector2 {
-            X: inner_bounds,
-            Y: inner_bounds,
+            X: auto_shadow_bounds,
+            Y: auto_shadow_bounds,
         })?;
         auto_shadow_sprite.SetBrush(&auto_shadow_surface_brush)?;
         auto_shadow_sprite.SetShadow(&auto_shadow)?;
@@ -4154,12 +4190,13 @@ impl CompositionScene {
             self.tagging_root.SetClip(&clip)?;
             self.result_overlay.set_viewport(self.dpi, self.body_top)?;
             let inner_bounds = INNER_MASK_BOUNDS;
+            let auto_shadow_bounds = AUTO_SHADOW_DISPLAY_BOUNDS;
             let outer_bounds = ui_model::OUTER_DIAMETERS[0] as f32;
             let center_x = (BUTTON_X + BUTTON_SIZE * 0.5) as f32;
             let center_y = snapshot.body_top + (BUTTON_TOP + BUTTON_SIZE * 0.5) as f32;
             self.auto_shadow_root.SetOffset(Vector3 {
-                X: center_x - inner_bounds * 0.5,
-                Y: center_y - inner_bounds * 0.5,
+                X: center_x - auto_shadow_bounds * 0.5,
+                Y: center_y - auto_shadow_bounds * 0.5,
                 Z: 0.0,
             })?;
             self.inner_audio_root.SetOffset(Vector3 {
@@ -11766,8 +11803,8 @@ mod tests {
     use super::{
         advance_result_card_stage, animation_needs_frame, artwork_pixel_fingerprint,
         artwork_request_is_current, artwork_request_matches_track,
-        artwork_request_urls_match_track, button_border_arc_points, capture_animation_start,
-        capture_mode_in_progress, composition_button_pixel_snap_offset,
+        artwork_request_urls_match_track, auto_shadow_host_center, button_border_arc_points,
+        capture_animation_start, capture_mode_in_progress, composition_button_pixel_snap_offset,
         composition_header_viewport_offset, composition_root_layer_order,
         composition_scale_for_dpi, composition_scene_layer_order, copy_notification_text,
         copy_panel_pixels_into, create_text_format_with_locale, d2d_color_from_system,
@@ -11790,14 +11827,14 @@ mod tests {
         CompositionSceneLayer, HeaderFillScope, HistoryMutationEvent, HistoryMutationTransition,
         HistoryTimestampSource, MainPhase, NoMatchIconCommand, PageLinkFailure, ResultCardAdvance,
         ResultCardStage, Theme, ThemePreference, Track, TrackIdentity, UiConfigSnapshot,
-        UiLanguage, UiTextKey, ValidatedWebTrackUrl, WindowKind, AUTO_START_SPRING_DURATION,
-        BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X, CLOSE_BUTTON_GA_PIXELS,
-        FALLBACK_MATCH_DARK_PIXELS, FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE,
-        HISTORY_HEIGHT, HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH,
-        OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT, RESULT_ACTION_HEIGHT,
-        RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD, RESULT_CARD_TRANSITION,
-        RESULT_CLOSE_ICON_PIXELS, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS,
-        TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
+        UiLanguage, UiTextKey, ValidatedWebTrackUrl, WindowKind, AUTO_SHADOW_DISPLAY_BOUNDS,
+        AUTO_START_SPRING_DURATION, BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X,
+        CLOSE_BUTTON_GA_PIXELS, FALLBACK_MATCH_DARK_PIXELS, FALLBACK_MATCH_LIGHT_PIXELS,
+        FALLBACK_MATCH_LOGICAL_SIDE, HISTORY_HEIGHT, HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS,
+        NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT,
+        RESULT_ACTION_HEIGHT, RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD,
+        RESULT_CARD_TRANSITION, RESULT_CLOSE_ICON_PIXELS, RESULT_DETAILS_LEFT,
+        RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
     };
     use std::collections::HashMap;
     use std::collections::VecDeque;
@@ -13788,6 +13825,28 @@ mod tests {
         );
         assert_eq!(inverse_circle_clip_radii(96.0, 96.0), None);
         assert_eq!(inverse_circle_clip_radii(f32::NAN, 48.0), None);
+    }
+
+    #[test]
+    fn auto_shadow_display_host_stays_independent_of_its_mask_canvas() {
+        assert_eq!(AUTO_SHADOW_DISPLAY_BOUNDS, BUTTON_CLEAR_DIAMETER);
+        assert_eq!(AUTO_SHADOW_DISPLAY_BOUNDS, 96.0);
+        assert_eq!(INNER_MASK_BOUNDS, BUTTON_CLEAR_DIAMETER * 3.5);
+
+        let center = auto_shadow_host_center();
+        assert_eq!(center.X, 48.0);
+        assert_eq!(center.Y, 48.0);
+
+        // At the native 0.85 button pulse the 336pt mask still exceeds the
+        // display host; the visible edge is limited by the 96pt host bounds.
+        let pulse_scale = 0.85_f32;
+        let mask_outer_diameter = INNER_MASK_BOUNDS * pulse_scale;
+        let mask_hole_diameter = BUTTON_CLEAR_DIAMETER * pulse_scale;
+        let visible_host_diameter = AUTO_SHADOW_DISPLAY_BOUNDS;
+        let visible_edge_width = (visible_host_diameter - mask_hole_diameter) * 0.5;
+        assert!(mask_outer_diameter > visible_host_diameter);
+        assert!((mask_hole_diameter - 81.6).abs() < 1e-4);
+        assert!((visible_edge_width - 7.2).abs() < 1e-4);
     }
 
     #[test]
