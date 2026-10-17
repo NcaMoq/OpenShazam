@@ -270,11 +270,17 @@ namespace
             islandHwnd = winrt::Microsoft::UI::GetWindowFromWindowId(island.SiteBridge().WindowId());
             if (!islandHwnd || !::IsWindow(islandHwnd))
                 winrt::throw_hresult(E_HANDLE);
-            // Keep the island's child window in the normal Win32 focus chain.
-            // ShowWindow below changes visibility; setting only WS_VISIBLE on
-            // an existing HWND does not reliably make it appear.
-            auto style = ::GetWindowLongPtrW(islandHwnd, GWL_STYLE);
-            ::SetWindowLongPtrW(islandHwnd, GWL_STYLE, style | WS_TABSTOP);
+            // The WinAppSDK Islands sample sets the site HWND to an explicit
+            // child window. DesktopWindowXamlSource creates the HWND, but its
+            // initial style is not a reliable substitute for WS_CHILD here.
+            // Without WS_CHILD the site can exist in UI Automation and still
+            // fail to compose into the host window.
+            ::SetLastError(ERROR_SUCCESS);
+            auto previousStyle = ::SetWindowLongPtrW(
+                islandHwnd, GWL_STYLE, WS_TABSTOP | WS_CHILD | WS_VISIBLE);
+            auto styleError = ::GetLastError();
+            if (previousStyle == 0 && styleError != ERROR_SUCCESS)
+                winrt::throw_last_error();
             state = std::make_shared<SettingsState>();
             island.Content(BuildContent());
             Layout();
@@ -374,7 +380,18 @@ namespace
         {
             if (!hwnd) return;
             ::ShowWindow(hwnd, SW_SHOWNORMAL);
-            if (islandHwnd) ::ShowWindow(islandHwnd, SW_SHOWNA);
+            // The island is initially measured while its host HWND is hidden.
+            // Reapply its native site bounds after the parent becomes visible.
+            Layout();
+            if (islandHwnd)
+            {
+                ::ShowWindow(islandHwnd, SW_SHOWNA);
+                RECT rect{};
+                ::GetClientRect(hwnd, &rect);
+                ::SetWindowPos(islandHwnd, HWND_TOP, 0, 0,
+                    rect.right - rect.left, rect.bottom - rect.top,
+                    SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            }
             ::SetForegroundWindow(hwnd);
             if (islandHwnd)
             {

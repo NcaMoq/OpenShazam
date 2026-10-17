@@ -75,6 +75,10 @@ public static class OpenShazamSettingsHostSmoke
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr FindWindowExW(IntPtr parent, IntPtr childAfter, IntPtr className, IntPtr windowName);
     [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr GetParent(IntPtr window);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+    private static extern IntPtr GetWindowLongPtrW(IntPtr window, int index);
+    [DllImport("user32.dll", SetLastError = true)]
     private static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetWindowRect(IntPtr window, out Rect rect);
@@ -195,6 +199,11 @@ public static class OpenShazamSettingsHostSmoke
                 IntPtr islandWindow = FindWindowExW(settingsWindow, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
                 if (islandWindow == IntPtr.Zero || !IsWindowVisible(islandWindow))
                     throw new InvalidOperationException("WinUI island child window was not visible.");
+                long islandStyle = GetWindowLongPtrW(islandWindow, -16).ToInt64();
+                if (GetParent(islandWindow) != settingsWindow || (islandStyle & 0x40000000L) == 0)
+                    throw new InvalidOperationException(
+                        "WinUI site HWND is not a WS_CHILD of the Settings host. " +
+                        "parent=" + GetParent(islandWindow) + "; style=0x" + islandStyle.ToString("X"));
                 Rect islandRect;
                 if (!GetWindowRect(islandWindow, out islandRect) ||
                     islandRect.Right <= islandRect.Left || islandRect.Bottom <= islandRect.Top)
