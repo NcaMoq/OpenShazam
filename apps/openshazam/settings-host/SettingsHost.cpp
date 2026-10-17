@@ -64,7 +64,7 @@ namespace
     constexpr uint32_t kAppearanceLight = 1;
     constexpr uint32_t kAppearanceDark = 2;
     constexpr double kSettingsControlLaneWidthDips = 208.0;
-    constexpr double kAppearanceSelectorWidthDips = 144.0;
+    constexpr double kAppearanceSelectorWidthDips = 112.0;
     constexpr double kStartupControlGroupWidthDips = 94.0;
     constexpr int kWidthDips = 720;
     constexpr int kHeightDips = 380;
@@ -560,7 +560,7 @@ namespace
 
             auto dpi = ::GetDpiForWindow(parent);
             if (dpi < 96) dpi = 96;
-            auto windowTitle = Localized(L"OpenShazam Settings", L"OpenShazam の設定");
+            auto windowTitle = Localized(L"Shazam Settings", L"Shazam の設定");
             hwnd = ::CreateWindowExW(0, kSettingsClass, windowTitle.c_str(),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                 ::MulDiv(kWidthDips, dpi, 96), ::MulDiv(kHeightDips, dpi, 96),
