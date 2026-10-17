@@ -1393,6 +1393,8 @@ mod tests {
         assert_eq!(high.button_child_scale, 1.1);
         assert_eq!(low.outer_audio_scale, 0.9);
         assert_eq!(high.outer_audio_scale, 1.1);
+        assert_eq!(low.outer_audio_opacity, 0.3);
+        assert_eq!(high.outer_audio_opacity, 0.7);
         close(
             low.outer[0].shape_diameter,
             high.outer[0].shape_diameter,
