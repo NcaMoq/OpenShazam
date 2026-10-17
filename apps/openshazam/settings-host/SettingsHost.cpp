@@ -365,6 +365,14 @@ namespace
             controls::ScrollViewer viewer;
             viewer.Content(stack);
             viewer.VerticalScrollBarVisibility(controls::ScrollBarVisibility::Auto);
+            // A Win32 host paints COLOR_WINDOW behind a transparent island.
+            // On a dark Windows theme that leaves the WinUI's light text on a
+            // white native surface. Fill the XAML root with WinUI's own
+            // theme resource so content and foreground use the same palette.
+            auto pageBackground = app.Resources()
+                .Lookup(winrt::box_value(L"ApplicationPageBackgroundThemeBrush"))
+                .as<winrt::Microsoft::UI::Xaml::Media::Brush>();
+            viewer.Background(pageBackground);
             return viewer;
         }
 

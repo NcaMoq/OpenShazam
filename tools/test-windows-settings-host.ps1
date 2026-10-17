@@ -20,6 +20,8 @@ using System;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.Windows.Automation;
 
 public static class OpenShazamSettingsHostSmoke
@@ -83,6 +85,8 @@ public static class OpenShazamSettingsHostSmoke
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetWindowRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool PrintWindow(IntPtr window, IntPtr deviceContext, uint flags);
+    [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyWindow(IntPtr window);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool PeekMessageW(out Message message, IntPtr window, uint min, uint max, uint remove);
@@ -114,6 +118,7 @@ public static class OpenShazamSettingsHostSmoke
     {
         string stage = "create STA thread";
         string error = null;
+        string pixelSummary = "pixel check not run";
         IntPtr desktop = IntPtr.Zero;
         var thread = new Thread(() =>
         {
@@ -236,6 +241,36 @@ public static class OpenShazamSettingsHostSmoke
                     throw new InvalidOperationException(
                         "Startup ToggleSwitch was not exposed by the WinUI accessibility tree. " +
                         "Descendant count=" + descendants.Count + "; names=" + names);
+
+                stage = "verify rendered WinUI island pixels";
+                int width = islandRect.Right - islandRect.Left;
+                int height = islandRect.Bottom - islandRect.Top;
+                int sampledNonWhitePixels = 0;
+                bool pixelsCaptured;
+                using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+                using (var graphics = Graphics.FromImage(bitmap))
+                {
+                    graphics.Clear(Color.White);
+                    IntPtr dc = graphics.GetHdc();
+                    try { pixelsCaptured = PrintWindow(islandWindow, dc, 2); }
+                    finally { graphics.ReleaseHdc(dc); }
+                    if (pixelsCaptured)
+                    {
+                        for (int y = 0; y < height; y += 2)
+                            for (int x = 0; x < width; x += 2)
+                            {
+                                Color color = bitmap.GetPixel(x, y);
+                                if (color.R < 245 || color.G < 245 || color.B < 245)
+                                    sampledNonWhitePixels++;
+                            }
+                    }
+                }
+                pixelSummary = "PrintWindow=" + pixelsCaptured +
+                    "; sampledNonWhitePixels=" + sampledNonWhitePixels;
+                if (!pixelsCaptured || sampledNonWhitePixels < 100)
+                    throw new InvalidOperationException(
+                        "WinUI controls are present in UI Automation but the island rendered a blank white surface. " +
+                        pixelSummary);
                 stage = "shutdown XAML host";
             }
             catch (Exception exception)
@@ -260,7 +295,7 @@ public static class OpenShazamSettingsHostSmoke
         thread.Start();
         thread.Join();
         if (desktop != IntPtr.Zero) CloseDesktop(desktop);
-        return error ?? "Composition + WinUI Settings host initialized and shut down successfully.";
+        return error ?? "Composition + WinUI Settings host initialized and shut down successfully; " + pixelSummary;
     }
 
     private static IntPtr Activate(string className)
@@ -285,12 +320,14 @@ public static class OpenShazamSettingsHostSmoke
 
 $uiaClientAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationClient')
 $uiaTypesAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationTypes')
-if (-not $uiaClientAssembly -or -not $uiaTypesAssembly) {
-    throw 'Windows UI Automation assemblies are required for the Settings smoke test.'
+$drawingAssembly = [Reflection.Assembly]::LoadWithPartialName('System.Drawing')
+if (-not $uiaClientAssembly -or -not $uiaTypesAssembly -or -not $drawingAssembly) {
+    throw 'Windows UI Automation and System.Drawing assemblies are required for the Settings smoke test.'
 }
 $uiaClient = $uiaClientAssembly.Location
 $uiaTypes = $uiaTypesAssembly.Location
-Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @($uiaClient, $uiaTypes)
+$drawing = $drawingAssembly.Location
+Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @($uiaClient, $uiaTypes, $drawing)
 $result = [OpenShazamSettingsHostSmoke]::Run($dist)
 if ($result -notlike 'Composition + WinUI Settings host initialized*') {
     throw $result
