@@ -84,6 +84,11 @@ use windows::{
                 COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
             },
             LibraryLoader::GetModuleHandleW,
+            Registry::{
+                RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+                HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD,
+                REG_OPTION_NON_VOLATILE,
+            },
             WinRT::Composition::{
                 ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
             },
@@ -170,6 +175,7 @@ const WM_OS_THEME_CHANGED: u32 = WM_APP + 0x44;
 const WM_ARTWORK_READY: u32 = WM_APP + 0x45;
 const WM_ACTIVATE_MAIN_POPUP: u32 = WM_APP + 0x46;
 const WM_OPEN_SETTINGS: u32 = WM_APP + 0x47;
+const WM_APPEARANCE_CHANGED: u32 = WM_APP + 0x48;
 const TRAY_ICON_ID: u32 = 1;
 const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
     data1: 0x6a3d77b1,
@@ -303,6 +309,131 @@ enum WindowKind {
 enum Theme {
     Light,
     Dark,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u32)]
+enum ThemePreference {
+    #[default]
+    System = 0,
+    Light = 1,
+    Dark = 2,
+}
+
+impl ThemePreference {
+    fn from_raw(value: u32) -> Self {
+        match value {
+            1 => Self::Light,
+            2 => Self::Dark,
+            _ => Self::System,
+        }
+    }
+
+    fn resolve(self, system_theme: Theme) -> Theme {
+        match self {
+            Self::System => system_theme,
+            Self::Light => Theme::Light,
+            Self::Dark => Theme::Dark,
+        }
+    }
+
+    fn id(self) -> u32 {
+        self as u32
+    }
+}
+
+fn load_theme_preference() -> ThemePreference {
+    let key_path = wide("Software\\OpenShazam");
+    let value_name = wide("AppearanceMode");
+    let mut key = HKEY::default();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            None,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if opened.0 != 0 {
+        return ThemePreference::System;
+    }
+
+    let mut value = 0u32;
+    let mut value_type = Default::default();
+    let mut byte_count = size_of::<u32>() as u32;
+    let queried = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut value_type),
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut byte_count),
+        )
+    };
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    if queried.0 == 0 && value_type == REG_DWORD && byte_count == size_of::<u32>() as u32 {
+        ThemePreference::from_raw(value)
+    } else {
+        ThemePreference::System
+    }
+}
+
+fn save_theme_preference(preference: ThemePreference) {
+    let key_path = wide("Software\\OpenShazam");
+    let value_name = wide("AppearanceMode");
+    let mut key = HKEY::default();
+    let created = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            Some(0),
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+    };
+    if created.0 != 0 {
+        return;
+    }
+
+    let value = preference.id();
+    let bytes = unsafe {
+        std::slice::from_raw_parts((&value as *const u32).cast::<u8>(), size_of::<u32>())
+    };
+    unsafe {
+        let _ = RegSetValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            Some(0),
+            REG_DWORD,
+            Some(bytes),
+        );
+        let _ = RegCloseKey(key);
+    }
+}
+
+fn foreground_for_theme(theme: Theme) -> Color {
+    match theme {
+        Theme::Light => Color {
+            A: 255,
+            R: 0,
+            G: 0,
+            B: 0,
+        },
+        Theme::Dark => Color {
+            A: 255,
+            R: 255,
+            G: 255,
+            B: 255,
+        },
+    }
 }
 
 fn theme_from_foreground_rgb(red: u8, green: u8, blue: u8) -> Theme {
@@ -739,6 +870,7 @@ struct AppState {
     // leave the transform neutral until a measured profile is supplied.
     auto_spring: Option<ui_model::SpringProfile>,
     theme: Theme,
+    theme_preference: ThemePreference,
     theme_generation: u64,
     visible: bool,
     popup_opacity: u8,
@@ -7246,16 +7378,20 @@ unsafe fn open_settings_after_wndproc(app_ptr: *mut AppState) -> LRESULT {
 
     // Copy only plain handles/function pointers out. Drop all Rust references
     // before calling WinUI, whose ShowWindow/activation path re-enters WndProc.
-    let (show, owner) = {
+    let (show, owner, theme_preference) = {
         let app = &mut *app_ptr;
         let Some(host) = app.settings_host.as_ref() else {
             app.settings_opening = false;
             return LRESULT(0);
         };
-        (host.show_callback(), app.main_hwnd)
+        (
+            host.show_callback(),
+            app.main_hwnd,
+            app.theme_preference.id(),
+        )
     };
 
-    let hr = show(owner.0);
+    let hr = show(owner.0, theme_preference);
     (*app_ptr).settings_opening = false;
     if hr < 0 {
         (*app_ptr).message = Some(format!(
@@ -9188,8 +9324,13 @@ unsafe fn show_main(app: &mut AppState, mut renderer: Option<&mut Renderer>) {
 }
 
 fn refresh_os_theme(app: &mut AppState) -> bool {
-    let Ok((theme, system_foreground)) = theme_from_ui_settings(&app.theme_settings) else {
+    let Ok((system_theme, os_foreground)) = theme_from_ui_settings(&app.theme_settings) else {
         return false;
+    };
+    let theme = app.theme_preference.resolve(system_theme);
+    let system_foreground = match app.theme_preference {
+        ThemePreference::System => os_foreground,
+        ThemePreference::Light | ThemePreference::Dark => foreground_for_theme(theme),
     };
     if app.theme == theme && app.system_foreground == system_foreground {
         return false;
@@ -9361,6 +9502,16 @@ unsafe extern "system" fn window_proc(
             refresh_os_theme(app);
             refresh_history_date_labels(&mut app.history);
             update_visible_windows(app);
+            LRESULT(0)
+        }
+        WM_APPEARANCE_CHANGED if data.kind == WindowKind::Main => {
+            let preference = ThemePreference::from_raw(wparam.0 as u32);
+            if app.theme_preference != preference {
+                app.theme_preference = preference;
+                save_theme_preference(preference);
+                refresh_os_theme(app);
+                update_visible_windows(app);
+            }
             LRESULT(0)
         }
         WM_CREATE => {
@@ -9859,7 +10010,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         let compositor = Compositor::new()?;
         let theme_settings = UISettings::new()?;
-        let (theme, system_foreground) = theme_from_ui_settings(&theme_settings)?;
+        let theme_preference = load_theme_preference();
+        let (system_theme, os_foreground) = theme_from_ui_settings(&theme_settings)?;
+        let theme = theme_preference.resolve(system_theme);
+        let system_foreground = match theme_preference {
+            ThemePreference::System => os_foreground,
+            ThemePreference::Light | ThemePreference::Dark => foreground_for_theme(theme),
+        };
         let taskbar_created_name = wide(TRAY_TASKBAR_CREATED_NAME);
         let taskbar_created_message = RegisterWindowMessageW(PCWSTR(taskbar_created_name.as_ptr()));
         let app = Box::new(AppState {
@@ -9884,6 +10041,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             ui_levels: UiLevels::default(),
             auto_spring: None,
             theme,
+            theme_preference,
             theme_generation: 0,
             visible: false,
             popup_opacity: 0,
@@ -10136,7 +10294,7 @@ mod tests {
         visible_history_row_hit, ArrowEdge, ArtworkSource, CaptureMode, CompositionRootLayer,
         CompositionSceneLayer, HeaderFillScope, HistoryMutationEvent, HistoryMutationTransition,
         HistoryTimestampSource, MainPhase, NoMatchIconCommand, PageLinkFailure, ResultCardAdvance,
-        ResultCardStage, Theme, Track, UiConfigSnapshot, UiLanguage, UiTextKey,
+        ResultCardStage, Theme, ThemePreference, Track, UiConfigSnapshot, UiLanguage, UiTextKey,
         ValidatedWebTrackUrl, WindowKind, BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X,
         FALLBACK_MATCH_DARK_PIXELS, FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE,
         HISTORY_HEIGHT, HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH,
@@ -10780,6 +10938,18 @@ mod tests {
         assert_eq!(theme_from_foreground_rgb(255, 255, 255), Theme::Dark);
         assert_eq!(theme_from_foreground_rgb(128, 128, 128), Theme::Light);
         assert_eq!(theme_from_foreground_rgb(0, 255, 0), Theme::Dark);
+    }
+
+    #[test]
+    fn appearance_preference_overrides_or_follows_the_windows_theme() {
+        assert_eq!(ThemePreference::System.resolve(Theme::Light), Theme::Light);
+        assert_eq!(ThemePreference::System.resolve(Theme::Dark), Theme::Dark);
+        assert_eq!(ThemePreference::Light.resolve(Theme::Dark), Theme::Light);
+        assert_eq!(ThemePreference::Dark.resolve(Theme::Light), Theme::Dark);
+        assert_eq!(ThemePreference::from_raw(0), ThemePreference::System);
+        assert_eq!(ThemePreference::from_raw(1), ThemePreference::Light);
+        assert_eq!(ThemePreference::from_raw(2), ThemePreference::Dark);
+        assert_eq!(ThemePreference::from_raw(u32::MAX), ThemePreference::System);
     }
 
     #[test]

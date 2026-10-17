@@ -61,7 +61,7 @@ public static class OpenShazamSettingsHostSmoke
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void BootstrapShutdown();
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-    private delegate int SettingsShow(IntPtr owner);
+    private delegate int SettingsShow(IntPtr owner, uint appearanceMode);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void SettingsShutdown();
 
@@ -184,7 +184,7 @@ public static class OpenShazamSettingsHostSmoke
                 if (owner == IntPtr.Zero) throw new InvalidOperationException("Create owner window: " + Marshal.GetLastWin32Error());
 
                 stage = "initialize and show XAML host";
-                hr = show(owner);
+                hr = show(owner, 0); // Start in "Use system setting" mode.
                 if (hr < 0) Marshal.ThrowExceptionForHR(hr);
 
                 stage = "pump hidden desktop for XAML callbacks";
@@ -241,7 +241,9 @@ public static class OpenShazamSettingsHostSmoke
                 AutomationElementCollection descendants = islandRoot.FindAll(
                     TreeScope.Descendants, Condition.TrueCondition);
                 bool startupToggleFound = false;
-                bool extraVisibleSettingsTextFound = false;
+                bool appearanceSelectorFound = false;
+                bool appearanceLabelFound = false;
+                AutomationElement appearanceSelector = null;
                 StringBuilder names = new StringBuilder();
                 for (int i = 0; i < descendants.Count; i++)
                 {
@@ -253,20 +255,46 @@ public static class OpenShazamSettingsHostSmoke
                             .Append(descendants[i].Current.ControlType.ProgrammaticName)
                             .Append("]");
                     }
-                    if ((name == "Startup" || name == "\u81EA\u52D5\u8D77\u52D5") &&
+                    if ((name == "Start on sign-in" || name == "\u81EA\u52D5\u8D77\u52D5") &&
                         descendants[i].Current.ControlType == ControlType.Button)
                         startupToggleFound = true;
-                    if (name == "Settings" || name == "\u8A2D\u5B9A" ||
-                        name == "General" ||
-                        name == "\u5168\u822C" || name == "Audio input" ||
-                        name == "\u97F3\u58F0\u5165\u529B" ||
-                        name.Contains("MSIX"))
-                        extraVisibleSettingsTextFound = true;
+                    if (descendants[i].Current.ControlType == ControlType.ComboBox)
+                    {
+                        appearanceSelectorFound = true;
+                        appearanceSelector = descendants[i];
+                    }
+                    if (name == "Choose a mode" || name == "\u30E2\u30FC\u30C9\u3092\u9078\u3076")
+                        appearanceLabelFound = true;
                 }
-                if (!startupToggleFound || extraVisibleSettingsTextFound)
+                if (!startupToggleFound || !appearanceSelectorFound || !appearanceLabelFound)
                     throw new InvalidOperationException(
-                        "Settings should expose only the startup toggle. " +
+                        "Settings should expose the startup toggle and appearance selector. " +
                         "Descendant count=" + descendants.Count + "; names=" + names);
+
+                stage = "verify the appearance selector options";
+                var expandCollapse = (ExpandCollapsePattern)appearanceSelector.GetCurrentPattern(
+                    ExpandCollapsePattern.Pattern);
+                expandCollapse.Expand();
+                Thread.Sleep(150);
+                AutomationElementCollection expandedElements = islandRoot.FindAll(
+                    TreeScope.Descendants, Condition.TrueCondition);
+                bool lightOptionFound = false;
+                bool darkOptionFound = false;
+                bool systemOptionFound = false;
+                for (int i = 0; i < expandedElements.Count; i++)
+                {
+                    string name = expandedElements[i].Current.Name;
+                    if (name == "Light" || name == "\u30E9\u30A4\u30C8") lightOptionFound = true;
+                    if (name == "Dark" || name == "\u30C0\u30FC\u30AF") darkOptionFound = true;
+                    if (name == "Use system setting" || name == "\u30B7\u30B9\u30C6\u30E0\u8A2D\u5B9A\u306B\u5408\u308F\u305B\u308B")
+                        systemOptionFound = true;
+                }
+                expandCollapse.Collapse();
+                if (!lightOptionFound || !darkOptionFound || !systemOptionFound)
+                    throw new InvalidOperationException(
+                        "Appearance selector did not expose Light, Dark and Use system setting. " +
+                        "Light=" + lightOptionFound + "; Dark=" + darkOptionFound +
+                        "; System=" + systemOptionFound + "; names=" + expandedElements.Count);
 
                 stage = "verify rendered WinUI island pixels";
                 int width = islandRect.Right - islandRect.Left;

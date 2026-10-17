@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
 };
 
-pub(crate) type Show = unsafe extern "system" fn(*mut c_void) -> i32;
+pub(crate) type Show = unsafe extern "system" fn(*mut c_void, u32) -> i32;
 type Translate = unsafe extern "system" fn(*mut c_void) -> i32;
 type IsVisible = unsafe extern "system" fn() -> i32;
 type Shutdown = unsafe extern "system" fn();

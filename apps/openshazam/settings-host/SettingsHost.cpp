@@ -50,38 +50,46 @@ namespace
 
     constexpr wchar_t kSettingsClass[] = L"OpenShazamWinUI3Preferences";
     constexpr wchar_t kStartupTask[] = L"OpenShazamStartup";
+    constexpr UINT WM_APPEARANCE_CHANGED = WM_APP + 0x48;
+    constexpr uint32_t kAppearanceSystem = 0;
+    constexpr uint32_t kAppearanceLight = 1;
+    constexpr uint32_t kAppearanceDark = 2;
     constexpr int kWidthDips = 520;
     constexpr int kHeightDips = 380;
 
-    void ApplySystemTitleBarTheme(HWND window) noexcept
+    bool SystemUsesDarkAppearance() noexcept
     {
-        if (!window) return;
         try
         {
-            // WinUI's XAML theme does not style the native non-client caption.
-            // Ask DWM for the matching immersive caption using the current
-            // system foreground palette (light text implies the dark palette).
             viewmanagement::UISettings settings;
             auto foreground = settings.GetColorValue(viewmanagement::UIColorType::Foreground);
             const float luminance = 0.2126f * foreground.R +
                                     0.7152f * foreground.G +
                                     0.0722f * foreground.B;
-            BOOL useDarkMode = luminance >= 0.5f ? TRUE : FALSE;
-            auto setAttribute = [&](DWORD attribute) {
-                return SUCCEEDED(::DwmSetWindowAttribute(
-                    window,
-                    static_cast<DWMWINDOWATTRIBUTE>(attribute),
-                    &useDarkMode,
-                    sizeof(useDarkMode)));
-            };
-            // Attribute 20 is the documented Windows 11 value. Windows 10
-            // 1903 used value 19 before the public SDK constant was added.
-            if (!setAttribute(20)) setAttribute(19);
+            return luminance >= 0.5f;
         }
         catch (...)
         {
-            // Keep the OS default caption if UISettings is unavailable.
+            return false;
         }
+    }
+
+    void ApplyTitleBarTheme(HWND window, uint32_t appearanceMode) noexcept
+    {
+        if (!window) return;
+        BOOL useDarkMode = appearanceMode == kAppearanceSystem
+            ? (SystemUsesDarkAppearance() ? TRUE : FALSE)
+            : (appearanceMode == kAppearanceDark ? TRUE : FALSE);
+        auto setAttribute = [&](DWORD attribute) {
+            return SUCCEEDED(::DwmSetWindowAttribute(
+                window,
+                static_cast<DWMWINDOWATTRIBUTE>(attribute),
+                &useDarkMode,
+                sizeof(useDarkMode)));
+        };
+        // Attribute 20 is the documented Windows 11 value. Windows 10
+        // 1903 used value 19 before the public SDK constant was added.
+        if (!setAttribute(20)) setAttribute(19);
     }
 
     bool IsJapanese() noexcept
@@ -97,14 +105,54 @@ namespace
     struct SettingsState
     {
         controls::ToggleSwitch toggle{ nullptr };
-        bool loading{ true };
+        controls::ComboBox appearance{ nullptr };
+        controls::ScrollViewer viewer{ nullptr };
+        HWND owner{};
+        HWND hwnd{};
+        uint32_t appearanceMode{ kAppearanceSystem };
+        bool startupLoading{ true };
+        bool appearanceLoading{ true };
         bool alive{ true };
     };
+
+    int ComboIndexFromAppearance(uint32_t mode) noexcept
+    {
+        switch (mode)
+        {
+        case kAppearanceLight: return 0;
+        case kAppearanceDark: return 1;
+        default: return 2;
+        }
+    }
+
+    uint32_t AppearanceFromComboIndex(int index) noexcept
+    {
+        switch (index)
+        {
+        case 0: return kAppearanceLight;
+        case 1: return kAppearanceDark;
+        default: return kAppearanceSystem;
+        }
+    }
+
+    void ApplyAppearanceToSettings(std::shared_ptr<SettingsState> const& state, uint32_t mode)
+    {
+        if (!state || !state->alive) return;
+        if (mode > kAppearanceDark) mode = kAppearanceSystem;
+        state->appearanceMode = mode;
+        if (state->viewer)
+        {
+            auto theme = mode == kAppearanceDark ? x::ElementTheme::Dark :
+                mode == kAppearanceLight ? x::ElementTheme::Light : x::ElementTheme::Default;
+            state->viewer.RequestedTheme(theme);
+        }
+        ApplyTitleBarTheme(state->hwnd, mode);
+    }
 
     void DisableStartupControlNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
     {
         if (!state || !state->alive) return;
-        state->loading = false;
+        state->startupLoading = false;
         try
         {
             state->toggle.IsOn(false);
@@ -123,7 +171,7 @@ namespace
         if (!state || !state->alive) co_return;
         try
         {
-            state->loading = true;
+            state->startupLoading = true;
             state->toggle.IsEnabled(false);
             auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
             if (!state->alive) co_return;
@@ -132,7 +180,7 @@ namespace
                                current == appmodel::StartupTaskState::EnabledByPolicy);
             state->toggle.IsEnabled(current == appmodel::StartupTaskState::Disabled ||
                                     current == appmodel::StartupTaskState::Enabled);
-            state->loading = false;
+            state->startupLoading = false;
         }
         catch (winrt::hresult_error const&)
         {
@@ -150,7 +198,7 @@ namespace
         if (!state || !state->alive) co_return;
         try
         {
-            state->loading = true;
+            state->startupLoading = true;
             state->toggle.IsEnabled(false);
             auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
             if (!state->alive) co_return;
@@ -222,7 +270,7 @@ namespace
                 ::MulDiv(kWidthDips, dpi, 96), ::MulDiv(kHeightDips, dpi, 96),
                 parent, nullptr, instance, nullptr);
             if (!hwnd) winrt::throw_last_error();
-            ApplySystemTitleBarTheme(hwnd);
+            ApplyTitleBarTheme(hwnd, kAppearanceSystem);
             island = hosting::DesktopWindowXamlSource{};
             island.Initialize(winrt::Microsoft::UI::GetWindowIdFromWindow(hwnd));
             islandHwnd = winrt::Microsoft::UI::GetWindowFromWindowId(island.SiteBridge().WindowId());
@@ -240,6 +288,8 @@ namespace
             if (previousStyle == 0 && styleError != ERROR_SUCCESS)
                 winrt::throw_last_error();
             state = std::make_shared<SettingsState>();
+            state->owner = owner;
+            state->hwnd = hwnd;
             island.Content(BuildContent());
             Layout();
             RefreshStartup(state);
@@ -248,11 +298,14 @@ namespace
         x::UIElement BuildContent()
         {
             controls::StackPanel stack;
-            stack.Spacing(0);
+            stack.Spacing(8);
             stack.Padding(x::ThicknessHelper::FromUniformLength(24));
 
+            auto startupCard = markup::XamlReader::Load(
+                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="14" />)"
+            ).as<controls::Border>();
             state->toggle = controls::ToggleSwitch{};
-            auto startupName = Localized(L"Startup", L"自動起動");
+            auto startupName = Localized(L"Start on sign-in", L"自動起動");
             state->toggle.Header(winrt::box_value(startupName));
             automation::AutomationProperties::SetName(state->toggle, startupName);
             state->toggle.OnContent(winrt::box_value(Localized(L"On", L"オン")));
@@ -260,20 +313,84 @@ namespace
             state->toggle.IsEnabled(false);
             std::weak_ptr<SettingsState> weak = state;
             state->toggle.Toggled([weak](auto const&, auto const&) {
-                if (auto state = weak.lock(); state && state->alive && !state->loading)
+                if (auto state = weak.lock(); state && state->alive && !state->startupLoading)
                     ChangeStartup(weak, state->toggle.IsOn());
             });
-            stack.Children().Append(state->toggle);
+            startupCard.Child(state->toggle);
+            stack.Children().Append(startupCard);
+
+            auto appearanceCard = markup::XamlReader::Load(
+                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="14" />)"
+            ).as<controls::Border>();
+            controls::Grid appearanceRow;
+            auto iconColumn = controls::ColumnDefinition{};
+            iconColumn.Width(x::GridLengthHelper::FromValueAndType(34.0, x::GridUnitType::Pixel));
+            auto labelColumn = controls::ColumnDefinition{};
+            labelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
+            auto selectorColumn = controls::ColumnDefinition{};
+            selectorColumn.Width(x::GridLengthHelper::FromValueAndType(208.0, x::GridUnitType::Pixel));
+            appearanceRow.ColumnDefinitions().Append(iconColumn);
+            appearanceRow.ColumnDefinitions().Append(labelColumn);
+            appearanceRow.ColumnDefinitions().Append(selectorColumn);
+
+            controls::FontIcon appearanceIcon;
+            appearanceIcon.Glyph(L"\uE790");
+            appearanceIcon.FontSize(20.0);
+            appearanceIcon.VerticalAlignment(x::VerticalAlignment::Center);
+            controls::Grid::SetColumn(appearanceIcon, 0);
+            appearanceRow.Children().Append(appearanceIcon);
+
+            controls::StackPanel appearanceLabels;
+            appearanceLabels.Spacing(2.0);
+            appearanceLabels.VerticalAlignment(x::VerticalAlignment::Center);
+            controls::TextBlock appearanceTitle;
+            auto appearanceName = Localized(L"Choose a mode", L"モードを選ぶ");
+            appearanceTitle.Text(appearanceName);
+            appearanceTitle.FontSize(14.0);
+            automation::AutomationProperties::SetName(appearanceTitle, appearanceName);
+            controls::TextBlock appearanceDescription;
+            appearanceDescription.Text(Localized(
+                L"Changes the colors displayed in Windows and apps",
+                L"Windows とアプリに表示される色を変更します"));
+            appearanceDescription.FontSize(12.0);
+            appearanceLabels.Children().Append(appearanceTitle);
+            appearanceLabels.Children().Append(appearanceDescription);
+            controls::Grid::SetColumn(appearanceLabels, 1);
+            appearanceRow.Children().Append(appearanceLabels);
+
+            state->appearance = controls::ComboBox{};
+            state->appearance.Items().Append(winrt::box_value(Localized(L"Light", L"ライト")));
+            state->appearance.Items().Append(winrt::box_value(Localized(L"Dark", L"ダーク")));
+            state->appearance.Items().Append(winrt::box_value(Localized(
+                L"Use system setting", L"システム設定に合わせる")));
+            state->appearance.Width(208.0);
+            state->appearance.VerticalAlignment(x::VerticalAlignment::Center);
+            automation::AutomationProperties::SetName(state->appearance, appearanceName);
+            state->appearance.SelectedIndex(ComboIndexFromAppearance(state->appearanceMode));
+            state->appearanceLoading = false;
+            state->appearance.SelectionChanged([weak](auto const&, auto const&) {
+                auto state = weak.lock();
+                if (!state || !state->alive || state->appearanceLoading) return;
+                const uint32_t mode = AppearanceFromComboIndex(state->appearance.SelectedIndex());
+                ApplyAppearanceToSettings(state, mode);
+                ::PostMessageW(state->owner, WM_APPEARANCE_CHANGED,
+                    static_cast<WPARAM>(mode), 0);
+            });
+            controls::Grid::SetColumn(state->appearance, 2);
+            appearanceRow.Children().Append(state->appearance);
+            appearanceCard.Child(appearanceRow);
+            stack.Children().Append(appearanceCard);
 
             // Keep the background as a XAML ThemeResource expression rather
             // than copying the current brush instance. That lets the root
             // switch palettes when Windows changes app appearance at runtime.
-            controls::ScrollViewer viewer = markup::XamlReader::Load(
+            state->viewer = markup::XamlReader::Load(
                 LR"(<ScrollViewer xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" />)"
             ).as<controls::ScrollViewer>();
-            viewer.Content(stack);
-            viewer.VerticalScrollBarVisibility(controls::ScrollBarVisibility::Auto);
-            return viewer;
+            state->viewer.Content(stack);
+            state->viewer.VerticalScrollBarVisibility(controls::ScrollBarVisibility::Auto);
+            ApplyAppearanceToSettings(state, state->appearanceMode);
+            return state->viewer;
         }
 
         void Layout()
@@ -284,10 +401,16 @@ namespace
             island.SiteBridge().MoveAndResize({0, 0, rect.right - rect.left, rect.bottom - rect.top});
         }
 
-        void Show()
+        void Show(uint32_t appearanceMode)
         {
             if (!hwnd) return;
-            ApplySystemTitleBarTheme(hwnd);
+            if (state)
+            {
+                state->appearanceLoading = true;
+                state->appearance.SelectedIndex(ComboIndexFromAppearance(appearanceMode));
+                state->appearanceLoading = false;
+                ApplyAppearanceToSettings(state, appearanceMode);
+            }
             ::ShowWindow(hwnd, SW_SHOWNORMAL);
             // The island is initially measured while its host HWND is hidden.
             // Reapply its native site bounds after the parent becomes visible.
@@ -349,7 +472,8 @@ namespace
                 return 0;
             case WM_SETTINGCHANGE:
             case WM_THEMECHANGED:
-                ApplySystemTitleBarTheme(h);
+                if (host && host->hwnd == h && host->state)
+                    ApplyAppearanceToSettings(host->state, host->state->appearanceMode);
                 return ::DefWindowProcW(h, msg, wp, lp);
             case WM_CLOSE:
                 ::ShowWindow(h, SW_HIDE);
@@ -364,7 +488,8 @@ namespace
     std::unique_ptr<SettingsHost> g_settings;
 }
 
-extern "C" __declspec(dllexport) HRESULT __stdcall OpenShazamSettingsShow(HWND owner) noexcept
+extern "C" __declspec(dllexport) HRESULT __stdcall OpenShazamSettingsShow(
+    HWND owner, uint32_t appearanceMode) noexcept
 {
     try
     {
@@ -377,7 +502,7 @@ extern "C" __declspec(dllexport) HRESULT __stdcall OpenShazamSettingsShow(HWND o
             catch (...) { host->Close(); g_active = nullptr; throw; }
             g_settings = std::move(host);
         }
-        g_settings->Show();
+        g_settings->Show(appearanceMode);
         return S_OK;
     }
     catch (winrt::hresult_error const& e) { return e.code(); }
