@@ -8,6 +8,7 @@
 #include <system_error>
 #include <vector>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Microsoft.UI.Windowing.h>
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
 
 #pragma comment(lib, "Advapi32.lib")
@@ -190,6 +191,32 @@ namespace
     void ApplyTitleBarTheme(HWND window, uint32_t appearanceMode) noexcept
     {
         if (!window) return;
+
+        // AppWindow owns the WinUI 3 title-bar theme on Windows 11. Use the
+        // app's current light/dark selection directly so the native caption
+        // does not stay light while the XAML island is dark.
+        try
+        {
+            auto appWindow = winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(
+                winrt::Microsoft::UI::GetWindowIdFromWindow(window));
+            if (appWindow &&
+                winrt::Microsoft::UI::Windowing::AppWindowTitleBar::IsCustomizationSupported())
+            {
+                auto titleBarTheme = appearanceMode == kAppearanceSystem
+                    ? winrt::Microsoft::UI::Windowing::TitleBarTheme::UseDefaultAppMode
+                    : (appearanceMode == kAppearanceDark
+                        ? winrt::Microsoft::UI::Windowing::TitleBarTheme::Dark
+                        : winrt::Microsoft::UI::Windowing::TitleBarTheme::Light);
+                appWindow.TitleBar().PreferredTheme(titleBarTheme);
+                return;
+            }
+        }
+        catch (...)
+        {
+            // The HWND may not have an AppWindow on older Windows versions.
+            // Keep the documented DWM fallback below for those systems.
+        }
+
         BOOL useDarkMode = appearanceMode == kAppearanceSystem
             ? (SystemUsesDarkAppearance() ? TRUE : FALSE)
             : (appearanceMode == kAppearanceDark ? TRUE : FALSE);
@@ -456,7 +483,7 @@ namespace
             auto startupLabelColumn = controls::ColumnDefinition{};
             startupLabelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
             auto startupToggleColumn = controls::ColumnDefinition{};
-            startupToggleColumn.Width(x::GridLengthHelper::FromValueAndType(150.0, x::GridUnitType::Pixel));
+            startupToggleColumn.Width(x::GridLengthHelper::Auto());
             startupRow.ColumnDefinitions().Append(startupLabelColumn);
             startupRow.ColumnDefinitions().Append(startupToggleColumn);
 
