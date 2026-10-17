@@ -8674,7 +8674,7 @@ impl Renderer {
             &self.palette.white,
         );
         self.text(
-            "OpenShazam",
+            "Shazam",
             rect(40.0, 160.0, ABOUT_WIDTH as f32 - 40.0, 205.0),
             &self.text.centered_title,
             &self.palette.title,
@@ -9129,7 +9129,7 @@ unsafe fn add_tray_icon(hwnd: HWND) -> windows::core::Result<()> {
         guidItem: TRAY_ICON_GUID,
         ..Default::default()
     };
-    let tip = wide("OpenShazam");
+    let tip = wide("Shazam");
     for (dst, src) in data.szTip.iter_mut().zip(tip) {
         *dst = src;
     }
@@ -9156,7 +9156,7 @@ unsafe fn show_tray_context_menu(app: &mut AppState) {
         return;
     };
     let settings = wide("Settings");
-    let exit = wide("Exit OpenShazam");
+    let exit = wide("Exit Shazam");
     let _ = AppendMenuW(
         menu,
         MF_STRING,
@@ -9975,7 +9975,7 @@ unsafe fn open_about(app: &mut AppState) {
         if let Ok(hwnd) = create_window(
             app as *mut AppState,
             WindowKind::About,
-            "About OpenShazam",
+            "About Shazam",
             (ABOUT_WIDTH * factor).round() as i32,
             (ABOUT_HEIGHT * factor).round() as i32,
             false,
@@ -13342,7 +13342,14 @@ unsafe fn register_notification_application() -> windows::core::Result<()> {
     let programs_path = PCWSTR(programs.0).to_string();
     CoTaskMemFree(Some(programs.0.cast()));
     let programs_path = programs_path?;
-    let shortcut_path = wide(&format!("{programs_path}\\OpenShazam.lnk"));
+    let shortcut_path_string = format!("{programs_path}\\Shazam.lnk");
+    let legacy_shortcut_path = format!("{programs_path}\\OpenShazam.lnk");
+    if !std::path::Path::new(&shortcut_path_string).exists() {
+        // Rename the shortcut created by older builds so Start and toast
+        // surfaces use the public product name after an in-place update.
+        let _ = std::fs::rename(&legacy_shortcut_path, &shortcut_path_string);
+    }
+    let shortcut_path = wide(&shortcut_path_string);
 
     let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
     link.SetPath(PCWSTR(executable.as_ptr()))?;
@@ -13503,7 +13510,7 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
         let hwnd = create_window(
             app_ptr,
             WindowKind::Main,
-            "OpenShazam",
+            "Shazam",
             ui_model::physical_pixels(MAIN_WINDOW_WIDTH, dpi),
             ui_model::physical_pixels(MAIN_WINDOW_HEIGHT, dpi),
             false,

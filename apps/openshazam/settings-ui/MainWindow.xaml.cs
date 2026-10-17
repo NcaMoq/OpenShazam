@@ -30,16 +30,16 @@ public sealed partial class MainWindow : Window
         _isJapanese = CultureInfo.CurrentUICulture.TwoLetterISOLanguageName.Equals("ja", StringComparison.OrdinalIgnoreCase);
         PageTitle.Text = Text("Settings", "設定");
         PageDescription.Text = Text(
-            "Manage how OpenShazam starts and behaves.",
-            "OpenShazamの起動方法を設定します。");
+            "Manage how Shazam starts and behaves.",
+            "Shazamの起動方法を設定します。");
         StartupToggle.Header = Text(
-            "Launch OpenShazam when I sign in",
-            "Windowsへのサインイン時にOpenShazamを起動");
+            "Launch Shazam when I sign in",
+            "Windowsへのサインイン時にShazamを起動");
         StartupToggle.OffContent = Text("Off", "オフ");
         StartupToggle.OnContent = Text("On", "オン");
         StartupDescription.Text = Text(
-            "OpenShazam starts in the notification area. Music recognition will not start automatically.",
-            "OpenShazamは通知領域で起動します。楽曲認識は自動で開始しません。");
+            "Shazam starts in the notification area. Music recognition will not start automatically.",
+            "Shazamは通知領域で起動します。楽曲認識は自動で開始しません。");
         Root.Loaded += OnLoaded;
 
         var hwnd = WindowNative.GetWindowHandle(this);
@@ -167,8 +167,8 @@ public sealed partial class MainWindow : Window
             StartupToggle.IsOn = false;
             StartupToggle.IsEnabled = false;
             ShowInfo(Text(
-                "Automatic startup is available in the packaged version of OpenShazam.",
-                "自動起動はパッケージ版のOpenShazamで利用できます。"));
+                "Automatic startup is available in the packaged version of Shazam.",
+                "自動起動はパッケージ版のShazamで利用できます。"));
         }
         finally
         {

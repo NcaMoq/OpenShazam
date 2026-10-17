@@ -11,7 +11,7 @@
     Version="0.1.0.0"
     ProcessorArchitecture="x64" />
   <Properties>
-    <DisplayName>OpenShazam</DisplayName>
+    <DisplayName>Shazam</DisplayName>
     <PublisherDisplayName>OpenShazam Development</PublisherDisplayName>
     <Logo>assets\OpenShazamStoreLogo.png</Logo>
   </Properties>
@@ -34,8 +34,8 @@
       Executable="openshazam.exe"
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="OpenShazam"
-        Description="OpenShazam Windows UI"
+        DisplayName="Shazam"
+        Description="Shazam music recognition"
         BackgroundColor="transparent"
         Square44x44Logo="assets\OpenShazamSquare44.png"
         Square150x150Logo="assets\OpenShazamSquare150.png" />
@@ -47,7 +47,7 @@
           <uap5:StartupTask
             TaskId="OpenShazamStartup"
             Enabled="false"
-            DisplayName="OpenShazam" />
+            DisplayName="Shazam" />
         </uap5:Extension>
       </Extensions>
     </Application>
