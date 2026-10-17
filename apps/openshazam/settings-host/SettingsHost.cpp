@@ -597,6 +597,15 @@ namespace
             stack.Spacing(8);
             stack.Padding(x::ThicknessHelper::FromUniformLength(24));
 
+            controls::TextBlock pageTitle;
+            pageTitle.Text(L"\u8A2D\u5B9A");
+            pageTitle.FontSize(28.0);
+            pageTitle.FontWeight(winrt::Windows::UI::Text::FontWeights::Bold());
+            pageTitle.HorizontalAlignment(x::HorizontalAlignment::Left);
+            pageTitle.Margin(x::ThicknessHelper::FromLengths(0.0, 0.0, 0.0, 8.0));
+            automation::AutomationProperties::SetName(pageTitle, L"\u8A2D\u5B9A");
+            stack.Children().Append(pageTitle);
+
             state->startupCard = markup::XamlReader::Load(
                 LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="16" />)"
             ).as<controls::Border>();
@@ -738,7 +747,7 @@ namespace
             appearanceLabels.HorizontalAlignment(x::HorizontalAlignment::Left);
             appearanceLabels.VerticalAlignment(x::VerticalAlignment::Center);
             controls::TextBlock appearanceTitle;
-            auto appearanceName = Localized(L"Choose a mode", L"モードを選ぶ");
+            auto appearanceName = Localized(L"Theme", L"テーマ");
             appearanceTitle.Text(appearanceName);
             appearanceTitle.FontSize(14.0);
             appearanceTitle.HorizontalAlignment(x::HorizontalAlignment::Left);
@@ -746,8 +755,8 @@ namespace
             automation::AutomationProperties::SetName(appearanceTitle, appearanceName);
             controls::TextBlock appearanceDescription;
             auto appearanceDescriptionText = Localized(
-                L"Changes the colors displayed in Windows and apps",
-                L"Windows とアプリに表示される色を変更します");
+                L"Choose the app theme to display",
+                L"表示するアプリのテーマを選択します");
             appearanceDescription.Text(appearanceDescriptionText);
             appearanceDescription.FontSize(12.0);
             appearanceDescription.TextWrapping(x::TextWrapping::Wrap);
