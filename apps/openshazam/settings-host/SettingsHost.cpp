@@ -249,6 +249,7 @@ namespace
     struct SettingsState
     {
         controls::ToggleSwitch toggle{ nullptr };
+        controls::TextBlock startupValue{ nullptr };
         controls::ComboBox appearance{ nullptr };
         controls::ScrollViewer viewer{ nullptr };
         controls::Border startupCard{ nullptr };
@@ -297,6 +298,22 @@ namespace
         ApplyTitleBarTheme(state->hwnd, mode);
     }
 
+    void UpdateStartupValueNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
+    {
+        if (!state || !state->alive) return;
+        try
+        {
+            state->startupValue.Text(state->toggle.IsOn()
+                ? Localized(L"On", L"オン")
+                : Localized(L"Off", L"オフ"));
+            state->startupValue.Opacity(state->toggle.IsEnabled() ? 1.0 : 0.5);
+        }
+        catch (...)
+        {
+            // WinRT property updates can fail while the island is closing.
+        }
+    }
+
     void DisableStartupControlNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
     {
         if (!state || !state->alive) return;
@@ -305,6 +322,7 @@ namespace
         {
             state->toggle.IsOn(false);
             state->toggle.IsEnabled(false);
+            UpdateStartupValueNoThrow(state);
         }
         catch (...)
         {
@@ -326,6 +344,7 @@ namespace
             {
                 state->toggle.IsOn(RunStartupEnabled());
                 state->toggle.IsEnabled(true);
+                UpdateStartupValueNoThrow(state);
                 state->startupLoading = false;
                 co_return;
             }
@@ -341,6 +360,7 @@ namespace
                                current == appmodel::StartupTaskState::EnabledByPolicy);
             state->toggle.IsEnabled(current == appmodel::StartupTaskState::Disabled ||
                                     current == appmodel::StartupTaskState::Enabled);
+            UpdateStartupValueNoThrow(state);
             state->startupLoading = false;
         }
         catch (winrt::hresult_error const&)
@@ -368,6 +388,7 @@ namespace
                 if (!state->alive) co_return;
                 state->toggle.IsOn(enable);
                 state->toggle.IsEnabled(true);
+                UpdateStartupValueNoThrow(state);
                 state->startupLoading = false;
                 co_return;
             }
@@ -509,24 +530,34 @@ namespace
             startupRow.Children().Append(startupLabel);
 
             automation::AutomationProperties::SetName(state->toggle, startupName);
-            state->toggle.OnContent(winrt::box_value(Localized(L"On", L"オン")));
-            state->toggle.OffContent(winrt::box_value(Localized(L"Off", L"オフ")));
+            state->startupValue = controls::TextBlock{};
+            state->startupValue.Text(Localized(L"Off", L"オフ"));
+            state->startupValue.FontSize(14.0);
+            state->startupValue.Width(38.0);
+            state->startupValue.TextAlignment(x::TextAlignment::Center);
+            state->startupValue.VerticalAlignment(x::VerticalAlignment::Center);
             state->toggle.VerticalAlignment(x::VerticalAlignment::Center);
-            state->toggle.HorizontalAlignment(x::HorizontalAlignment::Right);
-            state->toggle.HorizontalContentAlignment(x::HorizontalAlignment::Right);
-            // ToggleSwitch reserves a wider internal layout slot than its
-            // switch/content peer. Align that peer with the selector lane.
-            auto switchAlignment = media::TranslateTransform{};
-            switchAlignment.X(80.0);
-            state->toggle.RenderTransform(switchAlignment);
+            state->toggle.OnContent(winrt::box_value(Localized(L"", L"")));
+            state->toggle.OffContent(winrt::box_value(Localized(L"", L"")));
+            state->toggle.Width(48.0);
             state->toggle.IsEnabled(false);
+            controls::StackPanel startupControl;
+            startupControl.Orientation(controls::Orientation::Horizontal);
+            startupControl.Spacing(8.0);
+            startupControl.HorizontalAlignment(x::HorizontalAlignment::Right);
+            startupControl.VerticalAlignment(x::VerticalAlignment::Center);
+            startupControl.Children().Append(state->startupValue);
+            startupControl.Children().Append(state->toggle);
             std::weak_ptr<SettingsState> weak = state;
             state->toggle.Toggled([weak](auto const&, auto const&) {
-                if (auto state = weak.lock(); state && state->alive && !state->startupLoading)
-                    ChangeStartup(weak, state->toggle.IsOn());
+                if (auto state = weak.lock(); state && state->alive)
+                {
+                    UpdateStartupValueNoThrow(state);
+                    if (!state->startupLoading) ChangeStartup(weak, state->toggle.IsOn());
+                }
             });
-            controls::Grid::SetColumn(state->toggle, 1);
-            startupRow.Children().Append(state->toggle);
+            controls::Grid::SetColumn(startupControl, 1);
+            startupRow.Children().Append(startupControl);
             state->startupCard.Child(startupRow);
             stack.Children().Append(state->startupCard);
 
