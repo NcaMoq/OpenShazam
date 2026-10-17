@@ -2994,6 +2994,12 @@ fn composition_root_layer_order() -> [CompositionRootLayer; 4] {
     ]
 }
 
+fn composition_outer_ripples_visible(mode: TaggingMode) -> bool {
+    // Native Auto start adds its shadow and inner circles, but does not add
+    // the outer circle group used by manual recognition.
+    mode == TaggingMode::Manual
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompositionSceneLayer {
     Tagging,
@@ -4313,28 +4319,37 @@ impl CompositionScene {
                     sublayer.StartAnimation(&HSTRING::from("Scale"), &animations.sublayer_scale)?;
                 }
             }
-            for ring in &self.rings[4..] {
-                ring.visual.SetOpacity(ring.base_opacity)?;
-                ring.visual
-                    .StartAnimation(&HSTRING::from("Scale"), &self.outer_scale_null_animation)?;
-                if let (Some(container), Some(scale)) = (
-                    ring.core_container.as_ref(),
-                    ring.core_scale_animation.as_ref(),
-                ) {
-                    container.StartAnimation(&HSTRING::from("Scale"), scale)?;
+            if composition_outer_ripples_visible(snapshot.mode) {
+                for ring in &self.rings[4..] {
+                    ring.visual.SetOpacity(ring.base_opacity)?;
+                    ring.visual.StartAnimation(
+                        &HSTRING::from("Scale"),
+                        &self.outer_scale_null_animation,
+                    )?;
+                    if let (Some(container), Some(scale)) = (
+                        ring.core_container.as_ref(),
+                        ring.core_scale_animation.as_ref(),
+                    ) {
+                        container.StartAnimation(&HSTRING::from("Scale"), scale)?;
+                    }
+                    if let (Some(size), Some(border)) = (
+                        ring.geometry_animation.as_ref(),
+                        ring.border_animation.as_ref(),
+                    ) {
+                        ring.geometry
+                            .as_ref()
+                            .expect("outer ring geometry")
+                            .StartAnimation(&HSTRING::from("Radius"), size)?;
+                        ring.shape
+                            .as_ref()
+                            .expect("outer ring shape")
+                            .StartAnimation(&HSTRING::from("StrokeThickness"), border)?;
+                    }
                 }
-                if let (Some(size), Some(border)) = (
-                    ring.geometry_animation.as_ref(),
-                    ring.border_animation.as_ref(),
-                ) {
-                    ring.geometry
-                        .as_ref()
-                        .expect("outer ring geometry")
-                        .StartAnimation(&HSTRING::from("Radius"), size)?;
-                    ring.shape
-                        .as_ref()
-                        .expect("outer ring shape")
-                        .StartAnimation(&HSTRING::from("StrokeThickness"), border)?;
+            } else {
+                self.stop_outer_ripple_tracks()?;
+                for ring in &self.rings[4..] {
+                    ring.visual.SetOpacity(0.0)?;
                 }
             }
             self.ripples_active = true;
@@ -4357,22 +4372,9 @@ impl CompositionScene {
                     Z: 1.0,
                 })?;
             }
+            self.stop_outer_ripple_tracks()?;
             for ring in &self.rings[4..] {
-                ring.visual.StopAnimation(&HSTRING::from("Scale"))?;
-                if let Some(container) = &ring.core_container {
-                    container.StopAnimation(&HSTRING::from("Scale"))?;
-                }
-                if let Some(geometry) = &ring.geometry {
-                    geometry.StopAnimation(&HSTRING::from("Radius"))?;
-                }
-                if let Some(shape) = &ring.shape {
-                    shape.StopAnimation(&HSTRING::from("StrokeThickness"))?;
-                }
-                ring.visual.SetScale(Vector3 {
-                    X: 1.0,
-                    Y: 1.0,
-                    Z: 1.0,
-                })?;
+                ring.visual.SetOpacity(0.0)?;
             }
             self.ripples_active = false;
         }
@@ -4425,8 +4427,13 @@ impl CompositionScene {
                 Y: frame.outer_audio_scale as f32,
                 Z: 1.0,
             })?;
-            self.outer_audio_root
-                .SetOpacity(frame.outer_audio_opacity as f32)?;
+            self.outer_audio_root.SetOpacity(
+                if composition_outer_ripples_visible(snapshot.mode) {
+                    frame.outer_audio_opacity as f32
+                } else {
+                    0.0
+                },
+            )?;
         } else if snapshot.success_elapsed.is_none() {
             // Do not write static values over the active success tracks. Once
             // the result leaves this state, restore the ready scene in one
@@ -4648,6 +4655,27 @@ impl CompositionScene {
             if let Some(shape) = &ring.shape {
                 shape.StopAnimation(&HSTRING::from("StrokeThickness"))?;
             }
+        }
+        Ok(())
+    }
+
+    fn stop_outer_ripple_tracks(&self) -> windows::core::Result<()> {
+        for ring in &self.rings[4..] {
+            ring.visual.StopAnimation(&HSTRING::from("Scale"))?;
+            if let Some(container) = &ring.core_container {
+                container.StopAnimation(&HSTRING::from("Scale"))?;
+            }
+            if let Some(geometry) = &ring.geometry {
+                geometry.StopAnimation(&HSTRING::from("Radius"))?;
+            }
+            if let Some(shape) = &ring.shape {
+                shape.StopAnimation(&HSTRING::from("StrokeThickness"))?;
+            }
+            ring.visual.SetScale(Vector3 {
+                X: 1.0,
+                Y: 1.0,
+                Z: 1.0,
+            })?;
         }
         Ok(())
     }
@@ -13847,6 +13875,19 @@ mod tests {
         assert!(mask_outer_diameter > visible_host_diameter);
         assert!((mask_hole_diameter - 81.6).abs() < 1e-4);
         assert!((visible_edge_width - 7.2).abs() < 1e-4);
+    }
+
+    #[test]
+    fn auto_shazam_omits_manual_outer_ripple_layers() {
+        assert!(super::composition_outer_ripples_visible(
+            ui_model::TaggingMode::Manual
+        ));
+        assert!(!super::composition_outer_ripples_visible(
+            ui_model::TaggingMode::Auto
+        ));
+        assert!(!super::composition_outer_ripples_visible(
+            ui_model::TaggingMode::Ready
+        ));
     }
 
     #[test]
