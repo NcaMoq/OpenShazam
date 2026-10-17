@@ -483,7 +483,11 @@ namespace
             auto startupLabelColumn = controls::ColumnDefinition{};
             startupLabelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
             auto startupToggleColumn = controls::ColumnDefinition{};
-            startupToggleColumn.Width(x::GridLengthHelper::Auto());
+            // Keep a stable trailing lane. Auto sizing can collapse while the
+            // XAML island is first measured, visually grouping the switch
+            // with the label instead of anchoring it to the card's right edge.
+            startupToggleColumn.Width(
+                x::GridLengthHelper::FromValueAndType(124.0, x::GridUnitType::Pixel));
             startupRow.ColumnDefinitions().Append(startupLabelColumn);
             startupRow.ColumnDefinitions().Append(startupToggleColumn);
 
@@ -504,6 +508,7 @@ namespace
             state->toggle.OffContent(winrt::box_value(Localized(L"Off", L"オフ")));
             state->toggle.VerticalAlignment(x::VerticalAlignment::Center);
             state->toggle.HorizontalAlignment(x::HorizontalAlignment::Right);
+            state->toggle.MinWidth(100.0);
             state->toggle.IsEnabled(false);
             std::weak_ptr<SettingsState> weak = state;
             state->toggle.Toggled([weak](auto const&, auto const&) {
@@ -548,6 +553,7 @@ namespace
             auto appearanceName = Localized(L"Choose a mode", L"モードを選ぶ");
             appearanceTitle.Text(appearanceName);
             appearanceTitle.FontSize(14.0);
+            appearanceTitle.HorizontalAlignment(x::HorizontalAlignment::Left);
             appearanceTitle.TextAlignment(x::TextAlignment::Left);
             automation::AutomationProperties::SetName(appearanceTitle, appearanceName);
             controls::TextBlock appearanceDescription;
@@ -555,6 +561,7 @@ namespace
                 L"Changes the colors displayed in Windows and apps",
                 L"Windows とアプリに表示される色を変更します"));
             appearanceDescription.FontSize(12.0);
+            appearanceDescription.HorizontalAlignment(x::HorizontalAlignment::Left);
             appearanceDescription.TextAlignment(x::TextAlignment::Left);
             appearanceLabels.Children().Append(appearanceTitle);
             appearanceLabels.Children().Append(appearanceDescription);
