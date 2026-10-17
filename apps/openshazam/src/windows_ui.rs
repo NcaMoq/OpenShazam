@@ -202,7 +202,7 @@ const SINGLE_CLICK_TIMEOUT_MS: u32 = 280;
 const LONG_PRESS_TIMEOUT_MS: u32 = 500;
 const DEACTIVATION_HIDE_DELAY_MS: u32 = 250;
 const PHASE_TICK_MS: u32 = 100;
-const ANIMATION_TICK_MS: u32 = 8;
+const ANIMATION_TICK_MS: u32 = 16;
 const AUTO_START_SPRING_DURATION: Duration = Duration::from_millis(200);
 const AUTO_CANDIDATE_DEDUPE_LIMIT: usize = 40;
 const MAIN_WINDOW_WIDTH: f64 = CONTENT_WIDTH;
@@ -1084,6 +1084,7 @@ struct AppState {
     deactivation_hide_pending: bool,
     phase_timer_active: bool,
     animation_timer_active: bool,
+    result_overlay_composition_ready: bool,
     status_text_composition_ready: bool,
     startup_animation_pending: bool,
     startup_logo_consumed: bool,
@@ -10315,6 +10316,10 @@ unsafe fn sync_main_timers(app: &mut AppState) {
         }
         let animate = app.popup_transition.is_some()
             || animation_needs_frame(&app.phase, app.startup_animation_pending)
+            || result_overlay_fallback_needs_frame(
+                &app.phase,
+                app.result_overlay_composition_ready,
+            )
             || (!app.status_text_composition_ready
                 && app
                     .status_alternator
@@ -10359,7 +10364,7 @@ fn phase_needs_frame(phase: &MainPhase) -> bool {
 fn phase_needs_frame_at(phase: &MainPhase, now: Instant) -> bool {
     match phase {
         // Listening ripples are continuous Windows Composition keyframes.
-        // They do not need an 8 ms UI-thread timer; future meter values enter
+        // They do not need a UI-thread timer; future meter values enter
         // through a change event and update the audio transforms once per value.
         MainPhase::Starting {
             mode: CaptureMode::Auto,
@@ -10373,13 +10378,9 @@ fn phase_needs_frame_at(phase: &MainPhase, now: Instant) -> bool {
             mode: CaptureMode::Manual,
             ..
         } => false,
-        MainPhase::Matched { stage, .. } => match stage {
-            ResultCardStage::Entering { started_at }
-            | ResultCardStage::Exiting { started_at, .. } => {
-                now.saturating_duration_since(*started_at) < RESULT_CARD_TRANSITION
-            }
-            ResultCardStage::Holding { .. } => false,
-        },
+        // Result cards animate on their Composition visual. Only the D2D
+        // layered-surface fallback needs per-frame UI-thread work.
+        MainPhase::Matched { .. } => false,
         MainPhase::NoMatch {
             entered_at,
             returned_to_ready_at,
@@ -10695,6 +10696,17 @@ fn advance_result_card_stage(stage: ResultCardStage, now: Instant) -> ResultCard
 
 fn animation_needs_frame(phase: &MainPhase, startup_animation_pending: bool) -> bool {
     startup_animation_pending || phase_needs_frame(phase)
+}
+
+fn result_overlay_fallback_needs_frame(phase: &MainPhase, composition_ready: bool) -> bool {
+    !composition_ready
+        && matches!(
+            phase,
+            MainPhase::Matched {
+                stage: ResultCardStage::Entering { .. } | ResultCardStage::Exiting { .. },
+                ..
+            }
+        )
 }
 
 fn animation_needs_d2d_redraw(
@@ -11110,7 +11122,12 @@ unsafe extern "system" fn window_proc(
             let mut paint = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
             let _ = BeginPaint(hwnd, &mut paint);
             if let Some(renderer) = data.renderer.as_mut() {
-                if data.kind == WindowKind::Main {
+                let result_overlay_matches =
+                    data.kind == WindowKind::Main && renderer.result_overlay_matches_current(app);
+                if data.kind == WindowKind::Main
+                    && (!result_overlay_matches
+                        || animation_needs_frame(&app.phase, app.startup_animation_pending))
+                {
                     match renderer.update_composition(animation_snapshot(app)) {
                         Ok(()) => {
                             app.status_text_composition_ready =
@@ -11126,6 +11143,13 @@ unsafe extern "system" fn window_proc(
                 if let Err(error) = renderer.draw(app, data.kind) {
                     app.message = Some(format!("描画エラー: {error}"));
                 }
+            }
+            if data.kind == WindowKind::Main {
+                app.result_overlay_composition_ready = data
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.result_overlay_matches_current(app));
+                sync_main_timers(app);
             }
             let _ = EndPaint(hwnd, &paint);
             LRESULT(0)
@@ -11248,12 +11272,33 @@ unsafe extern "system" fn window_proc(
         }
         WM_TIMER if data.kind == WindowKind::Main && wparam.0 == TIMER_PHASE => {
             let recognition_changed = poll_recognition_events(app);
-            let settle_frame = matches!(
+            let settle_update_due = matches!(
                 &app.phase,
                 MainPhase::Matched { track, .. }
-                    if track.recognized_at.elapsed() < SUCCESS_SETTLE_TOTAL
+                    if track.recognized_at.elapsed()
+                        < SUCCESS_SETTLE_TOTAL + Duration::from_millis(u64::from(PHASE_TICK_MS))
             );
-            if update_phase_timers(app) || recognition_changed || settle_frame {
+            let phase_changed = update_phase_timers(app);
+            if settle_update_due {
+                // The success settle and result-card motion are already
+                // running on Composition's clock. Poll their completion at
+                // the phase cadence without repainting/presenting the full
+                // layered popup every 100 ms.
+                if let Some(renderer) = data.renderer.as_mut() {
+                    match renderer.update_composition(animation_snapshot(app)) {
+                        Ok(()) => {
+                            app.status_text_composition_ready =
+                                renderer.status_text_composition_enabled;
+                        }
+                        Err(error) => {
+                            app.status_text_composition_ready = false;
+                            app.message =
+                                Some(format!("Windows Composition update failed: {error}"));
+                        }
+                    }
+                }
+            }
+            if phase_changed || recognition_changed {
                 update_visible_windows(app);
             }
             LRESULT(0)
@@ -11284,42 +11329,50 @@ unsafe extern "system" fn window_proc(
                     }
                 }
                 if app.visible {
-                    let mut composition_update_succeeded = false;
-                    if let Some(renderer) = data.renderer.as_mut() {
-                        match renderer.update_composition(animation_snapshot(app)) {
-                            Ok(()) => {
-                                composition_update_succeeded = true;
-                                app.status_text_composition_ready =
-                                    renderer.status_text_composition_enabled;
-                                if app.startup_animation_pending {
-                                    app.startup_animation_pending = renderer
-                                        .composition
-                                        .as_ref()
-                                        .is_some_and(|scene| !scene.startup_logo_complete());
+                    let composition_frame_needed =
+                        animation_needs_frame(&app.phase, app.startup_animation_pending);
+                    if composition_frame_needed {
+                        if let Some(renderer) = data.renderer.as_mut() {
+                            match renderer.update_composition(animation_snapshot(app)) {
+                                Ok(()) => {
+                                    app.status_text_composition_ready =
+                                        renderer.status_text_composition_enabled;
+                                    if app.startup_animation_pending {
+                                        app.startup_animation_pending = renderer
+                                            .composition
+                                            .as_ref()
+                                            .is_some_and(|scene| !scene.startup_logo_complete());
+                                    }
                                 }
-                            }
-                            Err(error) => {
-                                app.status_text_composition_ready = false;
-                                app.message =
-                                    Some(format!("Windows Composition update failed: {error}"));
-                                app.startup_animation_pending = false;
+                                Err(error) => {
+                                    app.status_text_composition_ready = false;
+                                    app.message =
+                                        Some(format!("Windows Composition update failed: {error}"));
+                                    app.startup_animation_pending = false;
+                                }
                             }
                         }
                     }
                     let status_text_animating = app
                         .status_alternator
                         .is_some_and(|status| status.animating(now));
-                    let result_overlay_composition_ready = composition_update_succeeded
-                        && data
-                            .renderer
-                            .as_ref()
-                            .is_some_and(|renderer| renderer.result_overlay_matches_current(app));
-                    if animation_needs_d2d_redraw(
-                        &app.phase,
-                        status_text_animating,
-                        app.status_text_composition_ready,
-                        result_overlay_composition_ready,
-                    ) {
+                    let result_overlay_composition_ready = data
+                        .renderer
+                        .as_ref()
+                        .is_some_and(|renderer| renderer.result_overlay_matches_current(app));
+                    app.result_overlay_composition_ready = result_overlay_composition_ready;
+                    let history_row_animating = app.history_transition.is_some_and(|transition| {
+                        now.saturating_duration_since(transition.started_at)
+                            < HISTORY_INSERT_TRANSITION
+                    });
+                    if history_row_animating
+                        || animation_needs_d2d_redraw(
+                            &app.phase,
+                            status_text_animating,
+                            app.status_text_composition_ready,
+                            result_overlay_composition_ready,
+                        )
+                    {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
@@ -11688,6 +11741,7 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             deactivation_hide_pending: false,
             phase_timer_active: false,
             animation_timer_active: false,
+            result_overlay_composition_ready: false,
             status_text_composition_ready: false,
             startup_animation_pending: false,
             startup_logo_consumed: false,
