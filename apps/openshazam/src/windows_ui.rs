@@ -643,6 +643,40 @@ fn artwork_request_urls_match_track(
     request_standard == track_standard && request_high_quality == track_high_quality
 }
 
+fn artwork_request_matches_track(
+    current: Option<&ArtworkRequest>,
+    incoming: ArtworkRequestIdentity,
+    track: Option<&Track>,
+) -> bool {
+    if !artwork_request_is_current(current, incoming) {
+        return false;
+    }
+    let Some(track) = track else {
+        return false;
+    };
+    track.display_id == incoming.track.display_id
+        && current.is_some_and(|request| {
+            artwork_request_urls_match_track(
+                request.standard_url.as_deref(),
+                request.high_quality_url.as_deref(),
+                track.artwork_url.as_deref(),
+                track.hq_artwork_url.as_deref(),
+            )
+        })
+}
+
+fn finish_active_artwork_request(
+    active_requests: &mut HashMap<TrackIdentity, ArtworkRequest>,
+    identity: ArtworkRequestIdentity,
+) -> bool {
+    if artwork_request_is_current(active_requests.get(&identity.track), identity) {
+        active_requests.remove(&identity.track);
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug)]
 struct ArtworkReady {
     identity: ArtworkRequestIdentity,
@@ -9568,26 +9602,12 @@ unsafe extern "system" fn window_proc(
             if !pointer.is_null() {
                 let ready = Box::from_raw(pointer);
                 let identity = ready.identity;
-                let is_current_request = artwork_request_is_current(
-                    app.active_artwork_requests.get(&identity.track),
-                    identity,
-                );
-                let is_bound_track = app
+                let bound_track = app
                     .history
                     .iter()
-                    .find(|track| track.display_id == identity.track.display_id)
-                    .is_some_and(|track| {
-                        let request = app.active_artwork_requests.get(&identity.track);
-                        request.is_some_and(|request| {
-                            artwork_request_urls_match_track(
-                                request.standard_url.as_deref(),
-                                request.high_quality_url.as_deref(),
-                                track.artwork_url.as_deref(),
-                                track.hq_artwork_url.as_deref(),
-                            )
-                        })
-                    });
-                if is_current_request && is_bound_track {
+                    .find(|track| track.display_id == identity.track.display_id);
+                let current_request = app.active_artwork_requests.get(&identity.track);
+                if artwork_request_matches_track(current_request, identity, bound_track) {
                     let pixels = ready.pixels;
                     let existing_is_better = app
                         .artwork_resources
@@ -9627,11 +9647,7 @@ unsafe extern "system" fn window_proc(
             let pointer = lparam.0 as *mut ArtworkRequestIdentity;
             if !pointer.is_null() {
                 let identity = *Box::from_raw(pointer);
-                if artwork_request_is_current(
-                    app.active_artwork_requests.get(&identity.track),
-                    identity,
-                ) {
-                    app.active_artwork_requests.remove(&identity.track);
+                if finish_active_artwork_request(&mut app.active_artwork_requests, identity) {
                     let track_is_retained = app
                         .history
                         .iter()
@@ -10425,19 +10441,20 @@ mod tests {
     use super::StatusTextAlternator;
     use super::{
         advance_result_card_stage, animation_needs_frame, artwork_pixel_fingerprint,
-        artwork_request_is_current, artwork_request_urls_match_track, button_border_arc_points,
+        artwork_request_is_current, artwork_request_matches_track,
+        artwork_request_urls_match_track, button_border_arc_points,
         composition_button_pixel_snap_offset, composition_header_viewport_offset,
         composition_root_layer_order, composition_scale_for_dpi, composition_scene_layer_order,
         copy_notification_text, copy_panel_pixels_into, create_text_format_with_locale,
         d2d_color_from_system, directwrite_locale, fallback_match_artwork_rect,
-        gradient_origin_transform, header_fill_scope, history_artwork_frame, history_row_top,
-        history_text_rects, history_title_color, inverse_circle_clip_radii, is_offline_failure,
-        is_tray_activation_event, localized_ui_text, native_icon_layout, no_match_copy,
-        no_match_icon_rect, page_url_for_display_id, phase_needs_timeout, point_in_rect,
-        popup_base_color, resolve_page_link, resolve_page_link_checked,
-        resolve_page_link_for_generation, result_artwork_rect, result_card_link_hit,
-        result_details_rects, result_gradient_colors, result_header_hit_test_contains,
-        result_header_visible_height, result_overlay_child_offset,
+        finish_active_artwork_request, gradient_origin_transform, header_fill_scope,
+        history_artwork_frame, history_row_top, history_text_rects, history_title_color,
+        inverse_circle_clip_radii, is_offline_failure, is_tray_activation_event, localized_ui_text,
+        native_icon_layout, no_match_copy, no_match_icon_rect, page_url_for_display_id,
+        phase_needs_timeout, point_in_rect, popup_base_color, resolve_page_link,
+        resolve_page_link_checked, resolve_page_link_for_generation, result_artwork_rect,
+        result_card_link_hit, result_details_rects, result_gradient_colors,
+        result_header_hit_test_contains, result_header_visible_height, result_overlay_child_offset,
         result_overlay_occludes_shazam_button, result_panel_draw_top, result_panel_top_at,
         select_ui_language_from_multisz, should_hide_popup_on_deactivation,
         should_replace_cached_artwork, should_show_initial_popup, should_start_startup_logo,
@@ -10455,6 +10472,8 @@ mod tests {
         RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT,
         WHITE_CLOSE_ICON_PIXELS,
     };
+    use std::collections::HashMap;
+    use std::time::SystemTime;
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
     #[test]
@@ -11521,6 +11540,85 @@ mod tests {
             old.high_quality_url.as_deref(),
             Some("https://cdn.example.test/b.jpg"),
             Some("https://cdn.example.test/b@2x.jpg"),
+        ));
+
+        let make_track = |standard: Option<&str>, high_quality: Option<&str>| Track {
+            display_id: track.display_id,
+            title: "Title".to_owned(),
+            artist: "Artist".to_owned(),
+            recognized_at: Instant::now(),
+            recognized_at_utc: SystemTime::now(),
+            recognized_date_label: String::new(),
+            timestamp_source: HistoryTimestampSource::ControllerEvent,
+            artwork_url: standard.map(str::to_owned),
+            hq_artwork_url: high_quality.map(str::to_owned),
+            background_artwork_url: None,
+            track_key: None,
+            config_generation: None,
+            page_url: None,
+        };
+        let track_a = make_track(Some("https://cdn.example.test/a.jpg"), None);
+        let track_b = make_track(
+            Some("https://cdn.example.test/b.jpg"),
+            Some("https://cdn.example.test/b@2x.jpg"),
+        );
+        let track_c = make_track(
+            Some("https://cdn.example.test/c.jpg"),
+            Some("https://cdn.example.test/c@2x.jpg"),
+        );
+        let request_c = ArtworkRequest {
+            identity: ArtworkRequestIdentity {
+                track,
+                generation: 3,
+                request_id: 12,
+            },
+            standard_url: track_c.artwork_url.clone(),
+            high_quality_url: track_c.hq_artwork_url.clone(),
+        };
+        let mut active = HashMap::from([(track, request_c.clone())]);
+
+        // Simulate A→B→C rebinding before any worker result reaches the UI.
+        // A/B successes and their completion events must not replace or clear C.
+        assert!(!artwork_request_matches_track(
+            active.get(&track),
+            old.identity,
+            Some(&track_a)
+        ));
+        assert!(!artwork_request_matches_track(
+            active.get(&track),
+            current.identity,
+            Some(&track_b)
+        ));
+        assert!(artwork_request_matches_track(
+            active.get(&track),
+            request_c.identity,
+            Some(&track_c)
+        ));
+        assert!(!artwork_request_matches_track(
+            active.get(&track),
+            request_c.identity,
+            None
+        ));
+        assert!(!artwork_request_matches_track(
+            active.get(&track),
+            request_c.identity,
+            Some(&make_track(None, None)),
+        ));
+
+        assert!(!finish_active_artwork_request(&mut active, old.identity));
+        assert!(!finish_active_artwork_request(
+            &mut active,
+            current.identity
+        ));
+        assert_eq!(active.get(&track), Some(&request_c));
+        assert!(finish_active_artwork_request(
+            &mut active,
+            request_c.identity
+        ));
+        assert!(active.is_empty());
+        assert!(!finish_active_artwork_request(
+            &mut active,
+            request_c.identity
         ));
     }
 
