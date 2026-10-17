@@ -603,6 +603,8 @@ namespace
             auto startupRow = state->startupRow;
             startupRow.HorizontalAlignment(x::HorizontalAlignment::Stretch);
             startupRow.ColumnSpacing(12.0);
+            auto startupIconColumn = controls::ColumnDefinition{};
+            startupIconColumn.Width(x::GridLengthHelper::FromValueAndType(34.0, x::GridUnitType::Pixel));
             auto startupLabelColumn = controls::ColumnDefinition{};
             startupLabelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
             auto startupToggleColumn = controls::ColumnDefinition{};
@@ -611,20 +613,45 @@ namespace
             startupToggleColumn.Width(
                 x::GridLengthHelper::FromValueAndType(
                     kSettingsControlLaneWidthDips, x::GridUnitType::Pixel));
+            startupRow.ColumnDefinitions().Append(startupIconColumn);
             startupRow.ColumnDefinitions().Append(startupLabelColumn);
             startupRow.ColumnDefinitions().Append(startupToggleColumn);
 
+            controls::FontIcon startupIcon;
+            startupIcon.Glyph(L"\uE7E8"); // PowerButton
+            startupIcon.FontSize(20.0);
+            startupIcon.HorizontalAlignment(x::HorizontalAlignment::Left);
+            startupIcon.VerticalAlignment(x::VerticalAlignment::Center);
+            controls::Grid::SetColumn(startupIcon, 0);
+            startupRow.Children().Append(startupIcon);
+
+            controls::StackPanel startupLabels;
+            startupLabels.Spacing(2.0);
+            startupLabels.HorizontalAlignment(x::HorizontalAlignment::Left);
+            startupLabels.VerticalAlignment(x::VerticalAlignment::Center);
             controls::TextBlock startupLabel;
             state->toggle = controls::ToggleSwitch{};
-            auto startupName = Localized(L"Start on sign-in", L"自動起動");
+            auto startupName = Localized(L"Open at startup", L"起動時に開く");
             startupLabel.Text(startupName);
             startupLabel.FontSize(14.0);
             startupLabel.HorizontalAlignment(x::HorizontalAlignment::Left);
             startupLabel.VerticalAlignment(x::VerticalAlignment::Center);
             startupLabel.TextAlignment(x::TextAlignment::Left);
             automation::AutomationProperties::SetName(startupLabel, startupName);
-            controls::Grid::SetColumn(startupLabel, 0);
-            startupRow.Children().Append(startupLabel);
+            startupLabels.Children().Append(startupLabel);
+            controls::TextBlock startupDescription;
+            auto startupDescriptionText = Localized(
+                L"Start Shazam every time Windows starts",
+                L"Windowsを起動するたびにShazamアプリも起動");
+            startupDescription.Text(startupDescriptionText);
+            startupDescription.FontSize(12.0);
+            startupDescription.TextWrapping(x::TextWrapping::Wrap);
+            startupDescription.HorizontalAlignment(x::HorizontalAlignment::Left);
+            startupDescription.TextAlignment(x::TextAlignment::Left);
+            automation::AutomationProperties::SetName(startupDescription, startupDescriptionText);
+            startupLabels.Children().Append(startupDescription);
+            controls::Grid::SetColumn(startupLabels, 1);
+            startupRow.Children().Append(startupLabels);
 
             automation::AutomationProperties::SetName(state->toggle, startupName);
             state->startupValue = controls::TextBlock{};
@@ -664,7 +691,7 @@ namespace
                     if (!state->startupLoading) ChangeStartup(weak, state->toggle.IsOn());
                 }
             });
-            controls::Grid::SetColumn(startupControl, 1);
+            controls::Grid::SetColumn(startupControl, 2);
             startupRow.Children().Append(startupControl);
             state->startupCard.Child(startupRow);
             stack.Children().Append(state->startupCard);
@@ -716,12 +743,15 @@ namespace
             appearanceTitle.TextAlignment(x::TextAlignment::Left);
             automation::AutomationProperties::SetName(appearanceTitle, appearanceName);
             controls::TextBlock appearanceDescription;
-            appearanceDescription.Text(Localized(
+            auto appearanceDescriptionText = Localized(
                 L"Changes the colors displayed in Windows and apps",
-                L"Windows とアプリに表示される色を変更します"));
+                L"Windows とアプリに表示される色を変更します");
+            appearanceDescription.Text(appearanceDescriptionText);
             appearanceDescription.FontSize(12.0);
+            appearanceDescription.TextWrapping(x::TextWrapping::Wrap);
             appearanceDescription.HorizontalAlignment(x::HorizontalAlignment::Left);
             appearanceDescription.TextAlignment(x::TextAlignment::Left);
+            automation::AutomationProperties::SetName(appearanceDescription, appearanceDescriptionText);
             appearanceLabels.Children().Append(appearanceTitle);
             appearanceLabels.Children().Append(appearanceDescription);
             controls::Grid::SetColumn(appearanceLabels, 1);

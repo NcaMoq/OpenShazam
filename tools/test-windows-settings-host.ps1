@@ -102,6 +102,9 @@ public static class OpenShazamSettingsHostSmoke
     private static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetWindowRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter,
+        int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll", EntryPoint = "SendMessageW", SetLastError = true)]
     private static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll", SetLastError = true)]
@@ -271,6 +274,23 @@ public static class OpenShazamSettingsHostSmoke
                 minimumSizeSummary = "DPI=" + dpi + "; minimumOuterTrack=" +
                     minMax.MinTrackSize.X + "x" + minMax.MinTrackSize.Y +
                     "; minimumClient=" + minimumClientWidth + "x" + minimumClientHeight;
+                if (!SetWindowPos(settingsWindow, IntPtr.Zero, 0, 0,
+                    minMax.MinTrackSize.X, minMax.MinTrackSize.Y, 0x0016))
+                    throw new InvalidOperationException(
+                        "Could not resize the hidden Settings window to its minimum track size. " +
+                        Marshal.GetLastWin32Error());
+                var resizeDeadline = DateTime.UtcNow.AddMilliseconds(300);
+                while (DateTime.UtcNow < resizeDeadline)
+                {
+                    Message resizeMessage;
+                    while (PeekMessageW(out resizeMessage, IntPtr.Zero, 0, 0, 1))
+                    {
+                        TranslateMessage(ref resizeMessage);
+                        DispatchMessageW(ref resizeMessage);
+                    }
+                    Thread.Sleep(10);
+                }
+                minimumSizeSummary += "; resizedToMinimumOuterTrack=true";
 
                 IntPtr islandWindow = FindWindowExW(settingsWindow, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
                 if (islandWindow == IntPtr.Zero || !IsWindowVisible(islandWindow))
@@ -294,6 +314,8 @@ public static class OpenShazamSettingsHostSmoke
                 bool startupToggleFound = false;
                 bool appearanceSelectorFound = false;
                 bool appearanceLabelFound = false;
+                AutomationElement startupDescription = null;
+                AutomationElement appearanceDescription = null;
                 AutomationElement startupToggle = null;
                 AutomationElement startupLabel = null;
                 AutomationElement appearanceSelector = null;
@@ -308,15 +330,19 @@ public static class OpenShazamSettingsHostSmoke
                             .Append(descendants[i].Current.ControlType.ProgrammaticName)
                             .Append("] ").Append(descendants[i].Current.BoundingRectangle);
                     }
-                    if ((name == "Start on sign-in" || name == "\u81EA\u52D5\u8D77\u52D5") &&
+                    if ((name == "Open at startup" || name == "\u8D77\u52D5\u6642\u306B\u958B\u304F") &&
                         descendants[i].Current.ControlType == ControlType.Button)
                     {
                         startupToggleFound = true;
                         startupToggle = descendants[i];
                     }
-                    if ((name == "Start on sign-in" || name == "\u81EA\u52D5\u8D77\u52D5") &&
+                    if ((name == "Open at startup" || name == "\u8D77\u52D5\u6642\u306B\u958B\u304F") &&
                         descendants[i].Current.ControlType == ControlType.Text)
                         startupLabel = descendants[i];
+                    if ((name == "Start Shazam every time Windows starts" ||
+                        name == "Windows\u3092\u8D77\u52D5\u3059\u308B\u305F\u3073\u306BShazam\u30A2\u30D7\u30EA\u3082\u8D77\u52D5") &&
+                        descendants[i].Current.ControlType == ControlType.Text)
+                        startupDescription = descendants[i];
                     if (descendants[i].Current.ControlType == ControlType.ComboBox)
                     {
                         appearanceSelectorFound = true;
@@ -324,15 +350,22 @@ public static class OpenShazamSettingsHostSmoke
                     }
                     if (name == "Choose a mode" || name == "\u30E2\u30FC\u30C9\u3092\u9078\u3076")
                         appearanceLabelFound = true;
+                    if ((name == "Changes the colors displayed in Windows and apps" ||
+                        name == "Windows \u3068\u30A2\u30D7\u30EA\u306B\u8868\u793A\u3055\u308C\u308B\u8272\u3092\u5909\u66F4\u3057\u307E\u3059") &&
+                        descendants[i].Current.ControlType == ControlType.Text)
+                        appearanceDescription = descendants[i];
                 }
-                if (!startupToggleFound || startupLabel == null ||
+                if (!startupToggleFound || startupLabel == null || startupDescription == null ||
+                    appearanceDescription == null ||
                     !appearanceSelectorFound || !appearanceLabelFound)
                     throw new InvalidOperationException(
-                        "Settings should expose a startup label and right-side toggle, plus the appearance selector. " +
+                        "Settings should expose wrapped startup/appearance descriptions, a startup label and right-side toggle, plus the appearance selector. " +
                         "Descendant count=" + descendants.Count + "; names=" + names);
 
                 stage = "verify Settings labels and controls are aligned in separate columns";
                 var startupLabelRect = startupLabel.Current.BoundingRectangle;
+                var startupDescriptionRect = startupDescription.Current.BoundingRectangle;
+                var appearanceDescriptionRect = appearanceDescription.Current.BoundingRectangle;
                 var startupToggleRect = startupToggle.Current.BoundingRectangle;
                 var appearanceSelectorRect = appearanceSelector.Current.BoundingRectangle;
                 var startupAncestry = new StringBuilder();
@@ -350,6 +383,10 @@ public static class OpenShazamSettingsHostSmoke
                     startupLabelRect.Bottom <= startupLabelRect.Top ||
                     startupToggleRect.Right <= startupToggleRect.Left ||
                     startupToggleRect.Bottom <= startupToggleRect.Top ||
+                    startupDescriptionRect.Right <= startupDescriptionRect.Left ||
+                    startupDescriptionRect.Bottom <= startupDescriptionRect.Top ||
+                    appearanceDescriptionRect.Right <= appearanceDescriptionRect.Left ||
+                    appearanceDescriptionRect.Bottom <= appearanceDescriptionRect.Top ||
                     appearanceSelectorRect.Right <= appearanceSelectorRect.Left ||
                     appearanceSelectorRect.Bottom <= appearanceSelectorRect.Top ||
                     startupLabelRect.Left >= startupToggleRect.Left ||
