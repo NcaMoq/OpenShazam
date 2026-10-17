@@ -551,6 +551,7 @@ namespace
             WNDCLASSW wc{};
             wc.lpfnWndProc = &WindowProc;
             wc.hInstance = instance;
+            wc.hIcon = ::LoadIconW(instance, MAKEINTRESOURCEW(101));
             wc.lpszClassName = kSettingsClass;
             wc.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
             wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);

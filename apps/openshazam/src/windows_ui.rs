@@ -120,15 +120,16 @@ use windows::{
                 RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
                 SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu,
                 TranslateMessage, UpdateLayeredWindow, WaitMessage, CS_DBLCLKS, CW_USEDEFAULT,
-                GWLP_USERDATA, ICONINFO, IDC_ARROW, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG,
-                PM_REMOVE, SM_CXICON, SM_CYICON, SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE,
-                SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA,
-                WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN,
-                WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-                WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_RBUTTONUP,
-                WM_SETFOCUS, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMECHANGE, WM_TIMER, WNDCLASSW,
-                WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+                GWLP_USERDATA, HICON, ICONINFO, IDC_ARROW, IDI_APPLICATION, MF_SEPARATOR,
+                MF_STRING, MSG, PM_REMOVE, SM_CXICON, SM_CYICON, SPI_GETWHEELSCROLLLINES,
+                SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
+                SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+                ULW_ALPHA, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
+                WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+                WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT,
+                WM_RBUTTONUP, WM_SETFOCUS, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMECHANGE,
+                WM_TIMER, WNDCLASSW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
+                WS_VISIBLE,
             },
         },
     },
@@ -182,6 +183,7 @@ const WM_OPEN_SETTINGS: u32 = WM_APP + 0x47;
 const WM_APPEARANCE_CHANGED: u32 = WM_APP + 0x48;
 const WM_ARTWORK_LOAD_FINISHED: u32 = WM_APP + 0x49;
 const TRAY_ICON_ID: u32 = 1;
+const APP_ICON_RESOURCE_ID: usize = 101;
 const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
     data1: 0x6a3d77b1,
     data2: 0x8e9c,
@@ -7858,13 +7860,14 @@ unsafe fn create_window(
 }
 
 unsafe fn add_tray_icon(hwnd: HWND) -> windows::core::Result<()> {
+    let instance = GetModuleHandleW(None)?;
     let mut data = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: TRAY_ICON_ID,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_GUID,
         uCallbackMessage: WM_TRAYICON_MESSAGE,
-        hIcon: LoadIconW(None, IDI_APPLICATION)?,
+        hIcon: load_application_icon(instance.into()),
         guidItem: TRAY_ICON_GUID,
         ..Default::default()
     };
@@ -11678,10 +11681,18 @@ fn window_class(instance: HINSTANCE, proc: WNDPROC, class_name: PCWSTR) -> WNDCL
         style: CS_DBLCLKS,
         lpfnWndProc: proc,
         hInstance: instance,
+        hIcon: unsafe { load_application_icon(instance) },
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() },
         lpszClassName: class_name,
         ..Default::default()
     }
+}
+
+unsafe fn load_application_icon(instance: HINSTANCE) -> HICON {
+    let resource_name = PCWSTR(APP_ICON_RESOURCE_ID as *const u16);
+    LoadIconW(Some(instance), resource_name)
+        .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+        .unwrap_or_default()
 }
 
 /// Start the resident Windows UI. The hidden notification-area host is kept
