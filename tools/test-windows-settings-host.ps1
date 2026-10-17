@@ -56,6 +56,23 @@ public static class OpenShazamSettingsHostSmoke
         public int Bottom;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Point
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MinMaxInfo
+    {
+        public Point Reserved;
+        public Point MaxSize;
+        public Point MaxPosition;
+        public Point MinTrackSize;
+        public Point MaxTrackSize;
+    }
+
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int BootstrapInitialize(uint release, [MarshalAs(UnmanagedType.LPWStr)] string tag, ulong minVersion);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
@@ -85,6 +102,10 @@ public static class OpenShazamSettingsHostSmoke
     private static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetWindowRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll", EntryPoint = "SendMessageW", SetLastError = true)]
+    private static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool PrintWindow(IntPtr window, IntPtr deviceContext, uint flags);
     [DllImport("dwmapi.dll", SetLastError = true)]
@@ -122,6 +143,8 @@ public static class OpenShazamSettingsHostSmoke
         string stage = "create STA thread";
         string error = null;
         string pixelSummary = "pixel check not run";
+        string minimumSizeSummary = "minimum size check not run";
+        string alignmentSummary = "alignment check not run";
         IntPtr desktop = IntPtr.Zero;
         var thread = new Thread(() =>
         {
@@ -221,6 +244,34 @@ public static class OpenShazamSettingsHostSmoke
                         "HRESULT=0x" + captionResult.ToString("X8") +
                         "; expectedDark=" + expectedDarkCaption +
                         "; actualDark=" + actualDarkCaption);
+
+                stage = "verify DPI-aware minimum client size";
+                IntPtr minMaxBuffer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(MinMaxInfo)));
+                MinMaxInfo minMax;
+                try
+                {
+                    Marshal.StructureToPtr(new MinMaxInfo(), minMaxBuffer, false);
+                    SendMessage(settingsWindow, 0x0024, IntPtr.Zero, minMaxBuffer); // WM_GETMINMAXINFO
+                    minMax = Marshal.PtrToStructure<MinMaxInfo>(minMaxBuffer);
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(minMaxBuffer);
+                }
+                uint dpi = GetDpiForWindow(settingsWindow);
+                if (dpi < 96) dpi = 96;
+                int minimumClientWidth = (int)Math.Ceiling(460.0 * dpi / 96.0);
+                int minimumClientHeight = (int)Math.Ceiling(320.0 * dpi / 96.0);
+                if (minMax.MinTrackSize.X <= minimumClientWidth ||
+                    minMax.MinTrackSize.Y <= minimumClientHeight)
+                    throw new InvalidOperationException(
+                        "Minimum outer tracking bounds do not preserve the required client area. " +
+                        "DPI=" + dpi + "; minTrack=" + minMax.MinTrackSize.X + "x" + minMax.MinTrackSize.Y +
+                        "; minimumClient=" + minimumClientWidth + "x" + minimumClientHeight);
+                minimumSizeSummary = "DPI=" + dpi + "; minimumOuterTrack=" +
+                    minMax.MinTrackSize.X + "x" + minMax.MinTrackSize.Y +
+                    "; minimumClient=" + minimumClientWidth + "x" + minimumClientHeight;
+
                 IntPtr islandWindow = FindWindowExW(settingsWindow, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
                 if (islandWindow == IntPtr.Zero || !IsWindowVisible(islandWindow))
                     throw new InvalidOperationException("WinUI island child window was not visible.");
@@ -308,6 +359,9 @@ public static class OpenShazamSettingsHostSmoke
                         "Startup label=" + startupLabelRect + "; startup toggle=" + startupToggleRect +
                         "; appearance selector=" + appearanceSelectorRect + "; controls=" + names +
                         "; startup ancestry=" + startupAncestry);
+                alignmentSummary = "startupControlRight=" + startupToggleRect.Right +
+                    "; appearanceControlRight=" + appearanceSelectorRect.Right +
+                    "; difference=" + Math.Abs(startupToggleRect.Right - appearanceSelectorRect.Right);
 
                 stage = "verify the appearance selector options";
                 var expandCollapse = (ExpandCollapsePattern)appearanceSelector.GetCurrentPattern(
@@ -324,13 +378,13 @@ public static class OpenShazamSettingsHostSmoke
                     string name = expandedElements[i].Current.Name;
                     if (name == "Light" || name == "\u30E9\u30A4\u30C8") lightOptionFound = true;
                     if (name == "Dark" || name == "\u30C0\u30FC\u30AF") darkOptionFound = true;
-                    if (name == "System" || name == "\u30B7\u30B9\u30C6\u30E0")
+                    if (name == "System settings" || name == "\u30B7\u30B9\u30C6\u30E0\u8A2D\u5B9A\u306B\u5408\u308F\u305B\u308B")
                         systemOptionFound = true;
                 }
                 expandCollapse.Collapse();
                 if (!lightOptionFound || !darkOptionFound || !systemOptionFound)
                     throw new InvalidOperationException(
-                        "Appearance selector did not expose Light, Dark and System. " +
+                        "Appearance selector did not expose Light, Dark and System settings. " +
                         "Light=" + lightOptionFound + "; Dark=" + darkOptionFound +
                         "; System=" + systemOptionFound + "; names=" + expandedElements.Count);
 
@@ -387,7 +441,8 @@ public static class OpenShazamSettingsHostSmoke
         thread.Start();
         thread.Join();
         if (desktop != IntPtr.Zero) CloseDesktop(desktop);
-        return error ?? "Composition + WinUI Settings host initialized and shut down successfully; " + pixelSummary;
+        return error ?? "Composition + WinUI Settings host initialized and shut down successfully; " +
+            minimumSizeSummary + "; " + alignmentSummary + "; " + pixelSummary;
     }
 
     private static IntPtr Activate(string className)

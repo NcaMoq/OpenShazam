@@ -64,10 +64,11 @@ namespace
     constexpr uint32_t kAppearanceLight = 1;
     constexpr uint32_t kAppearanceDark = 2;
     constexpr double kSettingsControlLaneWidthDips = 208.0;
+    constexpr double kStartupControlGroupWidthDips = 94.0;
     constexpr int kWidthDips = 520;
     constexpr int kHeightDips = 380;
-    constexpr int kMinimumWidthDips = 460;
-    constexpr int kMinimumHeightDips = 320;
+    constexpr int kMinimumClientWidthDips = 460;
+    constexpr int kMinimumClientHeightDips = 320;
     constexpr wchar_t kStartupRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kStartupRunValue[] = L"OpenShazam";
 
@@ -181,10 +182,10 @@ namespace
         {
             viewmanagement::UISettings settings;
             auto foreground = settings.GetColorValue(viewmanagement::UIColorType::Foreground);
-            const float luminance = 0.2126f * foreground.R +
-                                    0.7152f * foreground.G +
-                                    0.0722f * foreground.B;
-            return luminance >= 0.5f;
+            const auto red = static_cast<uint32_t>(foreground.R * 255.0f + 0.5f);
+            const auto green = static_cast<uint32_t>(foreground.G * 255.0f + 0.5f);
+            const auto blue = static_cast<uint32_t>(foreground.B * 255.0f + 0.5f);
+            return 5u * green + 2u * red + blue > 8u * 128u;
         }
         catch (...)
         {
@@ -250,6 +251,7 @@ namespace
     {
         controls::ToggleSwitch toggle{ nullptr };
         controls::TextBlock startupValue{ nullptr };
+        controls::InfoBar startupInfoBar{ nullptr };
         controls::ComboBox appearance{ nullptr };
         controls::ScrollViewer viewer{ nullptr };
         controls::Border startupCard{ nullptr };
@@ -259,6 +261,8 @@ namespace
         HWND owner{};
         HWND hwnd{};
         uint32_t appearanceMode{ kAppearanceSystem };
+        bool startupLastKnownEnabled{};
+        bool startupHasKnownValue{};
         bool startupLoading{ true };
         bool appearanceLoading{ true };
         bool alive{ true };
@@ -284,20 +288,6 @@ namespace
         }
     }
 
-    void ApplyAppearanceToSettings(std::shared_ptr<SettingsState> const& state, uint32_t mode)
-    {
-        if (!state || !state->alive) return;
-        if (mode > kAppearanceDark) mode = kAppearanceSystem;
-        state->appearanceMode = mode;
-        if (state->viewer)
-        {
-            auto theme = mode == kAppearanceDark ? x::ElementTheme::Dark :
-                mode == kAppearanceLight ? x::ElementTheme::Light : x::ElementTheme::Default;
-            state->viewer.RequestedTheme(theme);
-        }
-        ApplyTitleBarTheme(state->hwnd, mode);
-    }
-
     void UpdateStartupValueNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
     {
         if (!state || !state->alive) return;
@@ -314,21 +304,134 @@ namespace
         }
     }
 
-    void DisableStartupControlNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
+    void ApplyAppearanceToSettings(std::shared_ptr<SettingsState> const& state, uint32_t mode)
+    {
+        if (!state || !state->alive) return;
+        if (mode > kAppearanceDark) mode = kAppearanceSystem;
+        state->appearanceMode = mode;
+        if (state->viewer)
+        {
+            auto theme = mode == kAppearanceDark ? x::ElementTheme::Dark :
+                mode == kAppearanceLight ? x::ElementTheme::Light : x::ElementTheme::Default;
+            state->viewer.RequestedTheme(theme);
+        }
+        ApplyTitleBarTheme(state->hwnd, mode);
+    }
+
+    void ShowStartupInfoNoThrow(
+        std::shared_ptr<SettingsState> const& state,
+        controls::InfoBarSeverity severity,
+        winrt::hstring const& title,
+        winrt::hstring const& message) noexcept
+    {
+        if (!state || !state->alive) return;
+        try
+        {
+            if (!state->startupInfoBar) return;
+            state->startupInfoBar.Severity(severity);
+            state->startupInfoBar.Title(title);
+            state->startupInfoBar.Message(message);
+            state->startupInfoBar.IsOpen(true);
+        }
+        catch (...)
+        {
+            // Keep native error handling from escaping the WinUI event loop.
+        }
+    }
+
+    void ApplyStartupStateNoThrow(
+        std::shared_ptr<SettingsState> const& state,
+        bool enabled,
+        bool canChange) noexcept
+    {
+        if (!state || !state->alive) return;
+        try
+        {
+            state->startupLastKnownEnabled = enabled;
+            state->startupHasKnownValue = true;
+            state->startupValue.Visibility(x::Visibility::Visible);
+            state->toggle.Visibility(x::Visibility::Visible);
+            state->toggle.IsOn(enabled);
+            state->toggle.IsEnabled(canChange);
+            state->startupLoading = false;
+            if (state->startupInfoBar) state->startupInfoBar.IsOpen(false);
+            UpdateStartupValueNoThrow(state);
+        }
+        catch (...)
+        {
+            // Keep native error handling from escaping the WinUI event loop.
+        }
+    }
+
+    void ReportStartupFailureNoThrow(
+        std::shared_ptr<SettingsState> const& state,
+        bool changeFailed) noexcept
     {
         if (!state || !state->alive) return;
         state->startupLoading = false;
         try
         {
-            state->toggle.IsOn(false);
+            if (state->startupHasKnownValue)
+            {
+                state->toggle.IsOn(state->startupLastKnownEnabled);
+                state->startupValue.Visibility(x::Visibility::Visible);
+                state->toggle.Visibility(x::Visibility::Visible);
+            }
+            else
+            {
+                state->startupValue.Visibility(x::Visibility::Collapsed);
+                state->toggle.Visibility(x::Visibility::Collapsed);
+            }
             state->toggle.IsEnabled(false);
             UpdateStartupValueNoThrow(state);
         }
         catch (...)
         {
-            // WinRT property updates can fail while the island is closing.
-            // Never allow an exception to escape a fire_and_forget coroutine.
+            // The InfoBar below is still best-effort while the island is alive.
         }
+
+        ShowStartupInfoNoThrow(
+            state,
+            controls::InfoBarSeverity::Error,
+            changeFailed
+                ? Localized(L"Could not update start on sign-in", L"自動起動を更新できませんでした")
+                : Localized(L"Could not read start on sign-in", L"自動起動の状態を取得できませんでした"),
+            changeFailed
+                ? Localized(
+                    L"The last known state is shown. Check Windows startup settings to confirm whether the change was applied.",
+                    L"以前に確認できた状態を表示しています。変更が反映されたか Windows のスタートアップ設定で確認してください。")
+                : Localized(
+                    L"Windows did not return the current state. Reopen Settings and try again.",
+                    L"Windows から現在の状態を取得できませんでした。設定を開き直してください。"));
+    }
+
+    void ReportStartupPolicyNoThrow(
+        std::shared_ptr<SettingsState> const& state,
+        appmodel::StartupTaskState current) noexcept
+    {
+        if (!state || !state->alive) return;
+        const bool enabled = current == appmodel::StartupTaskState::EnabledByPolicy;
+        if (current != appmodel::StartupTaskState::EnabledByPolicy &&
+            current != appmodel::StartupTaskState::DisabledByUser &&
+            current != appmodel::StartupTaskState::DisabledByPolicy)
+        {
+            ReportStartupFailureNoThrow(state, false);
+            return;
+        }
+        ApplyStartupStateNoThrow(state, enabled, false);
+        ShowStartupInfoNoThrow(
+            state,
+            controls::InfoBarSeverity::Informational,
+            current == appmodel::StartupTaskState::DisabledByUser
+                ? Localized(L"Start on sign-in is off in Windows", L"Windows 側で自動起動がオフです")
+                : Localized(L"Start on sign-in is managed", L"自動起動は管理されています"),
+            current == appmodel::StartupTaskState::DisabledByUser
+                ? Localized(
+                    L"Windows has disabled startup for this app. Change it in Windows Startup settings.",
+                    L"Windows 側でこのアプリの自動起動が無効です。Windows のスタートアップ設定から変更してください。")
+                : Localized(
+                    L"This setting is controlled by your organization.",
+                    L"この設定は組織のポリシーによって管理されています。"));
     }
 
     winrt::fire_and_forget RefreshStartup(std::weak_ptr<SettingsState> weak)
@@ -342,34 +445,31 @@ namespace
             const auto packageStatus = GetPackageIdentityStatus();
             if (packageStatus == PackageIdentityStatus::Unpackaged)
             {
-                state->toggle.IsOn(RunStartupEnabled());
-                state->toggle.IsEnabled(true);
-                UpdateStartupValueNoThrow(state);
-                state->startupLoading = false;
+                ApplyStartupStateNoThrow(state, RunStartupEnabled(), true);
                 co_return;
             }
             if (packageStatus != PackageIdentityStatus::Packaged)
             {
-                DisableStartupControlNoThrow(state);
+                ReportStartupFailureNoThrow(state, false);
                 co_return;
             }
             auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
             if (!state->alive) co_return;
             auto current = task.State();
-            state->toggle.IsOn(current == appmodel::StartupTaskState::Enabled ||
-                               current == appmodel::StartupTaskState::EnabledByPolicy);
-            state->toggle.IsEnabled(current == appmodel::StartupTaskState::Disabled ||
-                                    current == appmodel::StartupTaskState::Enabled);
-            UpdateStartupValueNoThrow(state);
-            state->startupLoading = false;
+            if (current == appmodel::StartupTaskState::Disabled)
+                ApplyStartupStateNoThrow(state, false, true);
+            else if (current == appmodel::StartupTaskState::Enabled)
+                ApplyStartupStateNoThrow(state, true, true);
+            else
+                ReportStartupPolicyNoThrow(state, current);
         }
         catch (winrt::hresult_error const&)
         {
-            DisableStartupControlNoThrow(state);
+            ReportStartupFailureNoThrow(state, false);
         }
         catch (...)
         {
-            DisableStartupControlNoThrow(state);
+            ReportStartupFailureNoThrow(state, false);
         }
     }
 
@@ -386,15 +486,12 @@ namespace
             {
                 SetRunStartupEnabled(enable);
                 if (!state->alive) co_return;
-                state->toggle.IsOn(enable);
-                state->toggle.IsEnabled(true);
-                UpdateStartupValueNoThrow(state);
-                state->startupLoading = false;
+                ApplyStartupStateNoThrow(state, enable, true);
                 co_return;
             }
             if (packageStatus != PackageIdentityStatus::Packaged)
             {
-                DisableStartupControlNoThrow(state);
+                ReportStartupFailureNoThrow(state, true);
                 co_return;
             }
             auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
@@ -412,11 +509,11 @@ namespace
         }
         catch (winrt::hresult_error const&)
         {
-            DisableStartupControlNoThrow(state);
+            ReportStartupFailureNoThrow(state, true);
         }
         catch (...)
         {
-            DisableStartupControlNoThrow(state);
+            ReportStartupFailureNoThrow(state, true);
         }
     }
 
@@ -536,18 +633,29 @@ namespace
             state->startupValue.Width(38.0);
             state->startupValue.TextAlignment(x::TextAlignment::Center);
             state->startupValue.VerticalAlignment(x::VerticalAlignment::Center);
+            state->toggle.HorizontalAlignment(x::HorizontalAlignment::Left);
             state->toggle.VerticalAlignment(x::VerticalAlignment::Center);
             state->toggle.OnContent(winrt::box_value(Localized(L"", L"")));
             state->toggle.OffContent(winrt::box_value(Localized(L"", L"")));
             state->toggle.Width(48.0);
             state->toggle.IsEnabled(false);
+
             controls::StackPanel startupControl;
             startupControl.Orientation(controls::Orientation::Horizontal);
             startupControl.Spacing(8.0);
-            startupControl.HorizontalAlignment(x::HorizontalAlignment::Right);
+            // The 38-DIP status label, 8-DIP gap and 48-DIP switch total
+            // 94 DIPs. Reserve the remaining leading space in the shared
+            // 208-DIP control lane so this compact group shares the ComboBox
+            // trailing edge; the Windows UIA smoke test checks the result.
+            startupControl.Width(kStartupControlGroupWidthDips);
+            startupControl.Margin(x::ThicknessHelper::FromLengths(
+                kSettingsControlLaneWidthDips - kStartupControlGroupWidthDips,
+                0.0, 0.0, 0.0));
+            startupControl.HorizontalAlignment(x::HorizontalAlignment::Left);
             startupControl.VerticalAlignment(x::VerticalAlignment::Center);
             startupControl.Children().Append(state->startupValue);
             startupControl.Children().Append(state->toggle);
+
             std::weak_ptr<SettingsState> weak = state;
             state->toggle.Toggled([weak](auto const&, auto const&) {
                 if (auto state = weak.lock(); state && state->alive)
@@ -560,6 +668,14 @@ namespace
             startupRow.Children().Append(startupControl);
             state->startupCard.Child(startupRow);
             stack.Children().Append(state->startupCard);
+
+            // Normal settings stay compact. This standard WinUI InfoBar opens
+            // only when Windows denies or cannot confirm the startup state.
+            state->startupInfoBar = controls::InfoBar{};
+            state->startupInfoBar.IsClosable(false);
+            state->startupInfoBar.IsOpen(false);
+            state->startupInfoBar.Severity(controls::InfoBarSeverity::Informational);
+            stack.Children().Append(state->startupInfoBar);
 
             state->appearanceCard = markup::XamlReader::Load(
                 LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" Padding="16" />)"
@@ -615,7 +731,7 @@ namespace
             state->appearance.Items().Append(winrt::box_value(Localized(L"Light", L"ライト")));
             state->appearance.Items().Append(winrt::box_value(Localized(L"Dark", L"ダーク")));
             state->appearance.Items().Append(winrt::box_value(Localized(
-                L"System", L"システム")));
+                L"System settings", L"システム設定に合わせる")));
             state->appearance.Width(kSettingsControlLaneWidthDips);
             state->appearance.HorizontalAlignment(x::HorizontalAlignment::Right);
             state->appearance.VerticalAlignment(x::VerticalAlignment::Center);
@@ -738,8 +854,24 @@ namespace
                     auto* limits = reinterpret_cast<MINMAXINFO*>(lp);
                     auto dpi = ::GetDpiForWindow(h);
                     if (dpi < 96) dpi = 96;
-                    limits->ptMinTrackSize.x = ::MulDiv(kMinimumWidthDips, dpi, 96);
-                    limits->ptMinTrackSize.y = ::MulDiv(kMinimumHeightDips, dpi, 96);
+                    RECT minimumClient{
+                        0,
+                        0,
+                        ::MulDiv(kMinimumClientWidthDips, dpi, 96),
+                        ::MulDiv(kMinimumClientHeightDips, dpi, 96),
+                    };
+                    const auto style = static_cast<DWORD>(::GetWindowLongPtrW(h, GWL_STYLE));
+                    const auto exStyle = static_cast<DWORD>(::GetWindowLongPtrW(h, GWL_EXSTYLE));
+                    if (::AdjustWindowRectExForDpi(&minimumClient, style, FALSE, exStyle, dpi))
+                    {
+                        limits->ptMinTrackSize.x = minimumClient.right - minimumClient.left;
+                        limits->ptMinTrackSize.y = minimumClient.bottom - minimumClient.top;
+                    }
+                    else
+                    {
+                        limits->ptMinTrackSize.x = minimumClient.right;
+                        limits->ptMinTrackSize.y = minimumClient.bottom;
+                    }
                 }
                 return 0;
             case WM_SIZE:
