@@ -225,6 +225,7 @@ namespace
     {
         HWND hwnd{};
         HWND owner{};
+        HWND islandHwnd{};
         hosting::DesktopWindowXamlSource island{ nullptr };
         dispatch::DispatcherQueueController queue{ nullptr };
         x::Application app{ nullptr };
@@ -266,9 +267,14 @@ namespace
             if (!hwnd) winrt::throw_last_error();
             island = hosting::DesktopWindowXamlSource{};
             island.Initialize(winrt::Microsoft::UI::GetWindowIdFromWindow(hwnd));
-            auto child = winrt::Microsoft::UI::GetWindowFromWindowId(island.SiteBridge().WindowId());
-            auto style = ::GetWindowLongPtrW(child, GWL_STYLE);
-            ::SetWindowLongPtrW(child, GWL_STYLE, style | WS_TABSTOP | WS_VISIBLE);
+            islandHwnd = winrt::Microsoft::UI::GetWindowFromWindowId(island.SiteBridge().WindowId());
+            if (!islandHwnd || !::IsWindow(islandHwnd))
+                winrt::throw_hresult(E_HANDLE);
+            // Keep the island's child window in the normal Win32 focus chain.
+            // ShowWindow below changes visibility; setting only WS_VISIBLE on
+            // an existing HWND does not reliably make it appear.
+            auto style = ::GetWindowLongPtrW(islandHwnd, GWL_STYLE);
+            ::SetWindowLongPtrW(islandHwnd, GWL_STYLE, style | WS_TABSTOP);
             state = std::make_shared<SettingsState>();
             island.Content(BuildContent());
             Layout();
@@ -368,8 +374,13 @@ namespace
         {
             if (!hwnd) return;
             ::ShowWindow(hwnd, SW_SHOWNORMAL);
+            if (islandHwnd) ::ShowWindow(islandHwnd, SW_SHOWNA);
             ::SetForegroundWindow(hwnd);
-            ::SetFocus(winrt::Microsoft::UI::GetWindowFromWindowId(island.SiteBridge().WindowId()));
+            if (islandHwnd)
+            {
+                ::UpdateWindow(islandHwnd);
+                if (::IsWindowVisible(islandHwnd)) ::SetFocus(islandHwnd);
+            }
             if (state) RefreshStartup(state);
         }
 
@@ -380,6 +391,7 @@ namespace
                 if (state) state->alive = false;
                 if (island) island.Close();
                 island = nullptr;
+                islandHwnd = nullptr;
                 if (hwnd) { auto w = hwnd; hwnd = nullptr; ::DestroyWindow(w); }
                 state.reset();
                 app = nullptr;

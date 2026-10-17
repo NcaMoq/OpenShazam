@@ -42,6 +42,15 @@ public static class OpenShazamSettingsHostSmoke
         public int Y;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Rect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int BootstrapInitialize(uint release, [MarshalAs(UnmanagedType.LPWStr)] string tag, ulong minVersion);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
@@ -59,6 +68,14 @@ public static class OpenShazamSettingsHostSmoke
     private static extern bool CloseDesktop(IntPtr desktop);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateWindowExW(uint exStyle, string className, string title, uint style, int x, int y, int width, int height, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr parameter);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr FindWindowW(string className, string windowName);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr FindWindowExW(IntPtr parent, IntPtr childAfter, IntPtr className, IntPtr windowName);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetWindowRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyWindow(IntPtr window);
     [DllImport("user32.dll", SetLastError = true)]
@@ -168,6 +185,18 @@ public static class OpenShazamSettingsHostSmoke
                     }
                     Thread.Sleep(10);
                 }
+
+                stage = "verify visible WinUI island child window";
+                IntPtr settingsWindow = FindWindowW("OpenShazamWinUI3Preferences", null);
+                if (settingsWindow == IntPtr.Zero || !IsWindowVisible(settingsWindow))
+                    throw new InvalidOperationException("Settings top-level window was not visible.");
+                IntPtr islandWindow = FindWindowExW(settingsWindow, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                if (islandWindow == IntPtr.Zero || !IsWindowVisible(islandWindow))
+                    throw new InvalidOperationException("WinUI island child window was not visible.");
+                Rect islandRect;
+                if (!GetWindowRect(islandWindow, out islandRect) ||
+                    islandRect.Right <= islandRect.Left || islandRect.Bottom <= islandRect.Top)
+                    throw new InvalidOperationException("WinUI island child window had empty bounds.");
                 stage = "shutdown XAML host";
             }
             catch (Exception exception)
