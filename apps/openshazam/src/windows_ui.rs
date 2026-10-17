@@ -886,6 +886,13 @@ struct ResultOverlayContentKey {
     language: UiLanguage,
 }
 
+fn result_overlay_failure_matches(
+    failure_key: Option<&ResultOverlayContentKey>,
+    current_key: Option<&ResultOverlayContentKey>,
+) -> bool {
+    matches!((failure_key, current_key), (Some(failure), Some(current)) if failure == current)
+}
+
 fn result_overlay_identity_matches_phase(
     identity: &ResultOverlayIdentity,
     phase: &MainPhase,
@@ -1247,6 +1254,7 @@ struct Renderer {
     result_details_cache: RefCell<Option<CachedResultDetailsMetrics>>,
     history_text_metrics_cache: RefCell<HashMap<u64, CachedHistoryTextMetrics>>,
     result_overlay_content_key: Option<ResultOverlayContentKey>,
+    result_overlay_failure_key: Option<ResultOverlayContentKey>,
     result_overlay_motion_key: Option<ResultOverlayMotionKey>,
     result_overlay_failure_reported: bool,
 }
@@ -3043,7 +3051,7 @@ struct CompositionScene {
     rings: [CompositionRing; 6],
     button: ContainerVisual,
     button_visible: bool,
-    result_fallback_occludes_button: bool,
+    result_fallback_suppresses_tagging: bool,
     button_content: ContainerVisual,
     button_fill: CompositionColorBrush,
     logo: CompositionLogo,
@@ -3530,14 +3538,16 @@ fn status_text_format(
     )
 }
 
-fn result_overlay_occludes_shazam_button(panel_top: Option<f32>, body_top: f32) -> bool {
+fn result_overlay_intersects_header(panel_top: Option<f32>, body_top: f32) -> bool {
     let Some(panel_top) = panel_top else {
         return false;
     };
+    if !panel_top.is_finite() || !body_top.is_finite() {
+        return false;
+    }
     let panel_bottom = panel_top + TOP_HEIGHT as f32;
-    let button_top = body_top + BUTTON_TOP as f32;
-    let button_bottom = button_top + BUTTON_SIZE as f32;
-    panel_top < button_bottom && panel_bottom > button_top
+    let header_bottom = body_top + TOP_HEIGHT as f32;
+    panel_top < header_bottom && panel_bottom > body_top
 }
 
 fn should_start_startup_logo(kind: WindowKind, already_started: bool) -> bool {
@@ -4233,7 +4243,7 @@ impl CompositionScene {
             rings,
             button,
             button_visible: true,
-            result_fallback_occludes_button: false,
+            result_fallback_suppresses_tagging: false,
             button_content,
             button_fill,
             logo,
@@ -4310,17 +4320,17 @@ impl CompositionScene {
         }
     }
 
-    fn set_result_fallback_occlusion(
+    fn set_result_fallback_tagging_suppressed(
         &mut self,
-        occludes_button: bool,
+        suppressed: bool,
     ) -> windows::core::Result<()> {
-        self.result_fallback_occludes_button = occludes_button;
-        self.button
-            .SetOpacity(if self.button_visible && !occludes_button {
-                1.0
-            } else {
-                0.0
-            })
+        if self.result_fallback_suppresses_tagging == suppressed {
+            return Ok(());
+        }
+        self.tagging_root
+            .SetOpacity(if suppressed { 0.0 } else { 1.0 })?;
+        self.result_fallback_suppresses_tagging = suppressed;
+        Ok(())
     }
 
     fn update(&mut self, snapshot: AnimationSnapshot) -> windows::core::Result<()> {
@@ -4465,13 +4475,8 @@ impl CompositionScene {
             })?;
         }
         self.button_visible = snapshot.show_button;
-        self.button.SetOpacity(
-            if snapshot.show_button && !self.result_fallback_occludes_button {
-                1.0
-            } else {
-                0.0
-            },
-        )?;
+        self.button
+            .SetOpacity(if snapshot.show_button { 1.0 } else { 0.0 })?;
 
         if snapshot.show_ripples && !self.ripples_active {
             for ring in &self.rings[..4] {
@@ -6078,6 +6083,7 @@ impl Renderer {
             result_details_cache: RefCell::new(None),
             history_text_metrics_cache: RefCell::new(HashMap::new()),
             result_overlay_content_key: None,
+            result_overlay_failure_key: None,
             result_overlay_motion_key: None,
             result_overlay_failure_reported: false,
         })
@@ -6219,8 +6225,28 @@ impl Renderer {
             .flatten();
         let overlay_motion_key = overlay_motion.as_ref().map(|motion| motion.key.clone());
         let overlay_motion_changed = self.result_overlay_motion_key != overlay_motion_key;
-        let composition_cache_ready =
-            self.composition.is_some() && self.layered_surface.is_some() && panel_top.is_some();
+        if kind == WindowKind::Main
+            && self.result_overlay_failure_key.is_some()
+            && (panel_top.is_none()
+                || self.composition.is_none()
+                || self.layered_surface.is_none()
+                || !result_overlay_failure_matches(
+                    self.result_overlay_failure_key.as_ref(),
+                    overlay_key.as_ref(),
+                ))
+        {
+            self.result_overlay_failure_key = None;
+            self.result_overlay_failure_reported = false;
+        }
+        let overlay_failure_latched = kind == WindowKind::Main
+            && result_overlay_failure_matches(
+                self.result_overlay_failure_key.as_ref(),
+                overlay_key.as_ref(),
+            );
+        let composition_cache_ready = self.composition.is_some()
+            && self.layered_surface.is_some()
+            && panel_top.is_some()
+            && !overlay_failure_latched;
         let composition_cache_hit = composition_cache_ready
             && overlay_key
                 .as_ref()
@@ -6272,7 +6298,9 @@ impl Renderer {
             let mut overlay_error = None;
             let mut overlay_update_failed = false;
             if let Some(scene) = self.composition.as_mut() {
-                let overlay_update = if self.layered_surface.is_some() {
+                let overlay_update = if overlay_failure_latched {
+                    Ok(())
+                } else if self.layered_surface.is_some() {
                     scene.update_result_overlay(
                         self.layered_surface.as_ref(),
                         (composition_cache_ready && !composition_cache_hit).then_some(body_top),
@@ -6295,12 +6323,18 @@ impl Renderer {
                 };
                 match overlay_update {
                     Ok(()) => {
-                        self.result_overlay_content_key = if composition_cache_ready {
-                            panel_top.and(overlay_key.clone())
+                        if overlay_failure_latched {
+                            self.result_overlay_content_key = None;
+                            self.result_overlay_motion_key = None;
                         } else {
-                            None
-                        };
-                        self.result_overlay_motion_key = overlay_motion_key.clone();
+                            self.result_overlay_failure_key = None;
+                            self.result_overlay_content_key = if composition_cache_ready {
+                                panel_top.and(overlay_key.clone())
+                            } else {
+                                None
+                            };
+                            self.result_overlay_motion_key = overlay_motion_key.clone();
+                        }
                     }
                     Err(error) => {
                         // The cached Composition surface failed to update.
@@ -6309,24 +6343,32 @@ impl Renderer {
                         // path is active.
                         let _ = scene.result_overlay.hide();
                         self.result_overlay_content_key = None;
+                        self.result_overlay_failure_key = overlay_key.clone();
                         self.result_overlay_motion_key = None;
                         overlay_update_failed = true;
                         overlay_error = Some(error);
                     }
                 }
-                // A failed Composition copy leaves the card in the layered
-                // D2D frame, which is behind the desktop Composition tree.
-                // Hide only the Shazam button while the fallback card crosses
-                // its bounds; restore it as soon as the card clears the area.
-                let fallback_occludes_button = overlay_error.is_some()
-                    && result_overlay_occludes_shazam_button(panel_top, body_top);
-                if let Err(error) = scene.set_result_fallback_occlusion(fallback_occludes_button) {
+                // The layered D2D fallback is behind the desktop Composition
+                // tree. Suppress the complete tagging group while the card
+                // intersects the fixed header; parent opacity leaves its GPU
+                // animation clocks running while preventing visual overlap.
+                let fallback_suppresses_tagging =
+                    result_overlay_failure_matches(
+                        self.result_overlay_failure_key.as_ref(),
+                        overlay_key.as_ref(),
+                    ) && result_overlay_intersects_header(panel_top, body_top);
+                if let Err(error) =
+                    scene.set_result_fallback_tagging_suppressed(fallback_suppresses_tagging)
+                {
                     if overlay_error.is_none() {
-                        overlay_error = Some(overlay_surface_error("FallbackButtonOpacity", error));
+                        overlay_error =
+                            Some(overlay_surface_error("FallbackTaggingOpacity", error));
                     }
                 }
             } else {
                 self.result_overlay_content_key = None;
+                self.result_overlay_failure_key = None;
                 self.result_overlay_motion_key = None;
             }
             if overlay_update_failed && self.layered_surface.is_some() {
@@ -12158,8 +12200,8 @@ mod tests {
         resolve_page_link, resolve_page_link_checked, resolve_page_link_for_generation,
         result_artwork_rect, result_card_link_hit, result_details_rects, result_gradient_colors,
         result_header_hit_test_contains, result_header_visible_height, result_overlay_child_offset,
-        result_overlay_occludes_shazam_button, result_panel_draw_top, result_panel_top_at,
-        scale_notification_artwork_to_size, select_ui_language_from_multisz,
+        result_overlay_failure_matches, result_overlay_intersects_header, result_panel_draw_top,
+        result_panel_top_at, scale_notification_artwork_to_size, select_ui_language_from_multisz,
         should_defer_hide_for_tray_activation, should_hide_popup_on_deactivation,
         should_replace_cached_artwork, should_show_initial_popup, should_start_startup_logo,
         status_text_snapshot, theme_from_foreground_rgb, timeout_copy, ui_model,
@@ -12167,15 +12209,16 @@ mod tests {
         ArtworkRequestIdentity, ArtworkSource, CaptureMode, CompositionRootLayer,
         CompositionSceneLayer, HeaderFillScope, HistoryMutationEvent, HistoryMutationTransition,
         HistoryTimestampSource, MainPhase, NoMatchIconCommand, PageLinkFailure, ResultCardAdvance,
-        ResultCardStage, Theme, ThemePreference, Track, TrackIdentity, UiConfigSnapshot,
-        UiLanguage, UiTextKey, ValidatedWebTrackUrl, WindowKind, AUTO_SHADOW_DISPLAY_BOUNDS,
-        AUTO_START_SPRING_DURATION, BUTTON_CLEAR_DIAMETER, BUTTON_SIZE, BUTTON_TOP, BUTTON_X,
-        CLOSE_BUTTON_GA_PIXELS, FALLBACK_MATCH_DARK_PIXELS, FALLBACK_MATCH_LIGHT_PIXELS,
-        FALLBACK_MATCH_LOGICAL_SIDE, HISTORY_HEIGHT, HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS,
-        NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT,
-        RESULT_ACTION_HEIGHT, RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD,
-        RESULT_CARD_TRANSITION, RESULT_CLOSE_ICON_PIXELS, RESULT_DETAILS_LEFT,
-        RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS, TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
+        ResultCardStage, ResultOverlayContentKey, ResultOverlayIdentity, Theme, ThemePreference,
+        Track, TrackIdentity, UiConfigSnapshot, UiLanguage, UiTextKey, ValidatedWebTrackUrl,
+        WindowKind, AUTO_SHADOW_DISPLAY_BOUNDS, AUTO_START_SPRING_DURATION, BUTTON_CLEAR_DIAMETER,
+        BUTTON_SIZE, BUTTON_TOP, BUTTON_X, CLOSE_BUTTON_GA_PIXELS, FALLBACK_MATCH_DARK_PIXELS,
+        FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE, HISTORY_HEIGHT,
+        HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH, OUTER_BASE_OPACITY,
+        POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT, RESULT_ACTION_HEIGHT,
+        RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD, RESULT_CARD_TRANSITION,
+        RESULT_CLOSE_ICON_PIXELS, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS,
+        TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
     };
     use std::collections::HashMap;
     use std::collections::VecDeque;
@@ -13923,28 +13966,66 @@ mod tests {
     }
 
     #[test]
-    fn result_fallback_hides_shazam_button_only_while_the_card_crosses_it() {
+    fn result_fallback_suppresses_tagging_for_the_full_header_intersection() {
         let body_top = POPUP_ARROW_HEIGHT as f32;
-        let button_top = body_top + BUTTON_TOP as f32;
-        let button_bottom = button_top + BUTTON_SIZE as f32;
 
-        assert!(!result_overlay_occludes_shazam_button(None, body_top));
-        assert!(!result_overlay_occludes_shazam_button(
-            Some(button_top - TOP_HEIGHT as f32),
+        assert!(!result_overlay_intersects_header(None, body_top));
+        assert!(!result_overlay_intersects_header(
+            Some(body_top - TOP_HEIGHT as f32),
             body_top
         ));
-        assert!(result_overlay_occludes_shazam_button(
-            Some(button_top - TOP_HEIGHT as f32 + 0.01),
+        assert!(result_overlay_intersects_header(
+            Some(body_top - TOP_HEIGHT as f32 + 0.01),
             body_top
         ));
-        assert!(result_overlay_occludes_shazam_button(
+        assert!(result_overlay_intersects_header(Some(body_top), body_top));
+        assert!(result_overlay_intersects_header(
+            Some(body_top + TOP_HEIGHT as f32 - 0.01),
+            body_top
+        ));
+        assert!(!result_overlay_intersects_header(
+            Some(body_top + TOP_HEIGHT as f32),
+            body_top
+        ));
+        assert!(!result_overlay_intersects_header(Some(f32::NAN), body_top));
+        assert!(!result_overlay_intersects_header(
             Some(body_top),
-            body_top
+            f32::INFINITY
         ));
-        assert!(!result_overlay_occludes_shazam_button(
-            Some(button_bottom),
-            body_top
+        assert!(result_overlay_intersects_header(
+            Some(TOP_HEIGHT as f32 - 0.01),
+            0.0
         ));
+        assert!(!result_overlay_intersects_header(
+            Some(TOP_HEIGHT as f32),
+            0.0
+        ));
+    }
+
+    #[test]
+    fn result_overlay_failure_latch_is_scoped_to_current_content_key() {
+        let key = ResultOverlayContentKey {
+            identity: ResultOverlayIdentity::NoMatch {
+                entered_at: Instant::now(),
+                offline: false,
+            },
+            theme_generation: 1,
+            dpi: 96,
+            edge: ArrowEdge::Bottom,
+            language: UiLanguage::English,
+        };
+        let changed_dpi = ResultOverlayContentKey {
+            dpi: 120,
+            ..key.clone()
+        };
+
+        assert!(result_overlay_failure_matches(Some(&key), Some(&key)));
+        assert!(!result_overlay_failure_matches(
+            Some(&key),
+            Some(&changed_dpi)
+        ));
+        assert!(!result_overlay_failure_matches(Some(&key), None));
+        assert!(!result_overlay_failure_matches(None, Some(&key)));
     }
 
     #[test]
