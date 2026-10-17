@@ -11,7 +11,7 @@ namespace OpenShazam.Settings;
 
 public sealed partial class MainWindow : Window
 {
-    internal const string WindowTitle = "OpenShazam Settings";
+    internal const string WindowTitle = "Shazam";
     private const string StartupTaskId = "OpenShazamStartup";
     private const double SettingsWidthDips = 520;
     private const double SettingsHeightDips = 300;

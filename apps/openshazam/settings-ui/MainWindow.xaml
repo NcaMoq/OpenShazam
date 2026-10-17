@@ -2,7 +2,7 @@
     x:Class="OpenShazam.Settings.MainWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="OpenShazam Settings">
+    Title="Shazam">
     <Grid x:Name="Root" MinWidth="480" Padding="24">
         <StackPanel Spacing="18">
             <TextBlock x:Name="PageTitle" Style="{StaticResource TitleTextBlockStyle}" />
