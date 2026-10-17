@@ -137,10 +137,10 @@ use windows::{
     UI::{
         Color,
         Composition::{
-            AnimationController, AnimationIterationBehavior, CompositionBorderMode,
-            CompositionColorBrush, CompositionDrawingSurface, CompositionEllipseGeometry,
-            CompositionGeometricClip, CompositionGraphicsDevice, CompositionPath,
-            CompositionPathGeometry, CompositionSpriteShape, CompositionStretch,
+            AnimationController, AnimationIterationBehavior, CompositionBitmapInterpolationMode,
+            CompositionBorderMode, CompositionColorBrush, CompositionDrawingSurface,
+            CompositionEllipseGeometry, CompositionGeometricClip, CompositionGraphicsDevice,
+            CompositionPath, CompositionPathGeometry, CompositionSpriteShape, CompositionStretch,
             CompositionSurfaceBrush, CompositionVisualSurface, Compositor, ContainerVisual,
             CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow,
             ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual, Vector2KeyFrameAnimation,
@@ -2906,15 +2906,23 @@ unsafe fn make_inverse_circle_clip_at(
     compositor.CreateGeometricClipWithGeometry(&geometry)
 }
 
-fn make_auto_shadow_circle_visual(
+fn make_auto_shadow_outline_mask(
     compositor: &Compositor,
     bounds: f32,
-    brush: &CompositionColorBrush,
-    shadow: &DropShadow,
-) -> windows::core::Result<SpriteVisual> {
-    // Keep the AutoShadow background as vector geometry all the way to the
-    // compositor. Capturing a 4x visual into a VisualSurface and shrinking it
-    // with linear filtering can alias again during minification.
+    stroke_width: f32,
+) -> windows::core::Result<(
+    ShapeVisual,
+    CompositionVisualSurface,
+    CompositionSurfaceBrush,
+)> {
+    // This off-tree shape is the alpha source for the native clear outer
+    // stroke's shadow. It is not drawn as a visible white outline.
+    let source = compositor.CreateShapeVisual()?;
+    source.SetBorderMode(CompositionBorderMode::Soft)?;
+    source.SetSize(Vector2 {
+        X: bounds,
+        Y: bounds,
+    })?;
     let geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
     geometry.SetCenter(Vector2 {
         X: bounds * 0.5,
@@ -2924,17 +2932,87 @@ fn make_auto_shadow_circle_visual(
         X: bounds * 0.5,
         Y: bounds * 0.5,
     })?;
-    let clip = compositor.CreateGeometricClipWithGeometry(&geometry)?;
-    let visual = compositor.CreateSpriteVisual()?;
-    visual.SetSize(Vector2 {
+    let shape = compositor.CreateSpriteShapeWithGeometry(&geometry)?;
+    let mask_color = compositor.CreateColorBrushWithColor(composition_color(255, 255, 255, 255))?;
+    shape.SetStrokeBrush(&mask_color)?;
+    shape.SetStrokeThickness(stroke_width)?;
+    source.Shapes()?.Append(&shape)?;
+
+    let surface = compositor.CreateVisualSurface()?;
+    surface.SetSourceVisual(&source)?;
+    surface.SetSourceOffset(Vector2 { X: 0.0, Y: 0.0 })?;
+    surface.SetSourceSize(Vector2 {
         X: bounds,
         Y: bounds,
     })?;
-    visual.SetBorderMode(CompositionBorderMode::Soft)?;
-    visual.SetClip(&clip)?;
-    visual.SetBrush(brush)?;
-    visual.SetShadow(shadow)?;
-    Ok(visual)
+    let mask_brush = compositor.CreateSurfaceBrushWithSurface(&surface)?;
+    mask_brush.SetStretch(CompositionStretch::Fill)?;
+    mask_brush.SetBitmapInterpolationMode(CompositionBitmapInterpolationMode::Linear)?;
+    Ok((source, surface, mask_brush))
+}
+
+struct AutoShadowCircleVisuals {
+    clipped_layer: ContainerVisual,
+    background: SpriteVisual,
+    shadow: SpriteVisual,
+    circle_clip: CompositionGeometricClip,
+}
+
+fn make_auto_shadow_circle_visuals(
+    compositor: &Compositor,
+    bounds: f32,
+    background_brush: &CompositionColorBrush,
+    shadow_brush: &CompositionColorBrush,
+    shadow: &DropShadow,
+    outer_mask: &CompositionSurfaceBrush,
+) -> windows::core::Result<AutoShadowCircleVisuals> {
+    // The native background layer clips both its fill and outer-shadow child
+    // to its circular bounds. Keep the fill vector-clipped to avoid bitmap
+    // minification on the high-contrast edge around the button.
+    let geometry: CompositionEllipseGeometry = compositor.CreateEllipseGeometry()?;
+    geometry.SetCenter(Vector2 {
+        X: bounds * 0.5,
+        Y: bounds * 0.5,
+    })?;
+    geometry.SetRadius(Vector2 {
+        X: bounds * 0.5,
+        Y: bounds * 0.5,
+    })?;
+    let circle_clip = compositor.CreateGeometricClipWithGeometry(&geometry)?;
+    let clipped_layer = compositor.CreateContainerVisual()?;
+    clipped_layer.SetSize(Vector2 {
+        X: bounds,
+        Y: bounds,
+    })?;
+    clipped_layer.SetBorderMode(CompositionBorderMode::Soft)?;
+    clipped_layer.SetClip(&circle_clip)?;
+
+    shadow.SetMask(outer_mask)?;
+    let shadow_visual = compositor.CreateSpriteVisual()?;
+    shadow_visual.SetSize(Vector2 {
+        X: bounds,
+        Y: bounds,
+    })?;
+    shadow_visual.SetBorderMode(CompositionBorderMode::Soft)?;
+    shadow_visual.SetBrush(shadow_brush)?;
+    shadow_visual.SetShadow(shadow)?;
+    clipped_layer.Children()?.InsertAtTop(&shadow_visual)?;
+
+    let background = compositor.CreateSpriteVisual()?;
+    background.SetSize(Vector2 {
+        X: bounds,
+        Y: bounds,
+    })?;
+    background.SetBorderMode(CompositionBorderMode::Soft)?;
+    background.SetBrush(background_brush)?;
+    clipped_layer.Children()?.InsertAtTop(&background)?;
+
+    Ok(AutoShadowCircleVisuals {
+        clipped_layer,
+        background,
+        shadow: shadow_visual,
+        circle_clip,
+    })
 }
 
 struct CompositionScene {
@@ -2947,7 +3025,13 @@ struct CompositionScene {
     auto_shadow_root: ContainerVisual,
     auto_shadow_mask: CompositionGeometricClip,
     auto_shadow_brush: CompositionColorBrush,
+    _auto_shadow_circle_layer: ContainerVisual,
+    _auto_shadow_circle_clip: CompositionGeometricClip,
     _auto_shadow_sprite: SpriteVisual,
+    _auto_shadow_shadow_sprite: SpriteVisual,
+    _auto_shadow_outline_source: ShapeVisual,
+    _auto_shadow_outline_surface: CompositionVisualSurface,
+    _auto_shadow_outline_mask: CompositionSurfaceBrush,
     auto_shadow: DropShadow,
     inner_audio_root: ContainerVisual,
     inner_wave_root: ContainerVisual,
@@ -3555,23 +3639,29 @@ impl CompositionScene {
         auto_shadow_root.SetClip(&auto_shadow_mask)?;
         let auto_shadow_brush =
             compositor.CreateColorBrushWithColor(composition_auto_shadow_color(theme))?;
+        let (auto_shadow_outline_source, auto_shadow_outline_surface, auto_shadow_outline_mask) =
+            make_auto_shadow_outline_mask(compositor, auto_shadow_bounds, 2.0)?;
         let auto_shadow = compositor.CreateDropShadow()?;
         auto_shadow.SetBlurRadius(3.0)?;
         auto_shadow.SetOffset(Vector3::default())?;
         auto_shadow.SetOpacity(0.5)?;
         auto_shadow.SetColor(composition_color(255, 36, 36, 36))?;
         auto_shadow.SetSourcePolicy(
-            windows::UI::Composition::CompositionDropShadowSourcePolicy::InheritFromVisualContent,
+            windows::UI::Composition::CompositionDropShadowSourcePolicy::Default,
         )?;
-        let auto_shadow_sprite = make_auto_shadow_circle_visual(
+        let auto_shadow_shadow_brush =
+            compositor.CreateColorBrushWithColor(composition_color(0, 0, 0, 0))?;
+        let auto_shadow_circle = make_auto_shadow_circle_visuals(
             compositor,
             auto_shadow_bounds,
             &auto_shadow_brush,
+            &auto_shadow_shadow_brush,
             &auto_shadow,
+            &auto_shadow_outline_mask,
         )?;
         auto_shadow_root
             .Children()?
-            .InsertAtTop(&auto_shadow_sprite)?;
+            .InsertAtTop(&auto_shadow_circle.clipped_layer)?;
 
         let inner_audio_root = compositor.CreateContainerVisual()?;
         inner_audio_root.SetSize(Vector2 {
@@ -4125,7 +4215,13 @@ impl CompositionScene {
             auto_shadow_root,
             auto_shadow_mask,
             auto_shadow_brush,
-            _auto_shadow_sprite: auto_shadow_sprite,
+            _auto_shadow_circle_layer: auto_shadow_circle.clipped_layer,
+            _auto_shadow_circle_clip: auto_shadow_circle.circle_clip,
+            _auto_shadow_sprite: auto_shadow_circle.background,
+            _auto_shadow_shadow_sprite: auto_shadow_circle.shadow,
+            _auto_shadow_outline_source: auto_shadow_outline_source,
+            _auto_shadow_outline_surface: auto_shadow_outline_surface,
+            _auto_shadow_outline_mask: auto_shadow_outline_mask,
             auto_shadow,
             inner_audio_root,
             inner_wave_root,
@@ -14938,7 +15034,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a Windows Composition dispatcher; run explicitly to verify AutoShadow vector clip interop"]
+    #[ignore = "requires a Windows Composition dispatcher; run explicitly to verify AutoShadow layer and mask interop"]
     fn composition_auto_shadow_uses_button_viewport_for_336pt_mask() {
         use super::*;
 
@@ -14979,26 +15075,37 @@ mod tests {
 
                 let color_brush =
                     compositor.CreateColorBrushWithColor(composition_color(255, 9, 9, 9))?;
+                let (outline_source, outline_surface, outline_mask) =
+                    make_auto_shadow_outline_mask(&compositor, AUTO_SHADOW_DISPLAY_BOUNDS, 2.0)?;
                 let shadow = compositor.CreateDropShadow()?;
                 shadow.SetBlurRadius(3.0)?;
                 shadow.SetOffset(Vector3::default())?;
                 shadow.SetOpacity(0.5)?;
                 shadow.SetColor(composition_color(255, 36, 36, 36))?;
                 shadow.SetSourcePolicy(
-                    windows::UI::Composition::CompositionDropShadowSourcePolicy::InheritFromVisualContent,
+                    windows::UI::Composition::CompositionDropShadowSourcePolicy::Default,
                 )?;
-                let sprite = make_auto_shadow_circle_visual(
+                let shadow_brush =
+                    compositor.CreateColorBrushWithColor(composition_color(0, 0, 0, 0))?;
+                let layers = make_auto_shadow_circle_visuals(
                     &compositor,
                     AUTO_SHADOW_DISPLAY_BOUNDS,
                     &color_brush,
+                    &shadow_brush,
                     &shadow,
+                    &outline_mask,
                 )?;
-                host.Children()?.InsertAtTop(&sprite)?;
+                host.Children()?.InsertAtTop(&layers.clipped_layer)?;
 
                 assert_eq!(host.Size()?, Vector2 { X: 96.0, Y: 96.0 });
-                assert_eq!(sprite.Size()?, Vector2 { X: 96.0, Y: 96.0 });
-                assert_eq!(sprite.BorderMode()?, CompositionBorderMode::Soft);
-                let circle_clip: CompositionGeometricClip = sprite.Clip()?.cast()?;
+                assert_eq!(layers.clipped_layer.Size()?, Vector2 { X: 96.0, Y: 96.0 });
+                assert_eq!(
+                    layers.clipped_layer.BorderMode()?,
+                    CompositionBorderMode::Soft
+                );
+                assert_eq!(layers.background.Size()?, Vector2 { X: 96.0, Y: 96.0 });
+                assert_eq!(layers.shadow.Size()?, Vector2 { X: 96.0, Y: 96.0 });
+                let circle_clip: CompositionGeometricClip = layers.clipped_layer.Clip()?.cast()?;
                 let circle: CompositionEllipseGeometry = circle_clip.Geometry()?.cast()?;
                 assert_eq!(
                     circle.Center()?,
@@ -15014,7 +15121,16 @@ mod tests {
                         Y: AUTO_SHADOW_DISPLAY_BOUNDS * 0.5,
                     }
                 );
-                assert_eq!(sprite.Shadow()?.cast::<DropShadow>()?.BlurRadius()?, 3.0);
+                let applied_shadow = layers.shadow.Shadow()?.cast::<DropShadow>()?;
+                assert_eq!(applied_shadow.BlurRadius()?, 3.0);
+                assert_eq!(
+                    applied_shadow.SourcePolicy()?,
+                    windows::UI::Composition::CompositionDropShadowSourcePolicy::Default
+                );
+                let applied_mask: CompositionSurfaceBrush = applied_shadow.Mask()?.cast()?;
+                assert_eq!(applied_mask.Stretch()?, CompositionStretch::Fill);
+                assert_eq!(outline_source.Size()?, Vector2 { X: 96.0, Y: 96.0 });
+                assert_eq!(outline_surface.SourceSize()?, Vector2 { X: 96.0, Y: 96.0 });
                 assert_eq!(clip.CenterPoint()?, auto_shadow_host_center());
                 assert_eq!(clip.Scale()?, Vector2 { X: 0.85, Y: 0.85 });
                 drop(color_brush);
