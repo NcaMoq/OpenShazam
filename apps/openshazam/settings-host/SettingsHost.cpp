@@ -64,7 +64,7 @@ namespace
     constexpr uint32_t kAppearanceLight = 1;
     constexpr uint32_t kAppearanceDark = 2;
     constexpr double kSettingsControlLaneWidthDips = 208.0;
-    constexpr double kAppearanceSelectorWidthDips = 100.0;
+    constexpr double kAppearanceSelectorWidthDips = 88.0;
     constexpr double kStartupControlGroupWidthDips = 94.0;
     constexpr int kWidthDips = 720;
     constexpr int kHeightDips = 380;
