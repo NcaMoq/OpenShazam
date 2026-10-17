@@ -1,0 +1,223 @@
+param(
+    [string]$Directory = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\windows-x64')
+)
+
+$ErrorActionPreference = 'Stop'
+
+$dist = (Resolve-Path -LiteralPath $Directory -ErrorAction Stop).Path
+foreach ($name in @('openshazam.exe', 'OpenShazam.SettingsHost.dll', 'Microsoft.WindowsAppRuntime.Bootstrap.dll')) {
+    $path = Join-Path $dist $name
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Missing $path. Run tools/build-windows.ps1 first."
+    }
+}
+
+# Run on an isolated, non-visible desktop. This checks the same STA,
+# DispatcherQueue, Windows.UI.Composition, Windows App SDK bootstrap, and
+# WinUI XAML host initialization order without interacting with the user's UI.
+$source = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public static class OpenShazamSettingsHostSmoke
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DispatcherQueueOptions
+    {
+        public uint Size;
+        public uint ThreadType;
+        public uint ApartmentType;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Message
+    {
+        public IntPtr Window;
+        public uint Id;
+        public UIntPtr WParam;
+        public IntPtr LParam;
+        public uint Time;
+        public int X;
+        public int Y;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int BootstrapInitialize(uint release, [MarshalAs(UnmanagedType.LPWStr)] string tag, ulong minVersion);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate void BootstrapShutdown();
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int SettingsShow(IntPtr owner);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate void SettingsShutdown();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateDesktopW(string name, IntPtr device, IntPtr mode, uint flags, uint access, IntPtr security);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetThreadDesktop(IntPtr desktop);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool CloseDesktop(IntPtr desktop);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateWindowExW(uint exStyle, string className, string title, uint style, int x, int y, int width, int height, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr parameter);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyWindow(IntPtr window);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool PeekMessageW(out Message message, IntPtr window, uint min, uint max, uint remove);
+    [DllImport("user32.dll")]
+    private static extern bool TranslateMessage(ref Message message);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr DispatchMessageW(ref Message message);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadLibraryW(string path);
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+    private static extern IntPtr GetProcAddress(IntPtr module, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FreeLibrary(IntPtr module);
+    [DllImport("ole32.dll")]
+    private static extern int CoInitializeEx(IntPtr reserved, uint apartment);
+    [DllImport("ole32.dll")]
+    private static extern void CoUninitialize();
+    [DllImport("combase.dll", CharSet = CharSet.Unicode)]
+    private static extern int WindowsCreateString(string value, uint length, out IntPtr hstring);
+    [DllImport("combase.dll")]
+    private static extern int WindowsDeleteString(IntPtr hstring);
+    [DllImport("combase.dll")]
+    private static extern int RoActivateInstance(IntPtr className, out IntPtr instance);
+    [DllImport("CoreMessaging.dll", EntryPoint = "CreateDispatcherQueueController")]
+    private static extern int CreateDispatcherQueueController(DispatcherQueueOptions options, out IntPtr controller);
+
+    public static string Run(string directory)
+    {
+        string stage = "create STA thread";
+        string error = null;
+        IntPtr desktop = IntPtr.Zero;
+        var thread = new Thread(() =>
+        {
+            IntPtr queue = IntPtr.Zero;
+            IntPtr compositor = IntPtr.Zero;
+            IntPtr uiSettings = IntPtr.Zero;
+            IntPtr bootstrap = IntPtr.Zero;
+            IntPtr settingsHost = IntPtr.Zero;
+            IntPtr owner = IntPtr.Zero;
+            bool comInitialized = false;
+            bool bootstrapInitialized = false;
+            SettingsShutdown shutdownSettings = null;
+            BootstrapShutdown shutdownBootstrap = null;
+            try
+            {
+                stage = "select isolated desktop";
+                desktop = CreateDesktopW("OpenShazamSettingsSmoke-" + Guid.NewGuid().ToString("N"), IntPtr.Zero, IntPtr.Zero, 0, 0x02000000, IntPtr.Zero);
+                if (desktop == IntPtr.Zero) throw new InvalidOperationException("CreateDesktopW: " + Marshal.GetLastWin32Error());
+                if (!SetThreadDesktop(desktop)) throw new InvalidOperationException("SetThreadDesktop: " + Marshal.GetLastWin32Error());
+
+                stage = "initialize STA";
+                int hr = CoInitializeEx(IntPtr.Zero, 2);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                comInitialized = true;
+
+                stage = "create DispatcherQueue";
+                var options = new DispatcherQueueOptions
+                {
+                    Size = (uint)Marshal.SizeOf(typeof(DispatcherQueueOptions)),
+                    ThreadType = 2,
+                    ApartmentType = 2,
+                };
+                hr = CreateDispatcherQueueController(options, out queue);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+
+                stage = "activate Windows Composition Compositor";
+                compositor = Activate("Windows.UI.Composition.Compositor");
+                stage = "activate Windows UISettings";
+                uiSettings = Activate("Windows.UI.ViewManagement.UISettings");
+
+                stage = "load Windows App SDK bootstrapper";
+                bootstrap = LoadLibraryW(System.IO.Path.Combine(directory, "Microsoft.WindowsAppRuntime.Bootstrap.dll"));
+                if (bootstrap == IntPtr.Zero) throw new InvalidOperationException("Load bootstrapper: " + Marshal.GetLastWin32Error());
+                var initialize = Marshal.GetDelegateForFunctionPointer<BootstrapInitialize>(GetProcAddress(bootstrap, "MddBootstrapInitialize"));
+                shutdownBootstrap = Marshal.GetDelegateForFunctionPointer<BootstrapShutdown>(GetProcAddress(bootstrap, "MddBootstrapShutdown"));
+
+                stage = "initialize Windows App SDK 1.8";
+                hr = initialize(0x00010008, "", 0x1F40032608CC0000UL);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                bootstrapInitialized = true;
+
+                stage = "load WinUI Settings host";
+                settingsHost = LoadLibraryW(System.IO.Path.Combine(directory, "OpenShazam.SettingsHost.dll"));
+                if (settingsHost == IntPtr.Zero) throw new InvalidOperationException("Load Settings host: " + Marshal.GetLastWin32Error());
+                var show = Marshal.GetDelegateForFunctionPointer<SettingsShow>(GetProcAddress(settingsHost, "OpenShazamSettingsShow"));
+                shutdownSettings = Marshal.GetDelegateForFunctionPointer<SettingsShutdown>(GetProcAddress(settingsHost, "OpenShazamSettingsShutdown"));
+
+                stage = "create hidden owner window";
+                owner = CreateWindowExW(0, "STATIC", "OpenShazam settings smoke owner", 0, 0, 0, 100, 100, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                if (owner == IntPtr.Zero) throw new InvalidOperationException("Create owner window: " + Marshal.GetLastWin32Error());
+
+                stage = "initialize and show XAML host";
+                hr = show(owner);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+
+                stage = "pump hidden desktop for XAML callbacks";
+                var deadline = DateTime.UtcNow.AddMilliseconds(500);
+                while (DateTime.UtcNow < deadline)
+                {
+                    Message message;
+                    while (PeekMessageW(out message, IntPtr.Zero, 0, 0, 1))
+                    {
+                        TranslateMessage(ref message);
+                        DispatchMessageW(ref message);
+                    }
+                    Thread.Sleep(10);
+                }
+                stage = "shutdown XAML host";
+            }
+            catch (Exception exception)
+            {
+                error = stage + ": " + exception;
+            }
+            finally
+            {
+                try { if (shutdownSettings != null) shutdownSettings(); } catch { }
+                try { if (owner != IntPtr.Zero) DestroyWindow(owner); } catch { }
+                try { if (bootstrapInitialized && shutdownBootstrap != null) shutdownBootstrap(); } catch { }
+                if (settingsHost != IntPtr.Zero) FreeLibrary(settingsHost);
+                if (bootstrap != IntPtr.Zero) FreeLibrary(bootstrap);
+                if (uiSettings != IntPtr.Zero) Marshal.Release(uiSettings);
+                if (compositor != IntPtr.Zero) Marshal.Release(compositor);
+                if (queue != IntPtr.Zero) Marshal.Release(queue);
+                if (comInitialized) CoUninitialize();
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (desktop != IntPtr.Zero) CloseDesktop(desktop);
+        return error ?? "Composition + WinUI Settings host initialized and shut down successfully.";
+    }
+
+    private static IntPtr Activate(string className)
+    {
+        IntPtr hstring;
+        int hr = WindowsCreateString(className, (uint)className.Length, out hstring);
+        if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+        try
+        {
+            IntPtr instance;
+            hr = RoActivateInstance(hstring, out instance);
+            if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+            return instance;
+        }
+        finally
+        {
+            WindowsDeleteString(hstring);
+        }
+    }
+}
+'@
+
+Add-Type -TypeDefinition $source -Language CSharp
+$result = [OpenShazamSettingsHostSmoke]::Run($dist)
+if ($result -notlike 'Composition + WinUI Settings host initialized*') {
+    throw $result
+}
+Write-Host $result
