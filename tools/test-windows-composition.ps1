@@ -1,9 +1,4 @@
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
-$cargoTargetDir = Join-Path (Join-Path $root 'dist\windows-x64') 'cargo-target'
-New-Item -ItemType Directory -Path $cargoTargetDir -Force | Out-Null
-$previousCargoTargetDir = $env:CARGO_TARGET_DIR
-$env:CARGO_TARGET_DIR = $cargoTargetDir
 
 # WinRT Composition and DispatcherQueue objects are thread/apartment scoped.
 # Keep each native integration test in its own test process so a previous test's
@@ -16,15 +11,10 @@ $tests = @(
     'windows_ui::tests::composition_status_text_renders_transitions_and_resizes_at_fractional_dpi'
 )
 
-try {
-    foreach ($test in $tests) {
-        Write-Host "Running isolated Windows Composition test: $test"
-        & cargo +1.85.0 test --locked -p openshazam --bin openshazam $test -- --ignored --exact --test-threads=1
-        if ($LASTEXITCODE -ne 0) {
-            throw "Windows Composition test failed: $test (exit code $LASTEXITCODE)"
-        }
+foreach ($test in $tests) {
+    Write-Host "Running isolated Windows Composition test: $test"
+    & cargo +1.85.0 test --locked -p openshazam --bin openshazam $test -- --ignored --exact --test-threads=1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Windows Composition test failed: $test (exit code $LASTEXITCODE)"
     }
-}
-finally {
-    $env:CARGO_TARGET_DIR = $previousCargoTargetDir
 }
