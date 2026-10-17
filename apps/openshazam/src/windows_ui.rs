@@ -2746,6 +2746,10 @@ fn logo_shadow_color(_theme: Theme) -> Color {
 const INNER_MASK_BOUNDS: f32 = 336.0;
 const BUTTON_CLEAR_DIAMETER: f32 = 96.0;
 const AUTO_SHADOW_DISPLAY_BOUNDS: f32 = BUTTON_CLEAR_DIAMETER;
+// AutoShadow is captured to a CompositionVisualSurface before it is scaled
+// with the popup root. Keep that source at 4x so the circle stays smooth at
+// fractional and high-DPI scales (including the supported 300% range).
+const AUTO_SHADOW_RASTER_SCALE: f32 = 4.0;
 const INNER_MASK_GEOMETRY_TOLERANCE: f32 = 0.01;
 
 fn auto_shadow_host_center() -> Vector2 {
@@ -3420,6 +3424,7 @@ impl CompositionScene {
             X: auto_shadow_bounds,
             Y: auto_shadow_bounds,
         })?;
+        auto_shadow_root.SetBorderMode(CompositionBorderMode::Soft)?;
         auto_shadow_root.SetCenterPoint(Vector3 {
             X: auto_shadow_bounds * 0.5,
             Y: auto_shadow_bounds * 0.5,
@@ -3447,20 +3452,22 @@ impl CompositionScene {
         auto_shadow_root.SetClip(&auto_shadow_mask)?;
         let auto_shadow_brush =
             compositor.CreateColorBrushWithColor(composition_auto_shadow_color(theme))?;
+        let auto_shadow_raster_bounds = auto_shadow_bounds * AUTO_SHADOW_RASTER_SCALE;
         let auto_shadow_source = compositor.CreateShapeVisual()?;
+        auto_shadow_source.SetBorderMode(CompositionBorderMode::Soft)?;
         auto_shadow_source.SetSize(Vector2 {
-            X: auto_shadow_bounds,
-            Y: auto_shadow_bounds,
+            X: auto_shadow_raster_bounds,
+            Y: auto_shadow_raster_bounds,
         })?;
         let auto_shadow_geometry: CompositionEllipseGeometry =
             compositor.CreateEllipseGeometry()?;
         auto_shadow_geometry.SetCenter(Vector2 {
-            X: auto_shadow_bounds * 0.5,
-            Y: auto_shadow_bounds * 0.5,
+            X: auto_shadow_raster_bounds * 0.5,
+            Y: auto_shadow_raster_bounds * 0.5,
         })?;
         auto_shadow_geometry.SetRadius(Vector2 {
-            X: auto_shadow_bounds * 0.5,
-            Y: auto_shadow_bounds * 0.5,
+            X: auto_shadow_raster_bounds * 0.5,
+            Y: auto_shadow_raster_bounds * 0.5,
         })?;
         let auto_shadow_shape = compositor.CreateSpriteShapeWithGeometry(&auto_shadow_geometry)?;
         auto_shadow_shape.SetFillBrush(&auto_shadow_brush)?;
@@ -3469,11 +3476,12 @@ impl CompositionScene {
         auto_shadow_surface.SetSourceVisual(&auto_shadow_source)?;
         auto_shadow_surface.SetSourceOffset(Vector2 { X: 0.0, Y: 0.0 })?;
         auto_shadow_surface.SetSourceSize(Vector2 {
-            X: auto_shadow_bounds,
-            Y: auto_shadow_bounds,
+            X: auto_shadow_raster_bounds,
+            Y: auto_shadow_raster_bounds,
         })?;
         let auto_shadow_surface_brush =
             compositor.CreateSurfaceBrushWithSurface(&auto_shadow_surface)?;
+        auto_shadow_surface_brush.SetStretch(CompositionStretch::Fill)?;
         let auto_shadow = compositor.CreateDropShadow()?;
         auto_shadow.SetBlurRadius(3.0)?;
         auto_shadow.SetOffset(Vector3::default())?;
@@ -3487,6 +3495,7 @@ impl CompositionScene {
             X: auto_shadow_bounds,
             Y: auto_shadow_bounds,
         })?;
+        auto_shadow_sprite.SetBorderMode(CompositionBorderMode::Soft)?;
         auto_shadow_sprite.SetBrush(&auto_shadow_surface_brush)?;
         auto_shadow_sprite.SetShadow(&auto_shadow)?;
         auto_shadow_root
