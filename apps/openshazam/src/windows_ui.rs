@@ -193,7 +193,7 @@ const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
 const TRAY_TASKBAR_CREATED_NAME: &str = "TaskbarCreated";
 const TRAY_MENU_SETTINGS: usize = 1;
 const TRAY_MENU_EXIT: usize = 2;
-const POPUP_FADE_DURATION: Duration = Duration::from_millis(150);
+const POPUP_FADE_DURATION: Duration = Duration::from_millis(100);
 const POPUP_ACTIVATION_GRACE: Duration = Duration::from_millis(350);
 const TIMER_SINGLE_CLICK: usize = 0x4f53;
 const TIMER_LONG_PRESS: usize = 0x4f54;
@@ -9394,8 +9394,15 @@ fn popup_opacity_at(app: &AppState, now: Instant) -> u8 {
     };
     let elapsed = now.saturating_duration_since(transition.started_at);
     let progress = (elapsed.as_secs_f64() / POPUP_FADE_DURATION.as_secs_f64()).clamp(0.0, 1.0);
-    let opacity = f64::from(transition.from)
-        + (f64::from(transition.to) - f64::from(transition.from)) * progress;
+    popup_transition_opacity(transition.from, transition.to, progress)
+}
+
+fn popup_transition_opacity(from: u8, to: u8, progress: f64) -> u8 {
+    let progress = progress.clamp(0.0, 1.0);
+    // Reach either endpoint quickly while preserving a short, soft transition.
+    // This makes tray activation responsive and outside-click dismissal prompt.
+    let progress = 1.0 - (1.0 - progress).powi(3);
+    let opacity = f64::from(from) + (f64::from(to) - f64::from(from)) * progress;
     opacity.round().clamp(0.0, 255.0) as u8
 }
 
@@ -12832,12 +12839,13 @@ mod tests {
         history_title_color, inverse_circle_clip_radii, is_offline_failure,
         is_tray_activation_event, localized_ui_text, native_icon_layout, no_match_copy,
         no_match_icon_rect, page_url_for_display_id, phase_animation_state, phase_needs_frame_at,
-        phase_needs_timeout, point_in_rect, popup_base_color, remember_auto_candidate_key,
-        resolve_page_link, resolve_page_link_checked, resolve_page_link_for_generation,
-        result_artwork_rect, result_card_link_hit, result_details_rects, result_gradient_colors,
-        result_header_hit_test_contains, result_header_visible_height, result_overlay_child_offset,
-        result_overlay_failure_matches, result_overlay_intersects_header, result_panel_draw_top,
-        result_panel_top_at, scale_notification_artwork_to_size, select_ui_language_from_multisz,
+        phase_needs_timeout, point_in_rect, popup_base_color, popup_transition_opacity,
+        remember_auto_candidate_key, resolve_page_link, resolve_page_link_checked,
+        resolve_page_link_for_generation, result_artwork_rect, result_card_link_hit,
+        result_details_rects, result_gradient_colors, result_header_hit_test_contains,
+        result_header_visible_height, result_overlay_child_offset, result_overlay_failure_matches,
+        result_overlay_intersects_header, result_panel_draw_top, result_panel_top_at,
+        scale_notification_artwork_to_size, select_ui_language_from_multisz,
         should_defer_hide_for_tray_activation, should_hide_popup_on_deactivation,
         should_replace_cached_artwork, should_show_initial_popup, should_start_startup_logo,
         status_text_snapshot, theme_from_foreground_rgb, timeout_copy, ui_model,
@@ -15509,6 +15517,18 @@ mod tests {
         assert!(!animation_timer_needed(false, false, false));
         assert!(animation_timer_needed(true, false, true));
         assert!(animation_timer_needed(false, true, false));
+    }
+
+    #[test]
+    fn popup_open_fade_becomes_visible_quickly_and_keeps_its_endpoint() {
+        assert_eq!(popup_transition_opacity(0, 255, 0.0), 0);
+        assert!(popup_transition_opacity(0, 255, 0.1) > 60);
+        assert!(popup_transition_opacity(0, 255, 0.35) > 180);
+        assert_eq!(popup_transition_opacity(0, 255, 1.0), 255);
+
+        assert!(popup_transition_opacity(255, 0, 0.1) < 200);
+        assert!(popup_transition_opacity(255, 0, 0.35) < 80);
+        assert_eq!(popup_transition_opacity(255, 0, 1.0), 0);
     }
 
     #[test]
