@@ -67,3 +67,11 @@ the environment variable, the pre-existing JSONL records remain unchanged.
 OPENSHZAM_UI_CONFIG_SNAPSHOT_JSONL=1 cargo run --locked -p openshazam -- \
   recognize-microphone-progressive --events-jsonl
 ```
+
+## Windows startup
+
+The unpackaged Windows app offers a per-user sign-in toggle in Settings.
+It uses the `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run` key
+(`OpenShazam`) with a quoted `openshazam.exe ui` command. No elevation or package
+identity is required; the toggle does not automatically start recognition.
+The installer should remove this value when uninstalling the app.

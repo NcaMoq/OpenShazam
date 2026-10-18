@@ -30,7 +30,7 @@ try {
 
     Write-Host "Compiled OpenShazam: $dist"
     Write-Host "Run: $(Join-Path $dist 'openshazam.exe') ui"
-    Write-Host 'The Windows App SDK Runtime is required; MSIX identity/startup-task support is not yet packaged.'
+    Write-Host 'Unpackaged WinUI 3 build: the Windows App SDK Runtime is required.'
 }
 finally {
     Pop-Location

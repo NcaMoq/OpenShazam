@@ -4,7 +4,7 @@ using Microsoft.UI;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using Windows.ApplicationModel;
+using Microsoft.Win32;
 using WinRT.Interop;
 
 namespace OpenShazam.Settings;
@@ -12,11 +12,12 @@ namespace OpenShazam.Settings;
 public sealed partial class MainWindow : Window
 {
     internal const string WindowTitle = "OpenShazam Settings";
-    private const string StartupTaskId = "OpenShazamStartup";
+    private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string RunValueName = "OpenShazam";
+    private static string StartupCommand => $"\"{Path.Combine(AppContext.BaseDirectory, "openshazam.exe")}\" ui";
     private const double SettingsWidthDips = 520;
     private const double SettingsHeightDips = 300;
     private const double DipsPerInch = 96;
-    private StartupTask? _startupTask;
     private bool _isLoading;
     private readonly bool _isJapanese;
     private readonly AppWindow _appWindow;
@@ -52,7 +53,7 @@ public sealed partial class MainWindow : Window
         ResizeForRasterizationScale(_lastRasterizationScale);
     }
 
-    private async void OnLoaded(object sender, RoutedEventArgs args)
+    private void OnLoaded(object sender, RoutedEventArgs args)
     {
         // Unlike UWP, WinUI 3 desktop windows must observe the XAML root's
         // rasterization scale for per-monitor DPI changes.
@@ -68,7 +69,7 @@ public sealed partial class MainWindow : Window
             ApplyRasterizationScale(xamlRoot.RasterizationScale);
         }
 
-        await RefreshStartupStateAsync();
+        RefreshStartupState();
     }
 
     private void OnXamlRootChanged(XamlRoot sender, XamlRootChangedEventArgs args)
@@ -97,12 +98,10 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void OnStartupToggled(object sender, RoutedEventArgs args)
+    private void OnStartupToggled(object sender, RoutedEventArgs args)
     {
-        if (_isLoading || _startupTask is null)
-        {
+        if (_isLoading)
             return;
-        }
 
         StartupToggle.IsEnabled = false;
         StatusInfo.IsOpen = false;
@@ -110,13 +109,15 @@ public sealed partial class MainWindow : Window
         {
             if (StartupToggle.IsOn)
             {
-                _ = await _startupTask.RequestEnableAsync();
+                using var key = Registry.CurrentUser.CreateSubKey(RunKeyPath, writable: true)
+                    ?? throw new InvalidOperationException("Could not open user startup key.");
+                key.SetValue(RunValueName, StartupCommand, RegistryValueKind.String);
             }
             else
             {
-                _startupTask.Disable();
+                using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true);
+                key?.DeleteValue(RunValueName, throwOnMissingValue: false);
             }
-            await RefreshStartupStateAsync();
         }
         catch (Exception error)
         {
@@ -124,51 +125,32 @@ public sealed partial class MainWindow : Window
                 $"Windows could not update the startup setting: {error.Message}",
                 $"自動起動の設定を変更できませんでした: {error.Message}"),
                 InfoBarSeverity.Error);
-            await RefreshStartupStateAsync();
+        }
+        finally
+        {
+            RefreshStartupState();
         }
     }
 
-    private async Task RefreshStartupStateAsync()
+    private void RefreshStartupState()
     {
         _isLoading = true;
         StartupToggle.IsEnabled = false;
         try
         {
-            _startupTask = await StartupTask.GetAsync(StartupTaskId);
-            var state = _startupTask.State;
-            StartupToggle.IsOn = state is StartupTaskState.Enabled or StartupTaskState.EnabledByPolicy;
-            StartupToggle.IsEnabled = state is StartupTaskState.Disabled or StartupTaskState.Enabled;
-
-            switch (state)
-            {
-                case StartupTaskState.DisabledByUser:
-                    ShowInfo(Text(
-                        "Startup was disabled in Windows. Turn it on in Settings or Task Manager to re-enable it.",
-                        "Windows側で自動起動が無効になっています。再度有効にするにはWindowsの設定またはタスクマネージャーを使用してください。"));
-                    break;
-                case StartupTaskState.DisabledByPolicy:
-                    ShowInfo(Text(
-                        "Startup is disabled by your organization's policy.",
-                        "組織のポリシーによって自動起動が無効になっています。"));
-                    break;
-                case StartupTaskState.EnabledByPolicy:
-                    ShowInfo(Text(
-                        "Startup is enabled by your organization's policy.",
-                        "組織のポリシーによって自動起動が有効になっています。"));
-                    break;
-                default:
-                    StatusInfo.IsOpen = false;
-                    break;
-            }
+            using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath);
+            var command = key?.GetValue(RunValueName) as string;
+            StartupToggle.IsOn = string.Equals(command, StartupCommand, StringComparison.OrdinalIgnoreCase);
+            StartupToggle.IsEnabled = true;
+            StatusInfo.IsOpen = false;
         }
         catch (Exception)
         {
-            _startupTask = null;
             StartupToggle.IsOn = false;
-            StartupToggle.IsEnabled = false;
             ShowInfo(Text(
-                "Automatic startup is available in the packaged version of OpenShazam.",
-                "自動起動はパッケージ版のOpenShazamで利用できます。"));
+                "Windows could not read the startup setting.",
+                "Windowsの自動起動設定を読み取れませんでした。"),
+                InfoBarSeverity.Error);
         }
         finally
         {

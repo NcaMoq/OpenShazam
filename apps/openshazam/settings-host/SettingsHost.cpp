@@ -7,7 +7,6 @@ namespace x = winrt::Microsoft::UI::Xaml;
 namespace controls = winrt::Microsoft::UI::Xaml::Controls;
 namespace hosting = winrt::Microsoft::UI::Xaml::Hosting;
 namespace dispatch = winrt::Microsoft::UI::Dispatching;
-namespace appmodel = winrt::Windows::ApplicationModel;
 namespace markup = winrt::Microsoft::UI::Xaml::Markup;
 namespace typeinfo = winrt::Microsoft::UI::Xaml::XamlTypeInfo;
 
@@ -39,7 +38,8 @@ namespace
     };
 
     constexpr wchar_t kSettingsClass[] = L"OpenShazamWinUI3Preferences";
-    constexpr wchar_t kStartupTask[] = L"OpenShazamStartup";
+    constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    constexpr wchar_t kRunValue[] = L"OpenShazam";
     constexpr int kWidthDips = 520;
     constexpr int kHeightDips = 300;
 
@@ -69,84 +69,119 @@ namespace
         }
     };
 
-    winrt::fire_and_forget RefreshStartup(std::weak_ptr<SettingsState> weak)
+    // An unpackaged, per-user login entry; does not auto-start recognition.
+    std::wstring StartupCommand()
+    {
+        std::wstring path(260, L'\0');
+        for (;;)
+        {
+            auto length = ::GetModuleFileNameW(nullptr, path.data(),
+                static_cast<DWORD>(path.size()));
+            if (!length) winrt::throw_last_error();
+            if (length < path.size())
+            {
+                path.resize(length);
+                break;
+            }
+            if (path.size() >= 32768)
+                winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE));
+            path.resize(path.size() * 2);
+        }
+        return L"\"" + path + L"\" ui";
+    }
+
+    void CheckRegistryStatus(LSTATUS status)
+    {
+        if (status != ERROR_SUCCESS)
+            winrt::throw_hresult(HRESULT_FROM_WIN32(status));
+    }
+
+    bool IsStartupEnabled()
+    {
+        DWORD bytes{};
+        auto status = ::RegGetValueW(HKEY_CURRENT_USER, kRunKey, kRunValue,
+            RRF_RT_REG_SZ, nullptr, nullptr, &bytes);
+        if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND)
+            return false;
+        CheckRegistryStatus(status);
+        std::wstring command(bytes / sizeof(wchar_t), L'\0');
+        status = ::RegGetValueW(HKEY_CURRENT_USER, kRunKey, kRunValue,
+            RRF_RT_REG_SZ, nullptr, command.data(), &bytes);
+        CheckRegistryStatus(status);
+        command.resize(command.find(L'\0'));
+        return command == StartupCommand();
+    }
+
+    void SetStartupEnabled(bool enabled)
+    {
+        HKEY key{};
+        if (enabled)
+        {
+            auto command = StartupCommand();
+            CheckRegistryStatus(::RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey,
+                0, nullptr, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr,
+                &key, nullptr));
+            auto status = ::RegSetValueExW(key, kRunValue, 0, REG_SZ,
+                reinterpret_cast<BYTE const*>(command.c_str()),
+                static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+            ::RegCloseKey(key);
+            CheckRegistryStatus(status);
+        }
+        else
+        {
+            auto status = ::RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0,
+                KEY_SET_VALUE, &key);
+            if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND)
+                return;
+            CheckRegistryStatus(status);
+            status = ::RegDeleteValueW(key, kRunValue);
+            ::RegCloseKey(key);
+            if (status != ERROR_FILE_NOT_FOUND)
+                CheckRegistryStatus(status);
+        }
+    }
+
+    void RefreshStartup(std::weak_ptr<SettingsState> weak)
     {
         auto state = weak.lock();
-        if (!state || !state->alive) co_return;
+        if (!state || !state->alive) return;
         state->loading = true;
         state->toggle.IsEnabled(false);
         try
         {
-            auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
-            if (!state->alive) co_return;
-            auto current = task.State();
-            state->toggle.IsOn(current == appmodel::StartupTaskState::Enabled ||
-                               current == appmodel::StartupTaskState::EnabledByPolicy);
-            state->toggle.IsEnabled(current == appmodel::StartupTaskState::Disabled ||
-                                    current == appmodel::StartupTaskState::Enabled);
-            switch (current)
-            {
-            case appmodel::StartupTaskState::DisabledByUser:
-                state->Status(Localized(L"Startup was disabled in Windows. Re-enable it in Windows Settings.",
-                    L"Windows側で自動起動が無効です。Windowsの設定で有効にしてください。"),
-                    controls::InfoBarSeverity::Informational);
-                break;
-            case appmodel::StartupTaskState::DisabledByPolicy:
-                state->Status(Localized(L"Startup is restricted by organization policy.",
-                    L"組織のポリシーにより自動起動が制限されています。"),
-                    controls::InfoBarSeverity::Informational);
-                break;
-            case appmodel::StartupTaskState::EnabledByPolicy:
-                state->Status(Localized(L"Startup is enabled by organization policy.",
-                    L"組織のポリシーにより自動起動が有効です。"),
-                    controls::InfoBarSeverity::Informational);
-                break;
-            default:
-                state->info.IsOpen(false);
-                break;
-            }
+            state->toggle.IsOn(IsStartupEnabled());
+            state->toggle.IsEnabled(true);
+            state->info.IsOpen(false);
         }
         catch (winrt::hresult_error const&)
         {
-            if (!state->alive) co_return;
             state->toggle.IsOn(false);
-            state->toggle.IsEnabled(false);
             state->Status(Localized(
-                L"Automatic startup is available in the packaged MSIX version.",
-                L"自動起動はMSIXパッケージ版で利用できます。"),
-                controls::InfoBarSeverity::Informational);
+                L"Windows could not read the startup setting.",
+                L"Windowsの自動起動設定を読み取れませんでした。"),
+                controls::InfoBarSeverity::Error);
         }
         state->loading = false;
     }
 
-    winrt::fire_and_forget ChangeStartup(std::weak_ptr<SettingsState> weak, bool enable)
+    void ChangeStartup(std::weak_ptr<SettingsState> weak, bool enable)
     {
         auto state = weak.lock();
-        if (!state || !state->alive) co_return;
+        if (!state || !state->alive) return;
         state->loading = true;
         state->toggle.IsEnabled(false);
         try
         {
-            auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
-            if (!state->alive) co_return;
-            if (enable)
-            {
-                co_await task.RequestEnableAsync();
-            }
-            else
-            {
-                task.Disable();
-            }
+            SetStartupEnabled(enable);
         }
         catch (winrt::hresult_error const&)
         {
-            if (!state->alive) co_return;
             state->Status(Localized(
                 L"Windows could not update the startup setting.",
                 L"Windowsで自動起動の設定を変更できませんでした。"),
                 controls::InfoBarSeverity::Error);
         }
-        if (!state->alive) co_return;
+        if (!state->alive) return;
         RefreshStartup(weak);
     }
 
