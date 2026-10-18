@@ -170,19 +170,22 @@ namespace
         if (!state || !state->alive) return;
         state->loading = true;
         state->toggle.IsEnabled(false);
+        bool failed = false;
         try
         {
             SetStartupEnabled(enable);
         }
         catch (winrt::hresult_error const&)
         {
+            failed = true;
+        }
+        if (!state->alive) return;
+        RefreshStartup(weak);
+        if (failed && state->alive)
             state->Status(Localized(
                 L"Windows could not update the startup setting.",
                 L"Windowsで自動起動の設定を変更できませんでした。"),
                 controls::InfoBarSeverity::Error);
-        }
-        if (!state->alive) return;
-        RefreshStartup(weak);
     }
 
     struct SettingsHost;

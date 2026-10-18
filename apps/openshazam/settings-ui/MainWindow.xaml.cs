@@ -121,15 +121,15 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception error)
         {
-            ShowInfo(Text(
+            var message = Text(
                 $"Windows could not update the startup setting: {error.Message}",
-                $"自動起動の設定を変更できませんでした: {error.Message}"),
-                InfoBarSeverity.Error);
-        }
-        finally
-        {
+                $"自動起動の設定を変更できませんでした: {error.Message}");
             RefreshStartupState();
+            ShowInfo(message, InfoBarSeverity.Error);
+            return;
         }
+
+        RefreshStartupState();
     }
 
     private void RefreshStartupState()
