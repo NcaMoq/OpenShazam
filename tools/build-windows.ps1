@@ -40,6 +40,18 @@ else {
         throw 'MSBuild was not found. Install Visual Studio 2022 with the C++ desktop workload.'
     }
 }
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$vsInstallationPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vsInstallationPath) { throw 'Visual Studio installation path was not found.' }
+$crtRedistRoot = Join-Path $vsInstallationPath 'VC\Redist\MSVC'
+$crtDirectory = Get-ChildItem -LiteralPath $crtRedistRoot -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^\d+(\.\d+){2,3}$' } |
+    Sort-Object { [version]$_.Name } -Descending |
+    ForEach-Object { Join-Path $_.FullName 'x64\Microsoft.VC143.CRT' } |
+    Where-Object { (Test-Path -LiteralPath (Join-Path $_ 'msvcp140.dll')) } |
+    Select-Object -First 1
+if (-not $crtDirectory) { throw "The x64 VC++ 14.3 runtime could not be found under $crtRedistRoot." }
+$crtRuntimeFiles = @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
 Push-Location $root
 try {
     if (-not (Test-Path -LiteralPath $dist -PathType Container)) {
@@ -62,6 +74,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Rust Win32/Composition main popup failed to compile" }
 
     Copy-Item -LiteralPath (Join-Path $root 'target\release\openshazam.exe') -Destination (Join-Path $dist 'openshazam.exe') -Force
+    Copy-Item -LiteralPath (Join-Path $root 'apps\openshazam\assets\OpenShazamSquare44.png') `
+        -Destination (Join-Path $dist 'OpenShazamSquare44.png') -Force
     $dll = Join-Path $nativeOut 'OpenShazam.SettingsHost.dll'
     if (-not (Test-Path -LiteralPath $dll)) { throw "SettingsHost DLL was not produced: $dll" }
     Copy-Item -LiteralPath $dll -Destination (Join-Path $dist 'OpenShazam.SettingsHost.dll') -Force
@@ -69,6 +83,11 @@ try {
     $bootstrap = Join-Path $nativeOut 'Microsoft.WindowsAppRuntime.Bootstrap.dll'
     if (-not (Test-Path -LiteralPath $bootstrap)) { throw "Windows App SDK bootstrapper was not produced: $bootstrap" }
     Copy-Item -LiteralPath $bootstrap -Destination (Join-Path $dist 'Microsoft.WindowsAppRuntime.Bootstrap.dll') -Force
+    foreach ($runtimeFile in $crtRuntimeFiles) {
+        $source = Join-Path $crtDirectory $runtimeFile
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required VC++ runtime is missing: $source" }
+        Copy-Item -LiteralPath $source -Destination (Join-Path $dist $runtimeFile) -Force
+    }
 
     # Preserve compiled WinUI/XAML package resource indexes emitted by MSBuild.
     Get-ChildItem -LiteralPath $nativeOut -File -Filter '*.pri' | ForEach-Object {

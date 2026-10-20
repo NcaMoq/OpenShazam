@@ -1,69 +1,9 @@
-# OpenShazam
+# Shazam
 
-An unofficial Rust command-line music recognition prototype.
-
-## Requirements
-
-- Rust 1.85 or newer
-- `ffmpeg` and `ffprobe` for audio-file input
-- `curl` for live recognition requests
+Shazam client for Windows with a native tray UI and a Rust recognition engine.
 
 ## Build
 
-```sh
-cargo build --workspace --locked
-```
+On Windows, run `tools/build-windows.ps1 -Product`. Runtime files are staged in `dist/windows-x64`; build intermediates use the normal `target` and Visual Studio output directories. Compile the user-level installer with Inno Setup 6 using `installer/OpenShazam.iss`.
 
-## Run
-
-Check configuration:
-
-```sh
-cargo run --locked -p shazam-http-lab -- config-check
-```
-
-Recognize an audio file:
-
-```sh
-cargo run --locked -p shazam-http-lab -- audio-live <audio-file> <seconds>
-cargo run --locked -p shazam-http-lab -- audio-progressive-live <audio-file> <seconds>
-```
-
-Capture from a microphone on macOS:
-
-```sh
-cargo run --locked -p openshazam -- recognize-microphone-progressive
-```
-
-Capture system audio on Windows:
-
-```sh
-cargo run --locked -p openshazam -- list-devices
-cargo run --locked -p openshazam -- recognize-loopback [device-id]
-```
-
-Launch the Windows tray UI:
-
-```sh
-cargo build --locked -p shazam-http-lab -p openshazam
-cargo run --locked -p openshazam -- ui
-```
-
-### Windows UI page links
-
-The Windows tray UI resolves `UiConfigSnapshot.web_track_url_template` with a
-result's `track_key`, validates the resulting Shazam HTTPS URL, and opens it in
-the default browser. The link stays disabled if either input is unavailable;
-the UI does not guess a URL. Config snapshots omit recognition endpoints,
-installation IDs, and other Config values.
-
-For CLI hosts, set `OPENSHZAM_UI_CONFIG_SNAPSHOT_JSONL=1` together with
-`--events-jsonl`. This opts into independent `openshazam.ui-config-snapshot.v1`
-and `openshazam.ui-recognition-input.v1` records. Each result wrapper names the
-generation of the Config snapshot used by that recognition session. Without
-the environment variable, the pre-existing JSONL records remain unchanged.
-
-```sh
-OPENSHZAM_UI_CONFIG_SNAPSHOT_JSONL=1 cargo run --locked -p openshazam -- \
-  recognize-microphone-progressive --events-jsonl
-```
+Windows releases are built from stable `vMAJOR.MINOR.PATCH` tags by GitHub Actions. Releases include an Inno Setup installer, its SHA-256 checksum, and an Ed25519-signed update manifest. Authenticode signing is optional. See [Windows release notes](docs/windows-release.md) for the required update signing secret.

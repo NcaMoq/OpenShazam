@@ -2092,6 +2092,8 @@ fn spawn_http_client_with_dispatch<F>(
 where
     F: FnOnce(),
 {
+    #[cfg(windows)]
+    suppress_child_console(command);
     let child = command
         .spawn()
         .map_err(|_| Error::Transport("could not start the system HTTPS client".into()))?;
@@ -2126,6 +2128,13 @@ fn system_curl_program() -> &'static str {
     "/usr/bin/curl"
 }
 
+#[cfg(windows)]
+fn suppress_child_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
 /// Fetch the current Shazam Config using an ordinary verified HTTPS GET.
 /// Redirects, cookies, proxies, AMP credentials, and Shazam app storage are
 /// not used. The response is parsed in memory and only `inid`, the Manual
@@ -2135,7 +2144,10 @@ fn system_curl_program() -> &'static str {
 pub fn fetch_shazam_config(profile: &ConfigRequestProfile) -> Result<ShazamConfiguration, Error> {
     let url = build_config_url(profile)?;
     let app_version_header = format!("X-Shazam-AppVersion: {}", profile.app_version);
-    let mut child = Command::new(system_curl_program())
+    let mut command = Command::new(system_curl_program());
+    #[cfg(windows)]
+    suppress_child_console(&mut command);
+    let mut child = command
         .args([
             "--disable",
             "--noproxy",
@@ -2630,7 +2642,9 @@ where
 #[cfg(windows)]
 pub fn windows_config_request_profile() -> Result<ConfigRequestProfile, Error> {
     const SCRIPT: &str = r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $culture=Get-Culture; $os=Get-CimInstance Win32_OperatingSystem; $computer=Get-CimInstance Win32_ComputerSystem; [ordered]@{language=$culture.TwoLetterISOLanguageName; locale=$culture.Name; model=$computer.Model; os_version=$os.Version; os_build=$os.BuildNumber} | ConvertTo-Json -Compress"#;
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    suppress_child_console(&mut command);
+    let output = command
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -2985,9 +2999,12 @@ fn track_candidate(track: &Value, origin: TrackCandidateOrigin) -> Option<TrackC
     // root result without subtitle is withheld instead of fabricating a value.
     let artist = match origin {
         TrackCandidateOrigin::RootTrack => track.get("subtitle").and_then(Value::as_str),
+        // Matcher entries can expose a distinct scalar `artist` alongside
+        // their presentation subtitle; use the explicit artist field first.
         TrackCandidateOrigin::MatchesEntry => track
-            .get("subtitle")
+            .get("artist")
             .and_then(Value::as_str)
+            .or_else(|| track.get("subtitle").and_then(Value::as_str))
             .or_else(|| {
                 track
                     .get("heading")

@@ -69,10 +69,8 @@ fn find_resource_compiler() -> Option<PathBuf> {
             if path.is_file() {
                 return Some(path);
             }
-        } else {
-            if let Some(compiler) = find_rc_in_sdk_bin(&path, architecture) {
-                return Some(compiler);
-            }
+        } else if let Some(compiler) = find_rc_in_sdk_bin(&path, architecture) {
+            return Some(compiler);
         }
     }
 

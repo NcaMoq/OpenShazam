@@ -1,0 +1,106 @@
+name: Publish Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish Windows x64 installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - uses: NuGet/setup-nuget@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.85.0'
+      - name: Require the Ed25519 release signing key
+        shell: pwsh
+        env:
+          OPEN_SHAZAM_UPDATE_SIGNING_KEY_BASE64: ${{ secrets.OPEN_SHAZAM_UPDATE_SIGNING_KEY_BASE64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:OPEN_SHAZAM_UPDATE_SIGNING_KEY_BASE64)) {
+            throw 'Configure the protected OPEN_SHAZAM_UPDATE_SIGNING_KEY_BASE64 Actions secret before creating a stable release.'
+          }
+      - name: Validate stable release version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $tagMatch = [regex]::Match($tag, '^v(?<version>(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*))$')
+          if (-not $tagMatch.Success) {
+            throw "Release tags must be stable vMAJOR.MINOR.PATCH values: $tag"
+          }
+          $tagVersion = $tagMatch.Groups['version'].Value
+          $cargo = Get-Content -LiteralPath Cargo.toml -Raw
+          $section = [regex]::Match($cargo, '(?ms)^\[workspace\.package\]\s*(?<body>.*?)(?=^\[|\z)')
+          if (-not $section.Success) { throw 'Cargo.toml has no [workspace.package] section.' }
+          $manifestVersion = [regex]::Match($section.Groups['body'].Value, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"')
+          if (-not $manifestVersion.Success -or $manifestVersion.Groups['version'].Value -cne $tagVersion) {
+            throw "Release tag $tag must match the Cargo workspace version."
+          }
+          "version=$tagVersion" >> $env:GITHUB_OUTPUT
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --version=6.7.3 --yes --no-progress
+      - name: Prepare the fixed runtime output directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path dist/windows-x64 -Force | Out-Null
+      - name: Build the unpackaged Windows application
+        shell: pwsh
+        run: .\tools\build-windows.ps1 -Product
+      - name: Prepare the Windows App SDK runtime prerequisite
+        shell: pwsh
+        run: .\tools\prepare-windows-app-sdk-runtime.ps1
+      - name: Optionally Authenticode-sign application binaries
+        shell: pwsh
+        env:
+          OPEN_SHAZAM_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          OPEN_SHAZAM_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: .\tools\sign-windows-artifacts.ps1 -Path @('dist/windows-x64/openshazam.exe', 'dist/windows-x64/OpenShazam.SettingsHost.dll')
+      - name: Compile installer
+        shell: pwsh
+        env:
+          OPEN_SHAZAM_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler is missing: $iscc" }
+          & $iscc /Qp installer\OpenShazam.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE." }
+          $installer = Join-Path $PWD "dist\windows-x64\Shazam-Setup-$env:OPEN_SHAZAM_VERSION-x64.exe"
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw 'The installer was not produced.' }
+      - name: Optionally Authenticode-sign installer
+        shell: pwsh
+        env:
+          OPEN_SHAZAM_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          OPEN_SHAZAM_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: .\tools\sign-windows-artifacts.ps1 -Path "dist/windows-x64/Shazam-Setup-${{ steps.version.outputs.version }}-x64.exe"
+      - name: Sign and verify the update manifest and installer hash
+        shell: pwsh
+        env:
+          OPEN_SHAZAM_UPDATE_SIGNING_KEY_BASE64: ${{ secrets.OPEN_SHAZAM_UPDATE_SIGNING_KEY_BASE64 }}
+        run: |
+          .\tools\prepare-release-update.ps1 -Version '${{ steps.version.outputs.version }}' -MinimumSupportedVersion '0.1.0'
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Shazam ${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/windows-x64/Shazam-Setup-${{ steps.version.outputs.version }}-x64.exe
+            dist/windows-x64/Shazam-Setup-${{ steps.version.outputs.version }}-x64.exe.sha256
+            dist/windows-x64/OpenShazam-update.json
+            dist/windows-x64/OpenShazam-update.json.sig

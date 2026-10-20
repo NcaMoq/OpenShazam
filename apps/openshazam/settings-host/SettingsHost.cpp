@@ -1,7 +1,6 @@
 // WinUI 3 Settings XAML Island hosted IN the native Rust/Win32 process.
 // No second recognition controller, process, webview, or legacy Win32 settings UI.
 #include "pch.h"
-#include <appmodel.h>
 #include <shellapi.h>
 #include <algorithm>
 #include <cwchar>
@@ -12,6 +11,7 @@
 #include <vector>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.System.h>
+#include <winrt/Windows.UI.h>
 #include <winrt/Microsoft.UI.Windowing.h>
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
 #include <winrt/Microsoft.UI.Xaml.Input.h>
@@ -35,8 +35,6 @@ namespace dispatch = winrt::Microsoft::UI::Dispatching;
 namespace automation = winrt::Microsoft::UI::Xaml::Automation;
 namespace markup = winrt::Microsoft::UI::Xaml::Markup;
 namespace typeinfo = winrt::Microsoft::UI::Xaml::XamlTypeInfo;
-namespace appmodel = winrt::Windows::ApplicationModel;
-namespace viewmanagement = winrt::Windows::UI::ViewManagement;
 
 namespace
 {
@@ -72,7 +70,6 @@ namespace
     };
 
     constexpr wchar_t kSettingsClass[] = L"OpenShazamWinUI3Preferences";
-    constexpr wchar_t kStartupTask[] = L"OpenShazamStartup";
     constexpr UINT WM_APPEARANCE_CHANGED = WM_APP + 0x48;
     constexpr UINT WM_GLOBAL_SHORTCUT_CHANGED = WM_APP + 0x4a;
     constexpr UINT WM_GLOBAL_SHORTCUT_CAPTURE = WM_APP + 0x4b;
@@ -82,7 +79,9 @@ namespace
     constexpr uint32_t kAppearanceDark = 2;
     constexpr uint32_t kLanguageJapanese = 1;
     constexpr uint32_t kLanguageEnglish = 2;
-    constexpr double kSettingsContentGutterDips = 24.0;
+    // WinUI's left-navigation silhouette reserves 56 epx between the pane
+    // and page content. Keep the content on that grid at every window size.
+    constexpr double kSettingsContentGutterDips = 56.0;
     constexpr double kSettingsCardPaddingDips = 16.0;
     constexpr double kSettingsSectionSpacingDips = 12.0;
     constexpr double kSettingsInlineMessageSpacingDips = 8.0;
@@ -96,24 +95,6 @@ namespace
     constexpr wchar_t kStartupRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kStartupRunValue[] = L"OpenShazam";
     uint32_t g_uiLanguage{};
-
-    enum class PackageIdentityStatus
-    {
-        Packaged,
-        Unpackaged,
-        Unknown,
-    };
-
-    PackageIdentityStatus GetPackageIdentityStatus() noexcept
-    {
-        UINT32 length = 0;
-        const LONG result = ::GetCurrentPackageFullName(&length, nullptr);
-        if (result == ERROR_INSUFFICIENT_BUFFER || result == ERROR_SUCCESS)
-            return PackageIdentityStatus::Packaged;
-        if (result == 15700 /* APPMODEL_ERROR_NO_PACKAGE */)
-            return PackageIdentityStatus::Unpackaged;
-        return PackageIdentityStatus::Unknown;
-    }
 
     [[noreturn]] void ThrowRegistryError(LSTATUS error, char const* operation)
     {
@@ -149,7 +130,7 @@ namespace
         return L"\"" + CurrentExecutablePath() + L"\" ui --startup";
     }
 
-    bool RunStartupEnabled()
+    bool HasMatchingRunStartupValue()
     {
         RunRegistryKey key;
         LSTATUS status = ::RegOpenKeyExW(HKEY_CURRENT_USER, kStartupRunKey, 0,
@@ -163,15 +144,63 @@ namespace
             nullptr, &byteCount);
         if (status == ERROR_FILE_NOT_FOUND) return false;
         if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegQueryValueExW failed");
-        if (type != REG_SZ || byteCount < sizeof(wchar_t)) return false;
+        if (type != REG_SZ || byteCount < sizeof(wchar_t) || byteCount % sizeof(wchar_t) != 0)
+            throw std::runtime_error("The Shazam startup entry is not a valid REG_SZ value.");
 
-        std::vector<wchar_t> value(byteCount / sizeof(wchar_t) + 1, L'\0');
+        std::vector<wchar_t> value(byteCount / sizeof(wchar_t), L'\0');
         status = ::RegQueryValueExW(key.value, kStartupRunValue, nullptr, &type,
             reinterpret_cast<BYTE*>(value.data()), &byteCount);
         if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegQueryValueExW failed");
-        const std::wstring actual(value.data());
+        if (value.empty() || value.back() != L'\0' ||
+            std::find(value.begin(), value.end() - 1, L'\0') != value.end() - 1)
+            throw std::runtime_error("The Shazam startup entry has malformed quoting or termination.");
+        const std::wstring actual(value.begin(), value.end() - 1);
         const std::wstring expected = StartupCommand();
-        return ::CompareStringOrdinal(actual.c_str(), -1, expected.c_str(), -1, TRUE) == CSTR_EQUAL;
+        if (::CompareStringOrdinal(actual.c_str(), -1, expected.c_str(), -1, TRUE) != CSTR_EQUAL)
+            throw std::runtime_error("The Shazam startup entry does not match this installation.");
+        return true;
+    }
+
+    bool StartupDisabledInWindows()
+    {
+        constexpr wchar_t kStartupApprovedKey[] =
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+        RunRegistryKey key;
+        LSTATUS status = ::RegOpenKeyExW(HKEY_CURRENT_USER, kStartupApprovedKey, 0,
+            KEY_QUERY_VALUE, &key.value);
+        if (status == ERROR_FILE_NOT_FOUND) return false;
+        if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegOpenKeyExW failed");
+
+        DWORD type = 0;
+        DWORD byteCount = 0;
+        status = ::RegQueryValueExW(key.value, kStartupRunValue, nullptr, &type,
+            nullptr, &byteCount);
+        if (status == ERROR_FILE_NOT_FOUND) return false;
+        if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegQueryValueExW failed");
+        if (type != REG_BINARY || byteCount == 0)
+            throw std::runtime_error("Windows returned an invalid startup approval state.");
+
+        std::vector<BYTE> state(byteCount);
+        status = ::RegQueryValueExW(key.value, kStartupRunValue, nullptr, &type,
+            state.data(), &byteCount);
+        if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegQueryValueExW failed");
+        if (state[0] == 0x03) return true;
+        if (state[0] == 0x02) return false;
+        throw std::runtime_error("Windows returned an unknown startup approval state.");
+    }
+
+    struct StartupStatus
+    {
+        bool enabled{};
+        bool canChange{ true };
+        bool disabledByWindows{};
+    };
+
+    StartupStatus ReadStartupStatus()
+    {
+        if (!HasMatchingRunStartupValue()) return {};
+        if (StartupDisabledInWindows()) return { false, false, true };
+        return { true, true, false };
     }
 
     void SetRunStartupEnabled(bool enable)
@@ -180,6 +209,9 @@ namespace
         LSTATUS status = ERROR_SUCCESS;
         if (enable)
         {
+            if (StartupDisabledInWindows())
+                throw std::runtime_error("Windows has disabled Shazam in Startup apps.");
+            if (HasMatchingRunStartupValue()) return;
             DWORD disposition = 0;
             status = ::RegCreateKeyExW(HKEY_CURRENT_USER, kStartupRunKey, 0, nullptr,
                 REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr, &key.value, &disposition);
@@ -196,70 +228,10 @@ namespace
             KEY_SET_VALUE, &key.value);
         if (status == ERROR_FILE_NOT_FOUND) return;
         if (status != ERROR_SUCCESS) ThrowRegistryError(status, "RegOpenKeyExW failed");
+        if (!HasMatchingRunStartupValue()) return;
         status = ::RegDeleteValueW(key.value, kStartupRunValue);
         if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND)
             ThrowRegistryError(status, "RegDeleteValueW failed");
-    }
-
-    bool SystemUsesDarkAppearance() noexcept
-    {
-        try
-        {
-            viewmanagement::UISettings settings;
-            auto foreground = settings.GetColorValue(viewmanagement::UIColorType::Foreground);
-            const auto red = static_cast<uint32_t>(foreground.R * 255.0f + 0.5f);
-            const auto green = static_cast<uint32_t>(foreground.G * 255.0f + 0.5f);
-            const auto blue = static_cast<uint32_t>(foreground.B * 255.0f + 0.5f);
-            return 5u * green + 2u * red + blue > 8u * 128u;
-        }
-        catch (...)
-        {
-            return false;
-        }
-    }
-
-    void ApplyTitleBarTheme(HWND window, uint32_t appearanceMode) noexcept
-    {
-        if (!window) return;
-
-        // AppWindow owns the WinUI 3 title-bar theme on Windows 11. Use the
-        // app's current light/dark selection directly so the native caption
-        // does not stay light while the XAML island is dark.
-        try
-        {
-            auto appWindow = winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(
-                winrt::Microsoft::UI::GetWindowIdFromWindow(window));
-            if (appWindow &&
-                winrt::Microsoft::UI::Windowing::AppWindowTitleBar::IsCustomizationSupported())
-            {
-                auto titleBarTheme = appearanceMode == kAppearanceSystem
-                    ? winrt::Microsoft::UI::Windowing::TitleBarTheme::UseDefaultAppMode
-                    : (appearanceMode == kAppearanceDark
-                        ? winrt::Microsoft::UI::Windowing::TitleBarTheme::Dark
-                        : winrt::Microsoft::UI::Windowing::TitleBarTheme::Light);
-                appWindow.TitleBar().PreferredTheme(titleBarTheme);
-                return;
-            }
-        }
-        catch (...)
-        {
-            // The HWND may not have an AppWindow on older Windows versions.
-            // Keep the documented DWM fallback below for those systems.
-        }
-
-        BOOL useDarkMode = appearanceMode == kAppearanceSystem
-            ? (SystemUsesDarkAppearance() ? TRUE : FALSE)
-            : (appearanceMode == kAppearanceDark ? TRUE : FALSE);
-        auto setAttribute = [&](DWORD attribute) {
-            return SUCCEEDED(::DwmSetWindowAttribute(
-                window,
-                static_cast<DWMWINDOWATTRIBUTE>(attribute),
-                &useDarkMode,
-                sizeof(useDarkMode)));
-        };
-        // Attribute 20 is the documented Windows 11 value. Windows 10
-        // 1903 used value 19 before the public SDK constant was added.
-        if (!setAttribute(20)) setAttribute(19);
     }
 
     bool IsJapanese() noexcept
@@ -282,6 +254,25 @@ namespace
     winrt::hstring Localized(wchar_t const* en, wchar_t const* ja)
     {
         return IsJapanese() ? winrt::hstring(ja) : winrt::hstring(en);
+    }
+
+    winrt::Windows::Foundation::Uri GetTitleBarIconUri()
+    {
+        std::wstring executablePath(32768, L'\0');
+        const auto length = ::GetModuleFileNameW(nullptr,
+            executablePath.data(), static_cast<DWORD>(executablePath.size()));
+        if (length == 0 || length >= executablePath.size())
+            winrt::throw_last_error();
+        executablePath.resize(length);
+        const auto separator = executablePath.find_last_of(L"\\/");
+        if (separator == std::wstring::npos)
+            throw std::runtime_error("Could not resolve the app icon path.");
+
+        executablePath.resize(separator + 1);
+        executablePath += L"OpenShazamSquare44.png";
+        std::replace(executablePath.begin(), executablePath.end(), L'\\', L'/');
+        return winrt::Windows::Foundation::Uri(
+            winrt::hstring(L"file:///" + executablePath));
     }
 
     std::wstring FormatShortcut(uint32_t modifiers, uint32_t key)
@@ -333,6 +324,8 @@ namespace
         controls::InfoBar startupInfoBar{ nullptr };
         controls::ComboBox appearance{ nullptr };
         controls::ComboBox language{ nullptr };
+        controls::Grid shellRoot{ nullptr };
+        controls::TitleBar titleBar{ nullptr };
         controls::NavigationView navigation{ nullptr };
         controls::Button shortcutButton{ nullptr };
         controls::InfoBar shortcutInfoBar{ nullptr };
@@ -345,6 +338,7 @@ namespace
         controls::TextBlock historyEmpty{ nullptr };
         controls::TextBlock historyTitle{ nullptr };
         controls::NavigationViewItem historyNavigationItem{ nullptr };
+        winrt::Microsoft::UI::Windowing::AppWindowTitleBar appWindowTitleBar{ nullptr };
         std::vector<HistoryRow> historySnapshot;
         controls::Border startupCard{ nullptr };
         controls::Border appearanceCard{ nullptr };
@@ -366,8 +360,80 @@ namespace
         bool appearanceLoading{ true };
         bool languageLoading{ true };
         bool shortcutRecording{};
+        bool customTitleBarActive{};
         bool alive{ true };
     };
+
+    bool FindFirstButton(
+        x::DependencyObject const& parent,
+        controls::Button& result)
+    {
+        const auto count = media::VisualTreeHelper::GetChildrenCount(parent);
+        for (int32_t index = 0; index < count; ++index)
+        {
+            auto child = media::VisualTreeHelper::GetChild(parent, index);
+            if (auto button = child.try_as<controls::Button>())
+            {
+                result = button;
+                return true;
+            }
+            if (FindFirstButton(child, result)) return true;
+        }
+        return false;
+    }
+
+    void UpdateTitleBarDragRegions(std::shared_ptr<SettingsState> const& state) noexcept
+    {
+        if (!state || !state->alive || !state->customTitleBarActive ||
+            !state->appWindowTitleBar || !state->titleBar || !state->shellRoot || !state->hwnd)
+            return;
+
+        try
+        {
+            RECT client{};
+            if (!::GetClientRect(state->hwnd, &client)) return;
+            const double scale = state->titleBar.XamlRoot().RasterizationScale();
+            if (scale <= 0.0) return;
+
+            const auto rowTopDip = state->titleBar.TransformToVisual(state->shellRoot)
+                .TransformPoint({ 0.0, 0.0 }).Y;
+            const auto top = static_cast<int32_t>(std::max(0.0, std::round(rowTopDip * scale)));
+            const auto bottom = static_cast<int32_t>(std::min(
+                static_cast<double>(client.bottom),
+                std::round((rowTopDip + state->titleBar.ActualHeight()) * scale)));
+            const auto right = std::max<int32_t>(0,
+                (client.right - client.left) - state->appWindowTitleBar.RightInset());
+            if (bottom <= top || right <= 0) return;
+
+            std::vector<winrt::Windows::Graphics::RectInt32> dragRegions;
+            controls::Button backButton{ nullptr };
+            if (FindFirstButton(state->titleBar, backButton) &&
+                backButton.Visibility() == x::Visibility::Visible && backButton.IsEnabled())
+            {
+                const auto origin = backButton.TransformToVisual(state->shellRoot)
+                    .TransformPoint({ 0.0, 0.0 });
+                const auto leftOfButton = static_cast<int32_t>(std::max(
+                    0.0, std::round(origin.X * scale)));
+                const auto rightOfButton = static_cast<int32_t>(std::min(
+                    static_cast<double>(right),
+                    std::round((origin.X + backButton.ActualWidth()) * scale)));
+                if (leftOfButton > 0)
+                    dragRegions.push_back({ 0, top, leftOfButton, bottom - top });
+                if (rightOfButton < right)
+                    dragRegions.push_back({ rightOfButton, top,
+                        right - rightOfButton, bottom - top });
+            }
+            else
+            {
+                dragRegions.push_back({ 0, top, right, bottom - top });
+            }
+            state->appWindowTitleBar.SetDragRectangles(dragRegions);
+        }
+        catch (...)
+        {
+            // Layout can be transient while the XAML island is measuring or changing DPI.
+        }
+    }
 
     void EndShortcutCaptureNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
     {
@@ -398,10 +464,11 @@ namespace
             !state->startupRow || !state->appearanceRow || !state->languageRow ||
             !state->shortcutRow)
             return;
-        const double paneWidth = state->navigation.IsPaneOpen()
-            ? state->navigation.OpenPaneLength()
-            : state->navigation.CompactPaneLength();
-        const double cardWidth = fullWidthDips - paneWidth - 48.0;
+        // LeftCompact opens as an overlay, so the content viewport stays the
+        // same width. Calculate from the persistent compact rail only.
+        const double paneWidth = state->navigation.CompactPaneLength();
+        const double cardWidth = fullWidthDips - paneWidth -
+            (2.0 * kSettingsContentGutterDips);
         if (cardWidth <= 28.0) return;
         state->startupCard.Width(cardWidth);
         state->appearanceCard.Width(cardWidth);
@@ -739,13 +806,28 @@ namespace
         if (!state || !state->alive) return;
         if (mode > kAppearanceDark) mode = kAppearanceSystem;
         state->appearanceMode = mode;
-        if (state->navigation)
+        if (state->shellRoot)
         {
             auto theme = mode == kAppearanceDark ? x::ElementTheme::Dark :
                 mode == kAppearanceLight ? x::ElementTheme::Light : x::ElementTheme::Default;
-            state->navigation.RequestedTheme(theme);
+            state->shellRoot.RequestedTheme(theme);
         }
-        ApplyTitleBarTheme(state->hwnd, mode);
+        if (state->customTitleBarActive && state->appWindowTitleBar)
+        {
+            try
+            {
+                const auto titleBarTheme = mode == kAppearanceSystem
+                    ? winrt::Microsoft::UI::Windowing::TitleBarTheme::UseDefaultAppMode
+                    : (mode == kAppearanceDark
+                        ? winrt::Microsoft::UI::Windowing::TitleBarTheme::Dark
+                        : winrt::Microsoft::UI::Windowing::TitleBarTheme::Light);
+                state->appWindowTitleBar.PreferredTheme(titleBarTheme);
+            }
+            catch (...)
+            {
+                // Older Windows versions retain their native title-bar theme.
+            }
+        }
     }
 
     void ShowStartupInfoNoThrow(
@@ -840,67 +922,34 @@ namespace
                     L"Windows から現在の状態を取得できませんでした。設定を開き直してください。"));
     }
 
-    void ReportStartupPolicyNoThrow(
-        std::shared_ptr<SettingsState> const& state,
-        appmodel::StartupTaskState current) noexcept
+    void ReportStartupDisabledByWindowsNoThrow(
+        std::shared_ptr<SettingsState> const& state) noexcept
     {
         if (!state || !state->alive) return;
-        const bool enabled = current == appmodel::StartupTaskState::EnabledByPolicy;
-        if (current != appmodel::StartupTaskState::EnabledByPolicy &&
-            current != appmodel::StartupTaskState::DisabledByUser &&
-            current != appmodel::StartupTaskState::DisabledByPolicy)
-        {
-            ReportStartupFailureNoThrow(state, false);
-            return;
-        }
-        ApplyStartupStateNoThrow(state, enabled, false);
+        ApplyStartupStateNoThrow(state, false, false);
         ShowStartupInfoNoThrow(
             state,
             controls::InfoBarSeverity::Informational,
-            current == appmodel::StartupTaskState::DisabledByUser
-                ? Localized(L"Start on sign-in is off in Windows", L"Windows 側で自動起動がオフです")
-                : Localized(L"Start on sign-in is managed", L"自動起動は管理されています"),
-            current == appmodel::StartupTaskState::DisabledByUser
-                ? Localized(
-                    L"Windows has disabled startup for this app. Change it in Windows Startup settings.",
-                    L"Windows 側でこのアプリの自動起動が無効です。Windows のスタートアップ設定から変更してください。")
-                : Localized(
-                    L"This setting is controlled by your organization.",
-                    L"この設定は組織のポリシーによって管理されています。"));
+            Localized(L"Start on sign-in is off in Windows", L"Windows \u5074\u3067\u81ea\u52d5\u8d77\u52d5\u304c\u30aa\u30d5\u3067\u3059"),
+            Localized(
+                L"Windows has disabled startup for Shazam. Change it in Windows Startup settings.",
+                L"Windows \u5074\u3067 Shazam \u306e\u81ea\u52d5\u8d77\u52d5\u304c\u7121\u52b9\u3067\u3059\u3002Windows \u306e\u30b9\u30bf\u30fc\u30c8\u30a2\u30c3\u30d7\u8a2d\u5b9a\u304b\u3089\u5909\u66f4\u3057\u3066\u304f\u3060\u3055\u3044."));
+
     }
 
-    winrt::fire_and_forget RefreshStartup(std::weak_ptr<SettingsState> weak)
+    void RefreshStartup(std::weak_ptr<SettingsState> weak)
     {
         auto state = weak.lock();
-        if (!state || !state->alive) co_return;
+        if (!state || !state->alive) return;
         try
         {
             state->startupLoading = true;
             state->toggle.IsEnabled(false);
-            const auto packageStatus = GetPackageIdentityStatus();
-            if (packageStatus == PackageIdentityStatus::Unpackaged)
-            {
-                ApplyStartupStateNoThrow(state, RunStartupEnabled(), true);
-                co_return;
-            }
-            if (packageStatus != PackageIdentityStatus::Packaged)
-            {
-                ReportStartupFailureNoThrow(state, false);
-                co_return;
-            }
-            auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
-            if (!state->alive) co_return;
-            auto current = task.State();
-            if (current == appmodel::StartupTaskState::Disabled)
-                ApplyStartupStateNoThrow(state, false, true);
-            else if (current == appmodel::StartupTaskState::Enabled)
-                ApplyStartupStateNoThrow(state, true, true);
+            const auto current = ReadStartupStatus();
+            if (current.disabledByWindows)
+                ReportStartupDisabledByWindowsNoThrow(state);
             else
-                ReportStartupPolicyNoThrow(state, current);
-        }
-        catch (winrt::hresult_error const&)
-        {
-            ReportStartupFailureNoThrow(state, false);
+                ApplyStartupStateNoThrow(state, current.enabled, current.canChange);
         }
         catch (...)
         {
@@ -908,43 +957,21 @@ namespace
         }
     }
 
-    winrt::fire_and_forget ChangeStartup(std::weak_ptr<SettingsState> weak, bool enable)
+    void ChangeStartup(std::weak_ptr<SettingsState> weak, bool enable)
     {
         auto state = weak.lock();
-        if (!state || !state->alive) co_return;
+        if (!state || !state->alive) return;
         try
         {
             state->startupLoading = true;
             state->toggle.IsEnabled(false);
-            const auto packageStatus = GetPackageIdentityStatus();
-            if (packageStatus == PackageIdentityStatus::Unpackaged)
-            {
-                SetRunStartupEnabled(enable);
-                if (!state->alive) co_return;
-                ApplyStartupStateNoThrow(state, enable, true);
-                co_return;
-            }
-            if (packageStatus != PackageIdentityStatus::Packaged)
-            {
-                ReportStartupFailureNoThrow(state, true);
-                co_return;
-            }
-            auto task = co_await appmodel::StartupTask::GetAsync(kStartupTask);
-            if (!state->alive) co_return;
-            if (enable)
-            {
-                co_await task.RequestEnableAsync();
-            }
+            SetRunStartupEnabled(enable);
+            if (!state->alive) return;
+            const auto current = ReadStartupStatus();
+            if (current.disabledByWindows)
+                ReportStartupDisabledByWindowsNoThrow(state);
             else
-            {
-                task.Disable();
-            }
-            if (!state->alive) co_return;
-            RefreshStartup(weak);
-        }
-        catch (winrt::hresult_error const&)
-        {
-            ReportStartupFailureNoThrow(state, true);
+                ApplyStartupStateNoThrow(state, current.enabled, current.canChange);
         }
         catch (...)
         {
@@ -990,7 +1017,10 @@ namespace
             wc.hIcon = ::LoadIconW(instance, MAKEINTRESOURCEW(101));
             wc.lpszClassName = kSettingsClass;
             wc.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
-            wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+            // The XAML island paints the entire client area. Avoid the native
+            // COLOR_WINDOW erase, which flashes white and conflicts with the
+            // WinUI theme surface during startup and theme changes.
+            wc.hbrBackground = static_cast<HBRUSH>(::GetStockObject(NULL_BRUSH));
             if (!::RegisterClassW(&wc) && ::GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
                 winrt::throw_last_error();
 
@@ -1002,7 +1032,33 @@ namespace
                 ::MulDiv(kWidthDips, dpi, 96), ::MulDiv(kHeightDips, dpi, 96),
                 parent, nullptr, instance, nullptr);
             if (!hwnd) winrt::throw_last_error();
-            ApplyTitleBarTheme(hwnd, kAppearanceSystem);
+            state = std::make_shared<SettingsState>();
+            state->owner = owner;
+            state->hwnd = hwnd;
+            state->languageId = g_uiLanguage;
+            try
+            {
+                auto appWindow = winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(
+                    winrt::Microsoft::UI::GetWindowIdFromWindow(hwnd));
+                if (appWindow &&
+                    winrt::Microsoft::UI::Windowing::AppWindowTitleBar::IsCustomizationSupported())
+                {
+                    state->appWindowTitleBar = appWindow.TitleBar();
+                    state->appWindowTitleBar.ExtendsContentIntoTitleBar(true);
+                    state->appWindowTitleBar.PreferredHeightOption(
+                        winrt::Microsoft::UI::Windowing::TitleBarHeightOption::Tall);
+                    const auto transparentCaptionBackground = winrt::box_value(
+                        winrt::Windows::UI::Color{ 0, 0, 0, 0 })
+                        .as<winrt::Windows::Foundation::IReference<winrt::Windows::UI::Color>>();
+                    state->appWindowTitleBar.ButtonBackgroundColor(transparentCaptionBackground);
+                    state->appWindowTitleBar.ButtonInactiveBackgroundColor(transparentCaptionBackground);
+                    state->customTitleBarActive = true;
+                }
+            }
+            catch (...)
+            {
+                // Older Windows versions keep the standard non-client title bar.
+            }
             island = hosting::DesktopWindowXamlSource{};
             island.Initialize(winrt::Microsoft::UI::GetWindowIdFromWindow(hwnd));
             islandHwnd = winrt::Microsoft::UI::GetWindowFromWindowId(island.SiteBridge().WindowId());
@@ -1019,10 +1075,6 @@ namespace
             auto styleError = ::GetLastError();
             if (previousStyle == 0 && styleError != ERROR_SUCCESS)
                 winrt::throw_last_error();
-            state = std::make_shared<SettingsState>();
-            state->owner = owner;
-            state->hwnd = hwnd;
-            state->languageId = g_uiLanguage;
             island.Content(BuildContent());
             Layout();
             RefreshStartup(state);
@@ -1033,7 +1085,8 @@ namespace
             state->settingsContent = controls::StackPanel{};
             auto stack = state->settingsContent;
             stack.Spacing(kSettingsSectionSpacingDips);
-            stack.Padding(x::ThicknessHelper::FromUniformLength(kSettingsContentGutterDips));
+            stack.Padding(x::ThicknessHelper::FromLengths(
+                kSettingsContentGutterDips, 24.0, kSettingsContentGutterDips, 24.0));
 
             controls::TextBlock pageTitle;
             pageTitle.Text(Localized(L"Settings", L"\u8A2D\u5B9A"));
@@ -1504,23 +1557,24 @@ namespace
             shortcutSection.Children().Append(state->shortcutInfoBar);
             stack.Children().Append(shortcutSection);
 
-            // Keep each page background as a XAML ThemeResource expression so
-            // the WinUI content follows the selected app theme.
+            // Leave page surfaces transparent so NavigationView's stock
+            // content surface and theme resources remain visible.
             state->settingsViewer = markup::XamlReader::Load(
-                LR"(<ScrollViewer xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" />)"
+                LR"(<ScrollViewer xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />)"
             ).as<controls::ScrollViewer>();
             state->settingsViewer.Content(stack);
             state->settingsViewer.VerticalScrollBarVisibility(controls::ScrollBarVisibility::Auto);
             state->settingsViewer.HorizontalScrollBarVisibility(controls::ScrollBarVisibility::Disabled);
 
             state->historyViewer = markup::XamlReader::Load(
-                LR"(<ScrollViewer xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" />)"
+                LR"(<ScrollViewer xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />)"
             ).as<controls::ScrollViewer>();
             state->historyViewer.VerticalScrollBarVisibility(controls::ScrollBarVisibility::Auto);
             state->historyViewer.HorizontalScrollBarVisibility(controls::ScrollBarVisibility::Disabled);
             state->historyContent = controls::StackPanel{};
             state->historyContent.Spacing(12.0);
-            state->historyContent.Padding(x::ThicknessHelper::FromUniformLength(24.0));
+            state->historyContent.Padding(x::ThicknessHelper::FromLengths(
+                kSettingsContentGutterDips, 24.0, kSettingsContentGutterDips, 24.0));
 
             controls::TextBlock historyTitle;
             state->historyTitle = historyTitle;
@@ -1554,22 +1608,77 @@ namespace
             state->pageHost.Children().Append(state->settingsViewer);
             state->pageHost.Children().Append(state->historyViewer);
 
-            // Keep the rail on the same theme surface as the content. The
-            // native host window is intentionally Win32-owned, so its default
-            // COLOR_WINDOW brush must not show through an empty NavigationView
-            // pane (which otherwise appears as a white strip in dark mode).
+            // The root fills the XAML island with WinUI's themed page surface.
+            // NavigationView can then use its own default pane and content
+            // resources instead of inheriting the native host's light color.
+            state->shellRoot = markup::XamlReader::Load(
+                LR"(<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" />)"
+            ).as<controls::Grid>();
+            if (state->customTitleBarActive)
+            {
+                state->titleBar = markup::XamlReader::Load(
+                    LR"(<TitleBar xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />)"
+                ).as<controls::TitleBar>();
+                state->titleBar.Title(Localized(L"Shazam", L"Shazam"));
+                state->titleBar.IsBackButtonVisible(true);
+                state->titleBar.IsBackButtonEnabled(true);
+                // Keep NavigationView's stock pane toggle in its own row.
+                state->titleBar.IsPaneToggleButtonVisible(false);
+                controls::BitmapIconSource iconSource;
+                iconSource.UriSource(GetTitleBarIconUri());
+                iconSource.ShowAsMonochrome(false);
+                state->titleBar.IconSource(iconSource);
+                state->titleBar.BackRequested([weak](auto const&, auto const&) {
+                    if (auto state = weak.lock(); state && state->alive)
+                    {
+                        if (state->historyViewer.Visibility() == x::Visibility::Visible)
+                            state->navigation.SelectedItem(state->navigation.SettingsItem());
+                        else
+                            ::SendMessageW(state->hwnd, WM_CLOSE, 0, 0);
+                    }
+                });
+
+                const auto titleBarHeight = state->appWindowTitleBar.Height();
+                if (titleBarHeight > 0)
+                {
+                    auto titleBarDpi = ::GetDpiForWindow(state->hwnd);
+                    if (titleBarDpi < 96) titleBarDpi = 96;
+                    state->titleBar.Height(
+                        static_cast<double>(::MulDiv(titleBarHeight, 96, titleBarDpi)));
+                }
+                auto titleRow = controls::RowDefinition{};
+                titleRow.Height(x::GridLengthHelper::FromValueAndType(
+                    1.0, x::GridUnitType::Auto));
+                auto navigationRow = controls::RowDefinition{};
+                navigationRow.Height(x::GridLengthHelper::FromValueAndType(
+                    1.0, x::GridUnitType::Star));
+                state->shellRoot.RowDefinitions().Append(titleRow);
+                state->shellRoot.RowDefinitions().Append(navigationRow);
+                state->shellRoot.Children().Append(state->titleBar);
+                state->titleBar.Loaded([weak](auto const&, auto const&) {
+                    if (auto state = weak.lock(); state && state->alive)
+                    {
+                        state->titleBar.ApplyTemplate();
+                        state->titleBar.UpdateLayout();
+                        UpdateTitleBarDragRegions(state);
+                    }
+                });
+                state->titleBar.SizeChanged([weak](auto const&, auto const&) {
+                    if (auto state = weak.lock(); state && state->alive)
+                        UpdateTitleBarDragRegions(state);
+                });
+            }
             state->navigation = markup::XamlReader::Load(
-                LR"(<NavigationView xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" />)"
+                LR"(<NavigationView xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />)"
             ).as<controls::NavigationView>();
             state->navigation.PaneDisplayMode(controls::NavigationViewPaneDisplayMode::LeftCompact);
-            state->navigation.CompactPaneLength(56.0);
-            state->navigation.OpenPaneLength(220.0);
-            state->navigation.IsPaneOpen(false);
-            state->navigation.IsPaneToggleButtonVisible(true);
+            state->navigation.IsBackButtonVisible(state->customTitleBarActive
+                ? controls::NavigationViewBackButtonVisible::Collapsed
+                : controls::NavigationViewBackButtonVisible::Visible);
+            state->navigation.IsBackEnabled(true);
             // NavigationView's built-in Settings destination belongs in the
             // footer, matching the standard Windows navigation silhouette.
             state->navigation.IsSettingsVisible(true);
-            state->navigation.IsBackButtonVisible(controls::NavigationViewBackButtonVisible::Collapsed);
 
             state->historyNavigationItem = controls::NavigationViewItem{};
             state->historyNavigationItem.Content(winrt::box_value(historyTitleText));
@@ -1604,6 +1713,15 @@ namespace
                     ? x::Visibility::Visible : x::Visibility::Collapsed);
                 if (showHistory) RefreshHistoryNoThrow(state);
             });
+            state->navigation.BackRequested([weak](auto const&, auto const&) {
+                if (auto state = weak.lock(); state && state->alive)
+                {
+                    if (state->historyViewer.Visibility() == x::Visibility::Visible)
+                        state->navigation.SelectedItem(state->navigation.SettingsItem());
+                    else
+                        ::SendMessageW(state->hwnd, WM_CLOSE, 0, 0);
+                }
+            });
             state->navigation.PaneOpened([weak](auto const&, auto const&) {
                 if (auto state = weak.lock(); state && state->alive)
                     UpdateSettingsCardWidths(state, state->navigation.ActualWidth());
@@ -1613,8 +1731,11 @@ namespace
                     UpdateSettingsCardWidths(state, state->navigation.ActualWidth());
             });
             state->navigation.SelectedItem(state->navigation.SettingsItem());
+            if (state->customTitleBarActive)
+                controls::Grid::SetRow(state->navigation, 1);
+            state->shellRoot.Children().Append(state->navigation);
             ApplyAppearanceToSettings(state, state->appearanceMode);
-            return state->navigation;
+            return state->shellRoot;
         }
 
         void Layout()
@@ -1625,8 +1746,19 @@ namespace
             auto dpi = ::GetDpiForWindow(hwnd);
             if (dpi < 96) dpi = 96;
             if (state)
+            {
                 UpdateSettingsCardWidths(state,
                     static_cast<double>(::MulDiv(rect.right - rect.left, 96, dpi)));
+                if (state->titleBar)
+                {
+                    const auto titleBarHeight = state->appWindowTitleBar.Height();
+                    if (titleBarHeight > 0)
+                        state->titleBar.Height(
+                            static_cast<double>(::MulDiv(titleBarHeight, 96, dpi)));
+                    state->titleBar.UpdateLayout();
+                    UpdateTitleBarDragRegions(state);
+                }
+            }
             island.SiteBridge().MoveAndResize({0, 0, rect.right - rect.left, rect.bottom - rect.top});
         }
 

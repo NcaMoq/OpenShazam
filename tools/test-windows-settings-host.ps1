@@ -23,7 +23,6 @@ using System.Threading;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Windows.Automation;
-using Microsoft.Win32;
 
 public static class OpenShazamSettingsHostSmoke
 {
@@ -79,7 +78,7 @@ public static class OpenShazamSettingsHostSmoke
     private delegate void BootstrapShutdown();
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int SettingsShow(IntPtr owner, uint appearanceMode,
-        uint shortcutModifiers, uint shortcutKey);
+        uint shortcutModifiers, uint shortcutKey, uint languageId);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void SettingsShutdown();
 
@@ -114,8 +113,6 @@ public static class OpenShazamSettingsHostSmoke
     private static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool PrintWindow(IntPtr window, IntPtr deviceContext, uint flags);
-    [DllImport("dwmapi.dll", SetLastError = true)]
-    private static extern int DwmGetWindowAttribute(IntPtr window, int attribute, out int value, uint size);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyWindow(IntPtr window);
     [DllImport("user32.dll", SetLastError = true)]
@@ -215,11 +212,11 @@ public static class OpenShazamSettingsHostSmoke
                 if (owner == IntPtr.Zero) throw new InvalidOperationException("Create owner window: " + Marshal.GetLastWin32Error());
 
                 stage = "initialize and show XAML host";
-                hr = show(owner, 0, 0x03, 0x53); // System theme, Ctrl+Alt+S.
+                hr = show(owner, 2, 0x03, 0x53, 2); // Dark theme, Ctrl+Alt+S, English.
                 if (hr < 0) Marshal.ThrowExceptionForHR(hr);
 
                 stage = "pump hidden desktop for XAML callbacks";
-                var deadline = DateTime.UtcNow.AddMilliseconds(500);
+                var deadline = DateTime.UtcNow.AddMilliseconds(1500);
                 while (DateTime.UtcNow < deadline)
                 {
                     Message message;
@@ -235,24 +232,6 @@ public static class OpenShazamSettingsHostSmoke
                 IntPtr settingsWindow = FindWindowW("OpenShazamWinUI3Preferences", null);
                 if (settingsWindow == IntPtr.Zero || !IsWindowVisible(settingsWindow))
                     throw new InvalidOperationException("Settings top-level window was not visible.");
-                stage = "verify native caption follows Windows appearance";
-                int appsUseLightTheme = (int)(Registry.GetValue(
-                    @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-                    "AppsUseLightTheme", 1) ?? 1);
-                int expectedDarkCaption = appsUseLightTheme == 0 ? 1 : 0;
-                int actualDarkCaption;
-                int captionResult = DwmGetWindowAttribute(settingsWindow, 20,
-                    out actualDarkCaption, sizeof(int));
-                if (captionResult < 0)
-                    captionResult = DwmGetWindowAttribute(settingsWindow, 19,
-                        out actualDarkCaption, sizeof(int));
-                if (captionResult < 0 || actualDarkCaption != expectedDarkCaption)
-                    throw new InvalidOperationException(
-                        "Native caption theme did not follow AppsUseLightTheme. " +
-                        "HRESULT=0x" + captionResult.ToString("X8") +
-                        "; expectedDark=" + expectedDarkCaption +
-                        "; actualDark=" + actualDarkCaption);
-
                 stage = "verify DPI-aware minimum client size";
                 IntPtr minMaxBuffer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(MinMaxInfo)));
                 MinMaxInfo minMax;
@@ -447,6 +426,8 @@ public static class OpenShazamSettingsHostSmoke
                 int width = islandRect.Right - islandRect.Left;
                 int height = islandRect.Bottom - islandRect.Top;
                 int sampledNonWhitePixels = 0;
+                int sampledDarkPixels = 0;
+                int sampledPixels = 0;
                 bool pixelsCaptured;
                 using (var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 using (var graphics = Graphics.FromImage(bitmap))
@@ -461,16 +442,25 @@ public static class OpenShazamSettingsHostSmoke
                             for (int x = 0; x < width; x += 2)
                             {
                                 Color color = bitmap.GetPixel(x, y);
+                                sampledPixels++;
                                 if (color.R < 245 || color.G < 245 || color.B < 245)
                                     sampledNonWhitePixels++;
+                                if (color.R < 128 && color.G < 128 && color.B < 128)
+                                    sampledDarkPixels++;
                             }
                     }
                 }
                 pixelSummary = "PrintWindow=" + pixelsCaptured +
-                    "; sampledNonWhitePixels=" + sampledNonWhitePixels;
+                    "; sampledNonWhitePixels=" + sampledNonWhitePixels +
+                    "; darkSurfaceRatio=" + (sampledPixels == 0 ? 0.0 :
+                        (double)sampledDarkPixels / sampledPixels).ToString("P1");
                 if (!pixelsCaptured || sampledNonWhitePixels < 100)
                     throw new InvalidOperationException(
                         "WinUI controls are present in UI Automation but the island rendered a blank white surface. " +
+                        pixelSummary);
+                if (sampledDarkPixels < sampledPixels / 2)
+                    throw new InvalidOperationException(
+                        "The explicitly selected dark theme did not render a predominantly dark WinUI surface. " +
                         pixelSummary);
                 stage = "verify closing Settings restores owner activation";
                 SendMessage(settingsWindow, 0x0010, IntPtr.Zero, IntPtr.Zero); // WM_CLOSE

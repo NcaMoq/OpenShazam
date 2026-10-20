@@ -1,27 +1,21 @@
-//! Packaged recognition-history storage.
+//! Per-user recognition-history storage.
 //!
-//! SQLite lives in the package-managed LocalState folder for MSIX installs.
-//! Unpackaged developer builds use a separate per-user LocalAppData location.
+//! SQLite lives under `%LOCALAPPDATA%\OpenShazam` for every Windows install.
 //! The database worker owns its connection so the recognition/UI thread never
 //! waits for writes.
 
 use std::{
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
-use windows::{
-    Storage::ApplicationData, Win32::Storage::Packaging::Appx::GetCurrentPackageFullName,
-};
 
 const SCHEMA_VERSION: i64 = 1;
 const HISTORY_LIMIT: usize = 40;
-const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
-const APPMODEL_ERROR_NO_PACKAGE: u32 = 15_700;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecognitionSource {
@@ -150,37 +144,108 @@ impl Drop for HistoryStore {
 }
 
 fn history_database_path() -> Result<PathBuf, String> {
-    if process_has_package_identity()? {
-        let application_data = ApplicationData::Current()
-            .map_err(|error| format!("Windows could not open package LocalState: {error}"))?;
-        let local_folder = application_data
-            .LocalFolder()
-            .map_err(|error| format!("Windows could not locate package LocalState: {error}"))?;
-        let path = local_folder
-            .Path()
-            .map_err(|error| format!("Windows could not read package LocalState path: {error}"))?;
-        return Ok(PathBuf::from(path.to_string()).join("history.db"));
-    }
-
     let local_app_data = env::var_os("LOCALAPPDATA")
-        .ok_or_else(|| "LOCALAPPDATA is unavailable for this unpackaged build".to_owned())?;
-    Ok(PathBuf::from(local_app_data)
+        .ok_or_else(|| "LOCALAPPDATA is unavailable for this Windows build".to_owned())?;
+    let local_app_data = PathBuf::from(local_app_data);
+    let destination = local_app_data.join("OpenShazam").join("history.db");
+    let legacy_sources = legacy_history_paths(&local_app_data)?;
+    migrate_legacy_history(&destination, &legacy_sources)?;
+    Ok(destination)
+}
+
+fn legacy_history_paths(local_app_data: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut paths = vec![local_app_data
         .join("OpenShazam")
         .join("Unpackaged")
         .join("LocalState")
-        .join("history.db"))
+        .join("history.db")];
+    let packages = local_app_data.join("Packages");
+    let entries = match std::fs::read_dir(packages) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
+        Err(error) => return Err(format!("could not inspect previous Shazam data: {error}")),
+    };
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("could not inspect previous Shazam data: {error}"))?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.starts_with("OpenShazam.Windows_") {
+            paths.push(entry.path().join("LocalState").join("history.db"));
+        }
+    }
+    Ok(paths)
 }
 
-fn process_has_package_identity() -> Result<bool, String> {
-    let mut package_full_name_length = 0u32;
-    let result = unsafe { GetCurrentPackageFullName(&mut package_full_name_length, None).0 };
-    match result {
-        0 | ERROR_INSUFFICIENT_BUFFER => Ok(true),
-        APPMODEL_ERROR_NO_PACKAGE => Ok(false),
-        code => Err(format!(
-            "Windows could not determine package identity (error {code})"
-        )),
+fn migrate_legacy_history(destination: &Path, candidates: &[PathBuf]) -> Result<(), String> {
+    if destination.exists() {
+        return Ok(());
     }
+    let existing: Vec<_> = candidates
+        .iter()
+        .filter(|path| path.is_file())
+        .cloned()
+        .collect();
+    if existing.is_empty() {
+        return Ok(());
+    }
+    if existing.len() != 1 {
+        return Err("multiple previous Shazam history databases were found; refusing to choose or overwrite one".to_owned());
+    }
+
+    let source = &existing[0];
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| "history database path has no parent directory".to_owned())?;
+    std::fs::create_dir_all(destination_parent)
+        .map_err(|error| format!("could not create history storage directory: {error}"))?;
+
+    let suffixes = ["", "-wal", "-shm", "-journal"];
+    let mut moves = Vec::new();
+    for suffix in suffixes {
+        let source_file = append_suffix(source, suffix);
+        if !source_file.exists() {
+            continue;
+        }
+        let destination_file = append_suffix(destination, suffix);
+        if destination_file.exists() {
+            return Err(format!(
+                "refusing to overwrite existing history data at {}",
+                destination_file.display()
+            ));
+        }
+        moves.push((source_file, destination_file));
+    }
+
+    let mut moved = Vec::new();
+    for (source_file, destination_file) in moves {
+        if let Err(error) = std::fs::rename(&source_file, &destination_file) {
+            let mut rollback_errors = Vec::new();
+            for (moved_source, moved_destination) in moved.into_iter().rev() {
+                if let Err(rollback_error) = std::fs::rename(&moved_destination, &moved_source) {
+                    rollback_errors.push(rollback_error.to_string());
+                }
+            }
+            let rollback_detail = if rollback_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; rollback errors: {}", rollback_errors.join("; "))
+            };
+            return Err(format!(
+                "could not move previous history from {} to {}: {error}{rollback_detail}",
+                source_file.display(),
+                destination_file.display()
+            ));
+        }
+        moved.push((source_file, destination_file));
+    }
+    Ok(())
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn open_database(path: &PathBuf) -> Result<Connection, String> {
@@ -346,4 +411,151 @@ fn save_history_entry(connection: &mut Connection, track: &PersistedTrack) -> Re
     transaction
         .commit()
         .map_err(|error| format!("could not commit recognition history: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary_database_path() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        env::temp_dir()
+            .join(format!(
+                "openshazam-history-{}-{unique}",
+                std::process::id()
+            ))
+            .join("history.db")
+    }
+
+    #[test]
+    fn legacy_history_and_sqlite_sidecars_move_to_the_user_data_root() {
+        let root = env::temp_dir().join(format!(
+            "openshazam-history-migration-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let legacy = root.join("OpenShazam/Unpackaged/LocalState/history.db");
+        let destination = root.join("OpenShazam/history.db");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"sqlite database").unwrap();
+        std::fs::write(append_suffix(&legacy, "-wal"), b"wal data").unwrap();
+        std::fs::write(append_suffix(&legacy, "-shm"), b"shm data").unwrap();
+
+        migrate_legacy_history(&destination, std::slice::from_ref(&legacy)).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"sqlite database");
+        assert_eq!(
+            std::fs::read(append_suffix(&destination, "-wal")).unwrap(),
+            b"wal data"
+        );
+        assert_eq!(
+            std::fs::read(append_suffix(&destination, "-shm")).unwrap(),
+            b"shm data"
+        );
+        assert!(!legacy.exists());
+        assert!(!append_suffix(&legacy, "-wal").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_history_migration_refuses_ambiguous_sources_without_moving_data() {
+        let root = env::temp_dir().join(format!(
+            "openshazam-history-ambiguity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let first = root.join("first/history.db");
+        let second = root.join("second/history.db");
+        let destination = root.join("OpenShazam/history.db");
+        for source in [&first, &second] {
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(source, b"legacy").unwrap();
+        }
+
+        let error =
+            migrate_legacy_history(&destination, &[first.clone(), second.clone()]).unwrap_err();
+
+        assert!(error.contains("multiple previous Shazam history databases"));
+        assert!(first.exists());
+        assert!(second.exists());
+        assert!(!destination.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_history_migration_never_overwrites_the_current_database() {
+        let root = env::temp_dir().join(format!(
+            "openshazam-history-existing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let legacy = root.join("legacy/history.db");
+        let destination = root.join("OpenShazam/history.db");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"old").unwrap();
+        std::fs::write(&destination, b"current").unwrap();
+
+        migrate_legacy_history(&destination, std::slice::from_ref(&legacy)).unwrap();
+
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"old");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"current");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_survives_closing_and_reopening_the_database() {
+        let path = temporary_database_path();
+        let recognized_at_utc = UNIX_EPOCH + Duration::from_millis(1_797_000_123_456);
+        let track = PersistedTrack {
+            title: "A test track".to_owned(),
+            artist: "OpenShazam test".to_owned(),
+            recognized_at_utc,
+            track_key: Some("track-key".to_owned()),
+            artwork_url: Some("https://example.invalid/artwork.jpg".to_owned()),
+            hq_artwork_url: Some("https://example.invalid/artwork-hq.jpg".to_owned()),
+            background_artwork_url: Some("https://example.invalid/background.jpg".to_owned()),
+            shazam_page_url: Some("https://www.shazam.com/track/123".to_owned()),
+            source: RecognitionSource::Auto,
+        };
+
+        {
+            let mut connection = open_database(&path).expect("open the first database connection");
+            save_history_entry(&mut connection, &track).expect("save a history row");
+        }
+
+        let reopened =
+            open_database(&path).expect("reopen the same database after an update-shaped restart");
+        let entries = load_history(&reopened).expect("restore history after reopening");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, track.title);
+        assert_eq!(entries[0].artist, track.artist);
+        assert_eq!(entries[0].recognized_at_utc, track.recognized_at_utc);
+        assert_eq!(entries[0].track_key, track.track_key);
+        assert_eq!(entries[0].artwork_url, track.artwork_url);
+        assert_eq!(entries[0].hq_artwork_url, track.hq_artwork_url);
+        assert_eq!(
+            entries[0].background_artwork_url,
+            track.background_artwork_url
+        );
+        assert_eq!(entries[0].shazam_page_url, track.shazam_page_url);
+        assert_eq!(entries[0].source, RecognitionSource::Auto);
+
+        drop(reopened);
+        if let Some(directory) = path.parent() {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
 }

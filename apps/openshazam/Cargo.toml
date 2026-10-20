@@ -19,6 +19,7 @@ sigx-core = { path = "../../crates/sigx-core" }
 shazam-http-lab = { path = "../../crates/shazam-http-lab" }
 shazam-progressive = { path = "../../crates/shazam-progressive" }
 openshazam-controller = { path = "../../crates/openshazam-controller" }
+openshazam-update = { path = "../../crates/openshazam-update" }
 
 [dev-dependencies]
 sigx-format = { path = "../../crates/sigx-format" }
@@ -26,13 +27,13 @@ sigx-format = { path = "../../crates/sigx-format" }
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.25.0"
 windows-core = "0.62.2"
+windows-collections = "0.3.2"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Globalization",
     "Globalization_DateTimeFormatting",
     "Foundation_Numerics",
     "Foundation",
-    "ApplicationModel_Activation",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_Direct3D",
@@ -61,10 +62,8 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Storage_EnhancedStorage",
-    "Win32_Storage_Packaging_Appx",
     "UI_Composition_Desktop",
     "UI_ViewManagement",
-    "Storage_Search",
 ] }
 windows-numerics = "0.3.1"
 rusqlite = { version = "0.32.1", features = ["bundled"] }

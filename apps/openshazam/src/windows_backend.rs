@@ -40,7 +40,7 @@ struct SessionWorker {
 ///     16,
 ///     64,
 /// )?;
-/// let ticket = controller.commands.start_manual()?;
+/// let ticket = controller.commands.start_manual().expect("manual command was accepted");
 /// // Poll controller.events for SignatureReady, RequestStarted,
 /// // ManualUiEvent and SessionEnded; inspect ticket.command_id for startup.
 /// # Ok::<(), Box<dyn std::error::Error>>(())

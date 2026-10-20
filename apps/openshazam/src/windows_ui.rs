@@ -3,6 +3,7 @@
 //! Win32 owns the tray, popup and input. Product recognition enters only
 //! through the typed controller API and WASAPI loopback.
 
+use std::os::windows::process::CommandExt;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
@@ -11,21 +12,25 @@ use std::{
     mem::size_of,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::windows_history_store::{HistoryStore, PersistedTrack, RecognitionSource};
+use crate::windows_update::UpdateCandidate;
+use windows_collections::IIterable;
 
 use windows::{
     core::{implement, Error, Interface, Ref, BOOL, HSTRING, PCWSTR, PWSTR},
-    ApplicationModel::{Activation::ActivationKind, AppInstance},
     Foundation::{DateTime, TimeSpan, TypedEventHandler},
     Globalization::DateTimeFormatting::DateTimeFormatter,
     Graphics::{
         DirectX::{DirectXAlphaMode, DirectXPixelFormat},
-        IGeometrySource2D,
+        IGeometrySource2D, RectInt32, SizeInt32,
     },
     System::DispatcherQueueController,
     Win32::Graphics::Imaging::{
@@ -69,8 +74,8 @@ use windows::{
                 DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
                 DWRITE_FONT_WEIGHT_DEMI_BOLD, DWRITE_FONT_WEIGHT_HEAVY, DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-                DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-                DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_WRAP,
+                DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS,
+                DWRITE_WORD_WRAPPING_WRAP,
             },
             Dxgi::{Common::DXGI_FORMAT_B8G8R8A8_UNORM, IDXGIDevice},
             Gdi::{
@@ -157,10 +162,10 @@ use windows::{
             CompositionBorderMode, CompositionColorBrush, CompositionDrawingSurface,
             CompositionEllipseGeometry, CompositionGeometricClip, CompositionGraphicsDevice,
             CompositionPath, CompositionPathGeometry, CompositionSpriteShape, CompositionStretch,
-            CompositionSurfaceBrush, CompositionVisualSurface, Compositor, ContainerVisual,
-            CubicBezierEasingFunction, Desktop::DesktopWindowTarget, DropShadow, InsetClip,
-            ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual, Vector2KeyFrameAnimation,
-            Vector3KeyFrameAnimation,
+            CompositionSurfaceBrush, CompositionVirtualDrawingSurface, CompositionVisualSurface,
+            Compositor, ContainerVisual, CubicBezierEasingFunction, Desktop::DesktopWindowTarget,
+            DropShadow, InsetClip, ScalarKeyFrameAnimation, ShapeVisual, SpriteVisual,
+            Vector2KeyFrameAnimation, Vector3KeyFrameAnimation,
         },
     },
 };
@@ -201,6 +206,8 @@ const WM_ARTWORK_LOAD_FINISHED: u32 = WM_APP + 0x49;
 const WM_GLOBAL_SHORTCUT_CHANGED: u32 = WM_APP + 0x4a;
 const WM_GLOBAL_SHORTCUT_CAPTURE: u32 = WM_APP + 0x4b;
 const WM_LANGUAGE_CHANGED: u32 = WM_APP + 0x4c;
+const WM_UPDATE_CHECK_COMPLETED: u32 = WM_APP + 0x4d;
+const WM_UPDATE_DOWNLOAD_COMPLETED: u32 = WM_APP + 0x4e;
 const GLOBAL_SHORTCUT_ID_PRIMARY: i32 = 0x5301;
 const GLOBAL_SHORTCUT_ID_SECONDARY: i32 = 0x5302;
 const GLOBAL_SHORTCUT_MODIFIER_MASK: u32 = 0x0f;
@@ -212,10 +219,9 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const TRAY_ICON_ID: u32 = 1;
 const APP_ICON_RESOURCE_ID: usize = 101;
 const APP_USER_MODEL_ID: &str = "OpenShazam.Desktop";
-// Result cards must share the layered popup's single antialiased mask. A
-// separate Composition card is blended over the already masked blue header,
-// which leaves a blue fringe at the card's outer edge.
-const COMPOSITION_RESULT_CARD_ENABLED: bool = false;
+// The Composition card is rasterized into its own unmasked premultiplied
+// surface, then inherits the popup's antialiased root clip exactly once.
+const COMPOSITION_RESULT_CARD_ENABLED: bool = true;
 const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
     data1: 0x6a3d77b1,
     data2: 0x8e9c,
@@ -225,12 +231,16 @@ const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
 const TRAY_TASKBAR_CREATED_NAME: &str = "TaskbarCreated";
 const TRAY_MENU_SETTINGS: usize = 1;
 const TRAY_MENU_EXIT: usize = 2;
+const TRAY_MENU_UPDATE: usize = 3;
 const POPUP_ACTIVATION_GRACE: Duration = Duration::from_millis(350);
 const TIMER_SINGLE_CLICK: usize = 0x4f53;
 const TIMER_LONG_PRESS: usize = 0x4f54;
 const TIMER_PHASE: usize = 0x4f55;
 const TIMER_ANIMATION: usize = 0x4f56;
 const TIMER_DEFERRED_DEACTIVATION_HIDE: usize = 0x4f57;
+const TIMER_HISTORY_SCROLL_SETTLE: usize = 0x4f59;
+const TIMER_UPDATE_CHECK: usize = 0x4f5a;
+const UPDATE_CHECK_INTERVAL_MS: u32 = 24 * 60 * 60 * 1000;
 const SINGLE_CLICK_TIMEOUT_MS: u32 = 280;
 const LONG_PRESS_TIMEOUT_MS: u32 = 500;
 const DEACTIVATION_HIDE_DELAY_MS: u32 = 250;
@@ -314,13 +324,7 @@ fn point_in_rect(point_x: f32, point_y: f32, bounds: [f32; 4]) -> bool {
     (bounds[0]..=bounds[2]).contains(&point_x) && (bounds[1]..=bounds[3]).contains(&point_y)
 }
 
-fn result_card_link_hit(
-    x: f32,
-    y: f32,
-    card_top: f32,
-    close: [f32; 4],
-    store_action: Option<[f32; 4]>,
-) -> bool {
+fn result_card_link_hit(x: f32, y: f32, card_top: f32, close: [f32; 4]) -> bool {
     point_in_rect(
         x,
         y,
@@ -331,7 +335,6 @@ fn result_card_link_hit(
             card_top + TOP_HEIGHT as f32,
         ],
     ) && !point_in_rect(x, y, close)
-        && !store_action.is_some_and(|action| point_in_rect(x, y, action))
 }
 
 fn visible_history_row_hit(y: f32, row_top: f32, history_top: f32, history_bottom: f32) -> bool {
@@ -822,7 +825,9 @@ fn winrt_datetime_from_system_time(value: SystemTime) -> DateTime {
 
 fn format_history_date_label(value: SystemTime) -> String {
     let template = HSTRING::from(WINDOWS_DATETIME_TEMPLATE);
-    DateTimeFormatter::CreateDateTimeFormatter(&template)
+    let languages =
+        IIterable::<HSTRING>::from(vec![HSTRING::from(directwrite_locale(ui_language()))]);
+    DateTimeFormatter::CreateDateTimeFormatterLanguages(&template, &languages)
         .and_then(|formatter| formatter.Format(winrt_datetime_from_system_time(value)))
         .map(|formatted| formatted.to_string())
         .unwrap_or_default()
@@ -1240,6 +1245,22 @@ struct HistoryCompositionKey {
     edge: ArrowEdge,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoryScrollRowKey {
+    display_id: u64,
+    title: String,
+    artist: String,
+    date: String,
+    artwork_url: Option<String>,
+    hq_artwork_url: Option<String>,
+    artwork_source: Option<ArtworkSource>,
+    artwork_fingerprint: Option<u128>,
+    hovered: bool,
+    theme_generation: u64,
+    dpi: u32,
+    language: UiLanguage,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ResultCardAdvance {
     Unchanged,
@@ -1316,6 +1337,7 @@ struct AppState {
     global_shortcut_capture_suspended: bool,
     settings_host: Option<crate::windows_settings::SettingsHost>,
     settings_opening: bool,
+    update_operation_active: bool,
     about_hwnd: HWND,
     microphone_hwnd: HWND,
     d2d_factory: ID2D1Factory,
@@ -1331,6 +1353,7 @@ struct AppState {
     history_composition_ready: bool,
     scroll_offset: f32,
     history_scroll_animation: Option<HistoryScrollAnimation>,
+    history_scroll_composition_ready: bool,
     hovered_row: Option<usize>,
     mouse_leave_tracking: bool,
     // UI-only adapter points. No service meter output is assumed or inferred.
@@ -1410,12 +1433,10 @@ struct TextStyles {
     date: IDWriteTextFormat,
     result_title: IDWriteTextFormat,
     result_artist: IDWriteTextFormat,
-    result_action: IDWriteTextFormat,
     button: IDWriteTextFormat,
     centered_body: IDWriteTextFormat,
     centered_title: IDWriteTextFormat,
     centered_heavy: IDWriteTextFormat,
-    trailing_small: IDWriteTextFormat,
     logo: IDWriteTextFormat,
 }
 
@@ -1423,7 +1444,6 @@ struct TextStyles {
 struct ResultDetailsRects {
     title: D2D_RECT_F,
     artist: D2D_RECT_F,
-    action: D2D_RECT_F,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1480,6 +1500,7 @@ struct CachedResultDetailsMetrics {
 struct CachedResultPanelBitmap {
     key: ResultOverlayContentKey,
     bitmap: ID2D1Bitmap,
+    pixels: Arc<[u8]>,
 }
 
 struct Renderer {
@@ -1512,6 +1533,7 @@ struct Renderer {
     result_panel_bitmap_failure_key: Option<ResultOverlayContentKey>,
     history_text_metrics_cache: RefCell<HashMap<u64, CachedHistoryTextMetrics>>,
     history_overlay_failure_transition: Option<Instant>,
+    history_scroll_overlay_failure: Option<Instant>,
     result_overlay_content_key: Option<ResultOverlayContentKey>,
     result_overlay_failure_key: Option<ResultOverlayContentKey>,
     result_overlay_motion_key: Option<ResultOverlayMotionKey>,
@@ -1915,6 +1937,7 @@ impl CompositionResultOverlay {
             .SetOffset(composition_header_viewport_offset(dpi, body_top))
     }
 
+    #[cfg(test)]
     unsafe fn update_from_layered(
         &mut self,
         source: &LayeredSurface,
@@ -1937,6 +1960,36 @@ impl CompositionResultOverlay {
             &mut self.scratch,
         );
 
+        self.refresh_surface_from_scratch()
+    }
+
+    unsafe fn update_from_pixels(
+        &mut self,
+        pixels: &[u8],
+        body_top: f32,
+        dpi: u32,
+    ) -> windows::core::Result<()> {
+        self.resize(dpi)?;
+        self.set_viewport(dpi, body_top)?;
+        let expected_len = self.size.width as usize * self.size.height as usize * 4;
+        if pixels.len() != expected_len {
+            return Err(overlay_surface_error(
+                "UpdatePixels",
+                Error::new(
+                    windows::core::HRESULT(0x80070057_u32 as i32),
+                    format!(
+                        "premultiplied card image has {} bytes; expected {expected_len}",
+                        pixels.len()
+                    ),
+                ),
+            ));
+        }
+        self.scratch.clear();
+        self.scratch.extend_from_slice(pixels);
+        self.refresh_surface_from_scratch()
+    }
+
+    unsafe fn refresh_surface_from_scratch(&mut self) -> windows::core::Result<()> {
         if !self.has_contents || self.scratch != self.pixels {
             let mut offset = POINT::default();
             let context = self
@@ -2270,6 +2323,7 @@ impl CompositionHistoryOverlay {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn capture_and_animate(
         &mut self,
         compositor: &Compositor,
@@ -2384,6 +2438,636 @@ impl CompositionHistoryOverlay {
             .SetOpacity(0.0)
             .map_err(|error| overlay_surface_error("History.Hide.SetOpacity", error))?;
         self.key = None;
+        Ok(())
+    }
+}
+
+/// Retained, sparsely allocated history content. The row pixels are rasterized
+/// once at the monitor DPI by Direct2D/DirectWrite, then the compositor moves
+/// the list visual without asking the UI thread to repaint every frame.
+#[allow(dead_code)]
+struct VirtualHistoryScrollOverlay {
+    viewport: ContainerVisual,
+    group: ContainerVisual,
+    sprite: SpriteVisual,
+    surface: Option<CompositionVirtualDrawingSurface>,
+    interop: Option<ICompositionDrawingSurfaceInterop>,
+    brush: Option<CompositionSurfaceBrush>,
+    size: Option<D2D_SIZE_U>,
+    dpi: u32,
+    item_count: usize,
+    content_height: f32,
+    row_keys: HashMap<usize, HistoryScrollRowKey>,
+    active_started_at: Option<Instant>,
+    trimmed_offset: Option<u32>,
+    visible: bool,
+    retained: bool,
+    composition_scroll_enabled: bool,
+    theme: Theme,
+}
+
+#[allow(dead_code)]
+impl VirtualHistoryScrollOverlay {
+    fn new(
+        compositor: &Compositor,
+        dpi: u32,
+        body_top: f32,
+        theme: Theme,
+    ) -> windows::core::Result<Self> {
+        let viewport = compositor.CreateContainerVisual()?;
+        viewport.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: HISTORY_HEIGHT as f32,
+        })?;
+        viewport.SetBorderMode(CompositionBorderMode::Soft)?;
+        let clip = compositor.CreateInsetClipWithInsets(0.0, 0.0, 0.0, 0.0)?;
+        viewport.SetClip(&clip)?;
+        viewport.SetOffset(composition_history_viewport_offset(dpi, body_top))?;
+        viewport.SetOpacity(0.0)?;
+
+        let group = compositor.CreateContainerVisual()?;
+        group.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: 1.0,
+        })?;
+        group.SetBorderMode(CompositionBorderMode::Soft)?;
+        group.SetOpacity(1.0)?;
+        let sprite = compositor.CreateSpriteVisual()?;
+        sprite.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: 1.0,
+        })?;
+        sprite.SetBorderMode(CompositionBorderMode::Soft)?;
+        group.Children()?.InsertAtTop(&sprite)?;
+        viewport.Children()?.InsertAtTop(&group)?;
+
+        Ok(Self {
+            viewport,
+            group,
+            sprite,
+            surface: None,
+            interop: None,
+            brush: None,
+            size: None,
+            dpi: dpi.max(96),
+            item_count: 0,
+            content_height: 0.0,
+            row_keys: HashMap::new(),
+            active_started_at: None,
+            trimmed_offset: None,
+            visible: false,
+            retained: false,
+            // Keep virtual-surface scrolling opt-in until row presentation has
+            // been verified on real Windows displays. Direct2D remains the
+            // reliable path for scrolling the list in this build.
+            composition_scroll_enabled: false,
+            theme,
+        })
+    }
+
+    fn active(&self) -> bool {
+        self.visible && self.retained
+    }
+
+    fn retained(&self) -> bool {
+        self.retained
+    }
+
+    fn set_theme(&mut self, theme: Theme) -> windows::core::Result<()> {
+        if self.theme == theme {
+            return Ok(());
+        }
+        self.theme = theme;
+        Ok(())
+    }
+
+    fn set_viewport(&self, dpi: u32, body_top: f32) -> windows::core::Result<()> {
+        self.viewport
+            .SetOffset(composition_history_viewport_offset(dpi, body_top))
+    }
+
+    unsafe fn ensure_surface(
+        &mut self,
+        compositor: &Compositor,
+        graphics_device: &CompositionGraphicsDevice,
+        dpi: u32,
+        item_count: usize,
+    ) -> windows::core::Result<()> {
+        let dpi = dpi.max(96);
+        let scale = composition_scale_for_dpi(dpi);
+        let content_height = composition_history_content_height(item_count);
+        let size = D2D_SIZE_U {
+            width: (CONTENT_WIDTH as f32 * scale).ceil().max(1.0) as u32,
+            height: (content_height * scale).ceil().max(1.0) as u32,
+        };
+        if self.size == Some(size) && self.dpi == dpi && self.item_count == item_count {
+            return Ok(());
+        }
+
+        // Virtual drawing surfaces are sparse. Their documented limit applies
+        // to each dimension, not the product of width and height; a total
+        // pixel cap would force ordinary long histories back to UI-thread D2D.
+        const MAX_VIRTUAL_SURFACE_DIMENSION: u32 = 1 << 24;
+        if size.width > MAX_VIRTUAL_SURFACE_DIMENSION || size.height > MAX_VIRTUAL_SURFACE_DIMENSION
+        {
+            return Err(Error::new(
+                windows::core::HRESULT(0x80070057_u32 as i32),
+                "The virtual history surface exceeds the Windows Composition dimension limit",
+            ));
+        }
+
+        let surface = graphics_device.CreateVirtualDrawingSurface(
+            SizeInt32 {
+                Width: size.width as i32,
+                Height: size.height as i32,
+            },
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            DirectXAlphaMode::Premultiplied,
+        )?;
+        let interop: ICompositionDrawingSurfaceInterop = surface.cast()?;
+        let brush = compositor.CreateSurfaceBrushWithSurface(&surface)?;
+        brush.SetStretch(CompositionStretch::Fill)?;
+        brush.SetBitmapInterpolationMode(CompositionBitmapInterpolationMode::Linear)?;
+
+        self.group.StopAnimation(&HSTRING::from("Offset.Y"))?;
+        self.group.SetOffset(Vector3::default())?;
+        self.group.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: content_height,
+        })?;
+        self.sprite.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: content_height,
+        })?;
+        self.sprite.SetBrush(&brush)?;
+        self.surface = Some(surface);
+        self.interop = Some(interop);
+        self.brush = Some(brush);
+        self.size = Some(size);
+        self.dpi = dpi;
+        self.item_count = item_count;
+        self.content_height = content_height;
+        self.row_keys.clear();
+        self.active_started_at = None;
+        self.trimmed_offset = None;
+        self.visible = false;
+        self.viewport.SetOpacity(0.0)?;
+        Ok(())
+    }
+
+    fn needs_row(&self, index: usize, key: &HistoryScrollRowKey) -> bool {
+        self.row_keys.get(&index) != Some(key)
+    }
+
+    unsafe fn upload_row(
+        &mut self,
+        index: usize,
+        key: HistoryScrollRowKey,
+        pixels: &[u8],
+        row_size: D2D_SIZE_U,
+    ) -> windows::core::Result<()> {
+        let interop = self.interop.as_ref().ok_or_else(|| {
+            Error::new(
+                windows::core::HRESULT(0x80004005_u32 as i32),
+                "The virtual history surface has not been created",
+            )
+        })?;
+        let size = self.size.ok_or_else(|| {
+            Error::new(
+                windows::core::HRESULT(0x80004005_u32 as i32),
+                "The virtual history surface has no size",
+            )
+        })?;
+        let expected = row_size.width as usize * row_size.height as usize * 4;
+        if pixels.len() != expected {
+            return Err(Error::new(
+                windows::core::HRESULT(0x80070057_u32 as i32),
+                "The rasterized history row has an unexpected pixel buffer size",
+            ));
+        }
+
+        let scale = composition_scale_for_dpi(self.dpi);
+        let top = (index as f32 * HISTORY_ROW_PITCH * scale).round() as i32;
+        let bottom = ((index + 1) as f32 * HISTORY_ROW_PITCH * scale)
+            .round()
+            .min(size.height as f32) as i32;
+        if bottom <= top {
+            return Ok(());
+        }
+        let update = RECT {
+            left: 0,
+            top,
+            right: size.width as i32,
+            bottom,
+        };
+        let mut offset = POINT::default();
+        let context = interop
+            .BeginDraw::<ID2D1DeviceContext>(Some(&update), &mut offset)
+            .map_err(|error| overlay_surface_error("HistoryScroll.BeginDraw", error))?;
+        let draw_result = (|| -> windows::core::Result<()> {
+            context.SetDpi(96.0, 96.0);
+            context.SetTransform(&Matrix3x2 {
+                M11: 1.0,
+                M22: 1.0,
+                M31: offset.x as f32,
+                M32: offset.y as f32,
+                ..Default::default()
+            });
+            let properties = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                colorContext: std::mem::ManuallyDrop::new(None),
+            };
+            let bitmap = context.CreateBitmap(
+                row_size,
+                Some(pixels.as_ptr().cast()),
+                row_size.width.saturating_mul(4),
+                &properties,
+            )?;
+            let destination = rect(0.0, 0.0, row_size.width as f32, row_size.height as f32);
+            context.DrawBitmap(
+                &bitmap,
+                Some(&destination),
+                1.0,
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                None,
+                None,
+            );
+            Ok(())
+        })();
+        let end_result = interop.EndDraw();
+        draw_result?;
+        end_result.map_err(|error| overlay_surface_error("HistoryScroll.EndDraw", error))?;
+        self.row_keys.insert(index, key);
+        self.trimmed_offset = None;
+        Ok(())
+    }
+
+    fn start(
+        &mut self,
+        compositor: &Compositor,
+        animation: HistoryScrollAnimation,
+        now: Instant,
+    ) -> windows::core::Result<()> {
+        if self.active_started_at == Some(animation.started_at) {
+            return Ok(());
+        }
+        self.group.StopAnimation(&HSTRING::from("Offset.Y"))?;
+        let elapsed = now.saturating_duration_since(animation.started_at);
+        let progress =
+            (elapsed.as_secs_f64() / HISTORY_SCROLL_TRANSITION.as_secs_f64()).clamp(0.0, 1.0);
+        let (offset, still_animating) = history_scroll_offset_at(animation, now);
+        self.group.SetOffset(Vector3 {
+            X: 0.0,
+            Y: -offset,
+            Z: 0.0,
+        })?;
+        self.group.SetOpacity(1.0)?;
+        self.viewport.SetOpacity(1.0)?;
+        self.visible = true;
+        self.retained = true;
+        self.trimmed_offset = None;
+        if !still_animating {
+            self.group.SetOffset(Vector3 {
+                X: 0.0,
+                Y: -animation.to_offset,
+                Z: 0.0,
+            })?;
+            self.active_started_at = Some(animation.started_at);
+            return Ok(());
+        }
+
+        let curve = history_scroll_easing();
+        let remaining_easing = remaining_cubic_easing(progress, curve).unwrap_or(curve);
+        let easing = compositor.CreateCubicBezierEasingFunction(
+            Vector2 {
+                X: remaining_easing.x1 as f32,
+                Y: remaining_easing.y1 as f32,
+            },
+            Vector2 {
+                X: remaining_easing.x2 as f32,
+                Y: remaining_easing.y2 as f32,
+            },
+        )?;
+        let remaining = HISTORY_SCROLL_TRANSITION.saturating_sub(elapsed);
+        let keyframe = compositor.CreateScalarKeyFrameAnimation()?;
+        keyframe.SetDuration(TimeSpan {
+            Duration: (remaining.as_nanos() / 100).min(i64::MAX as u128) as i64,
+        })?;
+        keyframe.InsertKeyFrameWithEasingFunction(1.0, -animation.to_offset, &easing)?;
+        self.group
+            .StartAnimation(&HSTRING::from("Offset.Y"), &keyframe)?;
+        self.active_started_at = Some(animation.started_at);
+        Ok(())
+    }
+
+    fn hide(&mut self) -> windows::core::Result<()> {
+        if !self.visible {
+            self.retained = false;
+            self.active_started_at = None;
+            return Ok(());
+        }
+        self.group.StopAnimation(&HSTRING::from("Offset.Y"))?;
+        self.viewport.SetOpacity(0.0)?;
+        self.visible = false;
+        self.retained = false;
+        self.active_started_at = None;
+        Ok(())
+    }
+
+    fn settle(&mut self, scroll_offset: f32) -> windows::core::Result<()> {
+        if !self.retained {
+            return Ok(());
+        }
+        self.group.StopAnimation(&HSTRING::from("Offset.Y"))?;
+        self.group.SetOffset(Vector3 {
+            X: 0.0,
+            Y: -scroll_offset.max(0.0),
+            Z: 0.0,
+        })?;
+        self.group.SetOpacity(1.0)?;
+        self.viewport.SetOpacity(1.0)?;
+        self.active_started_at = None;
+        self.visible = true;
+        Ok(())
+    }
+
+    fn trim_to_viewport(&mut self, scroll_offset: f32) -> windows::core::Result<()> {
+        let (Some(surface), Some(size)) = (self.surface.as_ref(), self.size) else {
+            return Ok(());
+        };
+        let scroll_offset = if scroll_offset.is_finite() {
+            scroll_offset.max(0.0)
+        } else {
+            0.0
+        };
+        let offset_bits = scroll_offset.to_bits();
+        if self.trimmed_offset == Some(offset_bits) {
+            return Ok(());
+        }
+        let scale = composition_scale_for_dpi(self.dpi);
+        let keep_top = ((scroll_offset - HISTORY_ROW_PITCH).max(0.0) * scale)
+            .floor()
+            .clamp(0.0, size.height as f32) as i32;
+        let keep_bottom = ((scroll_offset + HISTORY_HEIGHT as f32 + HISTORY_ROW_PITCH)
+            .min(self.content_height)
+            * scale)
+            .ceil()
+            .clamp(0.0, size.height as f32) as i32;
+        let mut trim = Vec::with_capacity(2);
+        if keep_top > 0 {
+            trim.push(RectInt32 {
+                X: 0,
+                Y: 0,
+                Width: size.width as i32,
+                Height: keep_top,
+            });
+        }
+        if keep_bottom < size.height as i32 {
+            trim.push(RectInt32 {
+                X: 0,
+                Y: keep_bottom,
+                Width: size.width as i32,
+                Height: size.height as i32 - keep_bottom,
+            });
+        }
+        if !trim.is_empty() {
+            surface.Trim(&trim)?;
+        }
+        let first =
+            ((scroll_offset - HISTORY_ROW_PITCH).max(0.0) / HISTORY_ROW_PITCH).floor() as usize;
+        let last = ((scroll_offset + HISTORY_HEIGHT as f32 + HISTORY_ROW_PITCH) / HISTORY_ROW_PITCH)
+            .ceil() as usize;
+        self.row_keys
+            .retain(|index, _| (*index >= first) && (*index <= last));
+        self.trimmed_offset = Some(offset_bits);
+        Ok(())
+    }
+}
+
+fn composition_history_content_height(item_count: usize) -> f32 {
+    (item_count as f32 * HISTORY_ROW_PITCH).max(1.0)
+}
+
+/// A per-scroll snapshot is small enough for a regular Composition drawing
+/// surface. Direct2D rasterizes the visible span once, then the compositor
+/// moves one sprite at display refresh rate. This avoids the missing tile and
+/// per-row alignment issues seen with virtual drawing surfaces.
+struct CompositionHistoryScrollOverlay {
+    viewport: ContainerVisual,
+    group: ContainerVisual,
+    sprite: SpriteVisual,
+    surface: Option<CompositionDrawingSurface>,
+    interop: Option<ICompositionDrawingSurfaceInterop>,
+    brush: Option<CompositionSurfaceBrush>,
+    active_started_at: Option<Instant>,
+    visible: bool,
+}
+
+impl CompositionHistoryScrollOverlay {
+    fn new(compositor: &Compositor, dpi: u32, body_top: f32) -> windows::core::Result<Self> {
+        let viewport = compositor.CreateContainerVisual()?;
+        viewport.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: HISTORY_HEIGHT as f32,
+        })?;
+        viewport.SetBorderMode(CompositionBorderMode::Soft)?;
+        let clip = compositor.CreateInsetClipWithInsets(0.0, 0.0, 0.0, 0.0)?;
+        viewport.SetClip(&clip)?;
+        viewport.SetOffset(composition_history_viewport_offset(dpi, body_top))?;
+        viewport.SetOpacity(0.0)?;
+
+        let group = compositor.CreateContainerVisual()?;
+        group.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: 1.0,
+        })?;
+        group.SetBorderMode(CompositionBorderMode::Soft)?;
+        group.SetOpacity(1.0)?;
+        let sprite = compositor.CreateSpriteVisual()?;
+        sprite.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: 1.0,
+        })?;
+        sprite.SetBorderMode(CompositionBorderMode::Soft)?;
+        group.Children()?.InsertAtTop(&sprite)?;
+        viewport.Children()?.InsertAtTop(&group)?;
+
+        Ok(Self {
+            viewport,
+            group,
+            sprite,
+            surface: None,
+            interop: None,
+            brush: None,
+            active_started_at: None,
+            visible: false,
+        })
+    }
+
+    fn active(&self) -> bool {
+        self.visible && self.active_started_at.is_some()
+    }
+
+    fn matches(&self, started_at: Instant) -> bool {
+        self.active() && self.active_started_at == Some(started_at)
+    }
+
+    fn set_viewport(&self, dpi: u32, body_top: f32) -> windows::core::Result<()> {
+        self.viewport
+            .SetOffset(composition_history_viewport_offset(dpi, body_top))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn upload_and_start(
+        &mut self,
+        compositor: &Compositor,
+        graphics_device: &CompositionGraphicsDevice,
+        pixels: &[u8],
+        size: D2D_SIZE_U,
+        content_height: f32,
+        origin_offset: f32,
+        animation: HistoryScrollAnimation,
+        now: Instant,
+    ) -> windows::core::Result<()> {
+        let expected = size.width as usize * size.height as usize * 4;
+        if pixels.len() != expected || size.width == 0 || size.height == 0 {
+            return Err(Error::new(
+                windows::core::HRESULT(0x80070057_u32 as i32),
+                "The history scroll snapshot has an unexpected pixel buffer size",
+            ));
+        }
+
+        let surface = graphics_device.CreateDrawingSurface(
+            windows::Foundation::Size {
+                Width: size.width as f32,
+                Height: size.height as f32,
+            },
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            DirectXAlphaMode::Premultiplied,
+        )?;
+        let interop: ICompositionDrawingSurfaceInterop = surface.cast()?;
+        let brush = compositor.CreateSurfaceBrushWithSurface(&surface)?;
+        brush.SetStretch(CompositionStretch::Fill)?;
+        brush.SetBitmapInterpolationMode(CompositionBitmapInterpolationMode::Linear)?;
+
+        let mut offset = POINT::default();
+        let context = interop
+            .BeginDraw::<ID2D1DeviceContext>(None, &mut offset)
+            .map_err(|error| overlay_surface_error("HistoryScrollSnapshot.BeginDraw", error))?;
+        let draw_result = (|| -> windows::core::Result<()> {
+            context.SetDpi(96.0, 96.0);
+            context.SetTransform(&Matrix3x2 {
+                M11: 1.0,
+                M22: 1.0,
+                M31: offset.x as f32,
+                M32: offset.y as f32,
+                ..Default::default()
+            });
+            let properties = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                colorContext: std::mem::ManuallyDrop::new(None),
+            };
+            let bitmap = context.CreateBitmap(
+                size,
+                Some(pixels.as_ptr().cast()),
+                size.width.saturating_mul(4),
+                &properties,
+            )?;
+            context.Clear(Some(&d2d_color(0, 0, 0, 0.0)));
+            let destination = rect(0.0, 0.0, size.width as f32, size.height as f32);
+            context.DrawBitmap(
+                &bitmap,
+                Some(&destination),
+                1.0,
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                None,
+                None,
+            );
+            Ok(())
+        })();
+        let end_result = interop.EndDraw();
+        draw_result?;
+        end_result
+            .map_err(|error| overlay_surface_error("HistoryScrollSnapshot.EndDraw", error))?;
+
+        self.group.StopAnimation(&HSTRING::from("Offset.Y"))?;
+        self.group.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: content_height,
+        })?;
+        self.sprite.SetSize(Vector2 {
+            X: CONTENT_WIDTH as f32,
+            Y: content_height,
+        })?;
+        self.sprite.SetBrush(&brush)?;
+        self.surface = Some(surface);
+        self.interop = Some(interop);
+        self.brush = Some(brush);
+
+        let current_offset = history_scroll_offset_at(animation, now).0;
+        let initial_y = origin_offset - current_offset;
+        let target_y = origin_offset - animation.to_offset;
+        self.group.SetOffset(Vector3 {
+            X: 0.0,
+            Y: initial_y,
+            Z: 0.0,
+        })?;
+        self.group.SetOpacity(1.0)?;
+        self.viewport.SetOpacity(1.0)?;
+        self.visible = true;
+
+        let elapsed = now.saturating_duration_since(animation.started_at);
+        let progress =
+            (elapsed.as_secs_f64() / HISTORY_SCROLL_TRANSITION.as_secs_f64()).clamp(0.0, 1.0);
+        if progress >= 1.0 {
+            self.group.SetOffset(Vector3 {
+                X: 0.0,
+                Y: target_y,
+                Z: 0.0,
+            })?;
+        } else {
+            let curve = history_scroll_easing();
+            let remaining_easing = remaining_cubic_easing(progress, curve).unwrap_or(curve);
+            let easing = compositor.CreateCubicBezierEasingFunction(
+                Vector2 {
+                    X: remaining_easing.x1 as f32,
+                    Y: remaining_easing.y1 as f32,
+                },
+                Vector2 {
+                    X: remaining_easing.x2 as f32,
+                    Y: remaining_easing.y2 as f32,
+                },
+            )?;
+            let remaining = HISTORY_SCROLL_TRANSITION.saturating_sub(elapsed);
+            let keyframe = compositor.CreateScalarKeyFrameAnimation()?;
+            keyframe.SetDuration(TimeSpan {
+                Duration: (remaining.as_nanos() / 100).min(i64::MAX as u128) as i64,
+            })?;
+            keyframe.InsertKeyFrameWithEasingFunction(1.0, target_y, &easing)?;
+            self.group
+                .StartAnimation(&HSTRING::from("Offset.Y"), &keyframe)?;
+        }
+        self.active_started_at = Some(animation.started_at);
+        Ok(())
+    }
+
+    fn hide(&mut self) -> windows::core::Result<()> {
+        self.group.StopAnimation(&HSTRING::from("Offset.Y"))?;
+        self.viewport.SetOpacity(0.0)?;
+        self.visible = false;
+        self.active_started_at = None;
         Ok(())
     }
 }
@@ -3721,6 +4405,7 @@ struct CompositionScene {
     tagging_clip: InsetClip,
     tagging_clip_bottom: f32,
     history_overlay: CompositionHistoryOverlay,
+    history_scroll_overlay: CompositionHistoryScrollOverlay,
     result_overlay: CompositionResultOverlay,
     status_text: CompositionStatusText,
     auto_shadow_root: ContainerVisual,
@@ -3894,13 +4579,15 @@ fn composition_outer_ripples_visible(mode: TaggingMode) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompositionSceneLayer {
     Tagging,
+    HistoryScrollOverlay,
     HistoryOverlay,
     ResultOverlay,
 }
 
-fn composition_scene_layer_order() -> [CompositionSceneLayer; 3] {
+fn composition_scene_layer_order() -> [CompositionSceneLayer; 4] {
     [
         CompositionSceneLayer::Tagging,
+        CompositionSceneLayer::HistoryScrollOverlay,
         CompositionSceneLayer::HistoryOverlay,
         CompositionSceneLayer::ResultOverlay,
     ]
@@ -4841,6 +5528,8 @@ impl CompositionScene {
                 body_top,
             )?
         };
+        let history_scroll_overlay =
+            CompositionHistoryScrollOverlay::new(compositor, dpi, body_top)?;
         let status_text = unsafe {
             CompositionStatusText::new(
                 compositor,
@@ -4857,6 +5546,9 @@ impl CompositionScene {
                 CompositionSceneLayer::Tagging => root_children.InsertAtTop(&tagging_root)?,
                 CompositionSceneLayer::HistoryOverlay => {
                     root_children.InsertAtTop(&history_overlay.viewport)?
+                }
+                CompositionSceneLayer::HistoryScrollOverlay => {
+                    root_children.InsertAtTop(&history_scroll_overlay.viewport)?
                 }
                 CompositionSceneLayer::ResultOverlay => {
                     root_children.InsertAtTop(&result_overlay.viewport)?
@@ -4937,6 +5629,7 @@ impl CompositionScene {
             tagging_clip: clip,
             tagging_clip_bottom: clip_bottom.max(0.0),
             history_overlay,
+            history_scroll_overlay,
             result_overlay,
             status_text,
             auto_shadow_root,
@@ -5017,6 +5710,9 @@ impl CompositionScene {
             self.result_overlay.set_viewport(dpi, self.body_top)?;
             self.history_overlay.resize(dpi)?;
             self.history_overlay.set_viewport(dpi, self.body_top)?;
+            self.history_scroll_overlay
+                .set_viewport(dpi, self.body_top)?;
+            self.history_scroll_overlay.hide()?;
             self.status_text.resize(dpi)
         }
     }
@@ -5026,7 +5722,7 @@ impl CompositionScene {
     #[allow(clippy::too_many_arguments)]
     unsafe fn update_result_overlay(
         &mut self,
-        source: Option<&LayeredSurface>,
+        card_pixels: Option<&[u8]>,
         capture_top: Option<f32>,
         panel_top: Option<f32>,
         body_top: f32,
@@ -5034,22 +5730,26 @@ impl CompositionScene {
         motion: Option<&ResultOverlayMotionAnimation>,
         motion_changed: bool,
     ) -> windows::core::Result<()> {
-        if let (Some(source), Some(capture_top)) = (source, capture_top) {
-            // A content-key miss captures a replacement card through the
-            // layered D2D surface. Hide the previous Composition card before
-            // refreshing that surface so consecutive NoMatch results cannot
-            // briefly show the old card alongside the capture copy.
+        if let (Some(card_pixels), Some(_)) = (card_pixels, capture_top) {
+            // Refresh from the standalone premultiplied card raster, not the
+            // popup's already masked frame. This lets the Composition root
+            // apply its outer antialiased clip once without sampling header
+            // color into the card edge.
             self.result_overlay
                 .hide()
                 .map_err(|error| overlay_surface_error("HideBeforeRefresh", error))?;
             self.result_overlay
-                .update_from_layered(source, capture_top, body_top, dpi)?;
+                .update_from_pixels(card_pixels, body_top, dpi)?;
         } else {
             self.result_overlay.resize(dpi)?;
         }
-        match (source, panel_top, motion) {
+        match (card_pixels, panel_top, motion) {
             (_, None, _) | (None, Some(_), _) => self.result_overlay.hide(),
-            (Some(_), Some(_), Some(motion)) if motion_changed => self
+            // A content refresh hides the group while its surface is updated.
+            // Resume the sampled in-flight motion even when its identity did
+            // not change; otherwise the group stays hidden until the card
+            // reaches its final position and appears to pop in.
+            (Some(_), Some(_), Some(motion)) if motion_changed || capture_top.is_some() => self
                 .result_overlay
                 .animate_position(&self.compositor, motion, body_top, dpi),
             (Some(_), Some(_), Some(_)) => Ok(()),
@@ -5923,6 +6623,7 @@ enum NoMatchScaleUp {
     Spring(ui_model::SpringProfile),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_no_match_scale_timeline(
     compositor: &Compositor,
     elapsed_seconds: f64,
@@ -5992,7 +6693,7 @@ fn create_no_match_scale_timeline(
         } else {
             (elapsed - down.0) / down.1
         };
-        if elapsed < down.0 && down.0 > elapsed {
+        if elapsed < down.0 {
             animation.InsertKeyFrame(
                 ((down.0 - elapsed) / timeline_duration) as f32,
                 Vector3 {
@@ -6382,31 +7083,17 @@ const RESULT_ARTIST_MIN_HEIGHT: f32 = 18.0;
 const RESULT_ARTIST_MAX_LINES: f32 = 4.0;
 const RESULT_ARTWORK_CORNER_RADIUS: f32 = 5.0;
 const RESULT_DETAILS_TITLE_ARTIST_GAP: f32 = 5.0;
-const RESULT_DETAILS_ARTIST_ACTION_GAP: f32 = 10.0;
-const RESULT_ACTION_HEIGHT: f32 = 20.0;
 
 fn result_details_rects(
     panel_top: f32,
     title_height: f32,
     artist_height: f32,
-    action_visible: bool,
 ) -> ResultDetailsRects {
-    let action_height = if action_visible {
-        RESULT_DETAILS_ARTIST_ACTION_GAP + RESULT_ACTION_HEIGHT
-    } else {
-        0.0
-    };
-    let total_height =
-        title_height + RESULT_DETAILS_TITLE_ARTIST_GAP + artist_height + action_height;
+    let total_height = title_height + RESULT_DETAILS_TITLE_ARTIST_GAP + artist_height;
     let title_top = panel_top + RESULT_DETAILS_CENTER_Y - total_height * 0.5;
     let title_bottom = title_top + title_height;
     let artist_top = title_bottom + RESULT_DETAILS_TITLE_ARTIST_GAP;
     let artist_bottom = artist_top + artist_height;
-    let action_top = if action_visible {
-        artist_bottom + RESULT_DETAILS_ARTIST_ACTION_GAP
-    } else {
-        artist_bottom
-    };
     ResultDetailsRects {
         title: rect(
             RESULT_DETAILS_LEFT,
@@ -6420,16 +7107,6 @@ fn result_details_rects(
             RESULT_DETAILS_RIGHT,
             artist_bottom,
         ),
-        action: if action_visible {
-            rect(
-                RESULT_DETAILS_LEFT,
-                action_top,
-                RESULT_DETAILS_RIGHT,
-                action_top + RESULT_ACTION_HEIGHT,
-            )
-        } else {
-            rect(0.0, 0.0, 0.0, 0.0)
-        },
     }
 }
 
@@ -6490,11 +7167,22 @@ fn history_scroll_offset_at(animation: HistoryScrollAnimation, now: Instant) -> 
         .as_secs_f32()
         / HISTORY_SCROLL_TRANSITION.as_secs_f32())
     .clamp(0.0, 1.0);
-    let eased = 1.0 - (1.0 - progress).powi(3);
+    let eased = sample_cubic_timing_curve(progress as f64, history_scroll_easing()) as f32;
     (
         animation.from_offset + (animation.to_offset - animation.from_offset) * eased,
         progress < 1.0,
     )
+}
+
+fn history_scroll_easing() -> CubicBezier {
+    // x(t)=t and y(t)=1-(1-t)^3, so Composition and the deterministic
+    // hit-test clock use the same ease-out cubic curve.
+    CubicBezier {
+        x1: 1.0 / 3.0,
+        y1: 1.0,
+        x2: 2.0 / 3.0,
+        y2: 1.0,
+    }
 }
 
 fn advance_history_scroll(app: &mut AppState, now: Instant) -> bool {
@@ -6513,6 +7201,12 @@ fn advance_history_scroll(app: &mut AppState, now: Instant) -> bool {
         app.history_scroll_animation = None;
     }
     changed
+}
+
+fn sample_history_scroll(app: &mut AppState, now: Instant) {
+    if let Some(animation) = app.history_scroll_animation {
+        app.scroll_offset = history_scroll_offset_at(animation, now).0;
+    }
 }
 
 fn history_offset_after_insert(
@@ -6874,6 +7568,7 @@ impl Renderer {
             result_panel_bitmap_failure_key: None,
             history_text_metrics_cache: RefCell::new(HashMap::new()),
             history_overlay_failure_transition: None,
+            history_scroll_overlay_failure: None,
             result_overlay_content_key: None,
             result_overlay_failure_key: None,
             result_overlay_motion_key: None,
@@ -6972,6 +7667,7 @@ impl Renderer {
         self.result_panel_bitmap = Some(CachedResultPanelBitmap {
             key: key.clone(),
             bitmap,
+            pixels: Arc::from(pixels),
         });
         Ok(())
     }
@@ -7099,6 +7795,102 @@ impl Renderer {
         }
     }
 
+    unsafe fn prepare_history_scroll_overlay(&mut self, app: &AppState, body_top: f32) -> bool {
+        let Some(animation) = app.history_scroll_animation else {
+            if let Some(scene) = self.composition.as_mut() {
+                let _ = scene.history_scroll_overlay.hide();
+            }
+            self.history_scroll_overlay_failure = None;
+            return false;
+        };
+        if app.history.is_empty() || app.history_transition.is_some() {
+            if let Some(scene) = self.composition.as_mut() {
+                let _ = scene.history_scroll_overlay.hide();
+            }
+            self.history_scroll_overlay_failure = None;
+            return false;
+        }
+        if self.history_scroll_overlay_failure == Some(animation.started_at) {
+            return false;
+        }
+        if let Some(scene) = self.composition.as_mut() {
+            if scene.history_scroll_overlay.matches(animation.started_at) {
+                return scene
+                    .history_scroll_overlay
+                    .set_viewport(self.dpi, body_top)
+                    .is_ok();
+            }
+        }
+
+        let now = Instant::now();
+        let low = animation.from_offset.min(animation.to_offset).max(0.0);
+        let high = animation.from_offset.max(animation.to_offset).max(0.0);
+        let content_height = HISTORY_HEIGHT as f32 + (high - low);
+        // Normal wheel gestures need at most a little more than one viewport.
+        // Bound allocation for unusual system wheel settings; the Direct2D
+        // path remains the safe fallback for unusually large jumps.
+        if !content_height.is_finite() || content_height > HISTORY_HEIGHT as f32 * 4.0 {
+            self.history_scroll_overlay_failure = Some(animation.started_at);
+            return false;
+        }
+
+        let result = (|| -> windows::core::Result<()> {
+            let (pixels, size) =
+                self.rasterize_history_scroll_snapshot(app, low, content_height)?;
+            let (compositor, graphics_device) = {
+                let scene = self.composition.as_ref().ok_or_else(|| {
+                    Error::new(
+                        windows::core::HRESULT(0x80004005_u32 as i32),
+                        "Windows Composition is unavailable for history scrolling",
+                    )
+                })?;
+                (
+                    scene.compositor.clone(),
+                    scene.result_overlay._graphics_device.clone(),
+                )
+            };
+            let scene = self.composition.as_mut().ok_or_else(|| {
+                Error::new(
+                    windows::core::HRESULT(0x80004005_u32 as i32),
+                    "Windows Composition was released before history animation",
+                )
+            })?;
+            scene
+                .history_scroll_overlay
+                .set_viewport(self.dpi, body_top)?;
+            scene.history_scroll_overlay.upload_and_start(
+                &compositor,
+                &graphics_device,
+                &pixels,
+                size,
+                content_height,
+                low,
+                animation,
+                now,
+            )
+        })();
+
+        match result {
+            Ok(()) => {
+                self.history_scroll_overlay_failure = None;
+                true
+            }
+            Err(error) => {
+                if let Some(scene) = self.composition.as_mut() {
+                    let _ = scene.history_scroll_overlay.hide();
+                }
+                self.history_scroll_overlay_failure = Some(animation.started_at);
+                eprintln!("Windows UI history scroll Composition failed; using Direct2D fallback: {error}");
+                false
+            }
+        }
+    }
+    fn history_scroll_composition_active(&self) -> bool {
+        self.composition
+            .as_ref()
+            .is_some_and(|scene| scene.history_scroll_overlay.active())
+    }
+
     unsafe fn prepare_history_overlay(
         &mut self,
         app: &AppState,
@@ -7211,8 +8003,12 @@ impl Renderer {
         if let (Some(scene), Some(outline)) = (self.composition.as_mut(), popup_outline.as_ref()) {
             unsafe { scene.update_popup_clip(outline, app.arrow_edge, app.arrow_center)? };
         }
-        let history_composition_active = kind == WindowKind::Main
+        let history_insert_composition_active = kind == WindowKind::Main
             && unsafe { self.prepare_history_overlay(app, body_top, Instant::now()) };
+        let history_scroll_composition_active = kind == WindowKind::Main
+            && unsafe { self.prepare_history_scroll_overlay(app, body_top) };
+        let history_composition_active =
+            history_insert_composition_active || history_scroll_composition_active;
         let panel_top = if kind == WindowKind::Main {
             match &app.phase {
                 MainPhase::Matched { .. }
@@ -7243,10 +8039,13 @@ impl Renderer {
                 }
             }
         }
-        let result_panel_bitmap = overlay_key
-            .as_ref()
-            .and_then(|key| self.cached_result_panel_bitmap(key))
-            .cloned();
+        let result_panel_cache = overlay_key.as_ref().and_then(|key| {
+            self.result_panel_bitmap
+                .as_ref()
+                .filter(|cached| cached.key == *key)
+        });
+        let result_panel_bitmap = result_panel_cache.map(|cached| cached.bitmap.clone());
+        let result_panel_pixels = result_panel_cache.map(|cached| Arc::clone(&cached.pixels));
         let overlay_motion = (kind == WindowKind::Main)
             .then(|| result_overlay_motion_animation(&app.phase, Instant::now()))
             .flatten();
@@ -7274,14 +8073,15 @@ impl Renderer {
         let composition_cache_ready = COMPOSITION_RESULT_CARD_ENABLED
             && self.composition.is_some()
             && self.layered_surface.is_some()
+            && result_panel_pixels.is_some()
             && panel_top.is_some()
             && !overlay_failure_latched;
         let composition_cache_hit = composition_cache_ready
             && overlay_key
                 .as_ref()
                 .is_some_and(|key| self.result_overlay_content_key.as_ref() == Some(key));
-        // Keep result cards in the same D2D pass as the popup mask. A separate
-        // Composition surface blends its soft edge over the blue header.
+        // The Composition surface contains the unmasked card pixels; the
+        // shared scene root supplies the popup's outer antialiased clip.
         let result_panel_draw_top = result_panel_draw_top(panel_top, composition_cache_ready);
         self.target.BeginDraw();
         let clear = d2d_color(0, 0, 0, 0.0);
@@ -7312,7 +8112,8 @@ impl Renderer {
             WindowKind::Main => self.draw_main(
                 app,
                 result_panel_draw_top,
-                history_composition_active,
+                history_insert_composition_active,
+                history_scroll_composition_active,
                 result_panel_bitmap.as_ref(),
             ),
             WindowKind::About => self.draw_about(app),
@@ -7337,9 +8138,9 @@ impl Renderer {
                     }
                 } else if overlay_failure_latched {
                     Ok(())
-                } else if self.layered_surface.is_some() {
+                } else if result_panel_pixels.is_some() {
                     scene.update_result_overlay(
-                        self.layered_surface.as_ref(),
+                        result_panel_pixels.as_deref(),
                         (composition_cache_ready && !composition_cache_hit).then_some(body_top),
                         panel_top,
                         body_top,
@@ -7417,7 +8218,12 @@ impl Renderer {
                 self.result_overlay_motion_key = None;
             }
             if overlay_update_failed && self.layered_surface.is_some() {
-                self.redraw_main_dynamic_fallback(app, panel_top, history_composition_active)?;
+                self.redraw_main_dynamic_fallback(
+                    app,
+                    panel_top,
+                    history_insert_composition_active,
+                    history_scroll_composition_active,
+                )?;
             }
             if let Some(error) = overlay_error {
                 if !self.result_overlay_failure_reported {
@@ -7440,7 +8246,8 @@ impl Renderer {
         &self,
         app: &AppState,
         panel_top: Option<f32>,
-        history_composition_active: bool,
+        history_insert_composition_active: bool,
+        history_scroll_composition_active: bool,
     ) -> windows::core::Result<()> {
         self.target.BeginDraw();
         let clear = d2d_color(0, 0, 0, 0.0);
@@ -7468,7 +8275,8 @@ impl Renderer {
         let draw_result = self.draw_main(
             app,
             panel_top,
-            history_composition_active,
+            history_insert_composition_active,
+            history_scroll_composition_active,
             result_panel_bitmap.as_ref(),
         );
         if self.popup_layer.is_some() {
@@ -7708,7 +8516,8 @@ impl Renderer {
         &self,
         app: &AppState,
         result_panel_draw_top: Option<f32>,
-        history_composition_active: bool,
+        history_insert_composition_active: bool,
+        history_scroll_composition_active: bool,
         result_panel_bitmap: Option<&ID2D1Bitmap>,
     ) -> windows::core::Result<()> {
         let arrow_top = app.arrow_edge == ArrowEdge::Top;
@@ -7822,7 +8631,13 @@ impl Renderer {
         } else if let Some(progress) = history_first_insert_progress(app.history_transition, now) {
             self.draw_skeleton_with_opacity(history_rect, 1.0 - progress);
         }
-        self.draw_history(app, history_top, now, history_composition_active)?;
+        self.draw_history(
+            app,
+            history_top,
+            now,
+            history_insert_composition_active,
+            history_scroll_composition_active,
+        )?;
         self.target.PopAxisAlignedClip();
 
         match &app.phase {
@@ -8332,9 +9147,19 @@ impl Renderer {
         app: &AppState,
         history_top: f32,
         now: Instant,
-        composition_transition_active: bool,
+        insert_composition_active: bool,
+        scroll_composition_active: bool,
     ) -> windows::core::Result<()> {
-        if composition_transition_active {
+        // Render the history rows through exactly one path at a time. Drawing
+        // Direct2D rows under the moving Composition rows creates doubled,
+        // vertically offset text/artwork while the two clocks are sampled at
+        // different frame times. The base history background remains in the
+        // D2D frame; Composition owns the rows whenever its scroll surface is
+        // active. If surface preparation fails, the caller leaves this false
+        // and Direct2D renders the complete list as the fallback.
+        if scroll_composition_active
+            || (insert_composition_active && app.history_transition.is_some())
+        {
             return Ok(());
         }
         for (index, track) in app.history.iter().enumerate() {
@@ -8423,6 +9248,15 @@ impl Renderer {
                 "Cannot rasterize an empty history row",
             )
         })?;
+        self.rasterize_history_row(app, 0, track)
+    }
+
+    unsafe fn rasterize_history_row(
+        &mut self,
+        app: &AppState,
+        index: usize,
+        track: &Track,
+    ) -> windows::core::Result<Vec<u8>> {
         let dc_target = self.dc_target.as_ref().ok_or_else(|| {
             Error::new(
                 windows::core::HRESULT(0x80004005_u32 as i32),
@@ -8448,7 +9282,7 @@ impl Renderer {
         dc_target.BindDC(offscreen.dc, &offscreen_bounds)?;
         self.target.BeginDraw();
         self.target.Clear(Some(&d2d_color(0, 0, 0, 0.0)));
-        let draw_result = self.draw_history_row(app, 0, track, 0.0);
+        let draw_result = self.draw_history_row(app, index, track, 0.0);
         let end_result = self.target.EndDraw(None, None);
         let main_bounds = RECT {
             left: 0,
@@ -8467,6 +9301,73 @@ impl Renderer {
         Ok(pixels.to_vec())
     }
 
+    unsafe fn rasterize_history_scroll_snapshot(
+        &mut self,
+        app: &AppState,
+        origin_offset: f32,
+        content_height: f32,
+    ) -> windows::core::Result<(Vec<u8>, D2D_SIZE_U)> {
+        let dc_target = self.dc_target.as_ref().ok_or_else(|| {
+            Error::new(
+                windows::core::HRESULT(0x80004005_u32 as i32),
+                "The history scroll snapshot requires a Direct2D DC render target",
+            )
+        })?;
+        let main_surface = self.layered_surface.as_ref().ok_or_else(|| {
+            Error::new(
+                windows::core::HRESULT(0x80004005_u32 as i32),
+                "The history scroll snapshot requires the main layered surface",
+            )
+        })?;
+        let scale = composition_scale_for_dpi(self.dpi);
+        let size = D2D_SIZE_U {
+            width: (CONTENT_WIDTH as f32 * scale).ceil().max(1.0) as u32,
+            height: (content_height * scale).ceil().max(1.0) as u32,
+        };
+        let offscreen = LayeredSurface::new(size.width, size.height)?;
+        let offscreen_bounds = RECT {
+            left: 0,
+            top: 0,
+            right: size.width as i32,
+            bottom: size.height as i32,
+        };
+        dc_target.BindDC(offscreen.dc, &offscreen_bounds)?;
+        self.target.BeginDraw();
+        self.target.Clear(Some(&d2d_color(0, 0, 0, 0.0)));
+        let visible_end = origin_offset + content_height;
+        let first = (origin_offset.max(0.0) / HISTORY_ROW_PITCH).floor() as usize;
+        let last = (visible_end.max(0.0) / HISTORY_ROW_PITCH)
+            .ceil()
+            .min(app.history.len() as f32) as usize;
+        let draw_result = (|| -> windows::core::Result<()> {
+            for index in first..last {
+                let track = &app.history[index];
+                let row_top = index as f32 * HISTORY_ROW_PITCH - origin_offset;
+                if row_top + HISTORY_ROW_HEIGHT < 0.0 || row_top > content_height {
+                    continue;
+                }
+                self.draw_history_row(app, index, track, row_top)?;
+            }
+            Ok(())
+        })();
+        let end_result = self.target.EndDraw(None, None);
+        let main_bounds = RECT {
+            left: 0,
+            top: 0,
+            right: main_surface.size.width as i32,
+            bottom: main_surface.size.height as i32,
+        };
+        let restore_result = dc_target.BindDC(main_surface.dc, &main_bounds);
+        draw_result?;
+        end_result?;
+        restore_result?;
+
+        let byte_len = size.width as usize * size.height as usize * 4;
+        let pixels =
+            unsafe { std::slice::from_raw_parts(offscreen._pixels.cast::<u8>(), byte_len) };
+        Ok((pixels.to_vec(), size))
+    }
+
     unsafe fn draw_result_panel(
         &self,
         app: &AppState,
@@ -8482,8 +9383,7 @@ impl Renderer {
         };
         self.fill_gradient_rect(&panel, gradient, top)?;
         let details = self.result_details_metrics(track)?;
-        let detail_rects =
-            result_details_rects(top, details.title_height, details.artist_height, true);
+        let detail_rects = result_details_rects(top, details.title_height, details.artist_height);
         // The image view is 150×150pt and clips at radius5. The native
         // placeholder has its own centered 131pt intrinsic image size and
         // alpha, so do not paint an opaque square under it.
@@ -8502,15 +9402,6 @@ impl Renderer {
             detail_rects.artist,
             &self.text.result_artist,
             &self.palette.result_label,
-        );
-        // UI-233 keeps a fixed Apple Music CTA visible. The current UI model
-        // has no verified destination, so show it disabled and keep its hit
-        // rectangle separate from the Shazam page link.
-        self.text(
-            localized_ui_text(UiTextKey::AppleMusicAction, ui_language()),
-            detail_rects.action,
-            &self.text.result_action,
-            &self.palette.subtitle,
         );
         self.draw_result_close_icon(top, edge);
         Ok(())
@@ -8928,12 +9819,6 @@ unsafe fn create_text_styles(factory: &IDWriteFactory) -> windows::core::Result<
             DWRITE_FONT_WEIGHT_BOLD,
             DWRITE_TEXT_ALIGNMENT_LEADING,
         )?,
-        result_action: create_text_format(
-            factory,
-            12.0,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_TEXT_ALIGNMENT_LEADING,
-        )?,
         button: create_text_format(
             factory,
             13.0,
@@ -8957,12 +9842,6 @@ unsafe fn create_text_styles(factory: &IDWriteFactory) -> windows::core::Result<
             18.0,
             DWRITE_FONT_WEIGHT_HEAVY,
             DWRITE_TEXT_ALIGNMENT_CENTER,
-        )?,
-        trailing_small: create_text_format(
-            factory,
-            12.0,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_TEXT_ALIGNMENT_TRAILING,
         )?,
         logo: create_text_format(
             factory,
@@ -9002,17 +9881,6 @@ fn is_tray_activation_event(event: u16) -> bool {
     event == windows::Win32::UI::Shell::NIN_SELECT as u16
         || event
             == (windows::Win32::UI::Shell::NIN_SELECT | windows::Win32::UI::Shell::NINF_KEY) as u16
-}
-
-fn should_show_initial_popup(startup_task_activation: bool) -> bool {
-    !startup_task_activation
-}
-
-fn is_startup_task_activation() -> bool {
-    AppInstance::GetActivatedEventArgs()
-        .ok()
-        .and_then(|args| args.Kind().ok())
-        .is_some_and(|kind| kind == ActivationKind::StartupTask)
 }
 
 struct SingleInstanceMutex(HANDLE);
@@ -9155,13 +10023,30 @@ unsafe fn show_tray_context_menu(app: &mut AppState) {
     let Ok(menu) = CreatePopupMenu() else {
         return;
     };
-    let settings = wide("Settings");
-    let exit = wide("Exit Shazam");
+    let language = ui_language();
+    let settings = wide(match language {
+        UiLanguage::Japanese => "設定",
+        UiLanguage::English => "Settings",
+    });
+    let check_for_updates = wide(match language {
+        UiLanguage::Japanese => "更新を確認",
+        UiLanguage::English => "Check for updates",
+    });
+    let exit = wide(match language {
+        UiLanguage::Japanese => "Shazam を終了",
+        UiLanguage::English => "Exit Shazam",
+    });
     let _ = AppendMenuW(
         menu,
         MF_STRING,
         TRAY_MENU_SETTINGS,
         PCWSTR(settings.as_ptr()),
+    );
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        TRAY_MENU_UPDATE,
+        PCWSTR(check_for_updates.as_ptr()),
     );
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, TRAY_MENU_EXIT, PCWSTR(exit.as_ptr()));
@@ -9190,10 +10075,184 @@ unsafe fn show_tray_context_menu(app: &mut AppState) {
     let _ = Shell_NotifyIconW(NIM_SETFOCUS, &data);
     match selected.0 as usize {
         TRAY_MENU_SETTINGS => open_settings(app),
+        TRAY_MENU_UPDATE => begin_update_check(app, true),
         TRAY_MENU_EXIT => {
             let _ = DestroyWindow(hwnd);
         }
         _ => {}
+    }
+}
+
+type UpdateCheckPayload = (bool, Result<Option<UpdateCandidate>, String>);
+type UpdateDownloadPayload = Result<std::path::PathBuf, String>;
+
+unsafe fn begin_update_check(app: &mut AppState, interactive: bool) {
+    if app.update_operation_active {
+        return;
+    }
+    app.update_operation_active = true;
+    let hwnd = app.main_hwnd;
+    let thread_hwnd = hwnd.0 as isize;
+    let spawned = thread::Builder::new()
+        .name("openshazam-update-check".to_owned())
+        .spawn(move || {
+            let result = crate::windows_update::check_for_update(env!("CARGO_PKG_VERSION"));
+            post_update_payload(
+                HWND(thread_hwnd as *mut c_void),
+                WM_UPDATE_CHECK_COMPLETED,
+                (interactive, result),
+            );
+        });
+    if let Err(error) = spawned {
+        app.update_operation_active = false;
+        if interactive {
+            show_update_message(
+                hwnd,
+                &format!("Could not start the update check: {error}"),
+                0,
+            );
+        } else {
+            eprintln!("Could not start the Shazam update check: {error}");
+        }
+    }
+}
+
+fn post_update_payload<T>(hwnd: HWND, message: u32, payload: T) {
+    let pointer = Box::into_raw(Box::new(payload));
+    unsafe {
+        if PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(pointer as isize)).is_err() {
+            drop(Box::from_raw(pointer));
+        }
+    }
+}
+
+unsafe fn show_update_message(hwnd: HWND, message: &str, flags: u32) -> i32 {
+    let title = wide("Shazam");
+    let body = wide(message);
+    windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+        Some(hwnd),
+        PCWSTR(body.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE(flags),
+    )
+    .0
+}
+
+unsafe fn handle_update_check_completed(app: &mut AppState, payload: UpdateCheckPayload) {
+    app.update_operation_active = false;
+    let (interactive, result) = payload;
+    match result {
+        Err(error) => {
+            if !interactive {
+                eprintln!("Shazam could not check for updates: {error}");
+                return;
+            }
+            let message = match ui_language() {
+                UiLanguage::Japanese => format!("更新を確認できませんでした。\n\n{error}"),
+                UiLanguage::English => format!("Shazam could not check for updates.\n\n{error}"),
+            };
+            show_update_message(app.main_hwnd, &message, 0x10);
+        }
+        Ok(None) => {
+            if !interactive {
+                return;
+            }
+            let message = match ui_language() {
+                UiLanguage::Japanese => "Shazam は最新です。",
+                UiLanguage::English => "Shazam is up to date.",
+            };
+            show_update_message(app.main_hwnd, message, 0x40);
+        }
+        Ok(Some(candidate)) => {
+            let message = match ui_language() {
+                UiLanguage::Japanese => format!(
+                    "Shazam {} をインストールできます。\n\n今すぐ更新しますか？Shazam は更新中に終了します。",
+                    candidate.manifest.version
+                ),
+                UiLanguage::English => format!(
+                    "Shazam {} is available.\n\nInstall the update now? Shazam will close while it installs.",
+                    candidate.manifest.version
+                ),
+            };
+            if show_update_message(app.main_hwnd, &message, 0x4 | 0x20 | 0x100) == 6 {
+                begin_update_download(app, candidate);
+            }
+        }
+    }
+}
+
+unsafe fn begin_update_download(app: &mut AppState, candidate: UpdateCandidate) {
+    if app.update_operation_active {
+        return;
+    }
+    app.update_operation_active = true;
+    let hwnd = app.main_hwnd;
+    let thread_hwnd = hwnd.0 as isize;
+    let spawned = thread::Builder::new()
+        .name("openshazam-update-download".to_owned())
+        .spawn(move || {
+            let result = crate::windows_update::download_verified_installer(&candidate);
+            post_update_payload(
+                HWND(thread_hwnd as *mut c_void),
+                WM_UPDATE_DOWNLOAD_COMPLETED,
+                result,
+            );
+        });
+    if let Err(error) = spawned {
+        app.update_operation_active = false;
+        show_update_message(
+            hwnd,
+            &format!("Could not start the update download: {error}"),
+            0x10,
+        );
+    }
+}
+
+unsafe fn handle_update_download_completed(app: &mut AppState, payload: UpdateDownloadPayload) {
+    app.update_operation_active = false;
+    match payload {
+        Err(error) => {
+            let message = match ui_language() {
+                UiLanguage::Japanese => {
+                    format!("更新をダウンロードまたは検証できませんでした。\n\n{error}")
+                }
+                UiLanguage::English => {
+                    format!("The update could not be downloaded or verified.\n\n{error}")
+                }
+            };
+            show_update_message(app.main_hwnd, &message, 0x10);
+        }
+        Ok(path) => {
+            if capture_mode_in_progress(&app.phase).is_some() {
+                let message = match ui_language() {
+                    UiLanguage::Japanese => "認識中です。認識を停止して更新インストーラーを起動しますか？",
+                    UiLanguage::English => "Recognition is still active. Stop Shazam and start the verified update installer?",
+                };
+                if show_update_message(app.main_hwnd, message, 0x4 | 0x20 | 0x100) != 6 {
+                    let _ = std::fs::remove_file(&path);
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::remove_dir(parent);
+                    }
+                    return;
+                }
+            }
+            match crate::windows_update::start_installer(&path) {
+                Ok(()) => {
+                    let _ = DestroyWindow(app.main_hwnd);
+                }
+                Err(error) => {
+                    let message = match ui_language() {
+                        UiLanguage::Japanese => {
+                            format!("更新インストーラーを起動できませんでした。\n\n{error}")
+                        }
+                        UiLanguage::English => {
+                            format!("Could not start the update installer.\n\n{error}")
+                        }
+                    };
+                    show_update_message(app.main_hwnd, &message, 0x10);
+                }
+            }
+        }
     }
 }
 
@@ -9631,13 +10690,7 @@ unsafe fn window_data(hwnd: HWND) -> Option<&'static mut WindowData> {
     ptr.as_mut()
 }
 
-unsafe fn main_hit_test(
-    app: &AppState,
-    x: f32,
-    y: f32,
-    body_top: f32,
-    renderer: Option<&Renderer>,
-) -> MainHit {
+unsafe fn main_hit_test(app: &AppState, x: f32, y: f32, body_top: f32) -> MainHit {
     let result_accepts_input = result_header_hit_test_contains(y, body_top)
         && match &app.phase {
             MainPhase::Matched { stage, .. } => !matches!(stage, ResultCardStage::Exiting { .. }),
@@ -9660,30 +10713,8 @@ unsafe fn main_hit_test(
             return MainHit::CloseResult;
         }
         if let MainPhase::Matched { track, .. } = &app.phase {
-            let action = renderer
-                .and_then(|renderer| renderer.result_details_metrics(track).ok())
-                .map(|metrics| {
-                    result_details_rects(
-                        body_top,
-                        metrics.title_height,
-                        metrics.artist_height,
-                        true,
-                    )
-                    .action
-                })
-                .unwrap_or_else(|| {
-                    // If DirectWrite metrics are unavailable, conservatively
-                    // keep the whole details column out of the Shazam link.
-                    rect(
-                        RESULT_DETAILS_LEFT,
-                        body_top,
-                        RESULT_DETAILS_RIGHT,
-                        body_top + TOP_HEIGHT as f32,
-                    )
-                });
-            let action_bounds = [action.left, action.top, action.right, action.bottom];
             if resolve_track_page_url(track, &app.ui_configs).is_some()
-                && result_card_link_hit(x, local_y, body_top, close, Some(action_bounds))
+                && result_card_link_hit(x, local_y, body_top, close)
             {
                 return MainHit::OpenTrack(track.display_id);
             }
@@ -10020,6 +11051,10 @@ fn hide_main(app: &mut AppState) {
         return;
     }
     unsafe { cancel_deferred_deactivation_hide(app) };
+    if let Some(animation) = app.history_scroll_animation.take() {
+        app.scroll_offset = history_scroll_offset_at(animation, Instant::now()).0;
+    }
+    app.history_scroll_composition_ready = false;
     app.popup_opacity = 0;
     app.visible = false;
     clear_history_hover(&mut app.hovered_row);
@@ -10028,6 +11063,7 @@ fn hide_main(app: &mut AppState) {
     app.popup_activation_grace_until = None;
     set_auto_recognition_context(app, RecognitionContext::Background);
     unsafe {
+        let _ = KillTimer(Some(app.main_hwnd), TIMER_HISTORY_SCROLL_SETTLE);
         sync_main_timers(app);
         if !app.main_hwnd.0.is_null() {
             let _ = ShowWindow(app.main_hwnd, SW_HIDE);
@@ -11161,6 +12197,9 @@ fn curl_artwork_request(
         "\nOPEN SHAZAM IMAGE RESPONSE:%{http_code}\n%{redirect_url}\n%{content_type}\n%{remote_ip}"
             .to_string();
     let mut command = Command::new("curl.exe");
+    // curl is a console executable. Do not let artwork requests open a terminal
+    // window when Shazam itself is running as a GUI-subsystem application.
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     command.args([
         "--disable",
         "--fail",
@@ -11661,7 +12700,6 @@ enum UiTextKey {
     NoMatchBody,
     OfflineBody,
     TryAgain,
-    AppleMusicAction,
     TimeoutDescription,
     TimeoutDismiss,
     TimeoutRestart,
@@ -11701,10 +12739,6 @@ fn localized_ui_text(key: UiTextKey, language: UiLanguage) -> &'static str {
         (UiTextKey::OfflineBody, UiLanguage::English) => "Please check your connection",
         (UiTextKey::TryAgain, UiLanguage::Japanese) => "再度試す",
         (UiTextKey::TryAgain, UiLanguage::English) => "Try Again",
-        (UiTextKey::AppleMusicAction, UiLanguage::Japanese) => {
-            "Apple Music\u{3067}\u{8074}\u{304f}"
-        }
-        (UiTextKey::AppleMusicAction, UiLanguage::English) => "Listen on Apple Music",
         (UiTextKey::TimeoutDescription, UiLanguage::Japanese) => {
             "引き続き聴きたい？「再起動」をクリックして Shazam を続けましょう！"
         }
@@ -11817,6 +12851,9 @@ fn animation_snapshot(app: &AppState) -> AnimationSnapshot {
 
 unsafe fn sync_main_timers(app: &mut AppState) {
     let hwnd = app.main_hwnd;
+    if !hwnd.0.is_null() && app.history_scroll_animation.is_none() {
+        let _ = KillTimer(Some(hwnd), TIMER_HISTORY_SCROLL_SETTLE);
+    }
     if app.visible || app.recognition_session.is_some() && !hwnd.0.is_null() {
         let track_phase = phase_needs_timeout(&app.phase)
             || app.history_transition.is_some()
@@ -11831,7 +12868,8 @@ unsafe fn sync_main_timers(app: &mut AppState) {
         }
         let content_animation_needs_frame =
             animation_needs_frame(&app.phase, app.startup_animation_pending)
-                || app.history_scroll_animation.is_some()
+                || (app.history_scroll_animation.is_some()
+                    && !app.history_scroll_composition_ready)
                 || result_overlay_fallback_needs_frame(
                     &app.phase,
                     app.result_overlay_composition_ready,
@@ -12535,6 +13573,24 @@ unsafe extern "system" fn window_proc(
     let app = &mut *data.app;
 
     match message {
+        WM_UPDATE_CHECK_COMPLETED if data.kind == WindowKind::Main => {
+            let pointer = lparam.0 as *mut UpdateCheckPayload;
+            if !pointer.is_null() {
+                handle_update_check_completed(app, *Box::from_raw(pointer));
+            }
+            LRESULT(0)
+        }
+        WM_UPDATE_DOWNLOAD_COMPLETED if data.kind == WindowKind::Main => {
+            let pointer = lparam.0 as *mut UpdateDownloadPayload;
+            if !pointer.is_null() {
+                handle_update_download_completed(app, *Box::from_raw(pointer));
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if data.kind == WindowKind::Main && wparam.0 == TIMER_UPDATE_CHECK => {
+            begin_update_check(app, false);
+            LRESULT(0)
+        }
         WM_HOTKEY
             if data.kind == WindowKind::Main
                 && app.global_shortcut_registration_id == Some(wparam.0 as i32) =>
@@ -12758,6 +13814,10 @@ unsafe extern "system" fn window_proc(
                     .renderer
                     .as_ref()
                     .is_some_and(|renderer| renderer.result_overlay_matches_current(app));
+                app.history_scroll_composition_ready = data
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.history_scroll_composition_active());
                 sync_main_timers(app);
             }
             let _ = EndPaint(hwnd, &paint);
@@ -12817,8 +13877,7 @@ unsafe extern "system" fn window_proc(
             } else {
                 0.0
             };
-            app.mouse_down_center =
-                main_hit_test(app, x, y, body_top, data.renderer.as_ref()) == MainHit::CenterButton;
+            app.mouse_down_center = main_hit_test(app, x, y, body_top) == MainHit::CenterButton;
             app.long_press_consumed = false;
             if app.mouse_down_center {
                 let _ = SetCapture(hwnd);
@@ -12830,13 +13889,14 @@ unsafe extern "system" fn window_proc(
             let _ = KillTimer(Some(hwnd), TIMER_SINGLE_CLICK);
             let _ = KillTimer(Some(hwnd), TIMER_LONG_PRESS);
             app.single_click_pending = false;
+            sample_history_scroll(app, Instant::now());
             let (x, y) = client_dips(hwnd, lparam);
             let body_top = if app.arrow_edge == ArrowEdge::Top {
                 POPUP_ARROW_HEIGHT as f32
             } else {
                 0.0
             };
-            if main_hit_test(app, x, y, body_top, data.renderer.as_ref()) == MainHit::CenterButton {
+            if main_hit_test(app, x, y, body_top) == MainHit::CenterButton {
                 app.mouse_down_center = true;
                 app.long_press_consumed = true;
                 if capture_mode_in_progress(&app.phase) == Some(CaptureMode::Auto) {
@@ -12847,16 +13907,14 @@ unsafe extern "system" fn window_proc(
             } else {
                 app.mouse_down_center = false;
                 app.long_press_consumed = false;
-                process_main_hit(
-                    app,
-                    main_hit_test(app, x, y, body_top, data.renderer.as_ref()),
-                );
+                process_main_hit(app, main_hit_test(app, x, y, body_top));
             }
             update_visible_windows(app);
             LRESULT(0)
         }
         WM_LBUTTONUP if data.kind == WindowKind::Main => {
             let _ = KillTimer(Some(hwnd), TIMER_LONG_PRESS);
+            sample_history_scroll(app, Instant::now());
             if app.mouse_down_center {
                 let _ = ReleaseCapture();
                 app.mouse_down_center = false;
@@ -12873,7 +13931,7 @@ unsafe extern "system" fn window_proc(
                 } else {
                     0.0
                 };
-                let hit = main_hit_test(app, x, y, body_top, data.renderer.as_ref());
+                let hit = main_hit_test(app, x, y, body_top);
                 process_main_hit(app, hit);
                 update_visible_windows(app);
             }
@@ -12922,13 +13980,60 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
+        WM_TIMER if data.kind == WindowKind::Main && wparam.0 == TIMER_HISTORY_SCROLL_SETTLE => {
+            let _ = KillTimer(Some(hwnd), TIMER_HISTORY_SCROLL_SETTLE);
+            if let Some(animation) = app.history_scroll_animation {
+                let now = Instant::now();
+                let (offset, still_animating) = history_scroll_offset_at(animation, now);
+                app.scroll_offset = if still_animating {
+                    offset
+                } else {
+                    animation.to_offset
+                };
+                if still_animating && app.visible {
+                    let remaining = HISTORY_SCROLL_TRANSITION
+                        .saturating_sub(now.saturating_duration_since(animation.started_at));
+                    let timeout = remaining.as_millis().clamp(1, u32::MAX as u128) as u32;
+                    let _ = SetTimer(Some(hwnd), TIMER_HISTORY_SCROLL_SETTLE, timeout, None);
+                } else {
+                    app.history_scroll_animation = None;
+                    app.history_scroll_composition_ready = false;
+                    if app.visible {
+                        app.hovered_row = unsafe { hovered_history_row_for_cursor(app) };
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    sync_main_timers(app);
+                }
+            }
+            LRESULT(0)
+        }
         WM_TIMER if data.kind == WindowKind::Main && wparam.0 == TIMER_ANIMATION => {
             if app.visible {
                 let now = Instant::now();
+                let hovered_row_before = app.hovered_row;
+                let history_scroll_composition_active = data
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.history_scroll_composition_active());
                 let history_scroll_moved = advance_history_scroll(app, now);
                 if history_scroll_moved {
-                    app.hovered_row = unsafe { hovered_history_row_for_cursor(app) };
+                    app.hovered_row = if history_scroll_composition_active
+                        && app.history_scroll_animation.is_some()
+                    {
+                        None
+                    } else {
+                        unsafe { hovered_history_row_for_cursor(app) }
+                    };
                 }
+                let history_scroll_finished =
+                    history_scroll_moved && app.history_scroll_animation.is_none();
+                if history_scroll_finished {
+                    let _ = KillTimer(Some(hwnd), TIMER_HISTORY_SCROLL_SETTLE);
+                }
+                let history_scroll_needs_d2d_redraw = history_scroll_moved
+                    && (!history_scroll_composition_active
+                        || history_scroll_finished
+                        || app.hovered_row != hovered_row_before);
                 let composition_frame_needed =
                     animation_needs_frame(&app.phase, app.startup_animation_pending);
                 if composition_frame_needed {
@@ -12966,7 +14071,7 @@ unsafe extern "system" fn window_proc(
                     now,
                     app.history_composition_ready,
                 );
-                if history_scroll_moved
+                if history_scroll_needs_d2d_redraw
                     || history_row_animating
                     || animation_needs_d2d_redraw(
                         &app.phase,
@@ -13015,6 +14120,8 @@ unsafe extern "system" fn window_proc(
                 };
                 app.mouse_leave_tracking = unsafe { TrackMouseEvent(&mut tracking).is_ok() };
             }
+            let now = Instant::now();
+            sample_history_scroll(app, now);
             let (x, y) = client_dips(hwnd, lparam);
             let body_top = if app.arrow_edge == ArrowEdge::Top {
                 POPUP_ARROW_HEIGHT as f32
@@ -13022,7 +14129,9 @@ unsafe extern "system" fn window_proc(
                 0.0
             };
             let history_top = body_top + TOP_HEIGHT as f32;
-            let next = if (0.0..CONTENT_WIDTH as f32).contains(&x) {
+            let next = if app.history_scroll_animation.is_some() {
+                None
+            } else if (0.0..CONTENT_WIDTH as f32).contains(&x) {
                 history_row_index_at(
                     y,
                     history_top,
@@ -13030,7 +14139,7 @@ unsafe extern "system" fn window_proc(
                     app.history.len(),
                     app.history_transition,
                     app.scroll_offset,
-                    Instant::now(),
+                    now,
                 )
             } else {
                 None
@@ -13073,9 +14182,13 @@ unsafe extern "system" fn window_proc(
             }
 
             let delta = (high_word(wparam.0 as isize) as i16) as f32;
-            let current_target = app
-                .history_scroll_animation
-                .map_or(app.scroll_offset, |animation| animation.to_offset);
+            let now = Instant::now();
+            let current_animation = app.history_scroll_animation;
+            let current_offset = current_animation.map_or(app.scroll_offset, |animation| {
+                history_scroll_offset_at(animation, now).0
+            });
+            let current_target =
+                current_animation.map_or(app.scroll_offset, |animation| animation.to_offset);
             let next = history_scroll_offset_after_wheel(
                 current_target,
                 delta,
@@ -13083,17 +14196,33 @@ unsafe extern "system" fn window_proc(
                 app.history.len(),
                 HISTORY_HEIGHT as f32,
             );
-            if (next - app.scroll_offset).abs() > f32::EPSILON {
-                app.history_scroll_animation = Some(HistoryScrollAnimation {
-                    started_at: Instant::now(),
-                    from_offset: app.scroll_offset,
-                    to_offset: next,
-                });
-                request_history_artwork_at_offset(app, next);
+            if (next - current_target).abs() > f32::EPSILON {
+                app.scroll_offset = current_offset;
+                app.history_scroll_animation = if (next - current_offset).abs() > f32::EPSILON {
+                    Some(HistoryScrollAnimation {
+                        started_at: now,
+                        from_offset: current_offset,
+                        to_offset: next,
+                    })
+                } else {
+                    None
+                };
+                app.history_scroll_composition_ready = false;
+                app.hovered_row = None;
+                if app.history_scroll_animation.is_some() {
+                    request_history_artwork_at_offset(app, next);
+                    let _ = SetTimer(
+                        Some(hwnd),
+                        TIMER_HISTORY_SCROLL_SETTLE,
+                        HISTORY_SCROLL_TRANSITION.as_millis() as u32,
+                        None,
+                    );
+                } else {
+                    let _ = KillTimer(Some(hwnd), TIMER_HISTORY_SCROLL_SETTLE);
+                    app.hovered_row = unsafe { hovered_history_row_for_cursor(app) };
+                }
                 sync_main_timers(app);
                 let _ = InvalidateRect(Some(hwnd), None, false);
-            } else if app.history_scroll_animation.take().is_some() {
-                sync_main_timers(app);
             }
             LRESULT(0)
         }
@@ -13120,7 +14249,7 @@ unsafe extern "system" fn window_proc(
             } else {
                 0.0
             };
-            if main_hit_test(app, x, y, body_top, data.renderer.as_ref()) == MainHit::CenterButton {
+            if main_hit_test(app, x, y, body_top) == MainHit::CenterButton {
                 if capture_mode_in_progress(&app.phase) == Some(CaptureMode::Auto) {
                     cancel_capture(app);
                 } else {
@@ -13381,7 +14510,7 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
         {
             eprintln!("OpenShazam could not set its Windows notification identity: {error}");
         }
-        let silent_startup = start_hidden || is_startup_task_activation();
+        let silent_startup = start_hidden;
         let (instance_mutex, already_running) = acquire_single_instance_mutex()?;
         if already_running {
             // A second explicit UI launch reuses the resident tray process.
@@ -13447,6 +14576,7 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             global_shortcut_capture_suspended: false,
             settings_host: None,
             settings_opening: false,
+            update_operation_active: false,
             about_hwnd: HWND::default(),
             microphone_hwnd: HWND::default(),
             d2d_factory,
@@ -13462,6 +14592,7 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             history_composition_ready: false,
             scroll_offset: 0.0,
             history_scroll_animation: None,
+            history_scroll_composition_ready: false,
             hovered_row: None,
             mouse_leave_tracking: false,
             ui_levels: UiLevels::default(),
@@ -13548,6 +14679,19 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             drop(Box::from_raw(app_ptr));
             return Err(Box::new(error));
         }
+        // Check in the background on launch and then once a day. This is only
+        // a signed manifest request; an update installer is never downloaded
+        // or started until the user accepts the prompt.
+        if SetTimer(
+            Some(hwnd),
+            TIMER_UPDATE_CHECK,
+            UPDATE_CHECK_INTERVAL_MS,
+            None,
+        ) == 0
+        {
+            eprintln!("Could not schedule the daily Shazam update check.");
+        }
+        begin_update_check(&mut *app_ptr, false);
         match register_global_shortcut(hwnd, GLOBAL_SHORTCUT_ID_PRIMARY, (*app_ptr).global_shortcut)
         {
             Ok(()) => {
@@ -13563,7 +14707,7 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
         // Let Explorer finish publishing the notification icon before asking
         // Shell_NotifyIconGetRect for its anchor. `ui` opens the popup on
         // launch; the tray icon remains available to hide/show it afterward.
-        if should_show_initial_popup(silent_startup) {
+        if !silent_startup {
             let _ = PostMessageW(Some(hwnd), WM_SHOW_INITIAL_POPUP, WPARAM(0), LPARAM(0));
         }
         // Mirror Shazam's persisted Auto Shazam state: once the user has
@@ -13808,19 +14952,19 @@ mod tests {
         result_overlay_failure_matches, result_overlay_intersects_header, result_panel_draw_top,
         result_panel_top_at, scale_notification_artwork_to_size, select_ui_language_from_multisz,
         should_defer_hide_for_tray_activation, should_hide_popup_on_deactivation,
-        should_replace_cached_artwork, should_show_initial_popup, should_start_startup_logo,
-        status_text_snapshot, theme_from_foreground_rgb, timeout_copy, ui_model,
-        valid_page_template, visible_history_row_hit, ArrowEdge, ArtworkPixels, ArtworkRequest,
-        ArtworkRequestIdentity, ArtworkSource, CaptureMode, CompositionRootLayer,
-        CompositionSceneLayer, HeaderFillScope, HistoryMutationEvent, HistoryMutationTransition,
-        HistoryTimestampSource, MainPhase, NoMatchIconCommand, PageLinkFailure, ResultCardAdvance,
-        ResultCardStage, ResultOverlayContentKey, ResultOverlayIdentity, Theme, ThemePreference,
-        Track, TrackIdentity, UiConfigSnapshot, UiLanguage, UiTextKey, ValidatedWebTrackUrl,
-        WindowKind, AUTO_SHADOW_DISPLAY_BOUNDS, AUTO_START_SPRING_DURATION, BUTTON_CLEAR_DIAMETER,
-        BUTTON_SIZE, BUTTON_TOP, BUTTON_X, CLOSE_BUTTON_GA_PIXELS, FALLBACK_MATCH_DARK_PIXELS,
+        should_replace_cached_artwork, should_start_startup_logo, status_text_snapshot,
+        theme_from_foreground_rgb, timeout_copy, ui_model, valid_page_template,
+        visible_history_row_hit, ArrowEdge, ArtworkPixels, ArtworkRequest, ArtworkRequestIdentity,
+        ArtworkSource, CaptureMode, CompositionRootLayer, CompositionSceneLayer, HeaderFillScope,
+        HistoryMutationEvent, HistoryMutationTransition, HistoryTimestampSource, MainPhase,
+        NoMatchIconCommand, PageLinkFailure, ResultCardAdvance, ResultCardStage,
+        ResultOverlayContentKey, ResultOverlayIdentity, Theme, ThemePreference, Track,
+        TrackIdentity, UiConfigSnapshot, UiLanguage, UiTextKey, ValidatedWebTrackUrl, WindowKind,
+        AUTO_SHADOW_DISPLAY_BOUNDS, AUTO_START_SPRING_DURATION, BUTTON_CLEAR_DIAMETER, BUTTON_SIZE,
+        BUTTON_TOP, BUTTON_X, CLOSE_BUTTON_GA_PIXELS, FALLBACK_MATCH_DARK_PIXELS,
         FALLBACK_MATCH_LIGHT_PIXELS, FALLBACK_MATCH_LOGICAL_SIDE, HISTORY_HEIGHT,
         HISTORY_INSERT_TRANSITION, HISTORY_ROW_HEIGHT, INNER_MASK_BOUNDS, NO_MATCH_ICON_PATH,
-        OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT, RESULT_ACTION_HEIGHT,
+        OUTER_BASE_OPACITY, POPUP_ACTIVATION_GRACE, POPUP_ARROW_HEIGHT,
         RESULT_ARTWORK_CORNER_RADIUS, RESULT_CARD_HOLD, RESULT_CARD_TRANSITION,
         RESULT_CLOSE_ICON_PIXELS, RESULT_DETAILS_LEFT, RESULT_DETAILS_RIGHT, SETTINGS_ICON_PIXELS,
         TOP_HEIGHT, WHITE_CLOSE_ICON_PIXELS,
@@ -13891,9 +15035,8 @@ mod tests {
     }
 
     #[test]
-    fn ui234_result_card_uses_the_single_d2d_popup_mask_to_avoid_edge_fringe() {
+    fn result_card_composition_uses_standalone_pixels_under_shared_popup_clip() {
         let body_top = 10.0;
-        assert!(!super::COMPOSITION_RESULT_CARD_ENABLED);
         assert_eq!(
             result_panel_draw_top(Some(body_top - TOP_HEIGHT as f32), false),
             Some(body_top - TOP_HEIGHT as f32)
@@ -14162,12 +15305,6 @@ mod tests {
             &mut recent,
             "track-key:a".to_owned()
         ));
-    }
-
-    #[test]
-    fn startup_task_activation_keeps_the_main_popup_hidden() {
-        assert!(should_show_initial_popup(false));
-        assert!(!should_show_initial_popup(true));
     }
 
     #[test]
@@ -14531,84 +15668,18 @@ mod tests {
     }
 
     #[test]
-    fn ui222_result_card_link_excludes_close_and_visible_store_action() {
+    fn ui222_result_card_link_excludes_close_button() {
         let top = 42.0;
         let close = [353.0, top + 25.0, 365.0, top + 37.0];
-        let action = result_details_rects(top, 24.0, 18.0, true).action;
-        let action_bounds = [action.left, action.top, action.right, action.bottom];
-
-        assert!(result_card_link_hit(
-            30.0,
-            top + 80.0,
-            top,
-            close,
-            Some(action_bounds)
-        ));
-        assert!(!result_card_link_hit(
-            359.0,
-            top + 31.0,
-            top,
-            close,
-            Some(action_bounds)
-        ));
-        assert!(!result_card_link_hit(
-            (action.left + action.right) * 0.5,
-            (action.top + action.bottom) * 0.5,
-            top,
-            close,
-            Some(action_bounds),
-        ));
-        assert!(!result_card_link_hit(
-            30.0,
-            top - 0.1,
-            top,
-            close,
-            Some(action_bounds)
-        ));
+        assert!(result_card_link_hit(30.0, top + 80.0, top, close));
+        assert!(!result_card_link_hit(359.0, top + 31.0, top, close));
+        assert!(!result_card_link_hit(30.0, top - 0.1, top, close));
         assert!(!result_card_link_hit(
             30.0,
             top + TOP_HEIGHT as f32 + 0.1,
             top,
-            close,
-            Some(action_bounds),
+            close
         ));
-    }
-
-    #[test]
-    fn ui233_fixed_store_cta_is_visible_but_separate_from_shazam_page_hit() {
-        let top = 42.0;
-        let close = [353.0, top + 25.0, 365.0, top + 37.0];
-        let action = result_details_rects(top, 24.0, 18.0, true).action;
-        assert_eq!(action.left, RESULT_DETAILS_LEFT);
-        assert_eq!(action.right, RESULT_DETAILS_RIGHT);
-        assert_eq!(action.bottom - action.top, RESULT_ACTION_HEIGHT);
-        let action_center = (
-            (action.left + action.right) * 0.5,
-            (action.top + action.bottom) * 0.5,
-        );
-
-        assert!(!result_card_link_hit(
-            action_center.0,
-            action_center.1,
-            top,
-            close,
-            Some([action.left, action.top, action.right, action.bottom]),
-        ));
-        assert!(result_card_link_hit(
-            30.0,
-            top + 80.0,
-            top,
-            close,
-            Some([action.left, action.top, action.right, action.bottom]),
-        ));
-        assert_eq!(
-            localized_ui_text(UiTextKey::AppleMusicAction, UiLanguage::Japanese),
-            "Apple Musicで聴く"
-        );
-        assert_eq!(
-            localized_ui_text(UiTextKey::AppleMusicAction, UiLanguage::English),
-            "Listen on Apple Music"
-        );
     }
 
     #[test]
@@ -15627,7 +16698,7 @@ mod tests {
             bass: 1.0,
             treble: 0.0,
         };
-        let max_button_diameter = BUTTON_SIZE as f64
+        let max_button_diameter = BUTTON_SIZE
             * ui_model::wave_frame_at(ui_model::TaggingMode::Manual, 0.0, levels)
                 .button_child_scale;
         for step in 0..=500 {
@@ -15644,6 +16715,7 @@ mod tests {
             composition_scene_layer_order(),
             [
                 CompositionSceneLayer::Tagging,
+                CompositionSceneLayer::HistoryScrollOverlay,
                 CompositionSceneLayer::HistoryOverlay,
                 CompositionSceneLayer::ResultOverlay,
             ]
@@ -16324,26 +17396,20 @@ mod tests {
 
     #[test]
     fn result_details_stack_tracks_artwork_center_and_expands_for_wrapping() {
-        let single_line = result_details_rects(10.0, 24.0, 18.0, true);
-        assert_eq!(single_line.title.top, 66.5);
-        assert_eq!(single_line.title.bottom, 90.5);
-        assert_eq!(single_line.artist.top, 95.5);
-        assert_eq!(single_line.action.top, 123.5);
+        let single_line = result_details_rects(10.0, 24.0, 18.0);
+        assert_eq!(single_line.title.top, 81.5);
+        assert_eq!(single_line.title.bottom, 105.5);
+        assert_eq!(single_line.artist.top, 110.5);
+        assert_eq!(single_line.artist.bottom, 128.5);
         assert_eq!(
-            (single_line.title.top + single_line.action.bottom) * 0.5,
+            (single_line.title.top + single_line.artist.bottom) * 0.5,
             105.0
         );
 
-        let no_action = result_details_rects(10.0, 24.0, 18.0, false);
-        assert_eq!(no_action.title.top, 81.5);
-        assert_eq!(no_action.artist.bottom, 128.5);
-        assert_eq!(no_action.action.left, 0.0);
-        assert_eq!((no_action.title.top + no_action.artist.bottom) * 0.5, 105.0);
-
-        let wrapped = result_details_rects(10.0, 48.0, 36.0, true);
-        assert_eq!(wrapped.title.top, 45.5);
-        assert_eq!(wrapped.action.bottom, 164.5);
-        assert_eq!((wrapped.title.top + wrapped.action.bottom) * 0.5, 105.0);
+        let wrapped = result_details_rects(10.0, 48.0, 36.0);
+        assert_eq!(wrapped.title.top, 60.5);
+        assert_eq!(wrapped.artist.bottom, 149.5);
+        assert_eq!((wrapped.title.top + wrapped.artist.bottom) * 0.5, 105.0);
     }
 
     #[test]
@@ -16356,10 +17422,9 @@ mod tests {
         assert!(text.title.top >= top);
         assert!(text.date.bottom <= top + HISTORY_ROW_HEIGHT);
 
-        // Result text uses measured DirectWrite line heights too. With the
-        // unavailable store action omitted, the maximum title/artist stack
-        // remains centered and does not escape the fixed 180-DIP header.
-        let result = result_details_rects(0.0, 80.0, 74.0, false);
+        // Result text uses measured DirectWrite line heights too. The
+        // title/artist stack remains centered inside the fixed 180-DIP header.
+        let result = result_details_rects(0.0, 80.0, 74.0);
         assert!(result.title.top >= 0.0);
         assert!(result.artist.bottom <= TOP_HEIGHT as f32);
     }

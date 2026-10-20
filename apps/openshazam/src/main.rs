@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(feature = "dev-cli")), windows_subsystem = "windows")]
+
 use std::process::ExitCode;
 
 #[cfg(any(windows, test))]
@@ -9,13 +11,25 @@ mod windows_history_store;
 mod windows_settings;
 #[cfg(windows)]
 mod windows_ui;
+#[cfg(windows)]
+mod windows_update;
 
 #[cfg(windows)]
 fn run_ui(start_hidden: bool) -> ExitCode {
     match windows_ui::run(start_hidden) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("OpenShazam UI failed: {error}");
+            let message =
+                windows_core::HSTRING::from(format!("Shazam を起動できませんでした。\n\n{error}"));
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                    None,
+                    &message,
+                    windows::core::w!("Shazam"),
+                    windows::Win32::UI::WindowsAndMessaging::MB_OK
+                        | windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+                );
+            }
             ExitCode::from(1)
         }
     }
@@ -55,9 +69,7 @@ fn main() -> ExitCode {
             }
             UiLaunchArguments::NotUi => {}
         }
-        // The product-only MSIX build excludes the development CLI. Windows
-        // launches its startup task without command-line arguments, so that
-        // build enters the tray UI directly and never starts recognition.
+        // The product build enters the tray UI directly and never starts recognition.
         if args.is_empty() && !cfg!(feature = "dev-cli") {
             return run_ui(false);
         }
