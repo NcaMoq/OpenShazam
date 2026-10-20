@@ -51,7 +51,7 @@ jobs:
           "version=$tagVersion" >> $env:GITHUB_OUTPUT
       - name: Install Inno Setup
         shell: pwsh
-        run: choco install innosetup --version=6.7.3 --yes --no-progress
+        run: choco install innosetup --version=6.7.1 --yes --no-progress
       - name: Prepare the fixed runtime output directory
         shell: pwsh
         run: New-Item -ItemType Directory -Path dist/windows-x64 -Force | Out-Null
