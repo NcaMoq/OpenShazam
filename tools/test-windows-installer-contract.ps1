@@ -1,14 +1,17 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$installer = Get-Content -LiteralPath (Join-Path $root 'installer/OpenShazam.iss') -Raw
-$startupHost = Get-Content -LiteralPath (Join-Path $root 'apps/openshazam/settings-host/SettingsHost.cpp') -Raw
-$historyStore = Get-Content -LiteralPath (Join-Path $root 'apps/openshazam/src/windows_history_store.rs') -Raw
-$ci = Get-Content -LiteralPath (Join-Path $root '.github/workflows/ci.yml') -Raw
-$release = Get-Content -LiteralPath (Join-Path $root '.github/workflows/release-windows.yml') -Raw
-$signing = Get-Content -LiteralPath (Join-Path $root 'tools/sign-windows-artifacts.ps1') -Raw
-$update = Get-Content -LiteralPath (Join-Path $root 'crates/openshazam-update/src/lib.rs') -Raw
-$updateUi = Get-Content -LiteralPath (Join-Path $root 'apps/openshazam/src/windows_ui.rs') -Raw
-$updateWorkflow = Get-Content -LiteralPath (Join-Path $root 'tools/prepare-release-update.ps1') -Raw
+function Read-ContractText([string]$RelativePath) {
+    (Get-Content -LiteralPath (Join-Path $root $RelativePath) -Raw).Replace("`r`n", "`n")
+}
+$installer = Read-ContractText 'installer/OpenShazam.iss'
+$startupHost = Read-ContractText 'apps/openshazam/settings-host/SettingsHost.cpp'
+$historyStore = Read-ContractText 'apps/openshazam/src/windows_history_store.rs'
+$ci = Read-ContractText '.github/workflows/ci.yml'
+$release = Read-ContractText '.github/workflows/release-windows.yml'
+$signing = Read-ContractText 'tools/sign-windows-artifacts.ps1'
+$update = Read-ContractText 'crates/openshazam-update/src/lib.rs'
+$updateUi = Read-ContractText 'apps/openshazam/src/windows_ui.rs'
+$updateWorkflow = Read-ContractText 'tools/prepare-release-update.ps1'
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
