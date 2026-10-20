@@ -1,9 +1,9 @@
 # OpenShazam
 
-Shazam client for Windows with a native tray UI and a Rust recognition engine.
+An unofficial Shazam client for Windows, built with Rust and a native tray UI. Recognize music playing on your PC, browse your history, or use Auto Shazam for continuous recognition.
+
+![OpenShazam tray UI in light and dark themes](assets/shazam-light-dark.png)
 
 ## Build
 
-On Windows, run `tools/build-windows.ps1 -Product`. Runtime files are staged in `dist/windows-x64`; build intermediates use the normal `target` and Visual Studio output directories. Compile the user-level installer with Inno Setup 6 using `installer/OpenShazam.iss`.
-
-Windows releases are built from stable `vMAJOR.MINOR.PATCH` tags by GitHub Actions. Releases include an Inno Setup installer, its SHA-256 checksum, and an Ed25519-signed update manifest. Authenticode signing is optional.
+On Windows, create `dist/windows-x64` and run `tools/build-windows.ps1 -Product`. This requires Rust 1.85, Visual Studio with C++ tools, the Windows SDK, and NuGet. To build the installer, use Inno Setup 6 with `installer/OpenShazam.iss`.
