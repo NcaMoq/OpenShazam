@@ -1,4 +1,4 @@
-//! User initiated, signature-verified update acquisition for the unpackaged
+//! Signature-verified update acquisition for the unpackaged
 //! Windows application. Network work is intended to run on a worker thread.
 
 use std::{
@@ -95,11 +95,28 @@ pub(crate) fn download_verified_installer(candidate: &UpdateCandidate) -> Result
     Ok(output)
 }
 
-pub(crate) fn start_installer(path: &Path) -> Result<(), String> {
+pub(crate) fn start_installer(
+    candidate: &UpdateCandidate,
+    path: &Path,
+    automatic: bool,
+) -> Result<(), String> {
     if !path.is_file() {
         return Err("The verified update installer is missing.".to_owned());
     }
-    Command::new(path)
+    let key = embedded_public_key().map_err(|error| error.to_string())?;
+    let manifest = verify_signed_manifest(&candidate.manifest_bytes, &candidate.signature, &key)
+        .map_err(|error| error.to_string())?;
+    if manifest != candidate.manifest
+        || path.file_name() != Some(std::ffi::OsStr::new(&manifest.installer_name))
+    {
+        return Err("The installer does not match the signed update metadata.".to_owned());
+    }
+    verify_installer_path(&manifest, path).map_err(|error| error.to_string())?;
+    let mut command = Command::new(path);
+    if automatic {
+        command.args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]);
+    }
+    command
         .current_dir(path.parent().unwrap_or_else(|| Path::new(".")))
         .spawn()
         .map(|_| ())
@@ -121,7 +138,7 @@ fn download_to_path(url: &str, path: &Path, max_bytes: u64) -> Result<(), String
         .arg("--connect-timeout")
         .arg("10")
         .arg("--max-time")
-        .arg("60")
+        .arg("600")
         .arg("--max-filesize")
         .arg(max_bytes.to_string())
         .arg("--output")

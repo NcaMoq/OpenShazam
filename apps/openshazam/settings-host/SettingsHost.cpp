@@ -74,6 +74,7 @@ namespace
     constexpr UINT WM_GLOBAL_SHORTCUT_CHANGED = WM_APP + 0x4a;
     constexpr UINT WM_GLOBAL_SHORTCUT_CAPTURE = WM_APP + 0x4b;
     constexpr UINT WM_LANGUAGE_CHANGED = WM_APP + 0x4c;
+    constexpr UINT WM_UPDATE_AUTO_CHANGED = WM_APP + 0x4f;
     constexpr uint32_t kAppearanceSystem = 0;
     constexpr uint32_t kAppearanceLight = 1;
     constexpr uint32_t kAppearanceDark = 2;
@@ -321,6 +322,12 @@ namespace
         controls::TextBlock languageDescription{ nullptr };
         controls::TextBlock shortcutTitle{ nullptr };
         controls::TextBlock shortcutDescription{ nullptr };
+        controls::TextBlock updateTitle{ nullptr };
+        controls::TextBlock updateDescription{ nullptr };
+        controls::TextBlock aboutHeading{ nullptr };
+        controls::TextBlock aboutVersion{ nullptr };
+        controls::TextBlock updateAutoValue{ nullptr };
+        controls::ToggleSwitch updateAutoToggle{ nullptr };
         controls::InfoBar startupInfoBar{ nullptr };
         controls::ComboBox appearance{ nullptr };
         controls::ComboBox language{ nullptr };
@@ -344,10 +351,14 @@ namespace
         controls::Border appearanceCard{ nullptr };
         controls::Border languageCard{ nullptr };
         controls::Border shortcutCard{ nullptr };
+        controls::Border autoUpdateCard{ nullptr };
+        controls::Border aboutCard{ nullptr };
         controls::Grid startupRow{ nullptr };
         controls::Grid appearanceRow{ nullptr };
         controls::Grid languageRow{ nullptr };
         controls::Grid shortcutRow{ nullptr };
+        controls::Grid autoUpdateRow{ nullptr };
+        controls::Grid aboutRow{ nullptr };
         HWND owner{};
         HWND hwnd{};
         uint32_t appearanceMode{ kAppearanceSystem };
@@ -360,6 +371,9 @@ namespace
         bool appearanceLoading{ true };
         bool languageLoading{ true };
         bool shortcutRecording{};
+        bool updateAutoLoading{ true };
+        bool updateAutoEnabled{ true };
+        uint32_t updateStatus{};
         bool customTitleBarActive{};
         bool alive{ true };
     };
@@ -461,8 +475,9 @@ namespace
     {
         if (!state || !state->navigation || !state->startupCard ||
             !state->appearanceCard || !state->languageCard || !state->shortcutCard ||
+            !state->autoUpdateCard || !state->aboutCard ||
             !state->startupRow || !state->appearanceRow || !state->languageRow ||
-            !state->shortcutRow)
+            !state->shortcutRow || !state->autoUpdateRow || !state->aboutRow)
             return;
         // LeftCompact opens as an overlay, so the content viewport stays the
         // same width. Calculate from the persistent compact rail only.
@@ -474,11 +489,15 @@ namespace
         state->appearanceCard.Width(cardWidth);
         state->languageCard.Width(cardWidth);
         state->shortcutCard.Width(cardWidth);
+        state->autoUpdateCard.Width(cardWidth);
+        state->aboutCard.Width(cardWidth);
         const double rowWidth = cardWidth - 32.0;
         state->startupRow.Width(rowWidth);
         state->appearanceRow.Width(rowWidth);
         state->languageRow.Width(rowWidth);
         state->shortcutRow.Width(rowWidth);
+        state->autoUpdateRow.Width(rowWidth);
+        state->aboutRow.Width(rowWidth);
     }
 
     void RefreshHistoryNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
@@ -663,6 +682,26 @@ namespace
         }
     }
 
+    void RefreshUpdateControlsNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
+    {
+        if (!state || !state->alive || !state->updateAutoToggle) return;
+        try
+        {
+            state->updateAutoToggle.IsEnabled(state->updateStatus != 5);
+            state->updateAutoLoading = true;
+            state->updateAutoToggle.IsOn(state->updateAutoEnabled);
+            state->updateAutoLoading = false;
+            if (state->updateAutoValue)
+            {
+                state->updateAutoValue.Text(state->updateAutoEnabled
+                    ? Localized(L"On", L"\u30AA\u30F3")
+                    : Localized(L"Off", L"\u30AA\u30D5"));
+                state->updateAutoValue.Opacity(state->updateAutoToggle.IsEnabled() ? 1.0 : 0.5);
+            }
+        }
+        catch (...) { }
+    }
+
     void ApplyLanguageToSettingsNoThrow(std::shared_ptr<SettingsState> const& state) noexcept
     {
         if (!state || !state->alive) return;
@@ -732,6 +771,22 @@ namespace
                 state->shortcutDescription.Text(text);
                 automation::AutomationProperties::SetName(state->shortcutDescription, text);
             }
+            if (state->updateTitle)
+            {
+                const auto text = Localized(L"Automatic updates", L"\u81EA\u52D5\u66F4\u65B0");
+                state->updateTitle.Text(text);
+                automation::AutomationProperties::SetName(state->updateTitle, text);
+                automation::AutomationProperties::SetName(state->updateAutoToggle, text);
+            }
+            if (state->updateDescription)
+            {
+                const auto text = Localized(L"Download and install updates automatically",
+                    L"\u66F4\u65B0\u3092\u81EA\u52D5\u3067\u30C0\u30A6\u30F3\u30ED\u30FC\u30C9\u30FB\u30A4\u30F3\u30B9\u30C8\u30FC\u30EB\u3057\u307E\u3059");
+                state->updateDescription.Text(text);
+            }
+            if (state->aboutHeading)
+                state->aboutHeading.Text(L"About");
+            RefreshUpdateControlsNoThrow(state);
 
             if (state->appearance)
             {
@@ -822,6 +877,25 @@ namespace
                         ? winrt::Microsoft::UI::Windowing::TitleBarTheme::Dark
                         : winrt::Microsoft::UI::Windowing::TitleBarTheme::Light);
                 state->appWindowTitleBar.PreferredTheme(titleBarTheme);
+                // With content extended into the title bar, keep the caption
+                // button backgrounds clear at rest and give their glyphs an
+                // explicit theme-appropriate contrast in both focus states.
+                const bool dark = mode == kAppearanceDark ||
+                    (mode == kAppearanceSystem && state->shellRoot &&
+                        state->shellRoot.ActualTheme() == x::ElementTheme::Dark);
+                auto colorReference = [](winrt::Windows::UI::Color color) {
+                    return winrt::box_value(color)
+                        .as<winrt::Windows::Foundation::IReference<winrt::Windows::UI::Color>>();
+                };
+                const auto clear = colorReference({ 0, 0, 0, 0 });
+                state->appWindowTitleBar.ButtonBackgroundColor(clear);
+                state->appWindowTitleBar.ButtonInactiveBackgroundColor(clear);
+                state->appWindowTitleBar.ButtonForegroundColor(colorReference(
+                    dark ? winrt::Windows::UI::Color{ 255, 255, 255, 255 }
+                         : winrt::Windows::UI::Color{ 255, 24, 24, 24 }));
+                state->appWindowTitleBar.ButtonInactiveForegroundColor(colorReference(
+                    dark ? winrt::Windows::UI::Color{ 255, 160, 160, 160 }
+                         : winrt::Windows::UI::Color{ 255, 120, 120, 120 }));
             }
             catch (...)
             {
@@ -1030,7 +1104,7 @@ namespace
             hwnd = ::CreateWindowExW(0, kSettingsClass, windowTitle.c_str(),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                 ::MulDiv(kWidthDips, dpi, 96), ::MulDiv(kHeightDips, dpi, 96),
-                parent, nullptr, instance, nullptr);
+                nullptr, nullptr, instance, nullptr);
             if (!hwnd) winrt::throw_last_error();
             state = std::make_shared<SettingsState>();
             state->owner = owner;
@@ -1047,11 +1121,6 @@ namespace
                     state->appWindowTitleBar.ExtendsContentIntoTitleBar(true);
                     state->appWindowTitleBar.PreferredHeightOption(
                         winrt::Microsoft::UI::Windowing::TitleBarHeightOption::Tall);
-                    const auto transparentCaptionBackground = winrt::box_value(
-                        winrt::Windows::UI::Color{ 0, 0, 0, 0 })
-                        .as<winrt::Windows::Foundation::IReference<winrt::Windows::UI::Color>>();
-                    state->appWindowTitleBar.ButtonBackgroundColor(transparentCaptionBackground);
-                    state->appWindowTitleBar.ButtonInactiveBackgroundColor(transparentCaptionBackground);
                     state->customTitleBarActive = true;
                 }
             }
@@ -1557,6 +1626,120 @@ namespace
             shortcutSection.Children().Append(state->shortcutInfoBar);
             stack.Children().Append(shortcutSection);
 
+            state->autoUpdateCard = markup::XamlReader::Load(
+                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" />)"
+            ).as<controls::Border>();
+            state->autoUpdateCard.Padding(x::ThicknessHelper::FromUniformLength(kSettingsCardPaddingDips));
+            state->autoUpdateRow = controls::Grid{};
+            controls::Grid updateHeader;
+            updateHeader.ColumnSpacing(12.0);
+            auto updateIconColumn = controls::ColumnDefinition{};
+            updateIconColumn.Width(x::GridLengthHelper::FromValueAndType(34.0, x::GridUnitType::Pixel));
+            auto updateLabelColumn = controls::ColumnDefinition{};
+            updateLabelColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
+            auto updateToggleColumn = controls::ColumnDefinition{};
+            updateToggleColumn.Width(x::GridLengthHelper::FromValueAndType(
+                kSettingsControlLaneWidthDips, x::GridUnitType::Pixel));
+            updateHeader.ColumnDefinitions().Append(updateIconColumn);
+            updateHeader.ColumnDefinitions().Append(updateLabelColumn);
+            updateHeader.ColumnDefinitions().Append(updateToggleColumn);
+            controls::FontIcon updateIcon;
+            updateIcon.Glyph(L"\uE895"); // Sync
+            updateIcon.FontSize(20.0);
+            updateIcon.VerticalAlignment(x::VerticalAlignment::Center);
+            controls::Grid::SetColumn(updateIcon, 0);
+            updateHeader.Children().Append(updateIcon);
+            controls::StackPanel updateLabels;
+            updateLabels.Spacing(2.0);
+            state->updateTitle = controls::TextBlock{};
+            state->updateTitle.FontSize(14.0);
+            updateLabels.Children().Append(state->updateTitle);
+            state->updateDescription = controls::TextBlock{};
+            state->updateDescription.FontSize(12.0);
+            state->updateDescription.TextWrapping(x::TextWrapping::Wrap);
+            updateLabels.Children().Append(state->updateDescription);
+            controls::Grid::SetColumn(updateLabels, 1);
+            updateHeader.Children().Append(updateLabels);
+            state->updateAutoToggle = controls::ToggleSwitch{};
+            state->updateAutoToggle.OnContent(winrt::box_value(Localized(L"", L"")));
+            state->updateAutoToggle.OffContent(winrt::box_value(Localized(L"", L"")));
+            state->updateAutoToggle.Width(48.0);
+            state->updateAutoToggle.VerticalAlignment(x::VerticalAlignment::Center);
+            state->updateAutoToggle.HorizontalAlignment(x::HorizontalAlignment::Left);
+            state->updateAutoToggle.IsOn(true);
+            state->updateAutoLoading = false;
+            state->updateAutoToggle.Toggled([weak](auto const&, auto const&) {
+                if (auto state = weak.lock(); state && state->alive && !state->updateAutoLoading)
+                    ::PostMessageW(state->owner, WM_UPDATE_AUTO_CHANGED,
+                        state->updateAutoToggle.IsOn() ? TRUE : FALSE, 0);
+            });
+            state->updateAutoValue = controls::TextBlock{};
+            state->updateAutoValue.Width(38.0);
+            state->updateAutoValue.FontSize(14.0);
+            state->updateAutoValue.TextAlignment(x::TextAlignment::Center);
+            state->updateAutoValue.VerticalAlignment(x::VerticalAlignment::Center);
+            controls::StackPanel updateAutoControl;
+            updateAutoControl.Orientation(controls::Orientation::Horizontal);
+            updateAutoControl.Spacing(8.0);
+            updateAutoControl.Width(kStartupControlGroupWidthDips);
+            updateAutoControl.Margin(x::ThicknessHelper::FromLengths(
+                kSettingsControlLaneWidthDips - kStartupControlGroupWidthDips, 0.0, 0.0, 0.0));
+            updateAutoControl.VerticalAlignment(x::VerticalAlignment::Center);
+            updateAutoControl.Children().Append(state->updateAutoValue);
+            updateAutoControl.Children().Append(state->updateAutoToggle);
+            controls::Grid::SetColumn(updateAutoControl, 2);
+            updateHeader.Children().Append(updateAutoControl);
+            state->autoUpdateRow.Children().Append(updateHeader);
+            state->autoUpdateCard.Child(state->autoUpdateRow);
+            stack.Children().Append(state->autoUpdateCard);
+
+            state->aboutHeading = controls::TextBlock{};
+            state->aboutHeading.FontSize(16.0);
+            state->aboutHeading.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            state->aboutHeading.Margin(x::ThicknessHelper::FromLengths(0.0, 16.0, 0.0, 0.0));
+            stack.Children().Append(state->aboutHeading);
+
+            state->aboutCard = markup::XamlReader::Load(
+                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" />)"
+            ).as<controls::Border>();
+            state->aboutCard.Padding(
+                x::ThicknessHelper::FromUniformLength(kSettingsCardPaddingDips));
+            state->aboutRow = controls::Grid{};
+            state->aboutRow.MinHeight(42.0);
+            state->aboutRow.ColumnSpacing(16.0);
+            auto aboutNameColumn = controls::ColumnDefinition{};
+            aboutNameColumn.Width(x::GridLengthHelper::FromValueAndType(
+                1.0, x::GridUnitType::Star));
+            auto aboutVersionColumn = controls::ColumnDefinition{};
+            aboutVersionColumn.Width(x::GridLengthHelper::FromValueAndType(
+                1.0, x::GridUnitType::Auto));
+            state->aboutRow.ColumnDefinitions().Append(aboutNameColumn);
+            state->aboutRow.ColumnDefinitions().Append(aboutVersionColumn);
+            controls::StackPanel aboutIdentity;
+            aboutIdentity.Spacing(2.0);
+            aboutIdentity.VerticalAlignment(x::VerticalAlignment::Center);
+            controls::TextBlock aboutName;
+            aboutName.Text(L"OpenShazam");
+            aboutName.FontSize(14.0);
+            aboutIdentity.Children().Append(aboutName);
+            controls::TextBlock aboutRepository;
+            aboutRepository.Text(L"https://github.com/NcaMoq/OpenShazam");
+            aboutRepository.FontSize(12.0);
+            aboutRepository.Opacity(0.72);
+            aboutIdentity.Children().Append(aboutRepository);
+            controls::Grid::SetColumn(aboutIdentity, 0);
+            state->aboutRow.Children().Append(aboutIdentity);
+            state->aboutVersion = controls::TextBlock{};
+            state->aboutVersion.FontSize(14.0);
+            state->aboutVersion.Opacity(0.72);
+            state->aboutVersion.VerticalAlignment(x::VerticalAlignment::Center);
+            controls::Grid::SetColumn(state->aboutVersion, 1);
+            state->aboutRow.Children().Append(state->aboutVersion);
+            state->aboutCard.Child(state->aboutRow);
+            stack.Children().Append(state->aboutCard);
+
+            ApplyLanguageToSettingsNoThrow(state);
+
             // Leave page surfaces transparent so NavigationView's stock
             // content surface and theme resources remain visible.
             state->settingsViewer = markup::XamlReader::Load(
@@ -1879,11 +2062,8 @@ namespace
             case WM_CLOSE:
                 if (host && host->hwnd == h)
                     EndShortcutCaptureNoThrow(host->state);
-                // While Settings is visible, the owner popup deliberately
-                // ignores its activation loss so it stays open behind this
-                // window. Restore the owner's activation before hiding
-                // Settings so the next outside click reaches the normal
-                // popup deactivation path and dismisses the main UI.
+                // The tray popup is normally hidden while Settings is open.
+                // If it was reopened separately, restore its activation on close.
                 if (host && host->hwnd == h && host->owner &&
                     ::IsWindowVisible(host->owner))
                 {
@@ -1907,7 +2087,7 @@ namespace
 
 extern "C" __declspec(dllexport) HRESULT __stdcall OpenShazamSettingsShow(
     HWND owner, uint32_t appearanceMode, uint32_t shortcutModifiers,
-    uint32_t shortcutKey, uint32_t languageId) noexcept
+    uint32_t shortcutKey, uint32_t languageId, wchar_t const* version) noexcept
 {
     try
     {
@@ -1920,6 +2100,8 @@ extern "C" __declspec(dllexport) HRESULT __stdcall OpenShazamSettingsShow(
             catch (...) { host->Close(); g_active = nullptr; throw; }
             g_settings = std::move(host);
         }
+        if (g_settings->state && g_settings->state->aboutVersion)
+            g_settings->state->aboutVersion.Text(version ? version : L"");
         g_settings->Show(appearanceMode, shortcutModifiers, shortcutKey, languageId);
         return S_OK;
     }
@@ -1932,6 +2114,16 @@ extern "C" __declspec(dllexport) void __stdcall OpenShazamSettingsSetHistory(
 {
     if (g_settings)
         SetHistoryNoThrow(g_settings->state, items, count);
+}
+
+extern "C" __declspec(dllexport) void __stdcall OpenShazamSettingsSetUpdateStatus(
+    BOOL automatic, uint32_t status, wchar_t const*, wchar_t const*, uint64_t) noexcept
+{
+    if (!g_settings || !g_settings->state) return;
+    auto state = g_settings->state;
+    state->updateAutoEnabled = automatic != FALSE;
+    state->updateStatus = status;
+    RefreshUpdateControlsNoThrow(state);
 }
 
 extern "C" __declspec(dllexport) BOOL __stdcall OpenShazamSettingsPreTranslate(MSG* msg) noexcept

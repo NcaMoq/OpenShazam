@@ -7,8 +7,10 @@ use std::{
     path::PathBuf,
 };
 
-pub(crate) type Show = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) -> i32;
+pub(crate) type Show =
+    unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32, *const u16) -> i32;
 type UpdateHistory = unsafe extern "system" fn(*const SettingsHistoryItem, usize);
+type UpdateStatus = unsafe extern "system" fn(i32, u32, *const u16, *const u16, u64);
 type Translate = unsafe extern "system" fn(*mut c_void) -> i32;
 type IsVisible = unsafe extern "system" fn() -> i32;
 type Shutdown = unsafe extern "system" fn();
@@ -40,6 +42,7 @@ pub struct SettingsHost {
     library: *mut c_void,
     show: Show,
     update_history: UpdateHistory,
+    update_status: UpdateStatus,
     pre_translate: Translate,
     is_visible: IsVisible,
     shutdown: Shutdown,
@@ -158,6 +161,9 @@ impl SettingsHost {
                 update_history: std::mem::transmute::<*mut c_void, UpdateHistory>(get(
                     b"OpenShazamSettingsSetHistory\0",
                 )?),
+                update_status: std::mem::transmute::<*mut c_void, UpdateStatus>(get(
+                    b"OpenShazamSettingsSetUpdateStatus\0",
+                )?),
                 pre_translate: std::mem::transmute::<*mut c_void, Translate>(get(
                     b"OpenShazamSettingsPreTranslate\0",
                 )?),
@@ -195,6 +201,27 @@ impl SettingsHost {
         // buffers and descriptor slice therefore only need to live for this
         // synchronous call.
         unsafe { (self.update_history)(items.as_ptr(), items.len()) };
+    }
+
+    pub(crate) fn update_status(
+        &self,
+        enabled: bool,
+        status: u32,
+        version: &str,
+        detail: &str,
+        last_checked: Option<u64>,
+    ) {
+        let version: Vec<u16> = OsStr::new(version).encode_wide().chain(Some(0)).collect();
+        let detail: Vec<u16> = OsStr::new(detail).encode_wide().chain(Some(0)).collect();
+        unsafe {
+            (self.update_status)(
+                enabled as i32,
+                status,
+                version.as_ptr(),
+                detail.as_ptr(),
+                last_checked.unwrap_or(0),
+            );
+        }
     }
 
     pub fn visible(&self) -> bool {

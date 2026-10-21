@@ -208,6 +208,15 @@ const WM_GLOBAL_SHORTCUT_CAPTURE: u32 = WM_APP + 0x4b;
 const WM_LANGUAGE_CHANGED: u32 = WM_APP + 0x4c;
 const WM_UPDATE_CHECK_COMPLETED: u32 = WM_APP + 0x4d;
 const WM_UPDATE_DOWNLOAD_COMPLETED: u32 = WM_APP + 0x4e;
+const WM_UPDATE_AUTO_CHANGED: u32 = WM_APP + 0x4f;
+const WM_UPDATE_INSTALL_COMPLETED: u32 = WM_APP + 0x52;
+const UPDATE_STATUS_IDLE: u32 = 0;
+const UPDATE_STATUS_CHECKING: u32 = 1;
+const UPDATE_STATUS_CURRENT: u32 = 2;
+const UPDATE_STATUS_AVAILABLE: u32 = 3;
+const UPDATE_STATUS_DOWNLOADING: u32 = 4;
+const UPDATE_STATUS_INSTALLING: u32 = 5;
+const UPDATE_STATUS_ERROR: u32 = 6;
 const GLOBAL_SHORTCUT_ID_PRIMARY: i32 = 0x5301;
 const GLOBAL_SHORTCUT_ID_SECONDARY: i32 = 0x5302;
 const GLOBAL_SHORTCUT_MODIFIER_MASK: u32 = 0x0f;
@@ -231,7 +240,6 @@ const TRAY_ICON_GUID: windows::core::GUID = windows::core::GUID {
 const TRAY_TASKBAR_CREATED_NAME: &str = "TaskbarCreated";
 const TRAY_MENU_SETTINGS: usize = 1;
 const TRAY_MENU_EXIT: usize = 2;
-const TRAY_MENU_UPDATE: usize = 3;
 const POPUP_ACTIVATION_GRACE: Duration = Duration::from_millis(350);
 const TIMER_SINGLE_CLICK: usize = 0x4f53;
 const TIMER_LONG_PRESS: usize = 0x4f54;
@@ -572,6 +580,84 @@ fn save_theme_preference(preference: ThemePreference) {
             Some(bytes),
         );
         let _ = RegCloseKey(key);
+    }
+}
+
+fn load_auto_update_preference() -> bool {
+    let key_path = wide("Software\\OpenShazam");
+    let value_name = wide("AutoUpdateEnabled");
+    let mut key = HKEY::default();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            None,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if opened.0 != 0 {
+        return true;
+    }
+    let mut value = 1u32;
+    let mut value_type = Default::default();
+    let mut size = size_of::<u32>() as u32;
+    let result = unsafe {
+        let result = RegQueryValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut value_type),
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        );
+        let _ = RegCloseKey(key);
+        result
+    };
+    if result.0 == 0 && value_type == REG_DWORD && size == size_of::<u32>() as u32 {
+        value != 0
+    } else {
+        true
+    }
+}
+
+fn save_auto_update_preference(enabled: bool) -> Result<(), i32> {
+    let key_path = wide("Software\\OpenShazam");
+    let value_name = wide("AutoUpdateEnabled");
+    let mut key = HKEY::default();
+    let created = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            Some(0),
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+    };
+    if created.0 != 0 {
+        return Err(created.0 as i32);
+    }
+    let value = u32::from(enabled);
+    let bytes = value.to_ne_bytes();
+    let result = unsafe {
+        let result = RegSetValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            Some(0),
+            REG_DWORD,
+            Some(&bytes),
+        );
+        let _ = RegCloseKey(key);
+        result
+    };
+    if result.0 == 0 {
+        Ok(())
+    } else {
+        Err(result.0 as i32)
     }
 }
 
@@ -1338,6 +1424,12 @@ struct AppState {
     settings_host: Option<crate::windows_settings::SettingsHost>,
     settings_opening: bool,
     update_operation_active: bool,
+    update_auto_enabled: bool,
+    update_candidate: Option<UpdateCandidate>,
+    update_status: u32,
+    update_detail: String,
+    update_version: String,
+    update_last_checked: Option<u64>,
     about_hwnd: HWND,
     microphone_hwnd: HWND,
     d2d_factory: ID2D1Factory,
@@ -10028,10 +10120,6 @@ unsafe fn show_tray_context_menu(app: &mut AppState) {
         UiLanguage::Japanese => "設定",
         UiLanguage::English => "Settings",
     });
-    let check_for_updates = wide(match language {
-        UiLanguage::Japanese => "更新を確認",
-        UiLanguage::English => "Check for updates",
-    });
     let exit = wide(match language {
         UiLanguage::Japanese => "Shazam を終了",
         UiLanguage::English => "Exit Shazam",
@@ -10041,12 +10129,6 @@ unsafe fn show_tray_context_menu(app: &mut AppState) {
         MF_STRING,
         TRAY_MENU_SETTINGS,
         PCWSTR(settings.as_ptr()),
-    );
-    let _ = AppendMenuW(
-        menu,
-        MF_STRING,
-        TRAY_MENU_UPDATE,
-        PCWSTR(check_for_updates.as_ptr()),
     );
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, TRAY_MENU_EXIT, PCWSTR(exit.as_ptr()));
@@ -10075,7 +10157,6 @@ unsafe fn show_tray_context_menu(app: &mut AppState) {
     let _ = Shell_NotifyIconW(NIM_SETFOCUS, &data);
     match selected.0 as usize {
         TRAY_MENU_SETTINGS => open_settings(app),
-        TRAY_MENU_UPDATE => begin_update_check(app, true),
         TRAY_MENU_EXIT => {
             let _ = DestroyWindow(hwnd);
         }
@@ -10084,13 +10165,34 @@ unsafe fn show_tray_context_menu(app: &mut AppState) {
 }
 
 type UpdateCheckPayload = (bool, Result<Option<UpdateCandidate>, String>);
-type UpdateDownloadPayload = Result<std::path::PathBuf, String>;
+type UpdateDownloadPayload = (bool, UpdateCandidate, Result<std::path::PathBuf, String>);
+type UpdateInstallPayload = (String, Result<(), String>);
+
+fn set_update_status(app: &mut AppState, status: u32, version: &str, detail: &str) {
+    app.update_status = status;
+    app.update_version = version.to_owned();
+    app.update_detail = detail.to_owned();
+    if let Some(host) = app.settings_host.as_ref() {
+        host.update_status(
+            app.update_auto_enabled,
+            status,
+            version,
+            detail,
+            app.update_last_checked,
+        );
+    }
+}
 
 unsafe fn begin_update_check(app: &mut AppState, interactive: bool) {
     if app.update_operation_active {
         return;
     }
+    if !interactive && !app.update_auto_enabled {
+        return;
+    }
     app.update_operation_active = true;
+    app.update_candidate = None;
+    set_update_status(app, UPDATE_STATUS_CHECKING, "", "");
     let hwnd = app.main_hwnd;
     let thread_hwnd = hwnd.0 as isize;
     let spawned = thread::Builder::new()
@@ -10105,15 +10207,8 @@ unsafe fn begin_update_check(app: &mut AppState, interactive: bool) {
         });
     if let Err(error) = spawned {
         app.update_operation_active = false;
-        if interactive {
-            show_update_message(
-                hwnd,
-                &format!("Could not start the update check: {error}"),
-                0,
-            );
-        } else {
-            eprintln!("Could not start the Shazam update check: {error}");
-        }
+        set_update_status(app, UPDATE_STATUS_ERROR, "", &error.to_string());
+        eprintln!("Could not start the Shazam update check: {error}");
     }
 }
 
@@ -10143,87 +10238,88 @@ unsafe fn handle_update_check_completed(app: &mut AppState, payload: UpdateCheck
     let (interactive, result) = payload;
     match result {
         Err(error) => {
-            if !interactive {
-                eprintln!("Shazam could not check for updates: {error}");
-                return;
-            }
-            let message = match ui_language() {
-                UiLanguage::Japanese => format!("更新を確認できませんでした。\n\n{error}"),
-                UiLanguage::English => format!("Shazam could not check for updates.\n\n{error}"),
-            };
-            show_update_message(app.main_hwnd, &message, 0x10);
+            set_update_status(app, UPDATE_STATUS_ERROR, "", &error);
+            eprintln!("Shazam could not check for updates: {error}");
         }
         Ok(None) => {
-            if !interactive {
-                return;
-            }
-            let message = match ui_language() {
-                UiLanguage::Japanese => "Shazam は最新です。",
-                UiLanguage::English => "Shazam is up to date.",
-            };
-            show_update_message(app.main_hwnd, message, 0x40);
+            app.update_last_checked = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|elapsed| elapsed.as_secs());
+            set_update_status(app, UPDATE_STATUS_CURRENT, "", "");
         }
         Ok(Some(candidate)) => {
-            let message = match ui_language() {
-                UiLanguage::Japanese => format!(
-                    "Shazam {} をインストールできます。\n\n今すぐ更新しますか？Shazam は更新中に終了します。",
-                    candidate.manifest.version
-                ),
-                UiLanguage::English => format!(
-                    "Shazam {} is available.\n\nInstall the update now? Shazam will close while it installs.",
-                    candidate.manifest.version
-                ),
-            };
-            if show_update_message(app.main_hwnd, &message, 0x4 | 0x20 | 0x100) == 6 {
-                begin_update_download(app, candidate);
+            app.update_last_checked = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|elapsed| elapsed.as_secs());
+            let version = candidate.manifest.version.clone();
+            app.update_candidate = Some(candidate.clone());
+            set_update_status(app, UPDATE_STATUS_AVAILABLE, &version, "");
+            if !interactive && app.update_auto_enabled {
+                begin_update_download(app, candidate, true);
             }
         }
     }
 }
 
-unsafe fn begin_update_download(app: &mut AppState, candidate: UpdateCandidate) {
+unsafe fn begin_update_download(app: &mut AppState, candidate: UpdateCandidate, automatic: bool) {
     if app.update_operation_active {
         return;
     }
     app.update_operation_active = true;
+    set_update_status(
+        app,
+        UPDATE_STATUS_DOWNLOADING,
+        &candidate.manifest.version,
+        "",
+    );
     let hwnd = app.main_hwnd;
     let thread_hwnd = hwnd.0 as isize;
+    let worker_candidate = candidate.clone();
     let spawned = thread::Builder::new()
         .name("openshazam-update-download".to_owned())
         .spawn(move || {
-            let result = crate::windows_update::download_verified_installer(&candidate);
+            let result = crate::windows_update::download_verified_installer(&worker_candidate);
             post_update_payload(
                 HWND(thread_hwnd as *mut c_void),
                 WM_UPDATE_DOWNLOAD_COMPLETED,
-                result,
+                (automatic, worker_candidate, result),
             );
         });
     if let Err(error) = spawned {
         app.update_operation_active = false;
-        show_update_message(
-            hwnd,
-            &format!("Could not start the update download: {error}"),
-            0x10,
-        );
+        set_update_status(app, UPDATE_STATUS_ERROR, "", &error.to_string());
     }
 }
 
 unsafe fn handle_update_download_completed(app: &mut AppState, payload: UpdateDownloadPayload) {
     app.update_operation_active = false;
-    match payload {
+    let (automatic, candidate, result) = payload;
+    match result {
         Err(error) => {
-            let message = match ui_language() {
-                UiLanguage::Japanese => {
-                    format!("更新をダウンロードまたは検証できませんでした。\n\n{error}")
-                }
-                UiLanguage::English => {
-                    format!("The update could not be downloaded or verified.\n\n{error}")
-                }
-            };
-            show_update_message(app.main_hwnd, &message, 0x10);
+            set_update_status(
+                app,
+                UPDATE_STATUS_ERROR,
+                &candidate.manifest.version,
+                &error,
+            );
         }
         Ok(path) => {
-            if capture_mode_in_progress(&app.phase).is_some() {
+            if automatic && !app.update_auto_enabled {
+                let _ = std::fs::remove_file(&path);
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+                set_update_status(
+                    app,
+                    UPDATE_STATUS_AVAILABLE,
+                    &candidate.manifest.version,
+                    "",
+                );
+                return;
+            }
+            if !automatic && capture_mode_in_progress(&app.phase).is_some() {
                 let message = match ui_language() {
                     UiLanguage::Japanese => "認識中です。認識を停止して更新インストーラーを起動しますか？",
                     UiLanguage::English => "Recognition is still active. Stop Shazam and start the verified update installer?",
@@ -10233,25 +10329,51 @@ unsafe fn handle_update_download_completed(app: &mut AppState, payload: UpdateDo
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::remove_dir(parent);
                     }
+                    set_update_status(
+                        app,
+                        UPDATE_STATUS_AVAILABLE,
+                        &candidate.manifest.version,
+                        "",
+                    );
                     return;
                 }
             }
-            match crate::windows_update::start_installer(&path) {
-                Ok(()) => {
-                    let _ = DestroyWindow(app.main_hwnd);
-                }
-                Err(error) => {
-                    let message = match ui_language() {
-                        UiLanguage::Japanese => {
-                            format!("更新インストーラーを起動できませんでした。\n\n{error}")
-                        }
-                        UiLanguage::English => {
-                            format!("Could not start the update installer.\n\n{error}")
-                        }
-                    };
-                    show_update_message(app.main_hwnd, &message, 0x10);
-                }
+            set_update_status(
+                app,
+                UPDATE_STATUS_INSTALLING,
+                &candidate.manifest.version,
+                "",
+            );
+            app.update_operation_active = true;
+            let version = candidate.manifest.version.clone();
+            let hwnd = app.main_hwnd.0 as isize;
+            let result = thread::Builder::new()
+                .name("openshazam-update-install".to_owned())
+                .spawn(move || {
+                    let result =
+                        crate::windows_update::start_installer(&candidate, &path, automatic);
+                    post_update_payload(
+                        HWND(hwnd as *mut c_void),
+                        WM_UPDATE_INSTALL_COMPLETED,
+                        (version, result),
+                    );
+                });
+            if let Err(error) = result {
+                app.update_operation_active = false;
+                set_update_status(app, UPDATE_STATUS_ERROR, "", &error.to_string());
             }
+        }
+    }
+}
+
+unsafe fn handle_update_install_completed(app: &mut AppState, payload: UpdateInstallPayload) {
+    app.update_operation_active = false;
+    match payload {
+        (_, Ok(())) => {
+            let _ = DestroyWindow(app.main_hwnd);
+        }
+        (version, Err(error)) => {
+            set_update_status(app, UPDATE_STATUS_ERROR, &version, &error);
         }
     }
 }
@@ -10855,12 +10977,17 @@ unsafe fn open_settings_after_wndproc(app_ptr: *mut AppState) -> LRESULT {
         )
     };
 
+    let product_version: Vec<u16> = env!("CARGO_PKG_VERSION")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
     let hr = show(
         owner.0,
         theme_preference,
         shortcut.modifiers,
         shortcut.key,
         language,
+        product_version.as_ptr(),
     );
     (*app_ptr).settings_opening = false;
     if hr < 0 {
@@ -10873,6 +11000,15 @@ unsafe fn open_settings_after_wndproc(app_ptr: *mut AppState) -> LRESULT {
         // Show initializes the WinUI island on the first request; send the
         // current in-memory history after that initialization has completed.
         update_settings_history(&*app_ptr);
+        if let Some(host) = (*app_ptr).settings_host.as_ref() {
+            host.update_status(
+                (*app_ptr).update_auto_enabled,
+                (*app_ptr).update_status,
+                &(*app_ptr).update_version,
+                &(*app_ptr).update_detail,
+                (*app_ptr).update_last_checked,
+            );
+        }
         // Settings takes focus without going through the popup's ordinary
         // deactivation path, so dismiss the main popup explicitly on success.
         hide_main(&mut *app_ptr);
@@ -13587,6 +13723,44 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
+        WM_UPDATE_INSTALL_COMPLETED if data.kind == WindowKind::Main => {
+            let pointer = lparam.0 as *mut UpdateInstallPayload;
+            if !pointer.is_null() {
+                handle_update_install_completed(app, *Box::from_raw(pointer));
+            }
+            LRESULT(0)
+        }
+        WM_UPDATE_AUTO_CHANGED if data.kind == WindowKind::Main => {
+            let enabled = wparam.0 != 0;
+            match save_auto_update_preference(enabled) {
+                Ok(()) => {
+                    app.update_auto_enabled = enabled;
+                    if enabled && !app.update_operation_active {
+                        begin_update_check(app, false);
+                    }
+                }
+                Err(error) => {
+                    set_update_status(
+                        app,
+                        UPDATE_STATUS_ERROR,
+                        "",
+                        &format!(
+                            "Could not save automatic update setting (Windows error {error})."
+                        ),
+                    );
+                }
+            }
+            if let Some(host) = app.settings_host.as_ref() {
+                host.update_status(
+                    app.update_auto_enabled,
+                    app.update_status,
+                    &app.update_version,
+                    &app.update_detail,
+                    app.update_last_checked,
+                );
+            }
+            LRESULT(0)
+        }
         WM_TIMER if data.kind == WindowKind::Main && wparam.0 == TIMER_UPDATE_CHECK => {
             begin_update_check(app, false);
             LRESULT(0)
@@ -14550,6 +14724,7 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
         let language = load_ui_language_preference();
         set_ui_language(language);
         let global_shortcut = load_global_shortcut();
+        let update_auto_enabled = load_auto_update_preference();
         let (history_store, history) = match HistoryStore::open() {
             Ok((store, entries)) => (Some(store), restore_history_tracks(entries)),
             Err(error) => {
@@ -14577,6 +14752,12 @@ pub fn run(start_hidden: bool) -> Result<(), Box<dyn std::error::Error>> {
             settings_host: None,
             settings_opening: false,
             update_operation_active: false,
+            update_auto_enabled,
+            update_candidate: None,
+            update_status: UPDATE_STATUS_IDLE,
+            update_detail: String::new(),
+            update_version: String::new(),
+            update_last_checked: None,
             about_hwnd: HWND::default(),
             microphone_hwnd: HWND::default(),
             d2d_factory,

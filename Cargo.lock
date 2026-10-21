@@ -739,7 +739,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "openshazam"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cpal",
  "ctrlc",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "openshazam-controller"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "shazam-http-lab",
  "shazam-progressive",
@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "openshazam-update"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -935,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "shazam-http-lab"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "getrandom",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "shazam-progressive"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sigx-core",
  "sigx-format",
@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "sigx-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sigx-core",
  "sigx-format",
@@ -979,7 +979,7 @@ dependencies = [
 
 [[package]]
 name = "sigx-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sigx-dsp",
  "sigx-format",
@@ -987,15 +987,15 @@ dependencies = [
 
 [[package]]
 name = "sigx-dsp"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sigx-format"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sigx-testkit"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "simd_cesu8"
