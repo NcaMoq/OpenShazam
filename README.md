@@ -12,7 +12,6 @@ Recognize music playing on your PC, view your recognition history, and automatic
 - **Auto Shazam** — Continuously recognize music in the background.
 - **Recognition History** — Browse your previously identified songs.
 - **Native Windows UI** — Lightweight system tray interface with light and dark theme support.
-- **Secure Updates** — Built-in update checks with Ed25519 signature verification.
 
 ## Download
 
