@@ -750,14 +750,17 @@ $uiaClientAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationCli
 $uiaTypesAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationTypes')
 $drawingAssembly = [Reflection.Assembly]::LoadWithPartialName('System.Drawing')
 $windowsBaseAssembly = [Reflection.Assembly]::LoadWithPartialName('WindowsBase')
-if (-not $uiaClientAssembly -or -not $uiaTypesAssembly -or -not $drawingAssembly -or -not $windowsBaseAssembly) {
-    throw 'Windows UI Automation and System.Drawing assemblies are required for the Settings smoke test.'
+# PowerShell 6+ does not add framework assemblies automatically when an explicit
+# -ReferencedAssemblies list is provided, so include the assembly defining Thread.
+$threadingAssembly = [System.Threading.Thread].Assembly.Location
+if (-not $uiaClientAssembly -or -not $uiaTypesAssembly -or -not $drawingAssembly -or -not $windowsBaseAssembly -or -not $threadingAssembly) {
+    throw 'Windows UI Automation, System.Drawing, and threading assemblies are required for the Settings smoke test.'
 }
 $uiaClient = $uiaClientAssembly.Location
 $uiaTypes = $uiaTypesAssembly.Location
 $drawing = $drawingAssembly.Location
 $windowsBase = $windowsBaseAssembly.Location
-Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @($uiaClient, $uiaTypes, $drawing, $windowsBase)
+Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @($uiaClient, $uiaTypes, $drawing, $windowsBase, $threadingAssembly)
 $result = [OpenShazamSettingsHostSmoke]::Run($dist)
 if ($result -notlike 'Composition + WinUI Settings host initialized*') {
     throw $result
