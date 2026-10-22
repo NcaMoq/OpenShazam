@@ -201,7 +201,15 @@ Assert-Contains $licenseGenerator 'cargo fetch --manifest-path ''apps/openshazam
 Assert-Contains $licenseGenerator '--offline' 'Third-party notices must be generated from the locked local dependency sources without live license lookups.'
 Assert-True ($licenseGenerator.IndexOf('cargo fetch --manifest-path') -lt $licenseGenerator.IndexOf('--offline')) 'All locked crate sources must be fetched before offline license analysis.'
 Assert-Contains $licenseGenerator 'THIRD-PARTY-NOTICES\.txt is stale' 'The notice generation step must fail when the committed third-party notices do not match the locked dependency graph.'
-Assert-Contains $licenseGenerator 'Get-FileHash.*generatedNoticePath[\s\S]*Get-FileHash.*trackedNoticePath[\s\S]*Copy-Item.*trackedNoticePath' 'CI must compare generated license text with the reviewed repository copy before staging it.'
+Assert-Contains $licenseGenerator '\$generatedNoticeText = \[IO\.File\]::ReadAllText\(\$generatedNoticePath\) -replace "`r`n\?", "`n"' 'Generated license text must be normalized to LF before comparison so Windows checkout line endings do not cause false stale notices.'
+Assert-Contains $licenseGenerator '\$trackedNoticeText = \[IO\.File\]::ReadAllText\(\$trackedNoticePath\) -replace "`r`n\?", "`n"' 'The reviewed notice file must be normalized to LF before comparison.'
+Assert-Contains $licenseGenerator '\$generatedNoticeText -cne \$trackedNoticeText[\s\S]*Copy-Item.*trackedNoticePath' 'CI must compare the complete normalized license text with the reviewed repository copy before staging it.'
+Assert-NotContains $licenseGenerator 'Get-FileHash.*generatedNoticePath|Get-FileHash.*trackedNoticePath' 'License freshness checks must not depend on platform-specific newline bytes.'
+$lfNoticeText = "license line one`nlicense line two`n"
+$crlfNoticeText = $lfNoticeText.Replace("`n", "`r`n")
+$normalizedLfNoticeText = $lfNoticeText -replace "`r`n?", "`n"
+$normalizedCrlfNoticeText = $crlfNoticeText -replace "`r`n?", "`n"
+Assert-True ($normalizedLfNoticeText -ceq $normalizedCrlfNoticeText) 'The Windows checkout CRLF form and generated LF form must compare as identical notice content.'
 Assert-Contains $licenseGenerator '\[switch\]\$UpdateTrackedNotice' 'Maintainers must have an explicit command to refresh notices after reviewing dependency license changes.'
 Assert-Contains $licenseGenerator 'packages\.config[\s\S]*packageNoticeText[\s\S]*AppendAllText\(\$generatedNoticePath' 'Native dependency notices must be generated from the exact restored NuGet packages and compared with the reviewed repository copy.'
 Assert-Contains $nativeLicenseNotices 'msvcp140\.dll[\s\S]*vcruntime140\.dll[\s\S]*vcruntime140_1\.dll[\s\S]*learn\.microsoft\.com/cpp/windows/redistributing-visual-cpp-files' 'The native notice source must identify the redistributable Visual C++ DLLs and their Microsoft licensing guidance.'

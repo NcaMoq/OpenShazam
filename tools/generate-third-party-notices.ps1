@@ -140,23 +140,20 @@ try {
     if (-not (Test-Path -LiteralPath $trackedNoticePath -PathType Leaf)) {
         throw 'The generated third-party notice file is missing from the repository.'
     }
-    $generatedNoticeHash = (Get-FileHash -LiteralPath $generatedNoticePath -Algorithm SHA256).Hash
+    $generatedNoticeText = [IO.File]::ReadAllText($generatedNoticePath) -replace "`r`n?", "`n"
     if ($UpdateTrackedNotice) {
-        $trackedNoticeHash = ''
+        $trackedNoticeText = ''
         if (Test-Path -LiteralPath $trackedNoticePath -PathType Leaf) {
-            $trackedNoticeHash = (Get-FileHash -LiteralPath $trackedNoticePath -Algorithm SHA256).Hash
+            $trackedNoticeText = [IO.File]::ReadAllText($trackedNoticePath) -replace "`r`n?", "`n"
         }
-        if ($generatedNoticeHash -cne $trackedNoticeHash) {
+        if ($generatedNoticeText -cne $trackedNoticeText) {
             Copy-Item -LiteralPath $generatedNoticePath -Destination $trackedNoticePath -Force
             Write-Host 'Updated THIRD-PARTY-NOTICES.txt from the pinned cargo-about output.'
         }
     }
     else {
-        if (-not (Test-Path -LiteralPath $trackedNoticePath -PathType Leaf)) {
-            throw 'The generated third-party notice file is missing from the repository.'
-        }
-        $trackedNoticeHash = (Get-FileHash -LiteralPath $trackedNoticePath -Algorithm SHA256).Hash
-        if ($generatedNoticeHash -cne $trackedNoticeHash) {
+        $trackedNoticeText = [IO.File]::ReadAllText($trackedNoticePath) -replace "`r`n?", "`n"
+        if ($generatedNoticeText -cne $trackedNoticeText) {
             throw 'THIRD-PARTY-NOTICES.txt is stale; regenerate it with -UpdateTrackedNotice before building.'
         }
     }
