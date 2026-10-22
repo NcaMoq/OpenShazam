@@ -1,5 +1,6 @@
 param(
-    [string]$Directory = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\windows-x64')
+    [string]$Directory = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\windows-x64'),
+    [switch]$UseCurrentDesktop
 )
 
 $ErrorActionPreference = 'Stop'
@@ -146,7 +147,7 @@ public static class OpenShazamSettingsHostSmoke
     [DllImport("CoreMessaging.dll", EntryPoint = "CreateDispatcherQueueController")]
     private static extern int CreateDispatcherQueueController(DispatcherQueueOptions options, out IntPtr controller);
 
-    public static string Run(string directory)
+    public static string Run(string directory, bool useCurrentDesktop)
     {
         string stage = "create STA thread";
         string error = null;
@@ -171,10 +172,17 @@ public static class OpenShazamSettingsHostSmoke
             BootstrapShutdown shutdownBootstrap = null;
             try
             {
-                stage = "select isolated desktop";
-                desktop = CreateDesktopW("OpenShazamSettingsSmoke-" + Guid.NewGuid().ToString("N"), IntPtr.Zero, IntPtr.Zero, 0, 0x02000000, IntPtr.Zero);
-                if (desktop == IntPtr.Zero) throw new InvalidOperationException("CreateDesktopW: " + Marshal.GetLastWin32Error());
-                if (!SetThreadDesktop(desktop)) throw new InvalidOperationException("SetThreadDesktop: " + Marshal.GetLastWin32Error());
+                if (useCurrentDesktop)
+                {
+                    stage = "select current interactive desktop";
+                }
+                else
+                {
+                    stage = "select isolated desktop";
+                    desktop = CreateDesktopW("OpenShazamSettingsSmoke-" + Guid.NewGuid().ToString("N"), IntPtr.Zero, IntPtr.Zero, 0, 0x02000000, IntPtr.Zero);
+                    if (desktop == IntPtr.Zero) throw new InvalidOperationException("CreateDesktopW: " + Marshal.GetLastWin32Error());
+                    if (!SetThreadDesktop(desktop)) throw new InvalidOperationException("SetThreadDesktop: " + Marshal.GetLastWin32Error());
+                }
 
                 stage = "initialize STA";
                 int hr = CoInitializeEx(IntPtr.Zero, 2);
@@ -759,7 +767,7 @@ $uiaTypes = $uiaTypesAssembly.Location
 $drawing = $drawingAssembly.Location
 $windowsBase = $windowsBaseAssembly.Location
 Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @($uiaClient, $uiaTypes, $drawing, $windowsBase, $threadingAssembly)
-$result = [OpenShazamSettingsHostSmoke]::Run($dist)
+$result = [OpenShazamSettingsHostSmoke]::Run($dist, $UseCurrentDesktop.IsPresent)
 if ($result -notlike 'Composition + WinUI Settings host initialized*') {
     throw $result
 }

@@ -103,7 +103,7 @@ jobs:
         run: .\tools\generate-third-party-notices.ps1
       - name: Verify the isolated WinUI Settings host
         shell: powershell
-        run: .\tools\test-windows-settings-host.ps1
+        run: .\tools\test-windows-settings-host.ps1 -UseCurrentDesktop
       - name: Run native Composition integration tests
         shell: pwsh
         run: .\tools\test-windows-composition.ps1
