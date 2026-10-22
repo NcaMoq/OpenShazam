@@ -1,0 +1,23 @@
+OpenShazam third-party software notices
+=======================================
+
+This file contains license notices for Rust dependencies included in the
+OpenShazam Windows x64 product build. The build also appends the applicable
+native Windows redistributable notices and license files from the pinned
+SettingsHost NuGet packages.
+
+Rust dependency notices below are generated from Cargo metadata and crate
+license files using cargo-about 0.9.1.
+
+{{#each licenses}}
+-------------------------------------------------------------------------------
+{{name}} ({{id}})
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

@@ -1,0 +1,24 @@
+Additional native Windows redistributable components
+===================================================
+
+The Windows x64 installer includes the following Visual C++ 14.3 (v143)
+runtime DLLs in the application directory:
+
+- msvcp140.dll
+- vcruntime140.dll
+- vcruntime140_1.dll
+
+These files are copied from the x64 Microsoft.VC143.CRT redistributable folder
+installed with Visual Studio 2022 Build Tools. Microsoft states that
+redistribution of Visual C++ runtime files is subject to the Microsoft Software
+License Terms and is limited to licensed Visual Studio users. See:
+https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files
+
+The installer also embeds Microsoft's Windows App Runtime 1.8 x64 installer
+and the Windows App SDK bootstrapper DLL. The runtime installer is downloaded
+from Microsoft's official Windows App SDK distribution, checked against a
+pinned SHA-256 digest, and verified with Microsoft's Authenticode signature.
+The applicable Windows App SDK license and package notices are included below
+from the exact NuGet package versions listed in
+apps/openshazam/settings-host/packages.config. See the deployment overview:
+https://learn.microsoft.com/windows/apps/windows-app-sdk/deployment-architecture

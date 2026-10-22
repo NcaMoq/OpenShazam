@@ -4,6 +4,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      upload_release_inputs:
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,18 +22,56 @@ jobs:
   windows-x64:
     name: Windows x64 validation
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: microsoft/setup-msbuild@v2
-      - uses: NuGet/setup-nuget@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3
+      - uses: NuGet/setup-nuget@fd55a6f3b34392fa83fde1454582407d8c714123 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: '1.85.0'
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-all-crates: true
+      - name: Validate GitHub Actions workflows
+        shell: pwsh
+        run: .\tools\test-github-workflows.ps1
+      - name: Install hash-pinned cargo-audit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedAuditVersion = 'cargo-audit 0.22.1'
+          $archiveName = 'cargo-audit-x86_64-pc-windows-msvc-v0.22.1.zip'
+          $expectedSha256 = '1523eedc57675eff07b230c06dcd545f3cb04e0ebf92f4009218c79000279a74'
+          $downloadUrl = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.1/$archiveName"
+          $installRoot = Join-Path $env:RUNNER_TEMP "cargo-audit-v0.22.1-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $archivePath = Join-Path $installRoot $archiveName
+          $toolDirectory = Join-Path $installRoot 'cargo-audit-x86_64-pc-windows-msvc-v0.22.1'
+          if (Test-Path -LiteralPath $installRoot) { throw 'The isolated cargo-audit install directory already exists.' }
+          New-Item -ItemType Directory -Path $installRoot | Out-Null
+          $curl = Get-Command 'curl.exe' -ErrorAction Stop
+          & $curl.Source --location --fail --silent --show-error --proto '=https' --proto-redir '=https' --max-redirs 5 --retry 2 --output $archivePath $downloadUrl
+          if ($LASTEXITCODE -ne 0) { throw "curl.exe exited with code $LASTEXITCODE while downloading cargo-audit." }
+          $actualSha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -cne $expectedSha256) { throw 'The cargo-audit archive SHA-256 did not match the pinned digest.' }
+          Expand-Archive -LiteralPath $archivePath -DestinationPath $installRoot
+          $auditExecutable = Join-Path $toolDirectory 'cargo-audit.exe'
+          if (-not (Test-Path -LiteralPath $auditExecutable -PathType Leaf)) { throw 'The pinned cargo-audit archive did not contain cargo-audit.exe.' }
+          $installedAuditVersion = (& $auditExecutable --version 2>$null | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $installedAuditVersion -cne $expectedAuditVersion) { throw 'The pinned cargo-audit executable reported an unexpected version.' }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $toolDirectory
+      - name: Audit locked dependencies
+        run: cargo audit --file Cargo.lock
       - name: Test workspace
         run: cargo test --workspace --all-targets --locked
       - name: Check production libraries without developer CLI feature
         run: cargo check --workspace --all-targets --locked --no-default-features
+      - name: Enforce Rust unsafe-operation lint policy
+        shell: pwsh
+        run: .\tools\test-rust-unsafe-policy.ps1
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
@@ -35,6 +79,9 @@ jobs:
       - name: Check Windows release and update security contract
         shell: pwsh
         run: .\tools\test-windows-installer-contract.ps1
+      - name: Check Authenticode fail-closed behavior without credentials
+        shell: pwsh
+        run: .\tools\test-windows-signing-contract.ps1
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --version=6.7.1 --yes --no-progress
@@ -47,36 +94,41 @@ jobs:
       - name: Prepare the Windows App SDK runtime prerequisite
         shell: pwsh
         run: .\tools\prepare-windows-app-sdk-runtime.ps1
+      - name: Generate Windows x64 third-party license notices
+        shell: pwsh
+        run: .\tools\generate-third-party-notices.ps1
+      - name: Verify the isolated WinUI Settings host
+        shell: pwsh
+        run: .\tools\test-windows-settings-host.ps1
+      - name: Run native Composition integration tests
+        shell: pwsh
+        run: .\tools\test-windows-composition.ps1
       - name: Compile the per-user installer
         shell: pwsh
-        run: |
-          $workspace = Get-Content -LiteralPath Cargo.toml -Raw
-          $package = [regex]::Match($workspace, '(?ms)^\[workspace\.package\]\s*(?<section>.*?)(?=^\[|\z)')
-          if (-not $package.Success) { throw 'Cargo.toml is missing [workspace.package].' }
-          $version = [regex]::Match($package.Groups['section'].Value, '(?m)^version\s*=\s*"(?<value>\d+\.\d+\.\d+)"')
-          if (-not $version.Success) { throw 'Cargo workspace version is missing or invalid.' }
-          $env:OPEN_SHAZAM_VERSION = $version.Groups['value'].Value
-          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
-          if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler is missing: $iscc" }
-          & $iscc /Qp installer\OpenShazam.iss
-          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE." }
-          $installer = Join-Path $PWD "dist\windows-x64\Shazam-Setup-$env:OPEN_SHAZAM_VERSION-x64.exe"
-          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw 'The installer was not produced.' }
-          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
-          [IO.File]::WriteAllText("$installer.sha256", "$hash *$(Split-Path -Leaf $installer)`n", [Text.UTF8Encoding]::new($false))
+        run: .\tools\build-installer.ps1
       - name: Verify installer checksum sidecar
         shell: pwsh
         run: |
           $installer = Get-ChildItem dist/windows-x64 -Filter 'Shazam-Setup-*-x64.exe' | Select-Object -First 1
           if (-not $installer) { throw 'The Inno Setup installer was not produced.' }
-          $sidecar = Get-Content -LiteralPath "$($installer.FullName).sha256" -Raw
-          $actual = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          if (-not $sidecar.StartsWith($actual, [StringComparison]::Ordinal)) { throw 'The installer SHA-256 sidecar does not match the executable.' }
-      - uses: actions/upload-artifact@v4
+          & .\tools\verify-sha256-sidecar.ps1 -Path $installer.FullName | Out-Null
+      - name: Build the release manifest verifier
+        if: ${{ inputs.upload_release_inputs }}
+        run: cargo build --locked --release -p openshazam-update --bin openshazam-update-tool
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ inputs.upload_release_inputs }}
         with:
           name: Shazam-Windows-x64-validation
           path: |
-            dist/windows-x64/Shazam-Setup-*-x64.exe
-            dist/windows-x64/Shazam-Setup-*-x64.exe.sha256
+            dist/windows-x64/openshazam.exe
+            dist/windows-x64/OpenShazam.SettingsHost.dll
+            dist/windows-x64/THIRD-PARTY-NOTICES.txt
+            dist/windows-x64/Microsoft.WindowsAppRuntime.Bootstrap.dll
+            dist/windows-x64/OpenShazamSquare44.png
+            dist/windows-x64/msvcp140.dll
+            dist/windows-x64/vcruntime140.dll
+            dist/windows-x64/vcruntime140_1.dll
+            dist/windows-x64/*.pri
+            target/release/openshazam-update-tool.exe
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1

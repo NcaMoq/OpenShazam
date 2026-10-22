@@ -3,9 +3,14 @@
 //! SQLite lives under `%LOCALAPPDATA%\OpenShazam` for every Windows install.
 //! The database worker owns its connection so the recognition/UI thread never
 //! waits for writes.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use std::{
     env,
+    os::windows::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawHandle,
+    },
     path::{Path, PathBuf},
     sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
@@ -13,9 +18,17 @@ use std::{
 };
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use windows::Win32::{
+    Foundation::HANDLE,
+    Storage::FileSystem::{
+        FileStandardInfo, GetFileInformationByHandleEx, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_STANDARD_INFO,
+    },
+};
 
 const SCHEMA_VERSION: i64 = 1;
 const HISTORY_LIMIT: usize = 40;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecognitionSource {
@@ -35,7 +48,7 @@ impl RecognitionSource {
         match value {
             "manual" => Ok(Self::Manual),
             "auto" => Ok(Self::Auto),
-            other => Err(format!("unknown saved recognition source `{other}`")),
+            _ => Err("unknown saved recognition source".to_owned()),
         }
     }
 }
@@ -146,20 +159,117 @@ impl Drop for HistoryStore {
 fn history_database_path() -> Result<PathBuf, String> {
     let local_app_data = env::var_os("LOCALAPPDATA")
         .ok_or_else(|| "LOCALAPPDATA is unavailable for this Windows build".to_owned())?;
-    let local_app_data = PathBuf::from(local_app_data);
-    let destination = local_app_data.join("OpenShazam").join("history.db");
+    history_database_path_at(&PathBuf::from(local_app_data))
+}
+
+fn history_database_path_at(local_app_data: &Path) -> Result<PathBuf, String> {
+    ensure_real_directory(local_app_data)?;
+    let local_app_data = std::fs::canonicalize(local_app_data)
+        .map_err(|error| format!("could not resolve Local AppData: {error}"))?;
+    let app_directory = local_app_data.join("OpenShazam");
+    create_or_validate_history_directory(&app_directory)?;
+    let canonical_app_directory = std::fs::canonicalize(&app_directory)
+        .map_err(|error| format!("could not resolve OpenShazam history storage: {error}"))?;
+    if canonical_app_directory.parent() != Some(local_app_data.as_path()) {
+        return Err("refusing to store history outside Local AppData".to_owned());
+    }
+
+    let destination = canonical_app_directory.join("history.db");
     let legacy_sources = legacy_history_paths(&local_app_data)?;
     migrate_legacy_history(&destination, &legacy_sources)?;
+    validate_history_file_set(&destination)?;
     Ok(destination)
 }
 
+fn create_or_validate_history_directory(path: &Path) -> Result<(), String> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "could not create history storage directory: {error}"
+            ));
+        }
+    }
+    ensure_real_directory(path)
+}
+
+fn ensure_real_directory(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect history storage directory: {error}"))?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(
+            "refusing to use a reparse point or non-directory for history storage".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_regular_history_file(path: &Path) -> Result<bool, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("could not inspect history file: {error}")),
+    };
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("refusing to use a reparse point or non-file for history storage".to_owned());
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)
+        .map_err(|error| format!("could not safely open history file metadata: {error}"))?;
+    let handle_metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect history file handle: {error}"))?;
+    if !handle_metadata.is_file()
+        || handle_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err("refusing to use a reparse point or non-file for history storage".to_owned());
+    }
+
+    let mut standard_info = FILE_STANDARD_INFO::default();
+    // SAFETY: `file` keeps a valid Windows handle alive and `standard_info` is
+    // a writable buffer with exactly the size required for FileStandardInfo.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle() as _),
+            FileStandardInfo,
+            (&mut standard_info as *mut FILE_STANDARD_INFO).cast(),
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    }
+    .map_err(|error| format!("could not inspect history file link count: {error}"))?;
+    if standard_info.NumberOfLinks != 1 {
+        return Err("refusing to use a multiply linked history file".to_owned());
+    }
+    Ok(true)
+}
+
+fn validate_history_file_set(database_path: &Path) -> Result<bool, String> {
+    let database_exists = validate_regular_history_file(database_path)?;
+    let mut sidecar_exists = false;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        sidecar_exists |= validate_regular_history_file(&append_suffix(database_path, suffix))?;
+    }
+    if !database_exists && sidecar_exists {
+        return Err("refusing to open SQLite history sidecars without their database".to_owned());
+    }
+    Ok(database_exists)
+}
+
 fn legacy_history_paths(local_app_data: &Path) -> Result<Vec<PathBuf>, String> {
+    let unpackaged = local_app_data.join("OpenShazam").join("Unpackaged");
+    validate_optional_history_directory(&unpackaged)?;
+    validate_optional_history_directory(&unpackaged.join("LocalState"))?;
     let mut paths = vec![local_app_data
         .join("OpenShazam")
         .join("Unpackaged")
         .join("LocalState")
         .join("history.db")];
     let packages = local_app_data.join("Packages");
+    validate_optional_history_directory(&packages)?;
     let entries = match std::fs::read_dir(packages) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
@@ -171,21 +281,38 @@ fn legacy_history_paths(local_app_data: &Path) -> Result<Vec<PathBuf>, String> {
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
         if file_name.starts_with("OpenShazam.Windows_") {
-            paths.push(entry.path().join("LocalState").join("history.db"));
+            let package_directory = entry.path();
+            ensure_real_directory(&package_directory)?;
+            let local_state = package_directory.join("LocalState");
+            validate_optional_history_directory(&local_state)?;
+            paths.push(local_state.join("history.db"));
         }
     }
     Ok(paths)
 }
 
+fn validate_optional_history_directory(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => ensure_real_directory(path).map(|()| true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("could not inspect previous Shazam data: {error}")),
+    }
+}
+
 fn migrate_legacy_history(destination: &Path, candidates: &[PathBuf]) -> Result<(), String> {
-    if destination.exists() {
+    if validate_regular_history_file(destination)? {
+        validate_history_file_set(destination)?;
         return Ok(());
     }
-    let existing: Vec<_> = candidates
-        .iter()
-        .filter(|path| path.is_file())
-        .cloned()
-        .collect();
+    let mut existing = Vec::new();
+    for path in candidates {
+        if validate_history_file_set(path)? {
+            if let Some(parent) = path.parent() {
+                ensure_real_directory(parent)?;
+            }
+            existing.push(path.clone());
+        }
+    }
     if existing.is_empty() {
         return Ok(());
     }
@@ -197,22 +324,22 @@ fn migrate_legacy_history(destination: &Path, candidates: &[PathBuf]) -> Result<
     let destination_parent = destination
         .parent()
         .ok_or_else(|| "history database path has no parent directory".to_owned())?;
-    std::fs::create_dir_all(destination_parent)
-        .map_err(|error| format!("could not create history storage directory: {error}"))?;
+    create_or_validate_history_directory(destination_parent)?;
 
-    let suffixes = ["", "-wal", "-shm", "-journal"];
+    // Move SQLite sidecars first and the database last. If the process or
+    // machine stops mid-migration, the destination then has no database and
+    // the source database remains available. A later launch can finish the
+    // move instead of mistaking the partial destination for a completed one.
+    let suffixes = ["-wal", "-shm", "-journal", ""];
     let mut moves = Vec::new();
     for suffix in suffixes {
         let source_file = append_suffix(source, suffix);
-        if !source_file.exists() {
+        if !validate_regular_history_file(&source_file)? {
             continue;
         }
         let destination_file = append_suffix(destination, suffix);
-        if destination_file.exists() {
-            return Err(format!(
-                "refusing to overwrite existing history data at {}",
-                destination_file.display()
-            ));
+        if validate_regular_history_file(&destination_file)? {
+            return Err("refusing to overwrite existing history data".to_owned());
         }
         moves.push((source_file, destination_file));
     }
@@ -232,9 +359,7 @@ fn migrate_legacy_history(destination: &Path, candidates: &[PathBuf]) -> Result<
                 format!("; rollback errors: {}", rollback_errors.join("; "))
             };
             return Err(format!(
-                "could not move previous history from {} to {}: {error}{rollback_detail}",
-                source_file.display(),
-                destination_file.display()
+                "could not move previous history data: {error}{rollback_detail}"
             ));
         }
         moved.push((source_file, destination_file));
@@ -252,13 +377,16 @@ fn open_database(path: &PathBuf) -> Result<Connection, String> {
     let parent = path
         .parent()
         .ok_or_else(|| "history database path has no parent directory".to_owned())?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("could not create history storage directory: {error}"))?;
+    create_or_validate_history_directory(parent)?;
+    validate_history_file_set(path)?;
     let mut connection = Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
-    .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    .map_err(|error| format!("could not open history database: {error}"))?;
+    validate_history_file_set(path)?;
     connection
         .busy_timeout(Duration::from_secs(2))
         .map_err(|error| format!("could not configure history database timeout: {error}"))?;
@@ -416,6 +544,10 @@ fn save_history_entry(connection: &mut Connection, track: &PersistedTrack) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        os::windows::{fs::OpenOptionsExt as WindowsOpenOptionsExt, process::CommandExt},
+        process::Command,
+    };
 
     fn temporary_database_path() -> PathBuf {
         let unique = SystemTime::now()
@@ -428,6 +560,16 @@ mod tests {
                 std::process::id()
             ))
             .join("history.db")
+    }
+
+    #[test]
+    fn invalid_saved_source_error_does_not_include_database_content() {
+        let private_value = "private-track-metadata";
+
+        let error = RecognitionSource::from_db_value(private_value).unwrap_err();
+
+        assert_eq!(error, "unknown saved recognition source");
+        assert!(!error.contains(private_value));
     }
 
     #[test]
@@ -460,6 +602,69 @@ mod tests {
         );
         assert!(!legacy.exists());
         assert!(!append_suffix(&legacy, "-wal").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_history_migration_finishes_after_a_crash_moved_sidecars_first() {
+        let root = env::temp_dir().join(format!(
+            "openshazam-history-migration-recovery-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let legacy = root.join("OpenShazam/Unpackaged/LocalState/history.db");
+        let destination = root.join("OpenShazam/history.db");
+        let legacy_wal = append_suffix(&legacy, "-wal");
+        let destination_wal = append_suffix(&destination, "-wal");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"sqlite database").unwrap();
+        std::fs::write(&legacy_wal, b"wal data").unwrap();
+
+        // Simulate interruption after the sidecar rename but before the
+        // database rename. Recovery must complete the set without overwriting
+        // the already-moved WAL.
+        std::fs::rename(&legacy_wal, &destination_wal).unwrap();
+        migrate_legacy_history(&destination, std::slice::from_ref(&legacy)).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"sqlite database");
+        assert_eq!(std::fs::read(&destination_wal).unwrap(), b"wal data");
+        assert!(!legacy.exists());
+        assert!(!legacy_wal.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_history_migration_preserves_conflicting_destination_sidecars() {
+        let root = env::temp_dir().join(format!(
+            "openshazam-history-migration-conflict-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let legacy = root.join("legacy/history.db");
+        let destination = root.join("OpenShazam/history.db");
+        let legacy_wal = append_suffix(&legacy, "-wal");
+        let destination_wal = append_suffix(&destination, "-wal");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"sqlite database").unwrap();
+        std::fs::write(&legacy_wal, b"legacy wal").unwrap();
+        std::fs::write(&destination_wal, b"existing wal").unwrap();
+
+        let error =
+            migrate_legacy_history(&destination, std::slice::from_ref(&legacy)).unwrap_err();
+
+        assert!(error.contains("refusing to overwrite existing history data"));
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"sqlite database");
+        assert_eq!(std::fs::read(&legacy_wal).unwrap(), b"legacy wal");
+        assert_eq!(std::fs::read(&destination_wal).unwrap(), b"existing wal");
+        assert!(!destination.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -516,6 +721,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_history_migration_rolls_back_if_a_sqlite_sidecar_cannot_move() {
+        let root = env::temp_dir().join(format!(
+            "openshazam-history-rollback-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let legacy = root.join("OpenShazam/Unpackaged/LocalState/history.db");
+        let legacy_wal = append_suffix(&legacy, "-wal");
+        let legacy_shm = append_suffix(&legacy, "-shm");
+        let destination = root.join("OpenShazam/history.db");
+        let destination_wal = append_suffix(&destination, "-wal");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"legacy database bytes").unwrap();
+        std::fs::write(&legacy_wal, b"legacy wal bytes").unwrap();
+        std::fs::write(&legacy_shm, b"legacy shm bytes").unwrap();
+        let shm_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(&legacy_shm)
+            .unwrap();
+
+        let error =
+            migrate_legacy_history(&destination, std::slice::from_ref(&legacy)).unwrap_err();
+
+        assert!(error.contains("could not move previous history"));
+        assert!(
+            !error.contains(root.to_string_lossy().as_ref()),
+            "history migration errors must not expose the per-user storage path"
+        );
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy database bytes");
+        assert_eq!(std::fs::read(&legacy_wal).unwrap(), b"legacy wal bytes");
+        assert_eq!(std::fs::read(&legacy_shm).unwrap(), b"legacy shm bytes");
+        assert!(!destination.exists());
+        assert!(!destination_wal.exists());
+        drop(shm_handle);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn history_survives_closing_and_reopening_the_database() {
         let path = temporary_database_path();
         let recognized_at_utc = UNIX_EPOCH + Duration::from_millis(1_797_000_123_456);
@@ -557,5 +804,124 @@ mod tests {
         if let Some(directory) = path.parent() {
             let _ = std::fs::remove_dir_all(directory);
         }
+    }
+
+    #[test]
+    fn history_keeps_only_the_newest_forty_entries_in_newest_first_order() {
+        let path = temporary_database_path();
+        let mut connection = open_database(&path).expect("open the history database");
+        for index in 0..(HISTORY_LIMIT + 5) {
+            let track = PersistedTrack {
+                title: format!("Track {index:02}"),
+                artist: "OpenShazam test".to_owned(),
+                recognized_at_utc: UNIX_EPOCH + Duration::from_millis(index as u64),
+                track_key: None,
+                artwork_url: None,
+                hq_artwork_url: None,
+                background_artwork_url: None,
+                shazam_page_url: None,
+                source: RecognitionSource::Manual,
+            };
+            save_history_entry(&mut connection, &track).expect("save a history row");
+        }
+
+        let entries = load_history(&connection).expect("restore recent history");
+
+        assert_eq!(entries.len(), HISTORY_LIMIT);
+        assert_eq!(
+            entries.first().map(|entry| entry.title.as_str()),
+            Some("Track 44")
+        );
+        assert_eq!(
+            entries.last().map(|entry| entry.title.as_str()),
+            Some("Track 05")
+        );
+        drop(connection);
+        if let Some(directory) = path.parent() {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn newer_history_schema_is_rejected_without_changing_its_version() {
+        let path = temporary_database_path();
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+
+        let error = open_database(&path).unwrap_err();
+
+        assert!(error.contains("is newer than this app supports"));
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION + 1);
+        drop(connection);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn history_storage_refuses_a_junction_for_the_product_data_directory() {
+        let root = env::temp_dir().join(format!(
+            "openshazam-history-junction-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let local_app_data = root.join("LocalAppData");
+        let target = root.join("redirected");
+        let junction = local_app_data.join("OpenShazam");
+        std::fs::create_dir_all(&local_app_data).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let command = format!(
+            "/D /C mklink /J \"{}\" \"{}\"",
+            junction.display(),
+            target.display()
+        );
+        let output = Command::new("cmd.exe")
+            .raw_arg(command)
+            .output()
+            .expect("create a Windows junction for the regression test");
+        assert!(
+            output.status.success(),
+            "could not create test junction: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let error = history_database_path_at(&local_app_data).unwrap_err();
+
+        assert!(error.contains("reparse point"));
+        std::fs::remove_dir(&junction).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_storage_refuses_multiply_linked_database_files() {
+        let root = env::temp_dir().join(format!(
+            "openshazam-history-hardlink-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let database = root.join("history.db");
+        let alias = root.join("history-copy.db");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&database, b"sqlite database").unwrap();
+        std::fs::hard_link(&database, &alias).unwrap();
+
+        let error = validate_regular_history_file(&database).unwrap_err();
+
+        assert!(error.contains("multiply linked"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

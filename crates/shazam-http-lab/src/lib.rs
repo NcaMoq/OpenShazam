@@ -7,10 +7,12 @@
 //! client for a non-public route, not an official API implementation. The
 //! request carries the observed Shazam 2.11.0 platform/version headers and
 //! omits the conditional AMP authentication header.
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
+    path::PathBuf,
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -169,6 +171,10 @@ pub enum NativeAutoUiEvent {
 /// the Rust HTTP adapter does not implement the Native duplicate reporter or
 /// manufacture its tag-context object.
 pub fn native_auto_ui_event_to_json(event: &NativeAutoUiEvent) -> String {
+    native_auto_ui_event_to_value(event).to_string()
+}
+
+fn native_auto_ui_event_to_value(event: &NativeAutoUiEvent) -> Value {
     match event {
         NativeAutoUiEvent::ContinuousMatchCandidate(result) => json!({
             "schema": "openshazam.auto-ui-event.v1",
@@ -178,8 +184,7 @@ pub fn native_auto_ui_event_to_json(event: &NativeAutoUiEvent) -> String {
             "native_duplicate_filter_applied": false,
             "primary_track": track_candidate_json(&result.primary_track),
             "alternative_track": result.alternative_track.as_deref().map(track_candidate_json),
-        })
-        .to_string(),
+        }),
     }
 }
 
@@ -209,8 +214,10 @@ pub fn native_auto_result_event(candidates: Vec<TrackCandidate>) -> Option<Nativ
 /// Native objects are not synthesized. The parser's documented image
 /// fallback is an explicit normalization, not a raw response copy.
 pub fn native_manual_ui_event_to_json(event: &NativeManualUiEvent) -> String {
-    use serde_json::json;
+    native_manual_ui_event_to_value(event).to_string()
+}
 
+fn native_manual_ui_event_to_value(event: &NativeManualUiEvent) -> Value {
     let value = match event {
         NativeManualUiEvent::Result(result) => {
             let (stage, native_main_view_action) = match result.stage {
@@ -262,7 +269,7 @@ pub fn native_manual_ui_event_to_json(event: &NativeManualUiEvent) -> String {
         }
     };
 
-    value.to_string()
+    value
 }
 
 /// Serialize the normalized terminal event for the Native tagging-session
@@ -631,12 +638,10 @@ impl UiRecognitionInput {
     /// Independent versioned record for hosts that explicitly opt into the
     /// new JSONL bridge. Existing Manual/Auto event schemas are nested intact.
     pub fn to_json(&self) -> String {
-        let event_json = match &self.event {
-            UiRecognitionEvent::Manual(event) => native_manual_ui_event_to_json(event),
-            UiRecognitionEvent::Auto(event) => native_auto_ui_event_to_json(event),
+        let recognition_event = match &self.event {
+            UiRecognitionEvent::Manual(event) => native_manual_ui_event_to_value(event),
+            UiRecognitionEvent::Auto(event) => native_auto_ui_event_to_value(event),
         };
-        let recognition_event: Value = serde_json::from_str(&event_json)
-            .expect("existing UI event serializers always produce JSON");
         json!({
             "schema": "openshazam.ui-recognition-input.v1",
             "event": "recognition_ui_input",
@@ -1967,7 +1972,7 @@ where
     }
     validate_shazam_request_endpoint(endpoint)?;
 
-    let mut command = Command::new(system_curl_program());
+    let mut command = Command::new(system_curl_program()?);
     command
         .args([
             "--disable",
@@ -2027,26 +2032,14 @@ where
     }
     drop(stdin);
 
-    let status = loop {
-        if cancelled.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err(Error::Transport("HTTPS request was cancelled".into()));
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+    let status =
+        match wait_for_child_cancellable(&mut child, cancelled, "HTTPS request was cancelled") {
+            Ok(status) => status,
+            Err(error) => {
                 let _ = reader.join();
-                return Err(Error::Transport(
-                    "could not wait for the HTTPS client".into(),
-                ));
+                return Err(error);
             }
-        }
-    };
+        };
     let (combined, exceeded_limit) = reader
         .join()
         .map_err(|_| Error::Transport("HTTPS response reader stopped unexpectedly".into()))?
@@ -2101,6 +2094,31 @@ where
     Ok(child)
 }
 
+fn wait_for_child_cancellable(
+    child: &mut std::process::Child,
+    cancelled: &AtomicBool,
+    cancellation_message: &'static str,
+) -> Result<std::process::ExitStatus, Error> {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Transport(cancellation_message.into()));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Transport(
+                    "could not wait for the HTTPS client".into(),
+                ));
+            }
+        }
+    }
+}
+
 fn read_bounded_response<R: Read>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
     let mut stored = Vec::with_capacity(limit.min(64 * 1024));
     let mut exceeded_limit = false;
@@ -2113,19 +2131,80 @@ fn read_bounded_response<R: Read>(mut reader: R, limit: usize) -> std::io::Resul
         let remaining = limit.saturating_sub(stored.len());
         let kept = remaining.min(count);
         stored.extend_from_slice(&buffer[..kept]);
-        exceeded_limit |= kept != count;
+        if kept != count {
+            // Drop the pipe promptly so the HTTPS child sees a closed stdout
+            // instead of continuing to download and emit an oversized body.
+            exceeded_limit = true;
+            break;
+        }
     }
     Ok((stored, exceeded_limit))
 }
 
-#[cfg(windows)]
-fn system_curl_program() -> &'static str {
-    "curl.exe"
+/// Resolve the operating system's HTTPS client without searching the current
+/// directory or `PATH`.
+///
+/// On Windows this uses `GetSystemDirectoryW` and accepts only a regular
+/// `curl.exe` beneath that protected directory. This prevents an unrelated
+/// executable in the application's working directory from intercepting
+/// recognition or update traffic.
+pub fn system_curl_program() -> Result<PathBuf, Error> {
+    #[cfg(windows)]
+    {
+        system_windows_program(&["curl.exe"], "the Windows system HTTPS client")
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(PathBuf::from("/usr/bin/curl"))
+    }
 }
 
-#[cfg(not(windows))]
-fn system_curl_program() -> &'static str {
-    "/usr/bin/curl"
+/// Resolve Windows PowerShell from the protected system directory instead of
+/// searching the current directory or `PATH`.
+#[cfg(windows)]
+pub fn system_powershell_program() -> Result<PathBuf, Error> {
+    system_windows_program(
+        &["WindowsPowerShell", "v1.0", "powershell.exe"],
+        "Windows PowerShell",
+    )
+}
+
+#[cfg(windows)]
+fn system_windows_program(
+    relative_components: &[&str],
+    description: &str,
+) -> Result<PathBuf, Error> {
+    use std::{
+        ffi::OsString,
+        os::windows::{ffi::OsStringExt, fs::MetadataExt},
+    };
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    let mut directory = vec![0u16; 32_768];
+    // SAFETY: the mutable slice supplies writable UTF-16 storage for the
+    // synchronous Win32 call, and the returned length is checked before use.
+    let length = unsafe { GetSystemDirectoryW(Some(&mut directory)) } as usize;
+    if length == 0 || length >= directory.len() {
+        return Err(Error::Transport(
+            "Windows could not resolve the system directory".into(),
+        ));
+    }
+    let mut program = PathBuf::from(OsString::from_wide(&directory[..length]));
+    for component in relative_components {
+        program.push(component);
+    }
+    let metadata = std::fs::symlink_metadata(&program)
+        .map_err(|_| Error::Transport(format!("{description} is unavailable")))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(Error::Transport(format!(
+            "{description} is not a regular file"
+        )));
+    }
+    Ok(program)
 }
 
 #[cfg(windows)]
@@ -2142,9 +2221,23 @@ fn suppress_child_console(command: &mut Command) {
 /// `backgroundhref`, and relevant timing fields are retained for the current
 /// process.
 pub fn fetch_shazam_config(profile: &ConfigRequestProfile) -> Result<ShazamConfiguration, Error> {
+    let cancelled = AtomicBool::new(false);
+    fetch_shazam_config_cancellable(profile, &cancelled)
+}
+
+/// Fetch Shazam Config while allowing the caller to stop the HTTPS process.
+pub fn fetch_shazam_config_cancellable(
+    profile: &ConfigRequestProfile,
+    cancelled: &AtomicBool,
+) -> Result<ShazamConfiguration, Error> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(Error::Transport(
+            "Config HTTPS request was cancelled".into(),
+        ));
+    }
     let url = build_config_url(profile)?;
     let app_version_header = format!("X-Shazam-AppVersion: {}", profile.app_version);
-    let mut command = Command::new(system_curl_program());
+    let mut command = Command::new(system_curl_program()?);
     #[cfg(windows)]
     suppress_child_console(&mut command);
     let mut child = command
@@ -2177,31 +2270,44 @@ pub fn fetch_shazam_config(profile: &ConfigRequestProfile) -> Result<ShazamConfi
         .spawn()
         .map_err(|_| Error::Transport("could not start the system HTTPS client".into()))?;
 
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::Transport("HTTPS client stdout was unavailable".into()))?;
-    let output_limit = MAX_RESPONSE_BYTES + b"\n__OPENSHZAM_CONFIG_STATUS__".len() + 8;
-    let mut combined = Vec::new();
-    stdout
-        .by_ref()
-        .take(output_limit as u64 + 1)
-        .read_to_end(&mut combined)
-        .map_err(|_| Error::Transport("could not read the Config response".into()))?;
-    if combined.len() > output_limit {
+    let stdout = child.stdout.take().ok_or_else(|| {
         let _ = child.kill();
         let _ = child.wait();
+        Error::Transport("HTTPS client stdout was unavailable".into())
+    })?;
+    let output_limit = MAX_RESPONSE_BYTES + b"\n__OPENSHZAM_CONFIG_STATUS__".len() + 8;
+    let reader = thread::Builder::new()
+        .name("openshazam-config-response-reader".into())
+        .spawn(move || read_bounded_response(stdout, output_limit))
+        .map_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+            Error::Transport("could not start the Config response reader".into())
+        })?;
+    let status = match wait_for_child_cancellable(
+        &mut child,
+        cancelled,
+        "Config HTTPS request was cancelled",
+    ) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = reader.join();
+            return Err(error);
+        }
+    };
+    let (combined, exceeded_limit) = reader
+        .join()
+        .map_err(|_| Error::Transport("Config response reader stopped unexpectedly".into()))?
+        .map_err(|_| Error::Transport("could not read the Config response".into()))?;
+    if exceeded_limit {
         return Err(Error::BadResponse(
             "Config response exceeded the local size limit".into(),
         ));
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|_| Error::Transport("could not wait for the HTTPS client".into()))?;
-    if !output.status.success() {
+    if !status.success() {
         return Err(Error::Transport(format!(
             "Config HTTPS request failed (curl exit {})",
-            output.status.code().unwrap_or(-1)
+            status.code().unwrap_or(-1)
         )));
     }
 
@@ -2641,10 +2747,26 @@ where
 /// fields describe the host while the established route identifier is kept.
 #[cfg(windows)]
 pub fn windows_config_request_profile() -> Result<ConfigRequestProfile, Error> {
+    let cancelled = AtomicBool::new(false);
+    windows_config_request_profile_cancellable(&cancelled)
+}
+
+/// Read the Windows Config profile while allowing the caller to cancel the
+/// PowerShell child before the HTTPS request begins.
+#[cfg(windows)]
+pub fn windows_config_request_profile_cancellable(
+    cancelled: &AtomicBool,
+) -> Result<ConfigRequestProfile, Error> {
     const SCRIPT: &str = r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $culture=Get-Culture; $os=Get-CimInstance Win32_OperatingSystem; $computer=Get-CimInstance Win32_ComputerSystem; [ordered]@{language=$culture.TwoLetterISOLanguageName; locale=$culture.Name; model=$computer.Model; os_version=$os.Version; os_build=$os.BuildNumber} | ConvertTo-Json -Compress"#;
-    let mut command = Command::new("powershell.exe");
+    const OUTPUT_LIMIT: usize = 16 * 1024;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(Error::Transport(
+            "Windows Config profile request was cancelled".into(),
+        ));
+    }
+    let mut command = Command::new(system_powershell_program()?);
     suppress_child_console(&mut command);
-    let output = command
+    let mut child = command
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -2652,18 +2774,53 @@ pub fn windows_config_request_profile() -> Result<ConfigRequestProfile, Error> {
             "-Command",
             SCRIPT,
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|error| {
             Error::Transport(format!(
                 "could not start PowerShell for Windows Config profile: {error}"
             ))
         })?;
-    if !output.status.success() {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        let _ = child.kill();
+        let _ = child.wait();
+        Error::Transport("PowerShell profile stdout was unavailable".into())
+    })?;
+    let reader = thread::Builder::new()
+        .name("openshazam-profile-response-reader".into())
+        .spawn(move || read_bounded_response(stdout, OUTPUT_LIMIT))
+        .map_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+            Error::Transport("could not start the Windows profile response reader".into())
+        })?;
+    let status = match wait_for_child_cancellable(
+        &mut child,
+        cancelled,
+        "Windows Config profile request was cancelled",
+    ) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = reader.join();
+            return Err(error);
+        }
+    };
+    let (output, exceeded_limit) = reader
+        .join()
+        .map_err(|_| Error::Transport("Windows profile reader stopped unexpectedly".into()))?
+        .map_err(|_| Error::Transport("could not read the Windows Config profile".into()))?;
+    if exceeded_limit {
+        return Err(Error::BadResponse(
+            "Windows Config profile exceeded the local size limit".into(),
+        ));
+    }
+    if !status.success() {
         return Err(Error::Transport(
             "PowerShell could not read the Windows locale, OS, or device model".into(),
         ));
     }
-    let host = parse_windows_host_profile(&output.stdout)?;
+    let host = parse_windows_host_profile(&output)?;
     let profile_value = |name: &str, detected: String| {
         std::env::var(name)
             .ok()
@@ -3225,6 +3382,53 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn system_https_client_is_an_absolute_regular_file() {
+        let program = system_curl_program().unwrap();
+        let metadata = std::fs::symlink_metadata(&program).unwrap();
+        assert!(program.is_absolute());
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        #[cfg(windows)]
+        assert_eq!(
+            program.file_name().and_then(|name| name.to_str()),
+            Some("curl.exe")
+        );
+        #[cfg(not(windows))]
+        assert_eq!(program, PathBuf::from("/usr/bin/curl"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_powershell_is_an_absolute_regular_file() {
+        use std::os::windows::fs::MetadataExt;
+
+        let program = system_powershell_program().unwrap();
+        let metadata = std::fs::symlink_metadata(&program).unwrap();
+        assert!(program.is_absolute());
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert!(metadata.file_attributes() & 0x0400 == 0);
+        assert_eq!(
+            program.file_name().and_then(|name| name.to_str()),
+            Some("powershell.exe")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_already_cancelled_windows_profile_does_not_start_powershell() {
+        let cancelled = AtomicBool::new(true);
+        let error = match windows_config_request_profile_cancellable(&cancelled) {
+            Err(error) => error,
+            Ok(_) => panic!("a cancelled profile request must not start"),
+        };
+
+        assert!(error
+            .to_string()
+            .contains("Windows Config profile request was cancelled"));
+    }
+
     fn valid_signature() -> Vec<u8> {
         sigx_format::encode_legacy_signature(&sigx_format::LegacySignatureInput {
             sample_rate: 16_000,
@@ -3249,6 +3453,90 @@ mod tests {
 
         assert!(dispatched);
         assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelling_a_config_request_terminates_the_https_child_promptly() {
+        let mut command = Command::new(system_powershell_program().unwrap());
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ]);
+        suppress_child_console(&mut command);
+        let mut child = command.spawn().expect("start the cancellable test child");
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let cancellation_signal = std::sync::Arc::clone(&cancelled);
+        let signaler = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancellation_signal.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+
+        let error = wait_for_child_cancellable(
+            &mut child,
+            &cancelled,
+            "Config HTTPS request was cancelled",
+        )
+        .expect_err("cancellation must terminate a still-running Config process");
+
+        signaler
+            .join()
+            .expect("join the cancellation signal worker");
+        assert!(error
+            .to_string()
+            .contains("Config HTTPS request was cancelled"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation must not wait for the HTTPS timeout"
+        );
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn an_already_cancelled_config_request_does_not_start_http() {
+        let cancelled = AtomicBool::new(true);
+        let error = match fetch_shazam_config_cancellable(&config_profile(), &cancelled) {
+            Err(error) => error,
+            Ok(_) => panic!("a cancelled request must not start"),
+        };
+
+        assert!(error
+            .to_string()
+            .contains("Config HTTPS request was cancelled"));
+    }
+
+    #[test]
+    fn bounded_response_reader_stops_after_first_excess_byte() {
+        struct CountingReader {
+            remaining: usize,
+            bytes_read: usize,
+        }
+
+        impl std::io::Read for CountingReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 || output.is_empty() {
+                    return Ok(0);
+                }
+                output[0] = b'x';
+                self.remaining -= 1;
+                self.bytes_read += 1;
+                Ok(1)
+            }
+        }
+
+        let mut reader = CountingReader {
+            remaining: 16,
+            bytes_read: 0,
+        };
+        let (body, exceeded_limit) = read_bounded_response(&mut reader, 3).unwrap();
+
+        assert_eq!(body, b"xxx");
+        assert!(exceeded_limit);
+        assert_eq!(reader.bytes_read, 4);
+        assert_eq!(reader.remaining, 12);
     }
 
     #[test]
@@ -4115,6 +4403,33 @@ mod tests {
             "openshazam.manual-ui-event.v2"
         );
         assert_eq!(record["recognition_event"]["event"], "no_match");
+        assert_eq!(
+            record["recognition_event"],
+            serde_json::from_str::<Value>(&native_manual_ui_event_to_json(
+                &NativeManualUiEvent::NoMatch
+            ))
+            .unwrap()
+        );
+
+        let auto_candidates = parse_track_candidates(
+            br#"{"matches":[{"trackid":"auto-key","title":"Auto Song","subtitle":"Auto Artist"}]}"#,
+        )
+        .unwrap();
+        let auto_event = NativeAutoUiEvent::ContinuousMatchCandidate(
+            native_auto_result_event(auto_candidates).unwrap(),
+        );
+        let auto_record: Value = UiRecognitionInput {
+            config_generation: 25,
+            event: UiRecognitionEvent::Auto(auto_event.clone()),
+        }
+        .to_json()
+        .parse()
+        .unwrap();
+        assert_eq!(auto_record["config_generation"], 25);
+        assert_eq!(
+            auto_record["recognition_event"],
+            serde_json::from_str::<Value>(&native_auto_ui_event_to_json(&auto_event)).unwrap()
+        );
 
         let candidates =
             parse_track_candidates(br#"{"track":{"title":"Song","subtitle":"Artist"}}"#).unwrap();

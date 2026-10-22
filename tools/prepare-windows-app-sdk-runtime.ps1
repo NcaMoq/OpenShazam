@@ -13,7 +13,11 @@ $existingHash = if (Test-Path -LiteralPath $output -PathType Leaf) {
 }
 if ($existingHash -cne $expectedSha256) {
     $uri = "https://aka.ms/windowsappsdk/1.8/$version/windowsappruntimeinstall-x64.exe"
-    Invoke-WebRequest -Uri $uri -OutFile $output
+    $curl = Get-Command 'curl.exe' -ErrorAction Stop
+    & $curl.Source --location --fail --silent --show-error --proto '=https' --proto-redir '=https' --max-redirs 5 --connect-timeout 10 --max-time 600 --retry 2 --output $output $uri
+    if ($LASTEXITCODE -ne 0) {
+        throw "curl.exe exited with code $LASTEXITCODE while downloading the Windows App SDK runtime."
+    }
 }
 $signature = Get-AuthenticodeSignature -LiteralPath $output
 $actualHash = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash.ToLowerInvariant()
