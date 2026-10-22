@@ -750,18 +750,7 @@ $uiaClientAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationCli
 $uiaTypesAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationTypes')
 $drawingAssembly = [Reflection.Assembly]::LoadWithPartialName('System.Drawing')
 $windowsBaseAssembly = [Reflection.Assembly]::LoadWithPartialName('WindowsBase')
-# PowerShell 6+ does not add framework assemblies automatically when an explicit
-# -ReferencedAssemblies list is provided. Use the .NET reference assembly
-# resolved by Add-Type on modern .NET; the runtime type itself is forwarded
-# from System.Private.CoreLib and isn't a suitable compiler reference.
-if ($PSVersionTable.PSEdition -eq 'Core') {
-    $threadingAssembly = Join-Path $PSHOME 'ref\System.Threading.Thread.dll'
-    if (-not (Test-Path -LiteralPath $threadingAssembly -PathType Leaf)) {
-        throw "PowerShell .NET reference assembly is missing: $threadingAssembly"
-    }
-} else {
-    $threadingAssembly = [System.Threading.Thread].Assembly.Location
-}
+$threadingAssembly = [System.Threading.Thread].Assembly.Location
 if (-not $uiaClientAssembly -or -not $uiaTypesAssembly -or -not $drawingAssembly -or -not $windowsBaseAssembly -or -not $threadingAssembly) {
     throw 'Windows UI Automation, System.Drawing, and threading assemblies are required for the Settings smoke test.'
 }

@@ -98,7 +98,7 @@ jobs:
         shell: pwsh
         run: .\tools\generate-third-party-notices.ps1
       - name: Verify the isolated WinUI Settings host
-        shell: pwsh
+        shell: powershell
         run: .\tools\test-windows-settings-host.ps1
       - name: Run native Composition integration tests
         shell: pwsh
