@@ -125,8 +125,15 @@ function Assert-SigningCredentialsCleared([string]$Name) {
         'OPEN_SHAZAM_SIGNING_CERTIFICATE_BASE64',
         'OPEN_SHAZAM_SIGNING_CERTIFICATE_PASSWORD'
     )) {
-        if (Test-Path -LiteralPath "Env:$variableName") {
+        $processValue = [Environment]::GetEnvironmentVariable(
+            $variableName,
+            [EnvironmentVariableTarget]::Process
+        )
+        if ($null -ne $processValue) {
             throw "Signing contract case '$Name' left $variableName in the process environment."
+        }
+        if (Test-Path -LiteralPath "Env:$variableName") {
+            throw "Signing contract case '$Name' left $variableName in the PowerShell environment provider."
         }
     }
 }

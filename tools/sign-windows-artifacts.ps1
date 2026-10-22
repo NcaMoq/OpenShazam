@@ -10,6 +10,8 @@ $encodedCertificate = $env:OPEN_SHAZAM_SIGNING_CERTIFICATE_BASE64
 $certificatePassword = $env:OPEN_SHAZAM_SIGNING_CERTIFICATE_PASSWORD
 [Environment]::SetEnvironmentVariable('OPEN_SHAZAM_SIGNING_CERTIFICATE_BASE64', $null, 'Process')
 [Environment]::SetEnvironmentVariable('OPEN_SHAZAM_SIGNING_CERTIFICATE_PASSWORD', $null, 'Process')
+Remove-Item -LiteralPath Env:OPEN_SHAZAM_SIGNING_CERTIFICATE_BASE64 -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath Env:OPEN_SHAZAM_SIGNING_CERTIFICATE_PASSWORD -ErrorAction SilentlyContinue
 if ([string]::IsNullOrWhiteSpace($encodedCertificate)) {
     if (-not [string]::IsNullOrWhiteSpace($certificatePassword)) {
         throw 'OPEN_SHAZAM_SIGNING_CERTIFICATE_PASSWORD is configured without OPEN_SHAZAM_SIGNING_CERTIFICATE_BASE64.'
