@@ -71,6 +71,15 @@ try {
     }
 
     $generatedNoticePath = Join-Path $temporaryDirectoryFullPath 'THIRD-PARTY-NOTICES.txt'
+    # cargo-about invokes cargo metadata, which can inspect locked target-specific
+    # packages even when only the Windows target is reported. Fetch the complete
+    # locked source set first; generation itself stays offline so license text is
+    # taken only from the pinned local crate archives.
+    & cargo fetch --manifest-path 'apps/openshazam/Cargo.toml' --locked
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo fetch could not prepare the locked dependency sources (exit $LASTEXITCODE)."
+    }
+
     & $toolPath generate `
         --manifest-path 'apps/openshazam/Cargo.toml' `
         --config 'about.toml' `
