@@ -174,6 +174,7 @@ Assert-Contains $ci 'curl\.Source.*--proto-redir ''=https''.*--output \$archiveP
 Assert-Contains $licenseGenerator 'curl\.Source.*--proto-redir ''=https''.*--output \$archivePath \$downloadUri[\s\S]*Get-FileHash' 'The license generator must download its pinned tool over HTTPS only before verifying the archive hash.'
 Assert-Contains $runtimePrerequisite 'curl\.Source.*--proto-redir ''=https''.*--output \$output \$uri[\s\S]*Get-FileHash' 'The Windows App SDK runtime must be downloaded over HTTPS only and hash-checked.'
 Assert-Contains $runtimePrerequisite 'Get-AuthenticodeSignature' 'The Windows App SDK runtime signature must be verified.'
+Assert-Contains $ci '\.\\tools\\prepare-windows-app-sdk-runtime\.ps1[\s\S]*\$runtimeInstaller = Join-Path \$PWD ''target/windows-app-sdk-runtime/WindowsAppRuntimeInstall-x64\.exe''[\s\S]*& \$runtimeInstaller --quiet[\s\S]*\$LASTEXITCODE -ne 0' 'Windows CI must quietly install the verified Windows App SDK runtime and fail if installation is unsuccessful.'
 Assert-NotContains $ci 'cargo install cargo-audit' 'Windows CI must not spend runner time compiling cargo-audit from source.'
 Assert-Contains $ci 'cargo check --workspace --all-targets --locked --no-default-features' 'CI must compile production configurations without developer CLI features.'
 Assert-Contains $release 'uses: \./\.github/workflows/ci\.yml' 'Release must run the same required CI checks for its tag commit.'

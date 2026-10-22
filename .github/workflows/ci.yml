@@ -93,7 +93,11 @@ jobs:
         run: .\tools\build-windows.ps1 -Product
       - name: Prepare the Windows App SDK runtime prerequisite
         shell: pwsh
-        run: .\tools\prepare-windows-app-sdk-runtime.ps1
+        run: |
+          .\tools\prepare-windows-app-sdk-runtime.ps1
+          $runtimeInstaller = Join-Path $PWD 'target/windows-app-sdk-runtime/WindowsAppRuntimeInstall-x64.exe'
+          & $runtimeInstaller --quiet
+          if ($LASTEXITCODE -ne 0) { throw "The Windows App SDK runtime installer failed with exit code $LASTEXITCODE." }
       - name: Generate Windows x64 third-party license notices
         shell: pwsh
         run: .\tools\generate-third-party-notices.ps1
