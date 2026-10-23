@@ -156,6 +156,13 @@ pub fn public_key_hex(signing_key: &SigningKey) -> String {
     encode_hex(signing_key.verifying_key().as_bytes())
 }
 
+pub fn signing_key_matches_public_key(
+    signing_key: &SigningKey,
+    expected_public_key: &VerifyingKey,
+) -> bool {
+    signing_key.verifying_key() == *expected_public_key
+}
+
 pub fn create_manifest(
     installer: &[u8],
     version: &str,
@@ -249,14 +256,35 @@ pub fn verify_installer_path(
     if file_size != manifest.installer_size_bytes {
         return Err(UpdateError::InstallerSizeMismatch);
     }
+    verify_installer_reader(manifest, &mut file)
+}
+
+/// Verify installer bytes from an already-open file handle. Callers can keep
+/// the handle open to prevent the path from being replaced between verification
+/// and process launch.
+pub fn verify_installer_reader(
+    manifest: &UpdateManifest,
+    mut reader: impl Read,
+) -> Result<(), UpdateError> {
+    manifest.validate()?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
+    let mut total_bytes = 0_u64;
     loop {
-        let read = file.read(&mut buffer).map_err(UpdateError::Io)?;
+        let read = reader.read(&mut buffer).map_err(UpdateError::Io)?;
         if read == 0 {
             break;
         }
+        total_bytes = total_bytes
+            .checked_add(read as u64)
+            .ok_or(UpdateError::InstallerSizeMismatch)?;
+        if total_bytes > manifest.installer_size_bytes {
+            return Err(UpdateError::InstallerSizeMismatch);
+        }
         hasher.update(&buffer[..read]);
+    }
+    if total_bytes != manifest.installer_size_bytes {
+        return Err(UpdateError::InstallerSizeMismatch);
     }
     if encode_hex(&hasher.finalize()) != manifest.installer_sha256 {
         return Err(UpdateError::InstallerHashMismatch);
@@ -419,6 +447,38 @@ mod tests {
     }
 
     #[test]
+    fn signed_manifest_rejects_changed_signature_oversized_data_and_unknown_fields() {
+        let (bytes, signature, key, _) = signed_fixture();
+        let mut signature_bytes = STANDARD.decode(&signature).unwrap();
+        signature_bytes[0] ^= 0x01;
+        assert!(matches!(
+            verify_signed_manifest(
+                &bytes,
+                &STANDARD.encode(signature_bytes),
+                &key.verifying_key()
+            ),
+            Err(UpdateError::BadSignature)
+        ));
+
+        let oversized_manifest = vec![b' '; MAX_MANIFEST_BYTES + 1];
+        assert!(matches!(
+            verify_signed_manifest(&oversized_manifest, &signature, &key.verifying_key()),
+            Err(UpdateError::Invalid(
+                "manifest size is outside the accepted range"
+            ))
+        ));
+
+        let mut object: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        object["unexpected"] = serde_json::Value::Bool(true);
+        let extended_bytes = serde_json::to_vec(&object).unwrap();
+        let extended_signature = STANDARD.encode(key.sign(&extended_bytes).to_bytes());
+        assert!(matches!(
+            verify_signed_manifest(&extended_bytes, &extended_signature, &key.verifying_key()),
+            Err(UpdateError::Json(_))
+        ));
+    }
+
+    #[test]
     fn manifest_rejects_untrusted_urls_wrong_platform_and_rollback() {
         let (bytes, signature, key, _) = signed_fixture();
         let mut value: UpdateManifest = serde_json::from_slice(&bytes).unwrap();
@@ -433,6 +493,10 @@ mod tests {
                 .is_newer_than("0.1.1")
                 .unwrap()
         );
+
+        value.architecture = "x64".to_owned();
+        value.minimum_supported_version = "0.2.0".to_owned();
+        assert!(value.validate().is_err());
     }
 
     #[test]
@@ -452,6 +516,22 @@ mod tests {
             public_key_hex(&SigningKey::from_bytes(&[7; 32]))
         );
         assert!(signing_key_from_base64("not base64!").is_err());
+    }
+
+    #[test]
+    fn release_signing_key_must_match_the_trusted_public_key() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let matching_public_key = signing_key.verifying_key();
+        let different_public_key = SigningKey::from_bytes(&[8_u8; 32]).verifying_key();
+
+        assert!(signing_key_matches_public_key(
+            &signing_key,
+            &matching_public_key
+        ));
+        assert!(!signing_key_matches_public_key(
+            &signing_key,
+            &different_public_key
+        ));
     }
 
     #[test]
@@ -476,5 +556,25 @@ mod tests {
         std::fs::write(&path, b"modified installer").unwrap();
         assert!(verify_installer_path(&manifest, &path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn installer_reader_verification_checks_streamed_hash_and_length() {
+        let bytes = b"installer through an already-open handle";
+        let (manifest_bytes, _, key, _) = signed_fixture();
+        let mut manifest: UpdateManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        manifest.installer_size_bytes = bytes.len() as u64;
+        manifest.installer_sha256 = sha256_hex(bytes);
+        let signed_bytes = manifest.signed_bytes().unwrap();
+        let signature = sign_manifest(&manifest, &key).unwrap();
+        let manifest =
+            verify_signed_manifest(&signed_bytes, &signature, &key.verifying_key()).unwrap();
+
+        verify_installer_reader(&manifest, bytes.as_slice()).unwrap();
+        assert!(verify_installer_reader(&manifest, b"different bytes".as_slice()).is_err());
+        assert!(
+            verify_installer_reader(&manifest, [bytes.as_slice(), b"x"].concat().as_slice())
+                .is_err()
+        );
     }
 }

@@ -9,6 +9,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $hostDir = Join-Path $root 'apps\openshazam\settings-host'
+$nugetConfig = Join-Path $root 'NuGet.Config'
 $expectedDist = [IO.Path]::GetFullPath((Join-Path $root 'dist\windows-x64')).TrimEnd('\')
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $dist = $expectedDist
@@ -58,8 +59,11 @@ try {
         throw "The executable destination must already exist: $dist"
     }
 
-    & nuget restore (Join-Path $hostDir 'packages.config') -PackagesDirectory $packagesDir -NonInteractive
+    & nuget restore (Join-Path $hostDir 'packages.config') `
+        -PackagesDirectory $packagesDir -ConfigFile $nugetConfig -NonInteractive
     if ($LASTEXITCODE -ne 0) { throw "Could not restore C++/WinRT WinUI 3 native dependencies" }
+
+    & (Join-Path $PSScriptRoot 'verify-native-package-signatures.ps1') -PackagesDirectory $packagesDir
 
     & $msbuild (Join-Path $hostDir 'SettingsHost.vcxproj') `
         /p:Configuration=Release `

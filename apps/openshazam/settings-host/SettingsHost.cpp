@@ -3,11 +3,14 @@
 #include "pch.h"
 #include <shellapi.h>
 #include <algorithm>
+#include <cstddef>
 #include <cwchar>
+#include <ctime>
 #include <iterator>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <type_traits>
 #include <vector>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.System.h>
@@ -26,6 +29,13 @@ struct OpenShazamHistoryItem
     wchar_t const* recognizedAt;
     wchar_t const* pageUrl;
 };
+
+static_assert(std::is_standard_layout_v<OpenShazamHistoryItem>);
+static_assert(offsetof(OpenShazamHistoryItem, title) == 0);
+static_assert(offsetof(OpenShazamHistoryItem, artist) == sizeof(void*));
+static_assert(offsetof(OpenShazamHistoryItem, recognizedAt) == 2 * sizeof(void*));
+static_assert(offsetof(OpenShazamHistoryItem, pageUrl) == 3 * sizeof(void*));
+static_assert(sizeof(OpenShazamHistoryItem) == 4 * sizeof(void*));
 
 namespace x = winrt::Microsoft::UI::Xaml;
 namespace controls = winrt::Microsoft::UI::Xaml::Controls;
@@ -70,11 +80,13 @@ namespace
     };
 
     constexpr wchar_t kSettingsClass[] = L"OpenShazamWinUI3Preferences";
+    constexpr int kMaxDpiSuggestedWindowDimension = 32768;
     constexpr UINT WM_APPEARANCE_CHANGED = WM_APP + 0x48;
     constexpr UINT WM_GLOBAL_SHORTCUT_CHANGED = WM_APP + 0x4a;
     constexpr UINT WM_GLOBAL_SHORTCUT_CAPTURE = WM_APP + 0x4b;
     constexpr UINT WM_LANGUAGE_CHANGED = WM_APP + 0x4c;
     constexpr UINT WM_UPDATE_AUTO_CHANGED = WM_APP + 0x4f;
+    constexpr UINT WM_UPDATE_ACTION = WM_APP + 0x50;
     constexpr uint32_t kAppearanceSystem = 0;
     constexpr uint32_t kAppearanceLight = 1;
     constexpr uint32_t kAppearanceDark = 2;
@@ -328,6 +340,16 @@ namespace
         controls::TextBlock aboutVersion{ nullptr };
         controls::TextBlock updateAutoValue{ nullptr };
         controls::ToggleSwitch updateAutoToggle{ nullptr };
+        controls::Border updateCheckCard{ nullptr };
+        controls::Grid updateCheckRow{ nullptr };
+        controls::TextBlock updateCheckStatus{ nullptr };
+        controls::TextBlock updateCheckDetail{ nullptr };
+        controls::FontIcon updateCheckIcon{ nullptr };
+        controls::ProgressRing updateCheckProgress{ nullptr };
+        controls::Button updateActionButton{ nullptr };
+        std::wstring updateVersion;
+        std::wstring updateDetail;
+        uint64_t updateLastChecked{};
         controls::InfoBar startupInfoBar{ nullptr };
         controls::ComboBox appearance{ nullptr };
         controls::ComboBox language{ nullptr };
@@ -475,9 +497,10 @@ namespace
     {
         if (!state || !state->navigation || !state->startupCard ||
             !state->appearanceCard || !state->languageCard || !state->shortcutCard ||
-            !state->autoUpdateCard || !state->aboutCard ||
+            !state->autoUpdateCard || !state->updateCheckCard || !state->aboutCard ||
             !state->startupRow || !state->appearanceRow || !state->languageRow ||
-            !state->shortcutRow || !state->autoUpdateRow || !state->aboutRow)
+            !state->shortcutRow || !state->autoUpdateRow || !state->updateCheckRow ||
+            !state->aboutRow)
             return;
         // LeftCompact opens as an overlay, so the content viewport stays the
         // same width. Calculate from the persistent compact rail only.
@@ -490,6 +513,7 @@ namespace
         state->languageCard.Width(cardWidth);
         state->shortcutCard.Width(cardWidth);
         state->autoUpdateCard.Width(cardWidth);
+        state->updateCheckCard.Width(cardWidth);
         state->aboutCard.Width(cardWidth);
         const double rowWidth = cardWidth - 32.0;
         state->startupRow.Width(rowWidth);
@@ -497,6 +521,7 @@ namespace
         state->languageRow.Width(rowWidth);
         state->shortcutRow.Width(rowWidth);
         state->autoUpdateRow.Width(rowWidth);
+        state->updateCheckRow.Width(rowWidth);
         state->aboutRow.Width(rowWidth);
     }
 
@@ -698,6 +723,83 @@ namespace
                     : Localized(L"Off", L"\u30AA\u30D5"));
                 state->updateAutoValue.Opacity(state->updateAutoToggle.IsEnabled() ? 1.0 : 0.5);
             }
+
+            if (!state->updateCheckStatus || !state->updateActionButton) return;
+            const auto busy = state->updateStatus == 1 ||
+                state->updateStatus == 4 || state->updateStatus == 5;
+            state->updateCheckProgress.IsActive(busy);
+            state->updateCheckProgress.Visibility(
+                busy ? x::Visibility::Visible : x::Visibility::Collapsed);
+            state->updateCheckIcon.Visibility(
+                busy ? x::Visibility::Collapsed : x::Visibility::Visible);
+
+            std::wstring statusText;
+            std::wstring detailText;
+            auto localized = [](winrt::hstring const& value) {
+                return std::wstring(value.c_str());
+            };
+            switch (state->updateStatus)
+            {
+            case 1:
+                statusText = localized(Localized(
+                    L"Checking for updates...", L"\u66F4\u65B0\u30D7\u30ED\u30B0\u30E9\u30E0\u3092\u78BA\u8A8D\u3057\u3066\u3044\u307E\u3059..."));
+                break;
+            case 2:
+                statusText = localized(Localized(
+                    L"You're up to date", L"\u6700\u65B0\u306E\u72B6\u614B\u3067\u3059"));
+                break;
+            case 3:
+                statusText = localized(Localized(L"Version ", L"\u30D0\u30FC\u30B8\u30E7\u30F3 ")) +
+                    state->updateVersion + localized(Localized(
+                        L" is available", L"\u304C\u5229\u7528\u3067\u304D\u307E\u3059"));
+                break;
+            case 4:
+                statusText = localized(Localized(L"Downloading update", L"\u66F4\u65B0\u3092\u30C0\u30A6\u30F3\u30ED\u30FC\u30C9\u4E2D"));
+                break;
+            case 5:
+                statusText = localized(Localized(L"Installing update", L"\u66F4\u65B0\u3092\u30A4\u30F3\u30B9\u30C8\u30FC\u30EB\u4E2D"));
+                break;
+            case 6:
+                statusText = localized(Localized(L"Update couldn't be completed", L"\u66F4\u65B0\u3092\u5B8C\u4E86\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F"));
+                detailText = state->updateDetail;
+                break;
+            case 7:
+                statusText = localized(Localized(L"Updated to version ", L"\u30D0\u30FC\u30B8\u30E7\u30F3 ")) +
+                    state->updateVersion;
+                break;
+            default:
+                statusText = localized(Localized(L"Check for updates", L"\u66F4\u65B0\u3092\u78BA\u8A8D"));
+                break;
+            }
+
+            if (state->updateStatus == 2 && state->updateLastChecked != 0)
+            {
+                const auto timestamp = static_cast<__time64_t>(state->updateLastChecked);
+                std::tm localTime{};
+                wchar_t formatted[96]{};
+                if (_localtime64_s(&localTime, &timestamp) == 0)
+                {
+                    const wchar_t* format = IsJapanese()
+                        ? L"\u6700\u7D42\u78BA\u8A8D\u65E5\u6642: %Y/%m/%d %H:%M"
+                        : L"Last checked: %Y-%m-%d %H:%M";
+                    if (std::wcsftime(formatted, std::size(formatted), format, &localTime) != 0)
+                        detailText = formatted;
+                }
+            }
+
+            state->updateCheckStatus.Text(winrt::hstring(statusText));
+            state->updateCheckDetail.Text(winrt::hstring(detailText));
+            state->updateCheckDetail.Visibility(
+                detailText.empty() ? x::Visibility::Collapsed : x::Visibility::Visible);
+            const bool installAvailable = state->updateStatus == 3;
+            const bool canCheck = state->updateStatus == 0 || state->updateStatus == 2 ||
+                state->updateStatus == 6 || state->updateStatus == 7;
+            const auto actionText = installAvailable
+                ? Localized(L"Install now", L"\u4ECA\u3059\u3050\u30A4\u30F3\u30B9\u30C8\u30FC\u30EB")
+                : Localized(L"Check for updates", L"\u66F4\u65B0\u30D7\u30ED\u30B0\u30E9\u30E0\u306E\u30C1\u30A7\u30C3\u30AF");
+            state->updateActionButton.Content(winrt::box_value(actionText));
+            automation::AutomationProperties::SetName(state->updateActionButton, actionText);
+            state->updateActionButton.IsEnabled(installAvailable || canCheck);
         }
         catch (...) { }
     }
@@ -1693,6 +1795,79 @@ namespace
             state->autoUpdateCard.Child(state->autoUpdateRow);
             stack.Children().Append(state->autoUpdateCard);
 
+            state->updateCheckCard = markup::XamlReader::Load(
+                LR"(<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8" />)"
+            ).as<controls::Border>();
+            state->updateCheckCard.Padding(
+                x::ThicknessHelper::FromUniformLength(kSettingsCardPaddingDips));
+            state->updateCheckRow = controls::Grid{};
+            state->updateCheckRow.ColumnSpacing(16.0);
+            auto statusIconColumn = controls::ColumnDefinition{};
+            statusIconColumn.Width(x::GridLengthHelper::FromValueAndType(36.0, x::GridUnitType::Pixel));
+            auto statusTextColumn = controls::ColumnDefinition{};
+            statusTextColumn.Width(x::GridLengthHelper::FromValueAndType(1.0, x::GridUnitType::Star));
+            auto statusActionColumn = controls::ColumnDefinition{};
+            statusActionColumn.Width(x::GridLengthHelper::FromValueAndType(
+                kSettingsControlLaneWidthDips, x::GridUnitType::Pixel));
+            state->updateCheckRow.ColumnDefinitions().Append(statusIconColumn);
+            state->updateCheckRow.ColumnDefinitions().Append(statusTextColumn);
+            state->updateCheckRow.ColumnDefinitions().Append(statusActionColumn);
+
+            controls::Grid updateStatusGlyph;
+            updateStatusGlyph.Width(36.0);
+            updateStatusGlyph.Height(36.0);
+            updateStatusGlyph.VerticalAlignment(x::VerticalAlignment::Center);
+            state->updateCheckIcon = controls::FontIcon{};
+            state->updateCheckIcon.Glyph(L"\uE895"); // Sync
+            state->updateCheckIcon.FontSize(28.0);
+            state->updateCheckIcon.HorizontalAlignment(x::HorizontalAlignment::Center);
+            state->updateCheckIcon.VerticalAlignment(x::VerticalAlignment::Center);
+            updateStatusGlyph.Children().Append(state->updateCheckIcon);
+            state->updateCheckProgress = controls::ProgressRing{};
+            state->updateCheckProgress.Width(32.0);
+            state->updateCheckProgress.Height(32.0);
+            state->updateCheckProgress.IsActive(false);
+            state->updateCheckProgress.Visibility(x::Visibility::Collapsed);
+            state->updateCheckProgress.HorizontalAlignment(x::HorizontalAlignment::Center);
+            state->updateCheckProgress.VerticalAlignment(x::VerticalAlignment::Center);
+            updateStatusGlyph.Children().Append(state->updateCheckProgress);
+            controls::Grid::SetColumn(updateStatusGlyph, 0);
+            state->updateCheckRow.Children().Append(updateStatusGlyph);
+
+            controls::StackPanel updateStatusLabels;
+            updateStatusLabels.Spacing(4.0);
+            updateStatusLabels.VerticalAlignment(x::VerticalAlignment::Center);
+            state->updateCheckStatus = controls::TextBlock{};
+            state->updateCheckStatus.FontSize(18.0);
+            state->updateCheckStatus.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            updateStatusLabels.Children().Append(state->updateCheckStatus);
+            state->updateCheckDetail = controls::TextBlock{};
+            state->updateCheckDetail.FontSize(12.0);
+            state->updateCheckDetail.Opacity(0.72);
+            state->updateCheckDetail.TextWrapping(x::TextWrapping::Wrap);
+            state->updateCheckDetail.Visibility(x::Visibility::Collapsed);
+            updateStatusLabels.Children().Append(state->updateCheckDetail);
+            controls::Grid::SetColumn(updateStatusLabels, 1);
+            state->updateCheckRow.Children().Append(updateStatusLabels);
+
+            state->updateActionButton = controls::Button{};
+            state->updateActionButton.MinWidth(176.0);
+            state->updateActionButton.Height(40.0);
+            state->updateActionButton.HorizontalAlignment(x::HorizontalAlignment::Right);
+            state->updateActionButton.VerticalAlignment(x::VerticalAlignment::Center);
+            automation::AutomationProperties::SetName(state->updateActionButton,
+                Localized(L"Check for updates", L"\u66F4\u65B0\u30D7\u30ED\u30B0\u30E9\u30E0\u306E\u30C1\u30A7\u30C3\u30AF"));
+            std::weak_ptr<SettingsState> updateActionWeak = state;
+            state->updateActionButton.Click([updateActionWeak](auto const&, auto const&) {
+                if (auto state = updateActionWeak.lock(); state && state->alive && state->owner)
+                    ::PostMessageW(state->owner, WM_UPDATE_ACTION,
+                        state->updateStatus == 3 ? 1 : 0, 0);
+            });
+            controls::Grid::SetColumn(state->updateActionButton, 2);
+            state->updateCheckRow.Children().Append(state->updateActionButton);
+            state->updateCheckCard.Child(state->updateCheckRow);
+            stack.Children().Append(state->updateCheckCard);
+
             state->aboutHeading = controls::TextBlock{};
             state->aboutHeading.FontSize(16.0);
             state->aboutHeading.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
@@ -2049,8 +2224,14 @@ namespace
                 if (lp)
                 {
                     auto rect = reinterpret_cast<RECT const*>(lp);
+                    const auto width = static_cast<LONGLONG>(rect->right) - rect->left;
+                    const auto height = static_cast<LONGLONG>(rect->bottom) - rect->top;
+                    if (width <= 0 || height <= 0 ||
+                        width > kMaxDpiSuggestedWindowDimension ||
+                        height > kMaxDpiSuggestedWindowDimension)
+                        return 0;
                     ::SetWindowPos(h, nullptr, rect->left, rect->top,
-                        rect->right - rect->left, rect->bottom - rect->top,
+                        static_cast<int>(width), static_cast<int>(height),
                         SWP_NOZORDER | SWP_NOACTIVATE);
                 }
                 return 0;
@@ -2117,19 +2298,39 @@ extern "C" __declspec(dllexport) void __stdcall OpenShazamSettingsSetHistory(
 }
 
 extern "C" __declspec(dllexport) void __stdcall OpenShazamSettingsSetUpdateStatus(
-    BOOL automatic, uint32_t status, wchar_t const*, wchar_t const*, uint64_t) noexcept
+    BOOL automatic, uint32_t status, wchar_t const* version,
+    wchar_t const* detail, uint64_t lastChecked) noexcept
 {
-    if (!g_settings || !g_settings->state) return;
-    auto state = g_settings->state;
-    state->updateAutoEnabled = automatic != FALSE;
-    state->updateStatus = status;
-    RefreshUpdateControlsNoThrow(state);
+    try
+    {
+        if (!g_settings || !g_settings->state) return;
+        auto state = g_settings->state;
+        auto nextVersion = winrt::hstring(version ? version : L"");
+        std::wstring nextDetail(detail ? detail : L"");
+        if (nextDetail.size() > 512)
+        {
+            nextDetail.resize(512);
+            const wchar_t last = nextDetail.back();
+            if (last >= 0xD800 && last <= 0xDBFF) nextDetail.pop_back();
+        }
+        state->updateVersion = std::move(nextVersion);
+        state->updateDetail = std::move(nextDetail);
+        state->updateAutoEnabled = automatic != FALSE;
+        state->updateStatus = status;
+        state->updateLastChecked = lastChecked;
+        RefreshUpdateControlsNoThrow(state);
+    }
+    catch (...)
+    {
+        // Never allow an allocation or WinRT exception to cross the C ABI.
+    }
 }
 
 extern "C" __declspec(dllexport) BOOL __stdcall OpenShazamSettingsPreTranslate(MSG* msg) noexcept
 {
     if (!g_settings || !g_settings->hwnd || !msg) return FALSE;
-    return ::ContentPreTranslateMessage(msg) ? TRUE : FALSE;
+    try { return ::ContentPreTranslateMessage(msg) ? TRUE : FALSE; }
+    catch (...) { return FALSE; }
 }
 
 extern "C" __declspec(dllexport) BOOL __stdcall OpenShazamSettingsIsVisible() noexcept

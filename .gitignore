@@ -7,6 +7,14 @@
 **/.DS_Store
 .env
 .env.*
+# Local code-signing material; never commit certificates or private keys.
+*.pfx
+*.p12
+*.key
+*.p8
+*.pem
+__pycache__/
+*.py[cod]
 **/bin/
 **/obj/
 *.pcm

@@ -1,0 +1,16 @@
+# Third-party licenses shipped with the Windows x64 product build.
+# Keep this allowlist restrictive; adding a license requires review first.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "Unlicense",
+    "Zlib",
+    "Unicode-3.0",
+]
+
+targets = ["x86_64-pc-windows-msvc"]
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false

@@ -30,6 +30,7 @@ static NEXT_UI_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(1);
 use std::process::Command;
 
 #[cfg(any(windows, test, target_os = "macos"))]
+#[cfg(any(test, all(windows, feature = "dev-cli")))]
 use sigx_core::{Config, SigX};
 
 #[cfg(windows)]
@@ -249,6 +250,7 @@ fn emit_session_timeout_event(tagging_type: NativeTaggingType, jsonl_output: boo
 }
 
 #[cfg(any(windows, target_os = "macos"))]
+#[cfg_attr(not(feature = "dev-cli"), allow(dead_code))] // The no-CLI product build intentionally ignores diagnostic UI snapshots.
 #[derive(Clone, Copy)]
 struct ProgressiveUiConfigInputs {
     tagging_type: NativeTaggingType,
@@ -535,20 +537,20 @@ fn decode_mono_f32le(bytes: &[u8]) -> io::Result<Vec<f32>> {
         .collect()
 }
 
-#[cfg(any(windows, test, target_os = "macos"))]
+#[cfg(any(test, all(windows, feature = "dev-cli")))]
 fn core_error(error: impl std::fmt::Debug) -> io::Error {
     io::Error::other(format!("SigX: {error:?}"))
 }
 
 /// Platform-independent packet-to-SigX boundary shared by capture adapters.
-#[cfg(any(windows, test, target_os = "macos"))]
+#[cfg(any(test, all(windows, feature = "dev-cli")))]
 struct CaptureAccumulator {
     sigx: SigX,
     target_frames: usize,
     frames_seen: usize,
 }
 
-#[cfg(any(windows, test, target_os = "macos"))]
+#[cfg(any(test, all(windows, feature = "dev-cli")))]
 impl CaptureAccumulator {
     #[cfg(test)]
     fn new(target_frames: usize) -> io::Result<Self> {
@@ -1008,11 +1010,17 @@ pub(crate) fn recognize_loopback_progressive_controlled(
 
     let (configuration_sender, configuration_receiver) = mpsc::sync_channel(1);
     control.config_fetching.store(true, Ordering::Release);
+    let config_cancelled = Arc::new(AtomicBool::new(false));
+    let config_worker_cancelled = Arc::clone(&config_cancelled);
     let configuration_task = match thread::Builder::new()
         .name("openshazam-config-fetch".into())
         .spawn(move || {
-            let result = windows_progressive_profile(sample_rate, mode.tagging_type)
-                .map_err(|error| error.to_string());
+            let result = windows_progressive_profile(
+                sample_rate,
+                mode.tagging_type,
+                &config_worker_cancelled,
+            )
+            .map_err(|error| error.to_string());
             let _ = configuration_sender.send(result);
         }) {
         Ok(task) => task,
@@ -1028,6 +1036,7 @@ pub(crate) fn recognize_loopback_progressive_controlled(
         loop {
             if cancelled.load(Ordering::Acquire) {
                 configuration_interrupted_by_control = true;
+                config_cancelled.store(true, Ordering::Release);
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "cancelled while loading Shazam Config",
@@ -1036,6 +1045,7 @@ pub(crate) fn recognize_loopback_progressive_controlled(
             }
             if control.stop_requested.load(Ordering::Acquire) {
                 configuration_interrupted_by_control = true;
+                config_cancelled.store(true, Ordering::Release);
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "stopped while loading Shazam Config",
@@ -1073,6 +1083,8 @@ pub(crate) fn recognize_loopback_progressive_controlled(
     let (configuration, timing, native_frame_targets) = match configuration_result {
         Ok(result) => result,
         Err(error) => {
+            config_cancelled.store(true, Ordering::Release);
+            control.config_fetching.store(false, Ordering::Release);
             let stop_result = audio_client.stop();
             request_cancelled.store(true, Ordering::Release);
             let cleanup_result = active_workers.join_all();
@@ -1897,6 +1909,7 @@ fn append_wasapi_packets(
 fn windows_progressive_profile(
     sample_rate: u32,
     tagging_type: NativeTaggingType,
+    cancelled: &AtomicBool,
 ) -> Result<
     (
         shazam_http_lab::ShazamConfiguration,
@@ -1905,8 +1918,8 @@ fn windows_progressive_profile(
     ),
     Box<dyn std::error::Error>,
 > {
-    let profile = shazam_http_lab::windows_config_request_profile()?;
-    let configuration = shazam_http_lab::fetch_shazam_config(&profile)?;
+    let profile = shazam_http_lab::windows_config_request_profile_cancellable(cancelled)?;
+    let configuration = shazam_http_lab::fetch_shazam_config_cancellable(&profile, cancelled)?;
     let manual = configuration.manual_timing();
     let native_frame_targets =
         configuration.native_frame_targets_for_type(tagging_type, sample_rate)?;
@@ -2678,7 +2691,7 @@ fn decode_wasapi_interleaved_into(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dev-cli"))]
 fn capture_loopback_frames(
     capture: &wasapi::AudioCaptureClient,
     event: &wasapi::Handle,

@@ -1,6 +1,6 @@
 use openshazam_update::{
     create_manifest, embedded_public_key, public_key_hex, sign_manifest, signing_key_from_base64,
-    verify_installer_bytes, verify_signed_manifest,
+    signing_key_matches_public_key, verify_installer_bytes, verify_signed_manifest,
 };
 use std::{env, fs, path::Path};
 use zeroize::Zeroizing;
@@ -35,7 +35,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let encoded_key = Zeroizing::new(env::var("OPEN_SHAZAM_UPDATE_SIGNING_KEY_BASE64")?);
             let signing_key = signing_key_from_base64(&encoded_key)?;
             let public_key = embedded_public_key()?;
-            if signing_key.verifying_key() != public_key {
+            if !signing_key_matches_public_key(&signing_key, &public_key) {
                 return Err("signing key does not match OPEN_SHAZAM_UPDATE_PUBLIC_KEY_HEX".into());
             }
             let installer = fs::read(&installer_path)?;

@@ -1,3 +1,4 @@
+#![deny(unsafe_op_in_unsafe_fn)]
 #![cfg_attr(all(windows, not(feature = "dev-cli")), windows_subsystem = "windows")]
 
 use std::process::ExitCode;

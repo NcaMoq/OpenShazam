@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$Version,
-    [string]$MinimumSupportedVersion = '0.1.0'
+    [string]$MinimumSupportedVersion = '0.1.0',
+    [switch]$UseValidatedUpdateTool
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,22 +24,49 @@ if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
 if ([string]::IsNullOrWhiteSpace($env:OPEN_SHAZAM_UPDATE_SIGNING_KEY_BASE64)) {
     throw 'OPEN_SHAZAM_UPDATE_SIGNING_KEY_BASE64 is required to sign a release manifest.'
 }
+$encodedSigningKey = $env:OPEN_SHAZAM_UPDATE_SIGNING_KEY_BASE64
+$signingKeyEnvironmentName = 'OPEN_SHAZAM_UPDATE_SIGNING_KEY_BASE64'
+$updateTool = Join-Path $root 'target\release\openshazam-update-tool.exe'
 
 Push-Location $root
 try {
-    & cargo +1.85.0 run --locked --release -p openshazam-update --bin openshazam-update-tool -- `
-        manifest $installer $Version $MinimumSupportedVersion 'NcaMoq/OpenShazam' $manifest $signature
+    if ($UseValidatedUpdateTool) {
+        if (-not (Test-Path -LiteralPath $updateTool -PathType Leaf)) {
+            throw 'The Ed25519 update tool from the validated Windows CI artifact is missing.'
+        }
+    }
+    else {
+        [Environment]::SetEnvironmentVariable($signingKeyEnvironmentName, $null, 'Process')
+        & cargo +1.85.0 build --locked --release -p openshazam-update --bin openshazam-update-tool
+        if ($LASTEXITCODE -ne 0) { throw "Ed25519 manifest tool build failed with exit code $LASTEXITCODE." }
+    }
+    if (-not (Test-Path -LiteralPath $updateTool -PathType Leaf)) {
+        throw 'The Ed25519 update manifest tool is unavailable.'
+    }
+
+    try {
+        [Environment]::SetEnvironmentVariable($signingKeyEnvironmentName, $encodedSigningKey, 'Process')
+        & $updateTool manifest $installer $Version $MinimumSupportedVersion 'NcaMoq/OpenShazam' $manifest $signature
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable($signingKeyEnvironmentName, $null, 'Process')
+    }
     if ($LASTEXITCODE -ne 0) { throw "Ed25519 manifest generation failed with exit code $LASTEXITCODE." }
 
-    & cargo +1.85.0 run --locked --release -p openshazam-update --bin openshazam-update-tool -- `
-        verify $manifest $signature $installer
+    & $updateTool verify $manifest $signature $installer
     if ($LASTEXITCODE -ne 0) { throw "Signed manifest verification failed with exit code $LASTEXITCODE." }
 
     $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
     [IO.File]::WriteAllText("$installer.sha256", "$hash *$(Split-Path -Leaf $installer)`n", [Text.UTF8Encoding]::new($false))
 }
 finally {
-    Pop-Location
+    try {
+        Pop-Location
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable($signingKeyEnvironmentName, $null, 'Process')
+        $encodedSigningKey = $null
+    }
 }
 
 Write-Host "Release update metadata written to $dist"
