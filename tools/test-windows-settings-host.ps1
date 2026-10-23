@@ -82,6 +82,8 @@ public static class OpenShazamSettingsHostSmoke
         uint shortcutModifiers, uint shortcutKey, uint languageId,
         [MarshalAs(UnmanagedType.LPWStr)] string version);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate IntPtr SettingsFailureStage();
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void SettingsShutdown();
 
     private const uint LoadLibrarySearchDllLoadDir = 0x00000100;
@@ -219,6 +221,7 @@ public static class OpenShazamSettingsHostSmoke
                 settingsHost = LoadLibraryExW(System.IO.Path.Combine(directory, "OpenShazam.SettingsHost.dll"), IntPtr.Zero, ProductDllSearchFlags);
                 if (settingsHost == IntPtr.Zero) throw new InvalidOperationException("Load Settings host: " + Marshal.GetLastWin32Error());
                 var show = Marshal.GetDelegateForFunctionPointer<SettingsShow>(GetProcAddress(settingsHost, "OpenShazamSettingsShow"));
+                var getFailureStage = Marshal.GetDelegateForFunctionPointer<SettingsFailureStage>(GetProcAddress(settingsHost, "OpenShazamSettingsGetLastFailureStage"));
                 shutdownSettings = Marshal.GetDelegateForFunctionPointer<SettingsShutdown>(GetProcAddress(settingsHost, "OpenShazamSettingsShutdown"));
 
                 stage = "create visible isolated-desktop owner window";
@@ -227,7 +230,13 @@ public static class OpenShazamSettingsHostSmoke
 
                 stage = "initialize and show XAML host";
                 hr = show(owner, 2, 0x03, 0x53, 2, "0.1.1"); // Dark theme, Ctrl+Alt+S, English.
-                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                if (hr < 0)
+                {
+                    string nativeStage = Marshal.PtrToStringUni(getFailureStage()) ?? "unknown native stage";
+                    throw new InvalidOperationException(
+                        "Settings host returned HRESULT 0x" + hr.ToString("X8") +
+                        " while executing: " + nativeStage);
+                }
 
                 stage = "pump hidden desktop for XAML callbacks";
                 var deadline = DateTime.UtcNow.AddMilliseconds(1500);
