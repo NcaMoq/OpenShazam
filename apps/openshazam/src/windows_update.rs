@@ -1151,10 +1151,34 @@ struct DownloadCommandOutput {
     size_bytes: u64,
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
+enum DownloadCommandTiming {
+    ChildSpawn(Duration),
+    SizeLimitDetected(Duration),
+    ChildKill(Duration),
+    ChildWait(Duration),
+    StdoutThreadJoin(Duration),
+    StderrThreadJoin(Duration),
+}
+
+type DownloadCommandTimingSender = std::sync::mpsc::Sender<DownloadCommandTiming>;
+
+#[cfg(test)]
 fn read_limited_download(
     reader: impl Read,
     path: &Path,
     max_bytes: u64,
+) -> Result<DownloadFileOutput, String> {
+    read_limited_download_timed(reader, path, max_bytes, None, None)
+}
+
+fn read_limited_download_timed(
+    reader: impl Read,
+    path: &Path,
+    max_bytes: u64,
+    timing: Option<DownloadCommandTimingSender>,
+    operation_started: Option<Instant>,
 ) -> Result<DownloadFileOutput, String> {
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -1162,13 +1186,24 @@ fn read_limited_download(
         .share_mode(FILE_SHARE_READ.0)
         .open(path)
         .map_err(|error| format!("Could not create the update download file: {error}"))?;
-    read_limited_download_into(reader, &mut file, max_bytes)
+    read_limited_download_into_timed(reader, &mut file, max_bytes, timing, operation_started)
 }
 
+#[cfg(test)]
 fn read_limited_download_into(
+    reader: impl Read,
+    file: &mut impl Write,
+    max_bytes: u64,
+) -> Result<DownloadFileOutput, String> {
+    read_limited_download_into_timed(reader, file, max_bytes, None, None)
+}
+
+fn read_limited_download_into_timed(
     mut reader: impl Read,
     file: &mut impl Write,
     max_bytes: u64,
+    timing: Option<DownloadCommandTimingSender>,
+    operation_started: Option<Instant>,
 ) -> Result<DownloadFileOutput, String> {
     let mut tail = Vec::with_capacity(MAX_HTTPS_CLIENT_OUTPUT_BYTES + 4096);
     let mut buffer = [0; 4096];
@@ -1189,6 +1224,12 @@ fn read_limited_download_into(
                 .checked_add(flush_bytes)
                 .is_none_or(|size| size > max_bytes)
             {
+                if let Some(operation_started) = operation_started {
+                    record_download_timing(
+                        &timing,
+                        DownloadCommandTiming::SizeLimitDetected(operation_started.elapsed()),
+                    );
+                }
                 return Err("The update download exceeded its signed size limit.".to_owned());
             }
             file.write_all(&tail[..flush_length])
@@ -1263,38 +1304,61 @@ fn read_limited_download_into(
 }
 
 fn run_download_command_cancellable(
-    mut command: Command,
+    command: Command,
     cancelled: &AtomicBool,
     path: &Path,
     max_bytes: u64,
 ) -> Result<DownloadCommandOutput, String> {
+    run_download_command_cancellable_timed(command, cancelled, path, max_bytes, None)
+}
+
+fn run_download_command_cancellable_timed(
+    mut command: Command,
+    cancelled: &AtomicBool,
+    path: &Path,
+    max_bytes: u64,
+    timing: Option<DownloadCommandTimingSender>,
+) -> Result<DownloadCommandOutput, String> {
     if cancelled.load(Ordering::Acquire) {
         return Err("The update operation was cancelled.".to_owned());
     }
+    let operation_started = timing.as_ref().map(|_| Instant::now());
+    let spawn_started = timing.as_ref().map(|_| Instant::now());
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Could not run the Windows HTTPS client: {error}"))?;
+    if let Some(spawn_started) = spawn_started {
+        record_download_timing(
+            &timing,
+            DownloadCommandTiming::ChildSpawn(spawn_started.elapsed()),
+        );
+    }
     let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_download_child(&mut child, &timing);
         return Err("The HTTPS client download pipe was not available.".to_owned());
     };
     let Some(stderr) = child.stderr.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_download_child(&mut child, &timing);
         return Err("The HTTPS client error pipe was not available.".to_owned());
     };
     let output_path = path.to_owned();
+    let stdout_timing = timing.clone();
     let stdout_reader = match thread::Builder::new()
         .name("openshazam-update-download-output".to_owned())
-        .spawn(move || read_limited_download(stdout, &output_path, max_bytes))
-    {
+        .spawn(move || {
+            read_limited_download_timed(
+                stdout,
+                &output_path,
+                max_bytes,
+                stdout_timing,
+                operation_started,
+            )
+        }) {
         Ok(reader) => reader,
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_download_child(&mut child, &timing);
             return Err(format!("Could not start the download writer: {error}"));
         }
     };
@@ -1304,9 +1368,8 @@ fn run_download_command_cancellable(
     {
         Ok(reader) => reader,
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
+            terminate_download_child(&mut child, &timing);
+            let _ = join_stdout_reader(stdout_reader, &timing);
             return Err(format!("Could not start the HTTPS error reader: {error}"));
         }
     };
@@ -1315,12 +1378,11 @@ fn run_download_command_cancellable(
     let mut downloaded = None;
     let status = loop {
         if cancelled.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_download_child(&mut child, &timing);
             if let Some(reader) = stdout_reader.take() {
-                let _ = reader.join();
+                let _ = join_stdout_reader(reader, &timing);
             }
-            let _ = stderr_reader.join();
+            let _ = join_stderr_reader(stderr_reader, &timing);
             return Err("The update operation was cancelled.".to_owned());
         }
         if downloaded.is_none()
@@ -1329,18 +1391,16 @@ fn run_download_command_cancellable(
                 .is_some_and(thread::JoinHandle::is_finished)
         {
             let reader = stdout_reader.take().expect("finished reader is present");
-            match reader.join() {
+            match join_stdout_reader(reader, &timing) {
                 Ok(Ok(output)) => downloaded = Some(output),
                 Ok(Err(error)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stderr_reader.join();
+                    terminate_download_child(&mut child, &timing);
+                    let _ = join_stderr_reader(stderr_reader, &timing);
                     return Err(error);
                 }
                 Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stderr_reader.join();
+                    terminate_download_child(&mut child, &timing);
+                    let _ = join_stderr_reader(stderr_reader, &timing);
                     return Err("The HTTPS download writer stopped unexpectedly.".to_owned());
                 }
             }
@@ -1349,30 +1409,29 @@ fn run_download_command_cancellable(
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_download_child(&mut child, &timing);
                 if let Some(reader) = stdout_reader.take() {
-                    let _ = reader.join();
+                    let _ = join_stdout_reader(reader, &timing);
                 }
-                let _ = stderr_reader.join();
+                let _ = join_stderr_reader(stderr_reader, &timing);
                 return Err(format!("Could not monitor the HTTPS client: {error}"));
             }
         }
     };
     let downloaded = match downloaded {
         Some(downloaded) => downloaded,
-        None => match stdout_reader
-            .take()
-            .expect("download writer is present until it finishes")
-            .join()
-        {
+        None => match join_stdout_reader(
+            stdout_reader
+                .take()
+                .expect("download writer is present until it finishes"),
+            &timing,
+        ) {
             Ok(Ok(downloaded)) => downloaded,
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err("The HTTPS download writer stopped unexpectedly.".to_owned()),
         },
     };
-    let stderr_exceeded_limit = stderr_reader
-        .join()
+    let stderr_exceeded_limit = join_stderr_reader(stderr_reader, &timing)
         .map_err(|_| "The HTTPS error reader stopped unexpectedly.".to_owned())?
         .map_err(|error| format!("Could not read HTTPS client error output: {error}"))?;
     if stderr_exceeded_limit {
@@ -1388,6 +1447,70 @@ fn run_download_command_cancellable(
         http_status: downloaded.http_status,
         size_bytes: downloaded.size_bytes,
     })
+}
+
+fn record_download_timing(
+    timing: &Option<DownloadCommandTimingSender>,
+    measurement: DownloadCommandTiming,
+) {
+    if let Some(timing) = timing {
+        let _ = timing.send(measurement);
+    }
+}
+
+fn terminate_download_child(
+    child: &mut std::process::Child,
+    timing: &Option<DownloadCommandTimingSender>,
+) {
+    if timing.is_some() {
+        let kill_started = Instant::now();
+        let _ = child.kill();
+        record_download_timing(
+            timing,
+            DownloadCommandTiming::ChildKill(kill_started.elapsed()),
+        );
+        let wait_started = Instant::now();
+        let _ = child.wait();
+        record_download_timing(
+            timing,
+            DownloadCommandTiming::ChildWait(wait_started.elapsed()),
+        );
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn join_stderr_reader(
+    reader: thread::JoinHandle<std::io::Result<bool>>,
+    timing: &Option<DownloadCommandTimingSender>,
+) -> thread::Result<std::io::Result<bool>> {
+    if timing.is_none() {
+        return reader.join();
+    }
+    let join_started = Instant::now();
+    let result = reader.join();
+    record_download_timing(
+        timing,
+        DownloadCommandTiming::StderrThreadJoin(join_started.elapsed()),
+    );
+    result
+}
+
+fn join_stdout_reader(
+    reader: thread::JoinHandle<Result<DownloadFileOutput, String>>,
+    timing: &Option<DownloadCommandTimingSender>,
+) -> thread::Result<Result<DownloadFileOutput, String>> {
+    if timing.is_none() {
+        return reader.join();
+    }
+    let join_started = Instant::now();
+    let result = reader.join();
+    record_download_timing(
+        timing,
+        DownloadCommandTiming::StdoutThreadJoin(join_started.elapsed()),
+    );
+    result
 }
 
 fn drain_bounded_output(mut reader: impl Read, limit: usize) -> std::io::Result<bool> {
@@ -1534,9 +1657,10 @@ mod tests {
         is_allowed_github_release_url, is_download_directory_name, is_transient_download_failure,
         parse_stable_version, path_entry_is_missing, read_limited_download,
         read_limited_download_into, remove_staged_installer_at, run_download_command_cancellable,
-        start_installer_process_if_enabled, try_begin_update_operation, update_directory_at,
-        validate_redirect_target, verify_staged_installer_for_install, version_at_least,
-        write_pending_update_marker_at, DownloadAttemptError, PendingUpdateResult, UpdateCandidate,
+        run_download_command_cancellable_timed, start_installer_process_if_enabled,
+        try_begin_update_operation, update_directory_at, validate_redirect_target,
+        verify_staged_installer_for_install, version_at_least, write_pending_update_marker_at,
+        DownloadAttemptError, DownloadCommandTiming, PendingUpdateResult, UpdateCandidate,
         CREATE_NO_WINDOW, DOWNLOAD_HTTP_STATUS_TRAILER, DOWNLOAD_REDIRECT_URL_TRAILER,
         DOWNLOAD_URL_TRAILER, MAX_HTTPS_CLIENT_OUTPUT_BYTES,
     };
@@ -1546,6 +1670,7 @@ mod tests {
         fs::{self, File, FileTimes, OpenOptions},
         io::{self, Cursor, Write},
         process::Command,
+        sync::mpsc,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
@@ -2215,21 +2340,49 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let path = root.join("installer.exe");
         let cancelled = AtomicBool::new(false);
-        let mut command = Command::new("powershell.exe");
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$stream=[Console]::OpenStandardOutput(); $bytes=New-Object byte[] 1048576; $stream.Write($bytes,0,$bytes.Length); Start-Sleep -Seconds 30",
-        ]);
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/Q", "/C", "for /L %i in (1,1,2147483647) do @echo x"]);
         command.creation_flags(CREATE_NO_WINDOW);
         let started = std::time::Instant::now();
+        let (timing_sender, timing_receiver) = mpsc::channel();
 
-        let error = run_download_command_cancellable(command, &cancelled, &path, 1024).unwrap_err();
+        let error = run_download_command_cancellable_timed(
+            command,
+            &cancelled,
+            &path,
+            1024,
+            Some(timing_sender),
+        )
+        .unwrap_err();
 
+        let timings = timing_receiver.try_iter().collect::<Vec<_>>();
         assert!(error.contains("signed size limit"));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(timings
+            .iter()
+            .any(|timing| matches!(timing, DownloadCommandTiming::ChildSpawn(_))));
+        assert!(timings
+            .iter()
+            .any(|timing| matches!(timing, DownloadCommandTiming::SizeLimitDetected(_))));
+        assert!(timings
+            .iter()
+            .any(|timing| matches!(timing, DownloadCommandTiming::ChildKill(_))));
+        assert!(timings
+            .iter()
+            .any(|timing| matches!(timing, DownloadCommandTiming::ChildWait(_))));
+        assert!(timings
+            .iter()
+            .any(|timing| matches!(timing, DownloadCommandTiming::StdoutThreadJoin(_))));
+        assert!(timings
+            .iter()
+            .any(|timing| matches!(timing, DownloadCommandTiming::StderrThreadJoin(_))));
+        eprintln!(
+            "oversized download process timings: {timings:?}; total: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "oversized download exceeded 5 seconds; stage timings: {timings:?}"
+        );
         assert!(fs::metadata(&path).unwrap().len() <= 1024);
         fs::remove_dir_all(root).unwrap();
     }

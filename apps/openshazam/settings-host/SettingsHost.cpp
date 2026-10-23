@@ -108,6 +108,12 @@ namespace
     constexpr wchar_t kStartupRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kStartupRunValue[] = L"OpenShazam";
     uint32_t g_uiLanguage{};
+    wchar_t const* g_settingsFailureStage = L"Settings host has not failed";
+
+    void SetSettingsFailureStage(wchar_t const* stage) noexcept
+    {
+        g_settingsFailureStage = stage;
+    }
 
     [[noreturn]] void ThrowRegistryError(LSTATUS error, char const* operation)
     {
@@ -1171,12 +1177,14 @@ namespace
 
         void Initialize(HWND parent, uint32_t languageId)
         {
+            SetSettingsFailureStage(L"set Settings language");
             g_uiLanguage = languageId == kLanguageJapanese
                 ? kLanguageJapanese : kLanguageEnglish;
             owner = parent;
             // The native application has an STA COM apartment and a USER32
             // message pump. This is only created on the first Settings request.
             // Reuse a Microsoft.UI queue if another in-process host initialized it.
+            SetSettingsFailureStage(L"get or create the WinUI DispatcherQueue");
             if (!dispatch::DispatcherQueue::GetForCurrentThread())
             {
                 queue = dispatch::DispatcherQueueController::CreateOnCurrentThread();
@@ -1184,8 +1192,11 @@ namespace
             }
             // Instantiate the XAML Application after the queue and before any
             // island/control. It supplies WinUI metadata and owns the manager.
+            SetSettingsFailureStage(L"initialize WindowsXamlManager and the WinUI Application");
             app = winrt::make<SettingsApplication>();
+            SetSettingsFailureStage(L"load XamlControlsResources");
             app.Resources().MergedDictionaries().Append(controls::XamlControlsResources{});
+            SetSettingsFailureStage(L"register the Settings window class");
             auto instance = ::GetModuleHandleW(nullptr);
             WNDCLASSW wc{};
             wc.lpfnWndProc = &WindowProc;
@@ -1200,6 +1211,7 @@ namespace
             if (!::RegisterClassW(&wc) && ::GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
                 winrt::throw_last_error();
 
+            SetSettingsFailureStage(L"create the Settings owner window");
             auto dpi = ::GetDpiForWindow(parent);
             if (dpi < 96) dpi = 96;
             auto windowTitle = Localized(L"Shazam", L"Shazam");
@@ -1208,6 +1220,7 @@ namespace
                 ::MulDiv(kWidthDips, dpi, 96), ::MulDiv(kHeightDips, dpi, 96),
                 nullptr, nullptr, instance, nullptr);
             if (!hwnd) winrt::throw_last_error();
+            SetSettingsFailureStage(L"create Settings state");
             state = std::make_shared<SettingsState>();
             state->owner = owner;
             state->hwnd = hwnd;
@@ -1230,8 +1243,10 @@ namespace
             {
                 // Older Windows versions keep the standard non-client title bar.
             }
+            SetSettingsFailureStage(L"initialize DesktopWindowXamlSource");
             island = hosting::DesktopWindowXamlSource{};
             island.Initialize(winrt::Microsoft::UI::GetWindowIdFromWindow(hwnd));
+            SetSettingsFailureStage(L"get the WinUI island window");
             islandHwnd = winrt::Microsoft::UI::GetWindowFromWindowId(island.SiteBridge().WindowId());
             if (!islandHwnd || !::IsWindow(islandHwnd))
                 winrt::throw_hresult(E_HANDLE);
@@ -1240,14 +1255,18 @@ namespace
             // initial style is not a reliable substitute for WS_CHILD here.
             // Without WS_CHILD the site can exist in UI Automation and still
             // fail to compose into the host window.
+            SetSettingsFailureStage(L"configure the WinUI island child window");
             ::SetLastError(ERROR_SUCCESS);
             auto previousStyle = ::SetWindowLongPtrW(
                 islandHwnd, GWL_STYLE, WS_TABSTOP | WS_CHILD | WS_VISIBLE);
             auto styleError = ::GetLastError();
             if (previousStyle == 0 && styleError != ERROR_SUCCESS)
                 winrt::throw_last_error();
+            SetSettingsFailureStage(L"build and attach WinUI Settings content");
             island.Content(BuildContent());
+            SetSettingsFailureStage(L"layout the WinUI Settings content");
             Layout();
+            SetSettingsFailureStage(L"read Windows startup state");
             RefreshStartup(state);
         }
 
@@ -2129,6 +2148,7 @@ namespace
             if (!hwnd) return;
             if (state)
             {
+                SetSettingsFailureStage(L"apply Settings language and appearance");
                 g_uiLanguage = languageId == kLanguageJapanese
                     ? kLanguageJapanese : kLanguageEnglish;
                 state->languageId = g_uiLanguage;
@@ -2143,12 +2163,14 @@ namespace
                 state->shortcutButton.Content(winrt::box_value(FormatShortcut(
                     state->shortcutModifiers, state->shortcutKey)));
             }
+            SetSettingsFailureStage(L"show the Settings window");
             ::ShowWindow(hwnd, SW_SHOWNORMAL);
             // The island is initially measured while its host HWND is hidden.
             // Reapply its native site bounds after the parent becomes visible.
             Layout();
             if (islandHwnd)
             {
+                SetSettingsFailureStage(L"show the WinUI island window");
                 ::ShowWindow(islandHwnd, SW_SHOWNA);
                 RECT rect{};
                 ::GetClientRect(hwnd, &rect);
@@ -2156,6 +2178,7 @@ namespace
                     rect.right - rect.left, rect.bottom - rect.top,
                     SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
             }
+            SetSettingsFailureStage(L"activate the Settings window");
             ::SetForegroundWindow(hwnd);
             if (islandHwnd)
             {
@@ -2163,6 +2186,7 @@ namespace
                 if (::IsWindowVisible(islandHwnd)) ::SetFocus(islandHwnd);
             }
             if (state) RefreshStartup(state);
+            SetSettingsFailureStage(L"complete Settings display");
         }
 
         void Close() noexcept
@@ -2270,24 +2294,38 @@ extern "C" __declspec(dllexport) HRESULT __stdcall OpenShazamSettingsShow(
     HWND owner, uint32_t appearanceMode, uint32_t shortcutModifiers,
     uint32_t shortcutKey, uint32_t languageId, wchar_t const* version) noexcept
 {
+    SetSettingsFailureStage(L"validate the Settings owner window");
     try
     {
         if (!owner || !::IsWindow(owner)) return E_INVALIDARG;
         if (!g_settings)
         {
+            SetSettingsFailureStage(L"allocate the Settings host");
             auto host = std::make_unique<SettingsHost>();
             g_active = host.get();
+            SetSettingsFailureStage(L"initialize the WinUI Settings host");
             try { host->Initialize(owner, languageId); }
             catch (...) { host->Close(); g_active = nullptr; throw; }
             g_settings = std::move(host);
         }
+        SetSettingsFailureStage(L"set the About version text");
         if (g_settings->state && g_settings->state->aboutVersion)
             g_settings->state->aboutVersion.Text(version ? version : L"");
+        SetSettingsFailureStage(L"show the WinUI Settings host");
         g_settings->Show(appearanceMode, shortcutModifiers, shortcutKey, languageId);
+        SetSettingsFailureStage(L"Settings host completed successfully");
         return S_OK;
     }
     catch (winrt::hresult_error const& e) { return e.code(); }
     catch (...) { return E_FAIL; }
+}
+
+// The smoke test reads this after a failed C ABI call so the CI log names the
+// native WinUI initialization step that produced a generic E_FAIL.
+extern "C" __declspec(dllexport) wchar_t const* __stdcall
+OpenShazamSettingsGetLastFailureStage() noexcept
+{
+    return g_settingsFailureStage;
 }
 
 extern "C" __declspec(dllexport) void __stdcall OpenShazamSettingsSetHistory(

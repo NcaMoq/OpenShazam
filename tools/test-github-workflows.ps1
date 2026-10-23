@@ -25,8 +25,8 @@ foreach ($trigger in @('pull_request:', 'workflow_dispatch:', 'workflow_call:'))
         throw "The Windows CI workflow is missing the required $trigger trigger."
     }
 }
-if ($ciWorkflow -match '(?m)^  push:\s*(?:#.*)?$') {
-    throw 'The Windows CI workflow must not run automatically on every main push.'
+if ($ciWorkflow -notmatch '(?m)^  push:\r?\n    branches: \[main\]\r?$') {
+    throw 'The Windows CI workflow must run on main pushes only.'
 }
 $ciValidationJob = [regex]::Match(
     $ciWorkflow,
@@ -54,6 +54,7 @@ foreach ($jobTimeout in @(
 }
 $ciRequiredSteps = @(
     'cargo audit --file Cargo.lock',
+    'windows_update::tests::oversized_update_process_is_terminated_while_streaming',
     'cargo test --workspace --all-targets --locked',
     'cargo check --workspace --all-targets --locked --no-default-features',
     'cargo fmt --all -- --check',

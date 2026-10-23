@@ -150,7 +150,7 @@ catch {
 }
 Assert-Contains ([string]$installerVersionError) 'does not match Cargo workspace version' 'The shared installer build must reject a mismatched release version before invoking Inno Setup.'
 Assert-Contains ($ci + $release) 'innosetup --version=6\.7\.1' 'CI and Release must use Inno Setup with the Windows RedirectionGuard support required by uninstall cleanup.'
-Assert-NotContains $ci '(?m)^  push:[ \t]*(?:#.*)?$' 'Windows CI must not run automatically on every main push.'
+Assert-Contains $ci '(?m)^  push:\n    branches: \[main\]$' 'Windows CI must run automatically on main pushes only.'
 Assert-Contains $ci '(?m)^  pull_request:\n    branches: \[main\]$' 'Pull requests targeting main must run Windows CI.'
 Assert-Contains $ci '(?m)^  workflow_dispatch:$' 'Windows CI must remain manually runnable.'
 Assert-Contains $ci '(?m)^  workflow_call:$' 'Release workflow must be able to require the full CI workflow.'
@@ -223,6 +223,9 @@ Assert-Contains $nugetTrustConfig '<add key="signatureValidationMode" value="req
 Assert-Contains $nugetTrustConfig '<repository name="nuget\.org" serviceIndex="https://api\.nuget\.org/v3/index\.json">[\s\S]*<certificate fingerprint="0E5F38F57DC1BCC806D8494F4F90FBCEDD988B46760709CBEEC6F4219AA6157D" hashAlgorithm="SHA256" allowUntrustedRoot="false"\s*/>[\s\S]*<certificate fingerprint="5A2901D6ADA3D18260B9C6DFE2133C95D74B9EEF6AE0E5DC334C8454D1477DF4" hashAlgorithm="SHA256" allowUntrustedRoot="false"\s*/>[\s\S]*<certificate fingerprint="1F4B311D9ACC115C8DC8018B5A49E00FCE6DA8E2855F9F014CA6F34570BC482D" hashAlgorithm="SHA256" allowUntrustedRoot="false"\s*/>[\s\S]*<owners>Microsoft;webview;CppWinRT;MicrosoftReunionESTeam</owners>' 'Native package restore must trust the pinned NuGet.org repository certificates and reviewed package owners only.'
 Assert-Contains $nativePackageVerifier 'foreach \(\$package in \$packageConfig\.packages\.package\)[\s\S]*verify -Signatures[\s\S]*-ConfigFile \$nugetConfigPath' 'Every pinned native package archive must pass NuGet signature and trusted-owner verification.'
 Assert-Contains $windowsBuilder 'nuget restore[\s\S]*-ConfigFile \$nugetConfig[\s\S]*verify-native-package-signatures\.ps1' 'The Windows product build must apply repository NuGet trust policy during restore and verify all restored package archives.'
+Assert-Contains $windowsBuilder '\$makePri createconfig[\s\S]*<packaging>[\s\S]*resources\.pri[\s\S]*\$makePri new' 'The unpackaged Windows product must stage a minimal Application PRI so framework resource lookup works with the pinned Windows App SDK runtime.'
+Assert-Contains $installer 'dist\\windows-x64\\\*\.pri' 'The installer must ship the application and compiled WinUI resource indexes beside the executable.'
+Assert-Contains $settingsHostTest 'OutputType WindowsApplication[\s\S]*resources\.pri[\s\S]*WorkingDirectory = \$dist' 'The WinUI smoke test must run from the staged app directory with its app-local resource index.'
 
 $sidecarTestDirectory = Join-Path ([IO.Path]::GetTempPath()) ("openshazam-sidecar-contract-" + [Guid]::NewGuid().ToString('N'))
 $sidecarTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar

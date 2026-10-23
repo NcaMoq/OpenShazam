@@ -82,6 +82,8 @@ public static class OpenShazamSettingsHostSmoke
         uint shortcutModifiers, uint shortcutKey, uint languageId,
         [MarshalAs(UnmanagedType.LPWStr)] string version);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate IntPtr SettingsFailureStage();
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void SettingsShutdown();
 
     private const uint LoadLibrarySearchDllLoadDir = 0x00000100;
@@ -219,6 +221,7 @@ public static class OpenShazamSettingsHostSmoke
                 settingsHost = LoadLibraryExW(System.IO.Path.Combine(directory, "OpenShazam.SettingsHost.dll"), IntPtr.Zero, ProductDllSearchFlags);
                 if (settingsHost == IntPtr.Zero) throw new InvalidOperationException("Load Settings host: " + Marshal.GetLastWin32Error());
                 var show = Marshal.GetDelegateForFunctionPointer<SettingsShow>(GetProcAddress(settingsHost, "OpenShazamSettingsShow"));
+                var getFailureStage = Marshal.GetDelegateForFunctionPointer<SettingsFailureStage>(GetProcAddress(settingsHost, "OpenShazamSettingsGetLastFailureStage"));
                 shutdownSettings = Marshal.GetDelegateForFunctionPointer<SettingsShutdown>(GetProcAddress(settingsHost, "OpenShazamSettingsShutdown"));
 
                 stage = "create visible isolated-desktop owner window";
@@ -227,7 +230,13 @@ public static class OpenShazamSettingsHostSmoke
 
                 stage = "initialize and show XAML host";
                 hr = show(owner, 2, 0x03, 0x53, 2, "0.1.1"); // Dark theme, Ctrl+Alt+S, English.
-                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                if (hr < 0)
+                {
+                    string nativeStage = Marshal.PtrToStringUni(getFailureStage()) ?? "unknown native stage";
+                    throw new InvalidOperationException(
+                        "Settings host returned HRESULT 0x" + hr.ToString("X8") +
+                        " while executing: " + nativeStage);
+                }
 
                 stage = "pump hidden desktop for XAML callbacks";
                 var deadline = DateTime.UtcNow.AddMilliseconds(1500);
@@ -390,11 +399,13 @@ public static class OpenShazamSettingsHostSmoke
                 bool appearanceLabelFound = false;
                 bool updateActionFound = false;
                 bool automaticUpdateToggleFound = false;
+                bool startupStatusValueFound = false;
                 AutomationElement startupDescription = null;
                 AutomationElement appearanceDescription = null;
                 AutomationElement languageDescription = null;
                 AutomationElement startupToggle = null;
                 AutomationElement startupLabel = null;
+                AutomationElement startupStatusValue = null;
                 AutomationElement appearanceSelector = null;
                 AutomationElement languageSelector = null;
                 AutomationElement automaticUpdateToggle = null;
@@ -436,6 +447,12 @@ public static class OpenShazamSettingsHostSmoke
                     if ((name == "Open at startup" || name == "\u8D77\u52D5\u6642\u306B\u958B\u304F") &&
                         descendants[i].Current.ControlType == ControlType.Text)
                         startupLabel = descendants[i];
+                    if ((name == "On" || name == "Off" || name == "\u30AA\u30F3" || name == "\u30AA\u30D5") &&
+                        descendants[i].Current.ControlType == ControlType.Text)
+                    {
+                        startupStatusValueFound = true;
+                        startupStatusValue = descendants[i];
+                    }
                     if ((name == "Start Shazam every time Windows starts" ||
                         name == "Windows\u3092\u8D77\u52D5\u3059\u308B\u305F\u3073\u306BShazam\u30A2\u30D7\u30EA\u3082\u8D77\u52D5") &&
                         descendants[i].Current.ControlType == ControlType.Text)
@@ -497,6 +514,18 @@ public static class OpenShazamSettingsHostSmoke
                 var startupDescriptionRect = startupDescription.Current.BoundingRectangle;
                 var appearanceDescriptionRect = appearanceDescription.Current.BoundingRectangle;
                 var appearanceSelectorRect = appearanceSelector.Current.BoundingRectangle;
+                double startupStatusLeft = 0.0;
+                double startupStatusRight = 0.0;
+                double startupStatusTop = 0.0;
+                double startupStatusBottom = 0.0;
+                if (startupStatusValueFound)
+                {
+                    var startupStatusRect = startupStatusValue.Current.BoundingRectangle;
+                    startupStatusLeft = startupStatusRect.Left;
+                    startupStatusRight = startupStatusRect.Right;
+                    startupStatusTop = startupStatusRect.Top;
+                    startupStatusBottom = startupStatusRect.Bottom;
+                }
                 if (startupLabelRect.Right <= startupLabelRect.Left ||
                     startupLabelRect.Bottom <= startupLabelRect.Top ||
                     startupDescriptionRect.Right <= startupDescriptionRect.Left ||
@@ -506,20 +535,25 @@ public static class OpenShazamSettingsHostSmoke
                     appearanceSelectorRect.Right <= appearanceSelectorRect.Left ||
                     appearanceSelectorRect.Bottom <= appearanceSelectorRect.Top ||
                     (startupToggleFound &&
-                        (startupToggle.Current.BoundingRectangle.Right <= startupToggle.Current.BoundingRectangle.Left ||
-                         startupToggle.Current.BoundingRectangle.Bottom <= startupToggle.Current.BoundingRectangle.Top ||
-                         startupLabelRect.Left >= startupToggle.Current.BoundingRectangle.Left ||
-                         Math.Abs(startupToggle.Current.BoundingRectangle.Right - appearanceSelectorRect.Right) > 24.0)))
+                        (!startupStatusValueFound ||
+                         startupStatusRight <= startupStatusLeft ||
+                         startupStatusBottom <= startupStatusTop ||
+                         startupLabelRect.Left >= startupStatusLeft ||
+                         Math.Abs(startupStatusLeft - (appearanceSelectorRect.Right - 94.0)) > 24.0)))
                     throw new InvalidOperationException(
                         "Settings controls should be right-aligned while labels remain left-aligned. " +
-                        "Startup label=" + startupLabelRect + "; appearance selector=" + appearanceSelectorRect +
+                        "Startup label=" + startupLabelRect + "; startup status=" + startupStatusLeft + "," +
+                        startupStatusTop + "," + (startupStatusRight - startupStatusLeft) + "," +
+                        (startupStatusBottom - startupStatusTop) +
+                        "; appearance selector=" + appearanceSelectorRect +
                         "; controls=" + names);
                 if (startupToggleFound)
                 {
-                    var startupToggleRect = startupToggle.Current.BoundingRectangle;
-                    alignmentSummary = "startupControlRight=" + startupToggleRect.Right +
+                    alignmentSummary = "startupStatusValueLeft=" + startupStatusLeft +
+                        "; expectedStartupStatusLeft=" + (appearanceSelectorRect.Right - 94.0) +
                         "; appearanceControlRight=" + appearanceSelectorRect.Right +
-                        "; difference=" + Math.Abs(startupToggleRect.Right - appearanceSelectorRect.Right);
+                        "; difference=" + Math.Abs(startupStatusLeft - (appearanceSelectorRect.Right - 94.0)) +
+                        "; startupToggleBoundingRectangle=" + startupToggle.Current.BoundingRectangle;
                 }
                 else
                 {
@@ -752,6 +786,29 @@ public static class OpenShazamSettingsHostSmoke
         }
     }
 }
+
+public static class OpenShazamSettingsHostSmokeProgram
+{
+    [STAThread]
+    public static int Main(string[] args)
+    {
+        if (args == null || args.Length != 3) return 2;
+        string result;
+        try
+        {
+            result = OpenShazamSettingsHostSmoke.Run(
+                args[0], String.Equals(args[1], "true", StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception exception)
+        {
+            result = exception.ToString();
+        }
+        try { System.IO.File.WriteAllText(args[2], result, Encoding.UTF8); }
+        catch { return 3; }
+        return result.StartsWith("Composition + WinUI Settings host initialized", StringComparison.Ordinal)
+            ? 0 : 1;
+    }
+}
 '@
 
 $uiaClientAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationClient')
@@ -766,9 +823,44 @@ $uiaClient = $uiaClientAssembly.Location
 $uiaTypes = $uiaTypesAssembly.Location
 $drawing = $drawingAssembly.Location
 $windowsBase = $windowsBaseAssembly.Location
-Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @($uiaClient, $uiaTypes, $drawing, $windowsBase, $threadingAssembly)
-$result = [OpenShazamSettingsHostSmoke]::Run($dist, $UseCurrentDesktop.IsPresent)
-if ($result -notlike 'Composition + WinUI Settings host initialized*') {
-    throw $result
+$smokeExecutable = Join-Path $dist ('OpenShazamSettingsHostSmoke-' + [guid]::NewGuid().ToString('N') + '.exe')
+$summaryPath = Join-Path $env:TEMP ('OpenShazamSettingsHostSmoke-' + [guid]::NewGuid().ToString('N') + '.txt')
+$smokeProcess = $null
+try {
+    Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
+        $uiaClient, $uiaTypes, $drawing, $windowsBase, $threadingAssembly
+    ) -OutputAssembly $smokeExecutable -OutputType WindowsApplication
+
+    # Run from dist so this native WinUI process resolves the same app-local
+    # resources.pri, framework runtime, and side-by-side binaries as the app.
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $smokeExecutable
+    $desktopArgument = if ($UseCurrentDesktop.IsPresent) { 'true' } else { 'false' }
+    $startInfo.Arguments = '"' + $dist + '" ' + $desktopArgument + ' "' + $summaryPath + '"'
+    $startInfo.WorkingDirectory = $dist
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $smokeProcess = [System.Diagnostics.Process]::Start($startInfo)
+    if (-not $smokeProcess.WaitForExit(70000)) {
+        $smokeProcess.Kill()
+        $smokeProcess.WaitForExit()
+        throw 'The WinUI Settings smoke runner exceeded its 70 second process bound.'
+    }
+    $result = if (Test-Path -LiteralPath $summaryPath -PathType Leaf) {
+        [IO.File]::ReadAllText($summaryPath)
+    }
+    else {
+        'The WinUI Settings smoke runner exited without writing its result.'
+    }
+    if ($smokeProcess.ExitCode -ne 0 -or
+        $result -notlike 'Composition + WinUI Settings host initialized*') {
+        throw $result
+    }
+    Write-Host $result
 }
-Write-Host $result
+finally {
+    if ($smokeProcess) { $smokeProcess.Dispose() }
+    Remove-Item -LiteralPath $smokeExecutable -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $summaryPath -Force -ErrorAction SilentlyContinue
+}

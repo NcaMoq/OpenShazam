@@ -1,6 +1,8 @@
 name: OpenShazam Windows CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -65,6 +67,8 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $toolDirectory
       - name: Audit locked dependencies
         run: cargo audit --file Cargo.lock
+      - name: Measure streaming update process shutdown
+        run: cargo test --locked -p openshazam --bin openshazam windows_update::tests::oversized_update_process_is_terminated_while_streaming -- --exact --nocapture
       - name: Test workspace
         run: cargo test --workspace --all-targets --locked
       - name: Check production libraries without developer CLI feature
