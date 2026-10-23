@@ -761,6 +761,29 @@ public static class OpenShazamSettingsHostSmoke
         }
     }
 }
+
+public static class OpenShazamSettingsHostSmokeProgram
+{
+    [STAThread]
+    public static int Main(string[] args)
+    {
+        if (args == null || args.Length != 3) return 2;
+        string result;
+        try
+        {
+            result = OpenShazamSettingsHostSmoke.Run(
+                args[0], String.Equals(args[1], "true", StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception exception)
+        {
+            result = exception.ToString();
+        }
+        try { System.IO.File.WriteAllText(args[2], result, Encoding.UTF8); }
+        catch { return 3; }
+        return result.StartsWith("Composition + WinUI Settings host initialized", StringComparison.Ordinal)
+            ? 0 : 1;
+    }
+}
 '@
 
 $uiaClientAssembly = [Reflection.Assembly]::LoadWithPartialName('UIAutomationClient')
@@ -775,9 +798,44 @@ $uiaClient = $uiaClientAssembly.Location
 $uiaTypes = $uiaTypesAssembly.Location
 $drawing = $drawingAssembly.Location
 $windowsBase = $windowsBaseAssembly.Location
-Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @($uiaClient, $uiaTypes, $drawing, $windowsBase, $threadingAssembly)
-$result = [OpenShazamSettingsHostSmoke]::Run($dist, $UseCurrentDesktop.IsPresent)
-if ($result -notlike 'Composition + WinUI Settings host initialized*') {
-    throw $result
+$smokeExecutable = Join-Path $dist ('OpenShazamSettingsHostSmoke-' + [guid]::NewGuid().ToString('N') + '.exe')
+$summaryPath = Join-Path $env:TEMP ('OpenShazamSettingsHostSmoke-' + [guid]::NewGuid().ToString('N') + '.txt')
+$smokeProcess = $null
+try {
+    Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
+        $uiaClient, $uiaTypes, $drawing, $windowsBase, $threadingAssembly
+    ) -OutputAssembly $smokeExecutable -OutputType WindowsApplication
+
+    # Run from dist so this native WinUI process resolves the same app-local
+    # resources.pri, framework runtime, and side-by-side binaries as the app.
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $smokeExecutable
+    $desktopArgument = if ($UseCurrentDesktop.IsPresent) { 'true' } else { 'false' }
+    $startInfo.Arguments = '"' + $dist + '" ' + $desktopArgument + ' "' + $summaryPath + '"'
+    $startInfo.WorkingDirectory = $dist
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $smokeProcess = [System.Diagnostics.Process]::Start($startInfo)
+    if (-not $smokeProcess.WaitForExit(70000)) {
+        $smokeProcess.Kill()
+        $smokeProcess.WaitForExit()
+        throw 'The WinUI Settings smoke runner exceeded its 70 second process bound.'
+    }
+    $result = if (Test-Path -LiteralPath $summaryPath -PathType Leaf) {
+        [IO.File]::ReadAllText($summaryPath)
+    }
+    else {
+        'The WinUI Settings smoke runner exited without writing its result.'
+    }
+    if ($smokeProcess.ExitCode -ne 0 -or
+        $result -notlike 'Composition + WinUI Settings host initialized*') {
+        throw $result
+    }
+    Write-Host $result
 }
-Write-Host $result
+finally {
+    if ($smokeProcess) { $smokeProcess.Dispose() }
+    Remove-Item -LiteralPath $smokeExecutable -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $summaryPath -Force -ErrorAction SilentlyContinue
+}

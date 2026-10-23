@@ -98,6 +98,32 @@ try {
         Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dist $_.Name) -Force
     }
 
+    # Framework-dependent unpackaged apps still need an application PRI root.
+    # Windows App SDK 1.8.6's MRT Core fails XamlControlsResources activation
+    # when no application PRI exists; a minimal Application map lets resource
+    # lookup fall through to the WinUI framework package as documented.
+    $windowsKitsBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+    $makePri = Get-ChildItem -LiteralPath $windowsKitsBin -Directory -ErrorAction Stop |
+        Where-Object { $_.Name -match '^10\.0\.\d+\.0$' } |
+        Sort-Object { [version]$_.Name } -Descending |
+        ForEach-Object { Join-Path $_.FullName 'x64\makepri.exe' } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+    if (-not $makePri) { throw "Windows SDK makepri.exe was not found under $windowsKitsBin." }
+    $resourceIndexRoot = Join-Path $root 'target\openshazam-resource-index'
+    New-Item -ItemType Directory -Path $resourceIndexRoot -Force | Out-Null
+    $resourceConfig = Join-Path $resourceIndexRoot 'priconfig.xml'
+    & $makePri createconfig /cf $resourceConfig /dq en-US /o | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "makepri.exe could not create the application PRI configuration ($LASTEXITCODE)." }
+    $resourceConfigXml = [IO.File]::ReadAllText($resourceConfig)
+    $resourceConfigXml = [regex]::Replace($resourceConfigXml, '(?s)\s*<packaging>.*?</packaging>', '')
+    [IO.File]::WriteAllText($resourceConfig, $resourceConfigXml, [Text.UTF8Encoding]::new($false))
+    $applicationPri = Join-Path $dist 'resources.pri'
+    & $makePri new /pr $resourceIndexRoot /cf $resourceConfig /of $applicationPri /o | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $applicationPri -PathType Leaf)) {
+        throw "makepri.exe failed to create the unpackaged Application resource index ($LASTEXITCODE)."
+    }
+
     Write-Host "Runtime files staged to: $dist"
     Write-Host "Cargo build output: $(Join-Path $root 'target\release')"
     Write-Host "Settings host build output: $nativeOut"
