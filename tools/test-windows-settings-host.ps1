@@ -399,11 +399,13 @@ public static class OpenShazamSettingsHostSmoke
                 bool appearanceLabelFound = false;
                 bool updateActionFound = false;
                 bool automaticUpdateToggleFound = false;
+                bool startupStatusValueFound = false;
                 AutomationElement startupDescription = null;
                 AutomationElement appearanceDescription = null;
                 AutomationElement languageDescription = null;
                 AutomationElement startupToggle = null;
                 AutomationElement startupLabel = null;
+                AutomationElement startupStatusValue = null;
                 AutomationElement appearanceSelector = null;
                 AutomationElement languageSelector = null;
                 AutomationElement automaticUpdateToggle = null;
@@ -445,6 +447,12 @@ public static class OpenShazamSettingsHostSmoke
                     if ((name == "Open at startup" || name == "\u8D77\u52D5\u6642\u306B\u958B\u304F") &&
                         descendants[i].Current.ControlType == ControlType.Text)
                         startupLabel = descendants[i];
+                    if ((name == "On" || name == "Off" || name == "\u30AA\u30F3" || name == "\u30AA\u30D5") &&
+                        descendants[i].Current.ControlType == ControlType.Text)
+                    {
+                        startupStatusValueFound = true;
+                        startupStatusValue = descendants[i];
+                    }
                     if ((name == "Start Shazam every time Windows starts" ||
                         name == "Windows\u3092\u8D77\u52D5\u3059\u308B\u305F\u3073\u306BShazam\u30A2\u30D7\u30EA\u3082\u8D77\u52D5") &&
                         descendants[i].Current.ControlType == ControlType.Text)
@@ -506,6 +514,18 @@ public static class OpenShazamSettingsHostSmoke
                 var startupDescriptionRect = startupDescription.Current.BoundingRectangle;
                 var appearanceDescriptionRect = appearanceDescription.Current.BoundingRectangle;
                 var appearanceSelectorRect = appearanceSelector.Current.BoundingRectangle;
+                double startupStatusLeft = 0.0;
+                double startupStatusRight = 0.0;
+                double startupStatusTop = 0.0;
+                double startupStatusBottom = 0.0;
+                if (startupStatusValueFound)
+                {
+                    var startupStatusRect = startupStatusValue.Current.BoundingRectangle;
+                    startupStatusLeft = startupStatusRect.Left;
+                    startupStatusRight = startupStatusRect.Right;
+                    startupStatusTop = startupStatusRect.Top;
+                    startupStatusBottom = startupStatusRect.Bottom;
+                }
                 if (startupLabelRect.Right <= startupLabelRect.Left ||
                     startupLabelRect.Bottom <= startupLabelRect.Top ||
                     startupDescriptionRect.Right <= startupDescriptionRect.Left ||
@@ -515,20 +535,25 @@ public static class OpenShazamSettingsHostSmoke
                     appearanceSelectorRect.Right <= appearanceSelectorRect.Left ||
                     appearanceSelectorRect.Bottom <= appearanceSelectorRect.Top ||
                     (startupToggleFound &&
-                        (startupToggle.Current.BoundingRectangle.Right <= startupToggle.Current.BoundingRectangle.Left ||
-                         startupToggle.Current.BoundingRectangle.Bottom <= startupToggle.Current.BoundingRectangle.Top ||
-                         startupLabelRect.Left >= startupToggle.Current.BoundingRectangle.Left ||
-                         Math.Abs(startupToggle.Current.BoundingRectangle.Right - appearanceSelectorRect.Right) > 24.0)))
+                        (!startupStatusValueFound ||
+                         startupStatusRight <= startupStatusLeft ||
+                         startupStatusBottom <= startupStatusTop ||
+                         startupLabelRect.Left >= startupStatusLeft ||
+                         Math.Abs(startupStatusLeft - (appearanceSelectorRect.Right - 94.0)) > 24.0)))
                     throw new InvalidOperationException(
                         "Settings controls should be right-aligned while labels remain left-aligned. " +
-                        "Startup label=" + startupLabelRect + "; appearance selector=" + appearanceSelectorRect +
+                        "Startup label=" + startupLabelRect + "; startup status=" + startupStatusLeft + "," +
+                        startupStatusTop + "," + (startupStatusRight - startupStatusLeft) + "," +
+                        (startupStatusBottom - startupStatusTop) +
+                        "; appearance selector=" + appearanceSelectorRect +
                         "; controls=" + names);
                 if (startupToggleFound)
                 {
-                    var startupToggleRect = startupToggle.Current.BoundingRectangle;
-                    alignmentSummary = "startupControlRight=" + startupToggleRect.Right +
+                    alignmentSummary = "startupStatusValueLeft=" + startupStatusLeft +
+                        "; expectedStartupStatusLeft=" + (appearanceSelectorRect.Right - 94.0) +
                         "; appearanceControlRight=" + appearanceSelectorRect.Right +
-                        "; difference=" + Math.Abs(startupToggleRect.Right - appearanceSelectorRect.Right);
+                        "; difference=" + Math.Abs(startupStatusLeft - (appearanceSelectorRect.Right - 94.0)) +
+                        "; startupToggleBoundingRectangle=" + startupToggle.Current.BoundingRectangle;
                 }
                 else
                 {
