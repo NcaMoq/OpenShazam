@@ -150,7 +150,7 @@ catch {
 }
 Assert-Contains ([string]$installerVersionError) 'does not match Cargo workspace version' 'The shared installer build must reject a mismatched release version before invoking Inno Setup.'
 Assert-Contains ($ci + $release) 'innosetup --version=6\.7\.1' 'CI and Release must use Inno Setup with the Windows RedirectionGuard support required by uninstall cleanup.'
-Assert-NotContains $ci '(?m)^  push:[ \t]*(?:#.*)?$' 'Windows CI must not run automatically on every main push.'
+Assert-Contains $ci '(?m)^  push:\n    branches: \[main\]$' 'Windows CI must run automatically on main pushes only.'
 Assert-Contains $ci '(?m)^  pull_request:\n    branches: \[main\]$' 'Pull requests targeting main must run Windows CI.'
 Assert-Contains $ci '(?m)^  workflow_dispatch:$' 'Windows CI must remain manually runnable.'
 Assert-Contains $ci '(?m)^  workflow_call:$' 'Release workflow must be able to require the full CI workflow.'
